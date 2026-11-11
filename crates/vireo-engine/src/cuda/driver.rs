@@ -74,6 +74,7 @@ driver_functions! {
     cuMemGetInfo_v2(free: *mut usize, total: *mut usize);
     cuMemcpyHtoDAsync_v2(destination: CuDevicePtr, source: *const c_void, bytes: usize, stream: CuStream);
     cuMemcpyDtoHAsync_v2(destination: *mut c_void, source: CuDevicePtr, bytes: usize, stream: CuStream);
+    cuMemcpyDtoDAsync_v2(destination: CuDevicePtr, source: CuDevicePtr, bytes: usize, stream: CuStream);
     cuStreamCreate(stream: *mut CuStream, flags: u32);
     cuStreamDestroy_v2(stream: CuStream);
     cuStreamSynchronize(stream: CuStream);

@@ -87,6 +87,8 @@ git), for checking our output and speed.
 | 2026-11-10 | 8-bit activations on the GPU by default (`Precision::Int8`; `--exact` keeps f32): dp4a matrix-vector and tensor-core matrix-matrix kernels for Q4_0, Q8_0, Q4_K, Q5_K and Q6_K, a second PTX for compute 8.0, Q4_0 repacked on upload (see "Second round") | Perplexity within 0.1% of exact on all three models; tensor-core and dp4a kernels agree to ~1e-6 and stay within the rounding of x of the CPU; the France answers unchanged; exact-mode tests still match llama.cpp's exact numbers. 74 engine tests pass |
 | 2026-11-10 | An f16 key/value cache in 8-bit mode, prompt attention on the tensor cores, one token's attention split along the context (see "Third round") | Tensor-core and per-token attention over an f16 cache against f64 for head sizes 64–512 and a sliding window; perplexity within 0.13% of exact; exact mode unchanged (still llama.cpp's exact numbers); batches and token-by-token pick the same next token (Gemma: 553 of 554). 75 engine tests pass |
 | 2026-11-10 | Prompt speed: deeper tensor-core matrix steps with scales read once, Qwen's DeltaNet split into parallel norms and a column-split state update, the convolution over every token at once (see "Fourth round") | Exact perplexity unchanged to every digit (Qwen 25.0418); 8-bit perplexity within 0.13% of exact; the tensor-core and dp4a kernels still agree to ~1e-6. 75 engine tests pass |
+| 2026-11-11 | Prompt speed again: m16n8k32 products, unpacking Q4_K/Q5_K by sub-block pairs and Q6_K by run pairs, Q6_K padded to aligned 224-byte blocks (see "Fifth round") | Perplexity unchanged to every digit, exact and 8-bit; the exact Q6_K kernels still equal the CPU on the padded layout; tensor-core and dp4a kernels agree to ~1e-6. 75 engine tests pass |
+| 2026-11-11 | Nsight Compute profiling; `__vsubss4` replaced by cheap sign extension everywhere; Gemma's shared-KV layers run only for tokens whose logits are wanted (see "Sixth round") | Perplexity unchanged to every digit, exact and 8-bit (scoring runs every layer); the Gemma GPU test still matches llama.cpp's exact probabilities with a prompt read through the new path. 75 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -97,16 +99,19 @@ exactly. GELU is part of it but not all: exact GELU gives 30.8273, GELU through 
 table 30.8275, llama.cpp 30.8287. Worth tracking down with a per-layer comparison
 (llama.cpp's `llama-eval-callback`-style tensor dumps).
 
-**Speed so far** (RTX 5060 Laptop on mains power, tokens/s; llama.cpp b12262 CUDA by
-`llama-bench`, run the same day; generating from a short prompt, reading a prompt of
-1,600–1,800 tokens; Vireo's default is 8-bit activations, `--exact` the f32 path):
+**Speed so far** (RTX 5060 Laptop on mains power, tokens/s, Vireo in 8-bit mode against
+llama.cpp b12262 by `llama-bench`, measured back to back on 2026-11-11; generating 128
+tokens from a short prompt, reading a prompt of 1,600–1,800 tokens). The laptop's clocks
+drift with temperature and power state (both engines moved ~10% between runs that day),
+so compare within a row:
 
-| Model | Generating: Vireo 8-bit / exact / llama.cpp | Generating after 1,700 tokens: 8-bit / exact / llama.cpp | Reading a prompt: Vireo 8-bit / exact / llama.cpp | Vireo CPU |
-|---|---|---|---|---|
-| Llama 3.2 1B Q4_K_M | ~130 / ~99 / 101 | ~107 / ~80 / 95 | ~2,130 / ~604 / 4,241 | ~25 |
-| Qwen 3.5 0.8B Q4_K_M | ~150 / ~121 / 126 | ~135 / ~108 / 121 | ~2,690 / ~887 / 4,756 | ~28 |
-| Gemma 4 E2B Q4_0 | ~64 / ~53 / 64 | ~57 / ~48 / 63 | ~1,200 / ~331 / 5,346 | ~6.5 |
+| Model | Generating: Vireo / llama.cpp | Reading a prompt: Vireo / llama.cpp | Vireo CPU |
+|---|---|---|---|
+| Llama 3.2 1B Q4_K_M | ~103 / 83 (125%) | ~2,110 / 3,590 (59%) | ~25 |
+| Qwen 3.5 0.8B Q4_K_M | ~127 / 106 (119%) | ~2,600 / 4,100 (63%) | ~28 |
+| Gemma 4 E2B Q4_0 | ~67 / 55 (122%) | ~3,040 / 4,710 (65%) | ~6.5 |
 
+Exact mode (`--exact`) is ~20% slower generating and ~2–3× slower reading prompts.
 Before the speed work below it was ~40 / 53 / 23 generating and ~40 / 53 / 17 reading a
 prompt. Exact perplexity on the GPU is unchanged to every digit.
 
@@ -183,26 +188,64 @@ prompt. Exact perplexity on the GPU is unchanged to every digit.
   token at once too (`conv_silu_parallel`, then `conv_history`).
 - Prompts: Llama ~1,900 → ~2,130, Qwen ~2,000 → ~2,690, Gemma ~1,030 → ~1,200 tokens/s.
 
+**Fifth round: prompts again (2026-11-11):**
+
+- The tensor-core products take a whole group of 32 columns at once (`mma.m16n8k32`),
+  halving the products and fragment loads for every type but Q6_K (scales per 16).
+- Unpacking by bigger units: Q4_K and Q5_K a pair of sub-blocks per thread (two 16-byte
+  loads and one scale header for 64 numbers, instead of four headers); Q6_K a pair of runs
+  that share their bytes. Q6_K's 210-byte blocks are padded to 224 when uploaded so they
+  start 16-byte aligned (`Q6K_BYTES`), which all Q6_K kernels use. Q4_K 6.3 → 7.9 TOPS at
+  8192 × 2048 × 512 tokens; Q5_K and Q6_K +13–40%.
+- Tried and dropped: `ldmatrix` for the fragments (2% slower than plain loads here);
+  f16 tensor-core products with the scales folded into f16 weights (no per-group scaling,
+  but f16 products top out at ~8.3 TOPS here against ~12.6 for int8); folding Q4_K's
+  integer sub-block scales into the sums (3% at most).
+- Measured, not adopted: activation scales per 128 or 256 numbers instead of 32 would
+  let the sums stay integers across groups (about half the tensor-core kernels' time is
+  the per-32 scaling), at 2–5× the perplexity cost of 8-bit mode today: +0.27–0.74% from
+  exact against +0.03–0.13%. A quality decision, left open.
+- Prompts: Llama ~2,130 → ~2,540, Qwen ~2,690 → ~3,020, Gemma ~1,200 → ~1,250 tokens/s.
+  Exact and 8-bit perplexity unchanged to every digit (the same integer sums).
+- The GPU ran at ~2.8 GHz this round (~1.5 GHz in earlier ones: a power setting); llama.cpp
+  was re-measured under the same conditions.
+
+**Sixth round: Nsight Compute, and Gemma's shared layers (2026-11-11):**
+
+- With the GPU's performance counters open (an NVIDIA Control Panel setting), Nsight
+  Compute on the Q4_0 tensor-core kernel at Gemma's shape: the tensor cores busy ~30% of
+  the time, ~28 instructions issued per tensor-core instruction (12 of them the per-32
+  scaling, ~5 unpacking, the rest addresses, loops and zeroing), issue half busy with ~1
+  eligible warp per scheduler (127 registers: 4 warps each). The SM clock fell to ~700 MHz
+  under this load, so fewer instructions also means less power.
+- `__vsubss4` (a byte-wise saturating subtract) has no instruction on this GPU and
+  compiles to ~8; replaced everywhere by a 3-instruction sign extension (`sext4`,
+  `sext6`), the same bytes. Q4_0's dp4a generation kernel went from ~135 to ~200 GB/s
+  (Gemma generates ~10% faster).
+- Tried in a standalone benchmark: cp.async double buffering with Q4_0's raw 4-bit
+  numbers read straight into the fragments (+6% with the cheaper sign extension, not yet
+  in the engine); 128-token tiles (too much shared memory and registers).
+- The big one came from profiling llama.cpp itself: it runs Gemma's shared-KV layers
+  (15–34 of 35 in E2B) only for the tokens whose logits are wanted. Those layers keep no
+  keys or values, so a token's pass through them only makes its own logits. Vireo now
+  does the same in `forward_batch`: a prompt runs layers 0–14 for every token and 15–34
+  for the last token alone (none at all for chunks without logits; every layer for
+  every token when all logits are asked for, as in scoring). Gemma reads prompts 2.6×
+  faster (~1,185 → ~3,100 tokens/s); its llama.cpp test still matches.
+
 **What limits speed now, and what's next:**
 
-- **Generating** is ahead of llama.cpp on Llama and Qwen, short or long context, and at
-  90–100% on Gemma, which reads ~1 GB of Q4_0 weights a token. The dp4a kernels reach
-  ~120–180 GB/s of ~400. The GPU runs at ~1.5 GHz under load (it reports a clock limit,
-  0x400; a pure f32 multiply-add loop reaches only ~4 TFLOPS), likely a laptop power mode;
-  llama.cpp ran under the same limit.
-- **Reading a prompt** is at 22–57% of llama.cpp. The tensor-core matrix products are
-  most of it; the remaining levers: the scaling (a cheaper epilogue, or a coarser x scale
-  per 128 or 256 so the group sums stay integers longer, which costs accuracy and needs
-  measuring), unpacking each weight tile once into a reusable layout at load time
-  (llama.cpp repacks for its MMQ kernels), and double buffering. For Qwen, the DeltaNet
-  scan (~21%) would need the chunked (WY) form to go much further.
-- **For larger models**: splitting a model between GPU and system memory (Muse Glimmer 30B), mixture-of-
-  experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), and more than one GPU are still to
-  do; the f16 cache is the first step.
-- Nsight Compute can't read the GPU's counters on this PC (`ERR_NVGPUCTRPERM`: allowing it
-  is an NVIDIA Control Panel setting, Desktop → Enable Developer Settings, then Developer →
-  Manage GPU Performance Counters). Nsight Systems works and gives per-kernel times,
-  including inside the graphs (`--cuda-graph-trace=node`).
+- **Reading a prompt** is at ~60–65% of llama.cpp on all three. What's left is the
+  tensor-core kernels' instruction count (the per-32 scaling is half of it and is the
+  same in llama.cpp, so it's the rest: unpacking, addresses, zeroing; and their
+  occupancy), then cp.async double buffering (measured +6% on Q4_0). llama.cpp also runs
+  the last layer's feed-forward only for output tokens (a few % on Llama and Qwen).
+  For Qwen, the DeltaNet scan would need the chunked (WY) form.
+- **Generating** is 19–25% ahead of llama.cpp on all three.
+- **For larger models**: splitting a model between GPU and system memory (Muse Glimmer
+  30B), mixture-of-experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), more than one GPU.
+- Nsight Compute: the counters are open on this PC now (all users); set them back to
+  administrators only when the tuning is done.
 
 **NPU check (2026-11-10):** the AMD NPU's driver is installed and working
 (32.0.203.329), with AMD's XRT runtime (`xrt_coreutil.dll`), but not Ryzen AI Software.
