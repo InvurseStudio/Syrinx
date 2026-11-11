@@ -14,6 +14,7 @@ use vireo_engine::models::llama::{Llama, Session};
 use vireo_engine::models::llama_cuda::{CudaSession, LlamaCuda};
 use vireo_engine::models::qwen35::{self, Qwen35};
 use vireo_engine::models::qwen35_cuda::{Qwen35Cuda, Qwen35CudaSession};
+use vireo_engine::models::{Logits, Precision};
 use vireo_engine::{GgufFile, Tokenizer};
 
 const USAGE: &str = "\
@@ -33,7 +34,9 @@ Usage:
       --top <k>       Also show the k likeliest first tokens and their probabilities
       --threads <n>   CPU threads (default: every core)
       --gpu           Run on the NVIDIA GPU instead of the CPU
-  vireo-cli perplexity <model.gguf> <text-file> [-c <context>] [--chunks <n>] [--gpu]
+      --exact         On the GPU, exact f32 arithmetic instead of 8-bit activations
+                      (slower; the CPU's numbers)
+  vireo-cli perplexity <model.gguf> <text-file> [-c <context>] [--chunks <n>] [--gpu] [--exact]
                                                How well the model predicts the text, scored
                                                as llama.cpp's llama-perplexity scores it
   vireo-cli --version                          Show the version";
@@ -67,11 +70,13 @@ fn main() -> ExitCode {
             let mut context = 512;
             let mut chunks = usize::MAX;
             let mut gpu = false;
+            let mut exact = false;
             let mut args = rest.iter();
             while let Some(&arg) = args.next() {
                 let mut value = || args.next().and_then(|v| v.parse().ok());
                 match arg {
                     "--gpu" => gpu = true,
+                    "--exact" => exact = true,
                     "-c" if let Some(v) = value() => context = v,
                     "--chunks" if let Some(v) = value() => chunks = v,
                     _ => {
@@ -80,7 +85,12 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            perplexity(path, text, context, chunks, gpu)
+            let precision = if exact {
+                Precision::Exact
+            } else {
+                Precision::Int8
+            };
+            perplexity(path, text, context, chunks, gpu, precision)
         }
         [] | ["help" | "--help" | "-h"] => {
             println!("vireo-cli {}\n\n{USAGE}", vireo_engine::VERSION);
@@ -137,12 +147,20 @@ impl State {
 }
 
 impl<'a> Engine<'a> {
-    fn load(file: &'a GgufFile, gpu: bool, threads: Option<usize>) -> Result<Self, String> {
+    fn load(
+        file: &'a GgufFile,
+        gpu: bool,
+        threads: Option<usize>,
+        precision: Precision,
+    ) -> Result<Self, String> {
         if file.architecture() == Some("gemma4") {
             if gpu {
                 let device = Gpu::open().map_err(|e| e.to_string())?;
                 return Gemma4Cuda::load(file, device)
-                    .map(Engine::Gemma4Gpu)
+                    .map(|mut m| {
+                        m.set_precision(precision);
+                        Engine::Gemma4Gpu(m)
+                    })
                     .map_err(|e| e.to_string());
             }
             let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
@@ -154,7 +172,10 @@ impl<'a> Engine<'a> {
             if gpu {
                 let device = Gpu::open().map_err(|e| e.to_string())?;
                 return Qwen35Cuda::load(file, device)
-                    .map(Engine::Qwen35Gpu)
+                    .map(|mut m| {
+                        m.set_precision(precision);
+                        Engine::Qwen35Gpu(m)
+                    })
                     .map_err(|e| e.to_string());
             }
             let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
@@ -165,7 +186,10 @@ impl<'a> Engine<'a> {
         if gpu {
             let device = Gpu::open().map_err(|e| e.to_string())?;
             return LlamaCuda::load(file, device)
-                .map(Engine::Gpu)
+                .map(|mut m| {
+                    m.set_precision(precision);
+                    Engine::Gpu(m)
+                })
                 .map_err(|e| e.to_string());
         }
         let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
@@ -183,10 +207,11 @@ impl<'a> Engine<'a> {
                 m.threads()
             ),
             Engine::Gpu(m) => format!(
-                "{} layers, {} wide, on the GPU ({})",
+                "{} layers, {} wide, on the GPU ({}, {:?})",
                 m.config.layers,
                 m.config.dim,
-                m.gpu().info.name
+                m.gpu().info.name,
+                m.precision()
             ),
             Engine::Gemma4(m) => format!(
                 "Gemma 4: {} layers ({} global), {} wide, on the CPU ({} threads)",
@@ -196,16 +221,18 @@ impl<'a> Engine<'a> {
                 m.threads()
             ),
             Engine::Qwen35Gpu(m) => format!(
-                "Qwen 3.5: {} layers, {} wide, on the GPU ({})",
+                "Qwen 3.5: {} layers, {} wide, on the GPU ({}, {:?})",
                 m.config.layers,
                 m.config.dim,
-                m.gpu().info.name
+                m.gpu().info.name,
+                m.precision()
             ),
             Engine::Gemma4Gpu(m) => format!(
-                "Gemma 4: {} layers, {} wide, on the GPU ({})",
+                "Gemma 4: {} layers, {} wide, on the GPU ({}, {:?})",
                 m.config.layers,
                 m.config.dim,
-                m.gpu().info.name
+                m.gpu().info.name,
+                m.precision()
             ),
             Engine::Qwen35(m) => format!(
                 "Qwen 3.5: {} layers ({} full attention, the rest DeltaNet), {} wide, on the CPU ({} threads)",
@@ -261,6 +288,42 @@ impl<'a> Engine<'a> {
             _ => unreachable!("a session belongs to the engine that made it"),
         }
     }
+
+    /// Runs `tokens` in order: in batches on the GPU, one by one on the CPU. Hands back
+    /// the logits asked for (the last token's, or a row of the vocabulary per token).
+    fn forward_batch(&self, state: &mut State, tokens: &[u32], logits: Logits) -> Option<Vec<f32>> {
+        let gpu = |r: Result<Option<&[f32]>, vireo_engine::models::Error>| {
+            r.unwrap_or_else(|e| panic!("the GPU failed: {e}"))
+                .map(<[f32]>::to_vec)
+        };
+        match (self, &mut *state) {
+            (Engine::Gpu(m), State::Gpu(s)) => return gpu(m.forward_batch(s, tokens, logits)),
+            (Engine::Qwen35Gpu(m), State::Qwen35Gpu(s)) => {
+                return gpu(m.forward_batch(s, tokens, logits));
+            }
+            (Engine::Gemma4Gpu(m), State::Gemma4Gpu(s)) => {
+                return gpu(m.forward_batch(s, tokens, logits));
+            }
+            _ => {}
+        }
+        let mut all = Vec::new();
+        let mut last = None;
+        for (i, &token) in tokens.iter().enumerate() {
+            let want = logits == Logits::All || (logits == Logits::Last && i + 1 == tokens.len());
+            if let Some(l) = self.forward(state, token, want) {
+                if logits == Logits::All {
+                    all.extend_from_slice(l);
+                } else {
+                    last = Some(l.to_vec());
+                }
+            }
+        }
+        match logits {
+            Logits::None => None,
+            Logits::Last => last,
+            Logits::All => Some(all),
+        }
+    }
 }
 
 struct GenerateOptions {
@@ -270,6 +333,7 @@ struct GenerateOptions {
     top: usize,
     threads: Option<usize>,
     gpu: bool,
+    exact: bool,
 }
 
 impl GenerateOptions {
@@ -281,6 +345,7 @@ impl GenerateOptions {
             top: 0,
             threads: None,
             gpu: false,
+            exact: false,
         };
         let mut args = args.iter();
         while let Some(&arg) = args.next() {
@@ -289,6 +354,7 @@ impl GenerateOptions {
                 "--file" => o.file = true,
                 "--raw" => o.raw = true,
                 "--gpu" => o.gpu = true,
+                "--exact" => o.exact = true,
                 "--top" => o.top = args.next()?.parse().ok()?,
                 "--threads" => o.threads = Some(args.next()?.parse().ok()?),
                 _ => return None,
@@ -324,7 +390,12 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
         Ok(t) => t,
         Err(e) => return fail("load the tokenizer", &e),
     };
-    let model = match Engine::load(&file, options.gpu, options.threads) {
+    let precision = if options.exact {
+        Precision::Exact
+    } else {
+        Precision::Int8
+    };
+    let model = match Engine::load(&file, options.gpu, options.threads, precision) {
         Ok(m) => m,
         Err(e) => return fail("load the model", &e),
     };
@@ -337,15 +408,11 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
     }
     let mut session = model.session(ids.len() + options.tokens);
 
-    // The prompt: every token but the last needs no logits.
+    // The prompt: only the last token's logits are needed.
     let started = Instant::now();
-    for &id in &ids[..ids.len() - 1] {
-        model.forward(&mut session, id, false);
-    }
     let mut logits = model
-        .forward(&mut session, ids[ids.len() - 1], true)
-        .expect("asked for logits")
-        .to_vec();
+        .forward_batch(&mut session, &ids, Logits::Last)
+        .expect("asked for logits");
     let prompt_time = started.elapsed();
 
     if options.top > 0 {
@@ -416,6 +483,7 @@ fn perplexity(
     context: usize,
     max_chunks: usize,
     gpu: bool,
+    precision: Precision,
 ) -> ExitCode {
     let text = match std::fs::read_to_string(text_path) {
         Ok(t) => t,
@@ -433,7 +501,7 @@ fn perplexity(
     };
     let (tokenizer, model) = match Tokenizer::from_gguf(&file)
         .map_err(|e| e.to_string())
-        .and_then(|t| Ok((t, Engine::load(&file, gpu, None)?)))
+        .and_then(|t| Ok((t, Engine::load(&file, gpu, None, precision)?)))
     {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -461,21 +529,25 @@ fn perplexity(
     for chunk in 0..chunks {
         let tokens = &tokens[chunk * context..(chunk + 1) * context];
         let mut session = model.session(context);
-        for (j, &token) in tokens.iter().enumerate() {
-            let token = match (j, tokenizer.bos()) {
-                (0, Some(bos)) => bos,
-                _ => token,
-            };
-            let scored = j >= context / 2 && j + 1 < context;
-            let logits = model.forward(&mut session, token, scored);
-            if let Some(logits) = logits {
-                // -log softmax(logits)[next], computed in f64 for a stable sum.
-                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-                let sum: f64 = logits.iter().map(|&l| (l as f64 - max).exp()).sum();
-                let next = tokens[j + 1] as usize;
-                nll += max + sum.ln() - logits[next] as f64;
-                count += 1;
-            }
+        let mut input = tokens.to_vec();
+        if let Some(bos) = tokenizer.bos() {
+            input[0] = bos;
+        }
+        // The first half only gives context; the second half's predictions are scored.
+        let half = context / 2;
+        model.forward_batch(&mut session, &input[..half], Logits::None);
+        let all = model
+            .forward_batch(&mut session, &input[half..], Logits::All)
+            .expect("asked for logits");
+        let vocab = all.len() / (context - half);
+        for j in half..context - 1 {
+            let logits = &all[(j - half) * vocab..(j - half + 1) * vocab];
+            // -log softmax(logits)[next], computed in f64 for a stable sum.
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let sum: f64 = logits.iter().map(|&l| (l as f64 - max).exp()).sum();
+            let next = tokens[j + 1] as usize;
+            nll += max + sum.ln() - logits[next] as f64;
+            count += 1;
         }
         eprintln!("  [{}] {:.4}", chunk + 1, (nll / count as f64).exp());
     }
