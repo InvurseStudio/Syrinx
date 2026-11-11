@@ -146,14 +146,24 @@ impl Drop for Buffer {
 struct Kernels {
     matvec_f32: CuFunction,
     matvec_f16: CuFunction,
+    matvec_q4_0: CuFunction,
     matvec_q8_0: CuFunction,
     matvec_q4_k: CuFunction,
+    matvec_q5_k: CuFunction,
     matvec_q6_k: CuFunction,
     rms_norm: CuFunction,
-    rope_norm: CuFunction,
+    l2_norm: CuFunction,
+    rope: CuFunction,
     attention: CuFunction,
     swiglu: CuFunction,
+    geglu: CuFunction,
     add: CuFunction,
+    scale: CuFunction,
+    softcap: CuFunction,
+    split_query: CuFunction,
+    apply_gate: CuFunction,
+    conv_silu: CuFunction,
+    delta_net: CuFunction,
 }
 
 /// What the driver reports about the GPU.
@@ -280,14 +290,24 @@ impl Gpu {
             let kernels = Kernels {
                 matvec_f32: function("matvec_f32")?,
                 matvec_f16: function("matvec_f16")?,
+                matvec_q4_0: function("matvec_q4_0")?,
                 matvec_q8_0: function("matvec_q8_0")?,
                 matvec_q4_k: function("matvec_q4_k")?,
+                matvec_q5_k: function("matvec_q5_k")?,
                 matvec_q6_k: function("matvec_q6_k")?,
                 rms_norm: function("rms_norm")?,
-                rope_norm: function("rope_norm")?,
+                l2_norm: function("l2_norm")?,
+                rope: function("rope")?,
                 attention: function("attention")?,
                 swiglu: function("swiglu")?,
+                geglu: function("geglu")?,
                 add: function("add")?,
+                scale: function("scale")?,
+                softcap: function("softcap")?,
+                split_query: function("split_query")?,
+                apply_gate: function("apply_gate")?,
+                conv_silu: function("conv_silu")?,
+                delta_net: function("delta_net")?,
             };
             Ok(Self {
                 context,
@@ -303,8 +323,10 @@ impl Gpu {
             kind,
             TensorType::F32
                 | TensorType::F16
+                | TensorType::Q4_0
                 | TensorType::Q8_0
                 | TensorType::Q4_K
+                | TensorType::Q5_K
                 | TensorType::Q6_K
         )
     }
@@ -377,6 +399,25 @@ impl Gpu {
         self.context.check("cuLaunchKernel", r)
     }
 
+    /// Queues `kernel` with `args`, in the kernel's parameter order.
+    fn run(&self, kernel: CuFunction, grid: u32, block: u32, args: &[Arg]) -> Result<()> {
+        let mut values = args.to_vec();
+        let mut params: Vec<*mut c_void> = values
+            .iter_mut()
+            .map(|a| match a {
+                Arg::Ptr(v) => (v as *mut u64).cast(),
+                Arg::I32(v) => (v as *mut i32).cast(),
+                Arg::F32(v) => (v as *mut f32).cast(),
+            })
+            .collect();
+        self.launch(kernel, grid, block, &mut params)
+    }
+
+    /// One thread per number, 256 to a block.
+    fn run_per_number(&self, kernel: CuFunction, n: usize, args: &[Arg]) -> Result<()> {
+        self.run(kernel, (n as u32).div_ceil(256), 256, args)
+    }
+
     /// `y = W x`: `w` holds `rows` rows of `cols` numbers of type `kind`.
     pub fn matvec(
         &self,
@@ -390,28 +431,25 @@ impl Gpu {
         let kernel = match kind {
             TensorType::F32 => self.kernels.matvec_f32,
             TensorType::F16 => self.kernels.matvec_f16,
+            TensorType::Q4_0 => self.kernels.matvec_q4_0,
             TensorType::Q8_0 => self.kernels.matvec_q8_0,
             TensorType::Q4_K => self.kernels.matvec_q4_k,
+            TensorType::Q5_K => self.kernels.matvec_q5_k,
             TensorType::Q6_K => self.kernels.matvec_q6_k,
             other => return Err(Error::Unsupported(other)),
         };
-        let (mut w, mut x, mut y) = (w, x, y);
-        let (mut rows_arg, mut cols_arg) = (rows as i32, cols as i32);
         let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK);
-        self.launch(
-            kernel,
-            grid,
-            ROWS_PER_BLOCK * 32,
-            &mut [
-                arg(&mut w),
-                arg(&mut x),
-                arg(&mut y),
-                arg(&mut rows_arg),
-                arg(&mut cols_arg),
-            ],
-        )
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+        ];
+        self.run(kernel, grid, ROWS_PER_BLOCK * 32, &args)
     }
 
+    /// RMSNorm of `n` numbers: `out = x / rms(x) × weight`.
     pub fn rms_norm(
         &self,
         x: CuDevicePtr,
@@ -420,22 +458,37 @@ impl Gpu {
         n: usize,
         eps: f32,
     ) -> Result<()> {
-        let (mut x, mut weight, mut out, mut n, mut eps) = (x, weight, out, n as i32, eps);
-        self.launch(
-            self.kernels.rms_norm,
-            1,
-            256,
-            &mut [
-                arg(&mut x),
-                arg(&mut weight),
-                arg(&mut out),
-                arg(&mut n),
-                arg(&mut eps),
-            ],
-        )
+        self.rms_norm_rows(x, weight, out, 1, n, eps)
     }
 
-    /// RoPE (adjacent pairs) in place; `factors` is 0 for none.
+    /// RMSNorm of each of `rows` rows of `n` numbers (heads, layer slices); `weight` is
+    /// the same for every row, or 0 for none. In place is fine.
+    pub fn rms_norm_rows(
+        &self,
+        x: CuDevicePtr,
+        weight: CuDevicePtr,
+        out: CuDevicePtr,
+        rows: usize,
+        n: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(weight),
+            Arg::Ptr(out),
+            Arg::I32(n as i32),
+            Arg::F32(eps),
+        ];
+        self.run(self.kernels.rms_norm, rows as u32, 256, &args)
+    }
+
+    /// Each of `rows` rows of `n` numbers divided by its length (at least `eps`), in place.
+    pub fn l2_norm_rows(&self, x: CuDevicePtr, rows: usize, n: usize, eps: f32) -> Result<()> {
+        let args = [Arg::Ptr(x), Arg::I32(n as i32), Arg::F32(eps)];
+        self.run(self.kernels.l2_norm, rows as u32, 128, &args)
+    }
+
+    /// RoPE (adjacent pairs, Llama's) over whole heads, in place; `factors` is 0 for none.
     pub fn rope_norm(
         &self,
         x: CuDevicePtr,
@@ -445,25 +498,38 @@ impl Gpu {
         base: f32,
         factors: CuDevicePtr,
     ) -> Result<()> {
-        let threads = (heads * head_dim / 2) as u32;
-        let (mut x, mut heads, mut head_dim, mut pos, mut base, mut factors) =
-            (x, heads as i32, head_dim as i32, pos as i32, base, factors);
-        self.launch(
-            self.kernels.rope_norm,
-            threads.div_ceil(128),
-            128,
-            &mut [
-                arg(&mut x),
-                arg(&mut heads),
-                arg(&mut head_dim),
-                arg(&mut pos),
-                arg(&mut base),
-                arg(&mut factors),
-            ],
-        )
+        self.rope(x, heads, head_dim, head_dim, pos, base, factors, false)
     }
 
-    /// Attention of `heads` query heads over `len` cached positions.
+    /// RoPE on the first `rope_dims` numbers of each head, in place: adjacent pairs, or
+    /// halves with `neox`. `factors` is 0 for none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(
+        &self,
+        x: CuDevicePtr,
+        heads: usize,
+        head_dim: usize,
+        rope_dims: usize,
+        pos: usize,
+        base: f32,
+        factors: CuDevicePtr,
+        neox: bool,
+    ) -> Result<()> {
+        let threads = (heads * rope_dims / 2) as u32;
+        let args = [
+            Arg::Ptr(x),
+            Arg::I32(heads as i32),
+            Arg::I32(head_dim as i32),
+            Arg::I32(rope_dims as i32),
+            Arg::I32(pos as i32),
+            Arg::F32(base),
+            Arg::Ptr(factors),
+            Arg::I32(neox as i32),
+        ];
+        self.run(self.kernels.rope, threads.div_ceil(128), 128, &args)
+    }
+
+    /// Attention of `heads` query heads over cached positions `first..len`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
@@ -473,6 +539,7 @@ impl Gpu {
         out: CuDevicePtr,
         scores: CuDevicePtr,
         heads: usize,
+        first: usize,
         len: usize,
         head_dim: usize,
         kv_dim: usize,
@@ -480,57 +547,178 @@ impl Gpu {
         capacity: usize,
         scale: f32,
     ) -> Result<()> {
-        let (mut q, mut keys, mut values, mut out, mut scores) = (q, keys, values, out, scores);
-        let (mut len, mut head_dim, mut kv_dim, mut group, mut capacity, mut scale) = (
-            len as i32,
-            head_dim as i32,
-            kv_dim as i32,
-            group as i32,
-            capacity as i32,
-            scale,
-        );
-        self.launch(
-            self.kernels.attention,
-            heads as u32,
-            128,
-            &mut [
-                arg(&mut q),
-                arg(&mut keys),
-                arg(&mut values),
-                arg(&mut out),
-                arg(&mut scores),
-                arg(&mut len),
-                arg(&mut head_dim),
-                arg(&mut kv_dim),
-                arg(&mut group),
-                arg(&mut capacity),
-                arg(&mut scale),
-            ],
-        )
+        let args = [
+            Arg::Ptr(q),
+            Arg::Ptr(keys),
+            Arg::Ptr(values),
+            Arg::Ptr(out),
+            Arg::Ptr(scores),
+            Arg::I32(first as i32),
+            Arg::I32(len as i32),
+            Arg::I32(head_dim as i32),
+            Arg::I32(kv_dim as i32),
+            Arg::I32(group as i32),
+            Arg::I32(capacity as i32),
+            Arg::F32(scale),
+        ];
+        self.run(self.kernels.attention, heads as u32, 128, &args)
     }
 
+    /// `gate = SiLU(gate) × up`
     pub fn swiglu(&self, gate: CuDevicePtr, up: CuDevicePtr, n: usize) -> Result<()> {
-        let (mut gate, mut up, mut n_arg) = (gate, up, n as i32);
-        self.launch(
+        self.run_per_number(
             self.kernels.swiglu,
-            (n as u32).div_ceil(256),
-            256,
-            &mut [arg(&mut gate), arg(&mut up), arg(&mut n_arg)],
+            n,
+            &[Arg::Ptr(gate), Arg::Ptr(up), Arg::I32(n as i32)],
         )
     }
 
-    pub fn add(&self, x: CuDevicePtr, y: CuDevicePtr, n: usize) -> Result<()> {
-        let (mut x, mut y, mut n_arg) = (x, y, n as i32);
-        self.launch(
-            self.kernels.add,
-            (n as u32).div_ceil(256),
-            256,
-            &mut [arg(&mut x), arg(&mut y), arg(&mut n_arg)],
+    /// `gate = GELU(gate) × up` (tanh approximation)
+    pub fn geglu(&self, gate: CuDevicePtr, up: CuDevicePtr, n: usize) -> Result<()> {
+        self.run_per_number(
+            self.kernels.geglu,
+            n,
+            &[Arg::Ptr(gate), Arg::Ptr(up), Arg::I32(n as i32)],
         )
+    }
+
+    /// `x += y`
+    pub fn add(&self, x: CuDevicePtr, y: CuDevicePtr, n: usize) -> Result<()> {
+        self.run_per_number(
+            self.kernels.add,
+            n,
+            &[Arg::Ptr(x), Arg::Ptr(y), Arg::I32(n as i32)],
+        )
+    }
+
+    /// `x *= s`
+    pub fn scale(&self, x: CuDevicePtr, s: f32, n: usize) -> Result<()> {
+        self.run_per_number(
+            self.kernels.scale,
+            n,
+            &[Arg::Ptr(x), Arg::F32(s), Arg::I32(n as i32)],
+        )
+    }
+
+    /// `x = cap × tanh(x / cap)`
+    pub fn softcap(&self, x: CuDevicePtr, cap: f32, n: usize) -> Result<()> {
+        self.run_per_number(
+            self.kernels.softcap,
+            n,
+            &[Arg::Ptr(x), Arg::F32(cap), Arg::I32(n as i32)],
+        )
+    }
+
+    /// The queries out of gated attention's `[query | gate]` per head.
+    pub fn split_query(
+        &self,
+        query_gate: CuDevicePtr,
+        q: CuDevicePtr,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(query_gate),
+            Arg::Ptr(q),
+            Arg::I32(heads as i32),
+            Arg::I32(head_dim as i32),
+        ];
+        self.run_per_number(self.kernels.split_query, heads * head_dim, &args)
+    }
+
+    /// `out ×= sigmoid(gate)`, the gates being the second halves of `[query | gate]`.
+    pub fn apply_gate(
+        &self,
+        out: CuDevicePtr,
+        query_gate: CuDevicePtr,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(out),
+            Arg::Ptr(query_gate),
+            Arg::I32(heads as i32),
+            Arg::I32(head_dim as i32),
+        ];
+        self.run_per_number(self.kernels.apply_gate, heads * head_dim, &args)
+    }
+
+    /// The causal convolution and SiLU of Gated DeltaNet, moving the history along.
+    pub fn conv_silu(
+        &self,
+        current: CuDevicePtr,
+        history: CuDevicePtr,
+        weights: CuDevicePtr,
+        out: CuDevicePtr,
+        channels: usize,
+        kernel: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(current),
+            Arg::Ptr(history),
+            Arg::Ptr(weights),
+            Arg::Ptr(out),
+            Arg::I32(channels as i32),
+            Arg::I32(kernel as i32),
+        ];
+        self.run_per_number(self.kernels.conv_silu, channels, &args)
+    }
+
+    /// One token of Gated DeltaNet for `v_heads` heads with states of `n` × `n` (n ≤ 256),
+    /// including the gated RMSNorm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_net(
+        &self,
+        q: CuDevicePtr,
+        k: CuDevicePtr,
+        v: CuDevicePtr,
+        beta_raw: CuDevicePtr,
+        alpha_raw: CuDevicePtr,
+        dt_bias: CuDevicePtr,
+        a: CuDevicePtr,
+        state: CuDevicePtr,
+        z: CuDevicePtr,
+        norm: CuDevicePtr,
+        out: CuDevicePtr,
+        v_heads: usize,
+        n: usize,
+        k_heads: usize,
+        eps: f32,
+    ) -> Result<()> {
+        assert!(
+            n <= 256 && n.is_multiple_of(32),
+            "state size {n}: the kernel takes multiples of 32 up to 256"
+        );
+        let args = [
+            Arg::Ptr(q),
+            Arg::Ptr(k),
+            Arg::Ptr(v),
+            Arg::Ptr(beta_raw),
+            Arg::Ptr(alpha_raw),
+            Arg::Ptr(dt_bias),
+            Arg::Ptr(a),
+            Arg::Ptr(state),
+            Arg::Ptr(z),
+            Arg::Ptr(norm),
+            Arg::Ptr(out),
+            Arg::I32(n as i32),
+            Arg::I32(k_heads as i32),
+            Arg::F32(eps),
+        ];
+        self.run(self.kernels.delta_net, v_heads as u32, n as u32, &args)
+    }
+
+    /// Fills `bytes` of GPU memory with zeros.
+    pub fn zero(&self, buffer: &Buffer) -> Result<()> {
+        let zeros = vec![0f32; buffer.len_bytes() / 4];
+        buffer.write_f32(&zeros)
     }
 }
 
-/// A kernel argument, as the pointer to it that `cuLaunchKernel` takes.
-fn arg<T>(value: &mut T) -> *mut c_void {
-    (value as *mut T).cast()
+/// A kernel argument, by type.
+#[derive(Clone, Copy)]
+enum Arg {
+    Ptr(CuDevicePtr),
+    I32(i32),
+    F32(f32),
 }

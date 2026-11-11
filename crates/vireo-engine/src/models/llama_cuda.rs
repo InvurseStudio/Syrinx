@@ -230,6 +230,7 @@ impl<'a> LlamaCuda<'a> {
                 s.attention.ptr(),
                 s.scores.ptr(),
                 c.heads,
+                0,
                 pos + 1,
                 hd,
                 kv_dim,

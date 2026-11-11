@@ -9,7 +9,7 @@
 
 use std::cmp::Ordering;
 
-use super::unicode_tables::{LETTERS, NUMBERS};
+use super::unicode_tables::{LETTERS, MARKS, NUMBERS};
 
 pub use super::unicode_tables::UNICODE_VERSION;
 
@@ -36,6 +36,12 @@ pub fn is_letter(c: char) -> bool {
     } else {
         in_table(LETTERS, c)
     }
+}
+
+/// Unicode general category M (combining marks). No ASCII character is a mark.
+#[inline]
+pub fn is_mark(c: char) -> bool {
+    !c.is_ascii() && in_table(MARKS, c)
 }
 
 /// Unicode general category N.
@@ -96,7 +102,7 @@ mod tests {
 
     #[test]
     fn tables_are_sorted_and_disjoint() {
-        for table in [LETTERS, NUMBERS] {
+        for table in [LETTERS, MARKS, NUMBERS] {
             for pair in table.windows(2) {
                 assert!(pair[0].0 <= pair[0].1 && pair[0].1 < pair[1].0, "{pair:?}");
             }

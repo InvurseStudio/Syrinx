@@ -8,8 +8,12 @@ use std::time::Instant;
 
 use vireo_engine::cpu::Pool;
 use vireo_engine::cuda::Gpu;
+use vireo_engine::models::gemma4::{self, Gemma4};
+use vireo_engine::models::gemma4_cuda::{Gemma4Cuda, Gemma4CudaSession};
 use vireo_engine::models::llama::{Llama, Session};
 use vireo_engine::models::llama_cuda::{CudaSession, LlamaCuda};
+use vireo_engine::models::qwen35::{self, Qwen35};
+use vireo_engine::models::qwen35_cuda::{Qwen35Cuda, Qwen35CudaSession};
 use vireo_engine::{GgufFile, Tokenizer};
 
 const USAGE: &str = "\
@@ -93,11 +97,19 @@ fn main() -> ExitCode {
 enum Engine<'a> {
     Cpu(Llama<'a>),
     Gpu(LlamaCuda<'a>),
+    Qwen35(Qwen35<'a>),
+    Gemma4(Gemma4<'a>),
+    Qwen35Gpu(Qwen35Cuda<'a>),
+    Gemma4Gpu(Gemma4Cuda<'a>),
 }
 
 enum State {
     Cpu(Session),
     Gpu(CudaSession),
+    Qwen35(qwen35::Session),
+    Gemma4(gemma4::Session),
+    Qwen35Gpu(Qwen35CudaSession),
+    Gemma4Gpu(Gemma4CudaSession),
 }
 
 impl State {
@@ -105,6 +117,10 @@ impl State {
         match self {
             State::Cpu(s) => s.len(),
             State::Gpu(s) => s.len(),
+            State::Qwen35(s) => s.len(),
+            State::Gemma4(s) => s.len(),
+            State::Qwen35Gpu(s) => s.len(),
+            State::Gemma4Gpu(s) => s.len(),
         }
     }
 
@@ -112,12 +128,40 @@ impl State {
         match self {
             State::Cpu(s) => s.capacity(),
             State::Gpu(s) => s.capacity(),
+            State::Qwen35(s) => s.capacity(),
+            State::Gemma4(s) => s.capacity(),
+            State::Qwen35Gpu(s) => s.capacity(),
+            State::Gemma4Gpu(s) => s.capacity(),
         }
     }
 }
 
 impl<'a> Engine<'a> {
     fn load(file: &'a GgufFile, gpu: bool, threads: Option<usize>) -> Result<Self, String> {
+        if file.architecture() == Some("gemma4") {
+            if gpu {
+                let device = Gpu::open().map_err(|e| e.to_string())?;
+                return Gemma4Cuda::load(file, device)
+                    .map(Engine::Gemma4Gpu)
+                    .map_err(|e| e.to_string());
+            }
+            let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
+            return Gemma4::load(file, pool)
+                .map(Engine::Gemma4)
+                .map_err(|e| e.to_string());
+        }
+        if file.architecture() == Some("qwen35") {
+            if gpu {
+                let device = Gpu::open().map_err(|e| e.to_string())?;
+                return Qwen35Cuda::load(file, device)
+                    .map(Engine::Qwen35Gpu)
+                    .map_err(|e| e.to_string());
+            }
+            let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
+            return Qwen35::load(file, pool)
+                .map(Engine::Qwen35)
+                .map_err(|e| e.to_string());
+        }
         if gpu {
             let device = Gpu::open().map_err(|e| e.to_string())?;
             return LlamaCuda::load(file, device)
@@ -144,12 +188,50 @@ impl<'a> Engine<'a> {
                 m.config.dim,
                 m.gpu().info.name
             ),
+            Engine::Gemma4(m) => format!(
+                "Gemma 4: {} layers ({} global), {} wide, on the CPU ({} threads)",
+                m.config.layers,
+                m.config.is_swa.iter().filter(|s| !**s).count(),
+                m.config.dim,
+                m.threads()
+            ),
+            Engine::Qwen35Gpu(m) => format!(
+                "Qwen 3.5: {} layers, {} wide, on the GPU ({})",
+                m.config.layers,
+                m.config.dim,
+                m.gpu().info.name
+            ),
+            Engine::Gemma4Gpu(m) => format!(
+                "Gemma 4: {} layers, {} wide, on the GPU ({})",
+                m.config.layers,
+                m.config.dim,
+                m.gpu().info.name
+            ),
+            Engine::Qwen35(m) => format!(
+                "Qwen 3.5: {} layers ({} full attention, the rest DeltaNet), {} wide, on the CPU ({} threads)",
+                m.config.layers,
+                (0..m.config.layers)
+                    .filter(|&l| m.config.is_full_attention(l))
+                    .count(),
+                m.config.dim,
+                m.threads()
+            ),
         }
     }
 
     fn session(&self, capacity: usize) -> State {
         match self {
             Engine::Cpu(m) => State::Cpu(m.session(capacity)),
+            Engine::Qwen35(m) => State::Qwen35(m.session(capacity)),
+            Engine::Gemma4(m) => State::Gemma4(m.session(capacity)),
+            Engine::Qwen35Gpu(m) => State::Qwen35Gpu(
+                m.session(capacity)
+                    .unwrap_or_else(|e| panic!("couldn't set up the GPU session: {e}")),
+            ),
+            Engine::Gemma4Gpu(m) => State::Gemma4Gpu(
+                m.session(capacity)
+                    .unwrap_or_else(|e| panic!("couldn't set up the GPU session: {e}")),
+            ),
             Engine::Gpu(m) => State::Gpu(
                 m.session(capacity)
                     .unwrap_or_else(|e| panic!("couldn't set up the GPU session: {e}")),
@@ -165,6 +247,14 @@ impl<'a> Engine<'a> {
     ) -> Option<&'s [f32]> {
         match (self, state) {
             (Engine::Cpu(m), State::Cpu(s)) => m.forward(s, token, want_logits),
+            (Engine::Qwen35(m), State::Qwen35(s)) => m.forward(s, token, want_logits),
+            (Engine::Gemma4(m), State::Gemma4(s)) => m.forward(s, token, want_logits),
+            (Engine::Qwen35Gpu(m), State::Qwen35Gpu(s)) => m
+                .forward(s, token, want_logits)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
+            (Engine::Gemma4Gpu(m), State::Gemma4Gpu(s)) => m
+                .forward(s, token, want_logits)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
             (Engine::Gpu(m), State::Gpu(s)) => m
                 .forward(s, token, want_logits)
                 .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
