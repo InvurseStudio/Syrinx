@@ -16,6 +16,7 @@
 //!   GET    /api/skill-library/commands no skills
 //!   GET    /api/assistant/approvals    and /activity: empty
 //!   POST   /api/upload                 an attachment (multipart) → {path, docId, extractedText}
+//!   GET    /uploads/{id}-{name}        a kept attachment's file
 //!   POST   /api/chat/completions       the reply as server-sent events
 //!   POST   /api/chat/runs/{id}/stop    stops a reply
 //! Anything else answers 404, which the app takes as "not on this server".
@@ -226,6 +227,10 @@ fn main() -> ExitCode {
             dir: store::data_dir().join("uploads"),
         },
     });
+    {
+        let shared = shared.clone();
+        std::thread::spawn(move || prune_uploads(&shared));
+    }
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
         std::thread::spawn(move || serve(stream, &shared));
@@ -443,7 +448,14 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 &id,
             );
             http::respond(&mut stream, status, &body);
+            if status == 200 {
+                prune_uploads(shared);
+            }
         }
+        ("GET", p) if p.starts_with("/uploads/") => match shared.uploads.file(p) {
+            Some((bytes, media_type)) => http::respond_with(&mut stream, 200, media_type, &bytes),
+            None => http::respond(&mut stream, 404, &error("That attachment isn't kept here.")),
+        },
         ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
         ("POST", "/api/agent/client-tool-result") => {
             let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
@@ -488,6 +500,8 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     let mut system = body.str("systemPrompt").map(str::to_string);
     // The documents attached to user messages: the message's index, the file's name and text.
     let mut documents: Vec<(usize, String, String)> = Vec::new();
+    // Attachments no longer kept: the message's index and the path.
+    let mut gone = Vec::new();
     for m in body.array("messages") {
         let (Some(role), Some(content)) = (m.str("role"), m.str("content")) else {
             continue;
@@ -496,8 +510,11 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
             "system" => system = Some(content.to_string()),
             "user" => {
                 // The app sends each message's attachment path every turn.
-                if let Some((name, text)) = m.str("image").and_then(|p| shared.uploads.by_path(p)) {
-                    documents.push((messages.len(), name, text));
+                if let Some(path) = m.str("image").filter(|p| p.starts_with("/uploads/")) {
+                    match shared.uploads.by_path(path) {
+                        Some((name, text)) => documents.push((messages.len(), name, text)),
+                        None => gone.push((messages.len(), path.to_string())),
+                    }
                 }
                 messages.push(Message {
                     role: "user".into(),
@@ -522,7 +539,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     let max_tokens = generation
         .and_then(|g| g.num("max_tokens"))
         .map_or(DEFAULT_MAX_TOKENS, |v| v.max(1.0) as usize);
-    add_documents(shared, &body, &mut messages, documents, max_tokens);
+    add_documents(shared, &body, &mut messages, documents, gone, max_tokens);
 
     let run_id = format!("run-{}", shared.next_run.fetch_add(1, Ordering::Relaxed));
     let stop = Arc::new(AtomicBool::new(false));
@@ -579,6 +596,7 @@ fn add_documents(
     body: &Value,
     messages: &mut [Message],
     mut documents: Vec<(usize, String, String)>,
+    gone: Vec<(usize, String)>,
     max_tokens: usize,
 ) {
     let last = messages.len() - 1;
@@ -595,6 +613,11 @@ fn add_documents(
             documents.push((last, name, text));
         }
     }
+    for (i, path) in gone {
+        if !documents.iter().any(|d| d.0 == i) {
+            messages[i].content = attach::gone(&messages[i].content, &path);
+        }
+    }
     if documents.is_empty() {
         return;
     }
@@ -607,6 +630,18 @@ fn add_documents(
         let message = &mut messages[*i];
         message.content = attach::with_document(&message.content, name, text, budget);
         budget = budget.saturating_sub(text.len().min(budget));
+    }
+}
+
+/// Removes attachments no chat has used for a while (see [`attach::KEEP_FOR`]).
+fn prune_uploads(shared: &Shared) {
+    let removed = shared.uploads.prune(
+        std::time::SystemTime::now(),
+        attach::KEEP_FOR,
+        attach::KEEP_BYTES,
+    );
+    if removed > 0 {
+        eprintln!("Removed {removed} attachments no chat has used for a while.");
     }
 }
 

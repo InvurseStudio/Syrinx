@@ -122,6 +122,11 @@ fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, Refusal> {
 }
 
 pub fn respond(stream: &mut TcpStream, status: u16, json: &str) {
+    respond_with(stream, status, "application/json", json.as_bytes());
+}
+
+/// A whole reply of any type (a kept attachment's bytes).
+pub fn respond_with(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -134,11 +139,11 @@ pub fn respond(stream: &mut TcpStream, status: u16, json: &str) {
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        json.len()
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        body.len()
     );
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(json.as_bytes());
+    let _ = stream.write_all(body);
     let _ = stream.flush();
 }
 
