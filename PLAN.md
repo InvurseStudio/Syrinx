@@ -89,6 +89,7 @@ git), for checking our output and speed.
 | 2026-11-10 | Prompt speed: deeper tensor-core matrix steps with scales read once, Qwen's DeltaNet split into parallel norms and a column-split state update, the convolution over every token at once (see "Fourth round") | Exact perplexity unchanged to every digit (Qwen 25.0418); 8-bit perplexity within 0.13% of exact; the tensor-core and dp4a kernels still agree to ~1e-6. 75 engine tests pass |
 | 2026-11-11 | Prompt speed again: m16n8k32 products, unpacking Q4_K/Q5_K by sub-block pairs and Q6_K by run pairs, Q6_K padded to aligned 224-byte blocks (see "Fifth round") | Perplexity unchanged to every digit, exact and 8-bit; the exact Q6_K kernels still equal the CPU on the padded layout; tensor-core and dp4a kernels agree to ~1e-6. 75 engine tests pass |
 | 2026-11-11 | Nsight Compute profiling; `__vsubss4` replaced by cheap sign extension everywhere; Gemma's shared-KV layers run only for tokens whose logits are wanted (see "Sixth round") | Perplexity unchanged to every digit, exact and 8-bit (scoring runs every layer); the Gemma GPU test still matches llama.cpp's exact probabilities with a prompt read through the new path. 75 engine tests pass |
+| 2026-11-11 | Where a prompt's time goes (Nsight Systems), then prompt attention rewritten: cp.async loads overlapping the arithmetic, values read with `ldmatrix.trans`, S worked out once for 512-wide heads (see "Seventh round" and "Eighth round") | The f16-cache attention test against f64 for every head size and a window; 8-bit perplexity unchanged to every digit on Llama and Qwen; Gemma's moves by up to 0.1% per chunk either way (the 512-wide scores are added in two halves), the same 0.27% from exact on average. 75 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -110,6 +111,10 @@ so compare within a row:
 | Llama 3.2 1B Q4_K_M | ~103 / 83 (125%) | ~2,110 / 3,590 (59%) | ~25 |
 | Qwen 3.5 0.8B Q4_K_M | ~127 / 106 (119%) | ~2,600 / 4,100 (63%) | ~28 |
 | Gemma 4 E2B Q4_0 | ~67 / 55 (122%) | ~3,040 / 4,710 (65%) | ~6.5 |
+
+After the eighth round (prompt attention; prompts of 1,900–2,200 tokens against
+`llama-bench -p 2048`, same day): Llama ~2,350 / 3,860 (61%), Qwen ~2,880 / 4,320 (67%),
+Gemma ~3,920 / 4,930 (79%). Generating is unchanged (it uses the per-token kernels).
 
 Exact mode (`--exact`) is ~20% slower generating and ~2–3× slower reading prompts.
 Before the speed work below it was ~40 / 53 / 23 generating and ~40 / 53 / 17 reading a
@@ -233,9 +238,57 @@ prompt. Exact perplexity on the GPU is unchanged to every digit.
   every token when all logits are asked for, as in scoring). Gemma reads prompts 2.6×
   faster (~1,185 → ~3,100 tokens/s); its llama.cpp test still matches.
 
+**Seventh round: where a prompt's time goes now (2026-11-11, Nsight Systems):**
+
+Reading a ~1,900–2,200-token prompt (the first 7,000 characters of this file) with
+`vireo-cli generate --gpu -n 1`, kernel time by kind:
+
+| Model (tokens/s) | Matrix products | Attention | Other |
+|---|---|---|---|
+| Llama 3.2 1B (~2,300) | 81% (`matmul8_q4_k` 70%, `_q6_k` 12%) | 8% (`attention_mma_64`) | `quantize_q8` 4%, `qkv_prep` 3%, `swiglu` 2% |
+| Qwen 3.5 0.8B (~2,750) | 53% | 11% (`attention_mma_256`) | `delta_scan` 24%, other DeltaNet 6%, `quantize_q8` 3% |
+| Gemma 4 E2B (~2,900) | 43% (`matmul8_q4_0`) + 5% `matmul_f16` | **41%** (`_512` 30%, `_256` 11%) | `quantize_q8` 4%, `qkv_prep` 3% |
+
+- The GPU is busy 95–99% of the prompt's span and copies take under 1%: launch gaps and
+  Gemma's per-layer embedding uploads don't matter.
+- The attention kernels for wide heads are slow: ~3.4 TFLOPS at head size 64 (Llama),
+  ~1.2–1.6 at 256 and ~0.4–0.5 at 512 (Gemma's three global layers in 0–14: 4–29 ms per
+  512-token chunk). Likely causes, from the code: values transposed into shared memory
+  one f16 at a time (bank conflicts; `ldmatrix.trans` would read them untransposed);
+  key/value chunks of 32 positions loaded synchronously with no overlap (each load
+  waited on before the next); 2 warps per block at 512 and ~87 KB of shared memory, so
+  one block (2 warps) per SM; S = Q Kᵀ computed twice at 512 (one block per half of the
+  output); and every query head of a group loading the same keys and values again.
+- `matmul_f16` (Gemma's per-layer embedding projection, f32 arithmetic) is ~1.7 TFLOPS.
+
+**Eighth round: prompt attention (2026-11-11):**
+
+- `attention_mma` loads keys and values with cp.async, as they lie in the cache: a
+  chunk's values load while its S = Q Kᵀ runs and the next chunk's keys while P V runs,
+  so one buffer of each is enough. Values are read for the second product with
+  `ldmatrix.x4.trans` instead of being transposed into shared memory. The output's
+  rescaling is skipped when no row's largest score moved (multiplying by 1: the same
+  numbers). The longest rows' blocks start first.
+- 512-wide heads: two warps share each 16 rows, each working out S over half the head;
+  the halves are added through shared memory (in the same order by both, so they agree)
+  and each warp makes half the output. S is worked out once instead of twice. Shapes
+  measured (rows × warps per row × positions per chunk): 2 × 2 × 16 best at 512
+  (1 × 4 × 32, 3 × 2 × 16 and 2 × 4 × 16 within noise or behind); the old 4 × 1 × 32 stays
+  best at 64, 128 and 256 (fewer rows, more rows, 16-position chunks and split warps all
+  measured slower).
+- Attention per ~2,000-token prompt: Gemma 305 → ~75 ms (512-wide 225 → ~41, 256-wide
+  80 → ~34), Qwen 88 → ~30 ms, Llama 68 → ~44 ms. Prompts: Gemma ~2,970 → ~3,920 tokens/s
+  (+32%), Qwen ~2,720 → ~2,880 (+5%), Llama unchanged within noise. On a ~10,000-token
+  prompt, where attention is a bigger share: Gemma 1,600 → 3,190 (2.0×), Qwen 2,080 →
+  2,500 (+20%), Llama 1,870 → 1,960 (+5%).
+- Not done: one block for all the query heads that share keys and values (Gemma E2B's
+  8 heads read one set): it would cut loads, not arithmetic, and loads no longer wait.
+
 **What limits speed now, and what's next:**
 
-- **Reading a prompt** is at ~60–65% of llama.cpp on all three. What's left is the
+- **Reading a prompt** is at ~61% (Llama), ~67% (Qwen) and ~79% (Gemma) of llama.cpp.
+  For Llama and Qwen it's the matrix products (81% and 53% of the time); for Qwen, the
+  DeltaNet scan next (24%). What's left in the matrix products is the
   tensor-core kernels' instruction count (the per-32 scaling is half of it and is the
   same in llama.cpp, so it's the rest: unpacking, addresses, zeroing; and their
   occupancy), then cp.async double buffering (measured +6% on Q4_0). llama.cpp also runs
