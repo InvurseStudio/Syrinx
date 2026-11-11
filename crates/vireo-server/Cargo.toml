@@ -1,0 +1,9 @@
+[package]
+name = "vireo-server"
+description = "Serves a GGUF model on this PC over the Vireo app's API, with Vireo's own engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vireo-engine = { path = "../vireo-engine" }
