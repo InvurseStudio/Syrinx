@@ -18,7 +18,7 @@ Nothing here is used by the shipping apps.
 | `models/` | Test models (not in git; see `crates/vireo-engine/tests/real_models.rs` for which) |
 | `crates/vireo-cli/` | Runs the engine from the command line, for testing and benchmarks |
 | `crates/vireo-server/` | A first server: one model on this PC over the part of the app's API that chats use, with the tools that change nothing (the app runs the PC's; no tools that change things or skills yet). The prototype app starts it itself; `start-server.cmd` runs it by hand. It keeps each chat's cache (in `%LOCALAPPDATA%\VireoPrototype\chat-cache`), so going back to a chat reads only what's new |
-| `crates/vireo-eval/` | How well each model uses the tools: `cargo run --release -p vireo-eval -- --out evals/latest.json` runs twelve cases through vireo-server against a stand-in PC and scores the tools, arguments and answers. The baseline is in `evals/baseline.json` |
+| `crates/vireo-eval/` | How well each model uses the tools: `cargo run --release -p vireo-eval -- --out evals/latest.json` runs twelve cases through vireo-server against a stand-in PC, on Gemma 4 E2B and E4B and Qwen 3.5 0.8B, 4B and 9B, and scores the tools, arguments and answers. The baseline is in `evals/baseline.json` |
 | `Windows/` | A copy of the native Windows app, the prototype's front end. It runs side by side with the Vireo app and keeps its own chats. See [Windows/README.md](Windows/README.md). |
 
 ## Chatting with the engine in the prototype app

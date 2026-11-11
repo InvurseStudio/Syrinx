@@ -7,7 +7,7 @@
 //!   vireo-eval [--models a.gguf,b.gguf] [--cases read,git] [--out results.json]
 //!              [--server-arg <arg>]...
 //!
-//! Models are paths, or names in VireoPrototype/models; all three test models by default.
+//! Models are paths, or names in VireoPrototype/models; every test model by default.
 //! `--server-arg` passes an argument on to vireo-server, to compare a feature on and off.
 
 mod cases;
@@ -26,10 +26,15 @@ use std::time::Instant;
 use cases::{Call, Case, Run};
 use json::Value;
 
-const DEFAULT_MODELS: [&str; 3] = [
+/// Small to large in each family: where a feature stops mattering shows along each.
+/// Models people choose today. Llama 3.2 1B (2024) isn't one any more; it stays the
+/// engine's reference in its own tests, and runs here on request (`--models`).
+const DEFAULT_MODELS: [&str; 5] = [
     "gemma-4-E2B_q4_0-it.gguf",
+    "gemma-4-E4B_q4_0-it.gguf",
     "Qwen3.5-0.8B-Q4_K_M.gguf",
-    "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "Qwen3.5-4B-Q4_K_M.gguf",
+    "Qwen3.5-9B-Q4_K_M.gguf",
 ];
 const TOKEN: &str = "vireo-eval";
 /// The PC tools the stand-in app runs (its `clientTools`).

@@ -49,7 +49,7 @@ use vireo_engine::{GgufFile, Tokenizer};
 const USAGE: &str = "\
 Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact]
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
-                    [--score-choices on|off] [--tools-shown all|scored]
+                    [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -68,6 +68,8 @@ struct Options {
     /// A tool's name chosen by scoring each whole name (`--score-choices on`), not a
     /// token at a time.
     score_choices: bool,
+    /// Token healing for forced text (`--heal off` to measure without it).
+    heal: bool,
     /// Only the tool groups a request needs, picked by scoring (`--tools-shown scored`),
     /// in place of every tool (`all`).
     scored_groups: bool,
@@ -93,6 +95,7 @@ fn main() -> ExitCode {
     let mut chat_cache = Some(None);
     let mut score_choices = false;
     let mut scored_groups = false;
+    let mut heal = true;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -119,6 +122,10 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "--with-app" => with_app = true,
+            "--heal" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                heal = value.unwrap() == "on";
+                i += 1;
+            }
             "--tools-shown" if matches!(value.map(String::as_str), Some("all" | "scored")) => {
                 scored_groups = value.unwrap() == "scored";
                 i += 1;
@@ -155,6 +162,7 @@ fn main() -> ExitCode {
 
     let _ = OPTIONS.set(Options {
         score_choices,
+        heal,
         scored_groups,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
@@ -1201,6 +1209,9 @@ fn reply(
             &job.messages[first..],
             &today,
         );
+        if std::env::var_os("VIREO_DEBUG_PROMPT").is_some() {
+            eprintln!("[prompt] {text}{}", chat::opening(family));
+        }
         let mut ids = tokenizer.encode(&text, false, true);
         let mark = ids.len();
         ids.extend_from_slice(&opening);
@@ -1523,23 +1534,56 @@ fn write_call(
     };
     loop {
         let forced = m.forced();
+        // Token healing: forced text's last token is left for the model to write, under
+        // the grammar, so it can merge it with what follows as its training did (Qwen's
+        // "=read", not "=" then "read"). Tokens no text of the model's would contain
+        // otherwise push it off course: Qwen 3.5 9B read files with git_diff.
+        let mut held: Vec<u8> = Vec::new();
         if !forced.is_empty() {
             let ids = tokenizer.encode(&String::from_utf8_lossy(&forced), false, true);
-            m.advance_all(&forced);
-            text.extend_from_slice(&forced);
-            room(kept, ids.len())?;
-            *logits = model.feed(kept, &ids)?;
-            *tokens += ids.len();
+            let ends = {
+                let mut t = m;
+                t.advance_all(&forced) && t.is_complete()
+            };
+            let mut keep = if ends || !options().heal {
+                ids.len()
+            } else {
+                ids.len() - 1
+            };
+            let mut fed_bytes = Vec::new();
+            for &id in &ids[..keep] {
+                tokenizer.token_bytes(id, true, &mut fed_bytes);
+            }
+            if !forced.starts_with(&fed_bytes) {
+                // Tokens that don't spell the text exactly: write it all.
+                keep = ids.len();
+                fed_bytes = forced.clone();
+            }
+            held = forced[fed_bytes.len()..].to_vec();
+            if keep > 0 {
+                m.advance_all(&fed_bytes);
+                text.extend_from_slice(&fed_bytes);
+                room(kept, keep)?;
+                *logits = model.feed(kept, &ids[..keep])?;
+                *tokens += keep;
+            }
         }
         if m.is_complete() {
             break;
         }
         // A branch (a tool's name): each option scored whole, and the likeliest written.
+        // (Each is scored with the text held back by healing before it, read as one.)
+        let ahead = {
+            let mut t = m;
+            t.advance_all(&held);
+            t
+        };
         if options().score_choices
-            && let Some(choices) = m.scored_options().filter(|c| c.len() > 1)
+            && let Some(choices) = ahead.scored_options().filter(|c| c.len() > 1)
         {
             let mut best: Option<(f64, Vec<u8>, Vec<u32>)> = None;
-            for bytes in choices {
+            for option in choices {
+                let bytes = [held.as_slice(), &option].concat();
                 let ids = tokenizer.encode(&String::from_utf8_lossy(&bytes), false, true);
                 if ids.is_empty() {
                     continue;
