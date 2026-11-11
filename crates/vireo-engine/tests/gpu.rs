@@ -524,21 +524,26 @@ fn reading_in_batches_matches_one_token_at_a_time() {
             let ids = long_text(&tokenizer, false);
             let mut m = Qwen35Cuda::load(&file, gpu).unwrap();
             m.set_precision(precision);
-            let mut a = m.session_with_batch(ids.len(), 7).unwrap();
-            let mut b = m.session(ids.len()).unwrap();
-            check_batches_match_tokens(
-                &label("Qwen 3.5"),
-                worst,
-                mean,
-                &ids,
-                &mut |ids| {
-                    m.forward_batch(&mut a, ids, Logits::All)
-                        .unwrap()
-                        .unwrap()
-                        .to_vec()
-                },
-                &mut |id| m.forward(&mut b, id, true).unwrap().unwrap().to_vec(),
-            );
+            // Batches of 7 stay inside one of the DeltaNet's 64-token chunks; batches of
+            // 200 cross three and end in a part of one (then a shorter batch follows).
+            assert!(ids.len() > 200, "{} tokens", ids.len());
+            for batch in [7, 200] {
+                let mut a = m.session_with_batch(ids.len(), batch).unwrap();
+                let mut b = m.session(ids.len()).unwrap();
+                check_batches_match_tokens(
+                    &label(&format!("Qwen 3.5, batches of {batch}")),
+                    worst,
+                    mean,
+                    &ids,
+                    &mut |ids| {
+                        m.forward_batch(&mut a, ids, Logits::All)
+                            .unwrap()
+                            .unwrap()
+                            .to_vec()
+                    },
+                    &mut |id| m.forward(&mut b, id, true).unwrap().unwrap().to_vec(),
+                );
+            }
         }
         if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
             let Some(gpu) = open_gpu() else { return };

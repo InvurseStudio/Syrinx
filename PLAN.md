@@ -90,6 +90,9 @@ git), for checking our output and speed.
 | 2026-11-11 | Prompt speed again: m16n8k32 products, unpacking Q4_K/Q5_K by sub-block pairs and Q6_K by run pairs, Q6_K padded to aligned 224-byte blocks (see "Fifth round") | Perplexity unchanged to every digit, exact and 8-bit; the exact Q6_K kernels still equal the CPU on the padded layout; tensor-core and dp4a kernels agree to ~1e-6. 75 engine tests pass |
 | 2026-11-11 | Nsight Compute profiling; `__vsubss4` replaced by cheap sign extension everywhere; Gemma's shared-KV layers run only for tokens whose logits are wanted (see "Sixth round") | Perplexity unchanged to every digit, exact and 8-bit (scoring runs every layer); the Gemma GPU test still matches llama.cpp's exact probabilities with a prompt read through the new path. 75 engine tests pass |
 | 2026-11-11 | Where a prompt's time goes (Nsight Systems), then prompt attention rewritten: cp.async loads overlapping the arithmetic, values read with `ldmatrix.trans`, S worked out once for 512-wide heads (see "Seventh round" and "Eighth round") | The f16-cache attention test against f64 for every head size and a window; 8-bit perplexity unchanged to every digit on Llama and Qwen; Gemma's moves by up to 0.1% per chunk either way (the 512-wide scores are added in two halves), the same 0.27% from exact on average. 75 engine tests pass |
+| 2026-11-11 | The tensor-core matrix kernels read the next step's bytes ahead into registers (one block per SM, all but Q6_K); Llama's and Qwen's last layer runs past its keys and values only for the token whose logits are wanted (see "Ninth round") | 8-bit perplexity unchanged to every digit on all three (the same integer sums; scoring runs every layer); the same generated tokens. 75 engine tests pass |
+| 2026-11-11 | The small kernels: Qwen's convolution in registers (it had gone to local memory), `qkv_prep` with a thread per number and 8 tokens a block, Gemma's F16 per-layer projection as Q8_0 in 8-bit mode (see "Tenth round") | Llama and Qwen: 8-bit perplexity and generated tokens unchanged to every digit. Gemma: the same tokens; perplexity per chunk within 0.3% of before and nearer exact on average (0.14% from it, 0.27% before); next-token probabilities nearer exact too (20.04% against exact 20.67%, before 22.12%). 75 engine tests pass |
+| 2026-11-11 | Qwen's DeltaNet for a prompt in chunks of 64 tokens, the WY form (`delta_chunk_prep`, `delta_chunk_scan`; see "Eleventh round") | Exact perplexity the same as token by token to every digit at 2,048 tokens (chunk 1: 16.2601 against 16.2602 on the first build, then identical); 8-bit within 0.25% per chunk, nearer exact on average. A new test case reads Qwen in batches of 200 (across chunks, ending in part of one) against one token at a time: logits within 1e-4 of 31 exact. 75 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -115,6 +118,29 @@ so compare within a row:
 After the eighth round (prompt attention; prompts of 1,900–2,200 tokens against
 `llama-bench -p 2048`, same day): Llama ~2,350 / 3,860 (61%), Qwen ~2,880 / 4,320 (67%),
 Gemma ~3,920 / 4,930 (79%). Generating is unchanged (it uses the per-token kernels).
+
+**Against Ollama too (2026-11-11):** Ollama 0.40.16 (its `llamacpp` runner, 100% on the
+GPU, default settings) with the same GGUF files imported by `ollama create` from a
+`FROM <file>` Modelfile, timed from its API's own `prompt_eval_duration` and
+`eval_duration`. Each request starts with a different number, so its prompt cache can't
+reuse the last one. Run back to back with Vireo and `llama-bench -p 2048 -n 128`, one
+model loaded at a time, while the GPU ran faster than earlier that day (tokens/s):
+
+| Model | Reading ~2,000 tokens: Vireo / Ollama / llama.cpp | Generating 128: Vireo / Ollama / llama.cpp |
+|---|---|---|
+| Llama 3.2 1B Q4_K_M | ~2,480 / ~2,600 / ~4,240 | ~131 / ~71 / ~99 |
+| Qwen 3.5 0.8B Q4_K_M | ~3,050 / ~2,880 / ~4,770 | ~146 / ~88 / ~123 |
+| Gemma 4 E2B Q4_0 | ~4,060 / ~2,930 / ~5,470 | ~77 / ~46 / ~63 |
+
+- Generating, Vireo is ~1.7–1.85× Ollama on all three; Ollama is ~25–30% behind the
+  llama.cpp it runs (per-token overhead outside the kernels).
+- Reading a prompt, Vireo is ~5% behind Ollama on Llama, ~6% ahead on Qwen and ~39%
+  ahead on Gemma. Ollama reads prompts at ~55–60% of `llama-bench` (its default batch of
+  512 tokens, and its server around the runner).
+- Not quite like for like: prompts are raw text with no chat template on all three, but
+  Ollama tokenized Gemma's prompt to 2,076 tokens against 2,168 for Vireo and llama.cpp.
+  Gemma's generation was timed from a raw story opening on Ollama and from the chat
+  template on Vireo (Vireo's raw run ended after one token); both are short prompts.
 
 Exact mode (`--exact`) is ~20% slower generating and ~2–3× slower reading prompts.
 Before the speed work below it was ~40 / 53 / 23 generating and ~40 / 53 / 17 reading a
@@ -284,16 +310,89 @@ Reading a ~1,900–2,200-token prompt (the first 7,000 characters of this file) 
 - Not done: one block for all the query heads that share keys and values (Gemma E2B's
   8 heads read one set): it would cut loads, not arithmetic, and loads no longer wait.
 
+**Ninth round: matrix kernels' reads, and the last layer (2026-11-11):**
+
+- `matmul8_*` read a step's weights and x into registers, unpacked them into shared
+  memory, synced, and multiplied: the reads' wait was never hidden (Q4_K and Q5_K ran one
+  block per SM). Now each step's raw bytes are read before the previous step's products
+  (`fetch`) and unpacked after them (`store`). That needs one block per SM: Q4_0 and
+  Q8_0 move from two blocks to one with the read-ahead and are faster for it; Q6_K
+  stays at two blocks without it (one with it measured 3% slower). No spills (ptxas on
+  sm_120: 252–255 registers). Kernel time on a ~2,000-token prompt: Q4_K −9%, Q5_K −3%,
+  Q4_0 −6%, Q8_0 −25%. The same integer sums, so the same results.
+- The last layer leaves nothing for later tokens but its keys and values (Llama) or its
+  keys, values or DeltaNet state (Qwen). So it runs its attention input (Llama) or its
+  whole mixer (Qwen) for every token, and the rest only for the token whose logits are
+  wanted: not at all for chunks without logits, every token when all are asked for
+  (scoring). Gemma did this already for its shared layers. Llama's last-token attention
+  then runs on the per-token kernel (no f16 rounding of the query and softmax), so its
+  next-token probabilities move slightly (25.35% → 25.49% on the test prompt; the same
+  tokens); Qwen's are unchanged to 4 digits.
+- Prompts (median of 3, old and new builds alternating): ~2,000 tokens Llama 2,608 →
+  2,928 (+12%), Qwen 3,194 → 3,362 (+5%), Gemma 4,330 → 4,530 (+5%); ~10,000 tokens +11%,
+  +4%, +3%. Against `llama-bench -p 2048` right after: Llama ~2,910 / 4,240 (69%), Qwen
+  ~3,350 / 4,780 (70%), Gemma ~4,530 / 5,420 (84%).
+
+**Tenth round: the small kernels (2026-11-11):**
+
+- A fresh profile (after the ninth round) showed kernels doing little work slowly:
+  `conv_silu_parallel` ~0.4 ms a call (5% of Qwen's prompt time), `qkv_prep` 0.4 ms
+  (4% of Llama's), and Gemma's `matmul_f16` (its per-layer embedding projection, F16
+  weights in f32 arithmetic) 8% of Gemma's.
+- `conv_silu_parallel`: its window arrays were in local memory (38 local stores in the
+  SASS: the kernel size was known only at run time), so it ran at 200 instructions per
+  output. The size is now a template constant (`CONV_DISPATCH`, 2–8), and a thread walks
+  16 tokens of its channel with the weights and last inputs in registers: 27.9 → 6.3 ms.
+  `conv_silu` (Qwen's per-token step) and `conv_history` had the same local memory and
+  get the same fix. Same sums, same order: the same numbers.
+- `qkv_prep`: a thread per number of a head (up to 256; Llama's 64-wide heads left 3 of 4
+  threads idle), each RoPE pair rotated by one thread, and a block for 8 tokens of a head
+  so each pair's `powf` is worked out once, not per token. Llama 25.8 → 9.6 ms, Gemma
+  20.1 → 12.5. The same numbers (block_sum counts missing warps as zeros).
+- Gemma's per-layer projection gets a Q8_0 copy on upload (`GpuMatrix::upload_q8_0`,
+  rounded as llama.cpp's `quantize_row_q8_0`), used in 8-bit mode: 35 → ~8 ms on the
+  tensor cores. Its next-token probabilities moved nearer exact, not away (20.04% against
+  exact 20.67% and 22.12% before on the test prompt; 97.24% against 97.43% and 97.11% on
+  another).
+- Prompts against the last commit (`main`, before the ninth round too; median of 3,
+  alternating): ~2,000 tokens Llama 2,583 → 2,962 (+15%), Qwen 3,157 → 3,438 (+9%), Gemma
+  4,283 → 4,815 (+12%); ~10,000 tokens +13%, +8%, +9%. So this round gives ~2%, ~4% and
+  ~7% over the ninth. Generating unchanged.
+
+**Eleventh round: Qwen's DeltaNet in chunks (2026-11-11):**
+
+- `delta_scan` (28% of Qwen's prompt time) ran each head's state 128 × 128 token by
+  token: 512 dependent steps a chunk with ~10 warps an SM, 2.35 ms a call.
+- Now the chunked (WY) form, as llama.cpp and flash-linear-attention: over 64 tokens from
+  a state S0, the δ's solve a triangular system, so δ = U − W S0 with W and U independent
+  of S0 (derivation at `delta_chunk_prep` in `vireo.cu`). `delta_chunk_prep` works out
+  W, U, P (masked, decayed q·k), Q̂, K̂ and the chunk's decay for every chunk and head at
+  once: k·k and q·k in 4 × 4 register tiles, then a forward substitution with a thread per
+  column of [W | U] (a column needs only its own earlier rows: no syncs; the sum in 4
+  parts). `delta_chunk_scan` runs the chunks in order, each head's columns split over
+  blocks of 16: δ = U − W S0, O = Q̂ S0 + P δ, S = γ S0 + K̂ᵀ δ, all f32. Scratch: ~18 MB
+  for a 512-token batch (Qwen 3.5 0.8B).
+- Tuned with Nsight Compute: the scan was held by shared-memory instruction throughput
+  (MIO throttle), so a thread takes 2 rows × 8 columns and reads 16 bytes at a time (99
+  → 67 ms); the prep fit one block an SM until q was read from GPU memory and A took k's
+  place (63 → 39 ms). Tried and dropped: blocks of 8 columns (twice the blocks, 99 ms).
+- DeltaNet per ~2,000-token prompt: 182 → ~123 ms (state update 166 → ~106, the norms
+  as before). Prompts against `main`: ~2,000 tokens 3,166 → 3,751 tokens/s (+18% with the
+  ninth and tenth rounds; this round ~9%), ~10,000 tokens 2,731 → 3,162 (+16%).
+  `llama-bench -p 2048` right after: 4,740, so ~79%.
+
 **What limits speed now, and what's next:**
 
-- **Reading a prompt** is at ~61% (Llama), ~67% (Qwen) and ~79% (Gemma) of llama.cpp.
-  For Llama and Qwen it's the matrix products (81% and 53% of the time); for Qwen, the
-  DeltaNet scan next (24%). What's left in the matrix products is the
-  tensor-core kernels' instruction count (the per-32 scaling is half of it and is the
-  same in llama.cpp, so it's the rest: unpacking, addresses, zeroing; and their
-  occupancy), then cp.async double buffering (measured +6% on Q4_0). llama.cpp also runs
-  the last layer's feed-forward only for output tokens (a few % on Llama and Qwen).
-  For Qwen, the DeltaNet scan would need the chunked (WY) form.
+- **Reading a prompt** is at about 70% (Llama), 79% (Qwen) and 89% (Gemma) of llama.cpp.
+  For Llama and Qwen it's the matrix products (Q4_K alone is 71% of Llama's time). Qwen's
+  DeltaNet is now ~20%: the scan's parallelism is fixed by heads × columns (128 blocks
+  on the 0.8B; the 27B has more heads), and its products could go to the tensor cores
+  (TF32, at some cost in precision). What's left in the matrix products is
+  the tensor-core kernels' instruction count (the per-32 scaling is half of it and is
+  the same in llama.cpp, so it's the rest: unpacking, addresses, zeroing) and Q6_K's
+  reads, still not overlapped (cp.async into a second buffer would avoid the
+  registers). Then the smaller kernels: `quantize_q8` (~4%) could be folded into the
+  norms and `swiglu` that make its input.
 - **Generating** is 19–25% ahead of llama.cpp on all three.
 - **For larger models**: splitting a model between GPU and system memory (Muse Glimmer
   30B), mixture-of-experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), more than one GPU.
