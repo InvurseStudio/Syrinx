@@ -103,6 +103,37 @@ impl GpuMatrix {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl GpuMatrix {
+    /// One token's `y = act(self x) × (up x)` (SiLU, or tanh-GELU with `gelu`) in one
+    /// dispatch (see [`Gpu::matvec_glu`]): false, having done nothing, when the two
+    /// matrices differ in type or shape or the type has no such kernel, so the caller runs
+    /// the products and the activation instead.
+    pub fn mul_glu(
+        &self,
+        gpu: &Gpu,
+        up: &GpuMatrix,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        gelu: bool,
+    ) -> Result<bool> {
+        if (up.kind, up.rows, up.cols) != (self.kind, self.rows, self.cols) {
+            return Ok(false);
+        }
+        gpu.matvec_glu(
+            self.kind,
+            self.data.ptr(),
+            up.data.ptr(),
+            x,
+            y,
+            self.rows,
+            self.cols,
+            gelu,
+        )
+        .map_err(gpu_error)
+    }
+}
+
 /// The input of one or more matrix products: `tokens` rows at `x`. With room for 8-bit
 /// activations (`q8`), it's rounded to 8 bits on its first use and the rounded copy
 /// serves the products after it, so make a new `Input` whenever `x` changes.

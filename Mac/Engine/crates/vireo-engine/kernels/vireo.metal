@@ -504,6 +504,171 @@ kernel void matvec_split_q6_k(ARGS, KP) {
     MATVEC_STORE_SPLIT
 }
 
+// One token's gate and up projections and the activation in one dispatch: y =
+// act(W_gate x) × (W_up x), act SiLU (0) or tanh-GELU (1). The split kernels with each
+// threadgroup taking 2 rows of both matrices (as 4 rows: r & 1 the row, r >> 1 which
+// matrix), x read once for both. Arguments: w_gate, x, y, rows, cols, w_up, act.
+#define GLU_ROWS 4
+#define MATVEC_ROWS_GLU                                     \
+    device const u8* wu = ARG_PTR(const u8, 5);             \
+    const int act = ARG_INT(6);                             \
+    threadgroup float mv_parts[MV_SPLIT][GLU_ROWS];         \
+    const int lane = tid & 31, sgi = tid >> 5;              \
+    const int row0 = gid.x * MV_ROWS;                       \
+    if (row0 >= rows) return;                               \
+    const int nrows = min(MV_ROWS, rows - row0);            \
+    float sum[GLU_ROWS];                                    \
+    for (int r = 0; r < GLU_ROWS; r++) sum[r] = 0.0f;
+
+#define MATVEC_STORE_GLU                                    \
+    for (int r = 0; r < GLU_ROWS; r++) {                    \
+        const float part = simd_sum(sum[r]);                \
+        if (lane == 0) mv_parts[sgi][r] = part;             \
+    }                                                       \
+    BARRIER;                                                \
+    if ((int)tid < nrows) {                                 \
+        float g = 0.0f, u = 0.0f;                           \
+        for (int k = 0; k < MV_SPLIT; k++) {                \
+            g += mv_parts[k][tid];                          \
+            u += mv_parts[k][2 + tid];                      \
+        }                                                   \
+        const float a = act == 0 ? g / (1.0f + exp(-g))     \
+                                 : 0.5f * g * (1.0f + tanh(0.7978846f * g * (1.0f + 0.044715f * g * g))); \
+        y[row0 + tid] = a * u;                              \
+    }
+
+kernel void matvec_glu_q8_0(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_GLU
+    const int blocks = cols / 32;
+    const ulong row_bytes = (ulong)blocks * 34;
+    const int sub = lane >> 3, j = (lane & 7) * 4;
+    for (int b = sub + 4 * sgi; b < blocks; b += 4 * MV_SPLIT) {
+        const float4 xv = f4(x + b * 32 + j);
+        for (int r = 0; r < GLU_ROWS; r++) {
+            if ((r & 1) >= nrows) continue;
+            device const u8* block = ((r >> 1) ? wu : w) + (row0 + (r & 1)) * row_bytes + b * 34;
+            const u32 q = u32_at2(block + 2 + j);
+            const float dot = small_int((q & 0xFF) ^ 0x80, 128.0f) * xv.x +
+                              small_int(((q >> 8) & 0xFF) ^ 0x80, 128.0f) * xv.y +
+                              small_int(((q >> 16) & 0xFF) ^ 0x80, 128.0f) * xv.z +
+                              small_int((q >> 24) ^ 0x80, 128.0f) * xv.w;
+            sum[r] += half_at(block) * dot;
+        }
+    }
+    MATVEC_STORE_GLU
+}
+
+kernel void matvec_glu_q4_0(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_GLU
+    const int blocks = cols / 32;
+    const ulong row_bytes = q4_0_row_bytes(cols);
+    const int sub = lane >> 1, j = (lane & 1) * 8;
+    for (int b = sub + 16 * sgi; b < blocks; b += 16 * MV_SPLIT) {
+        device const float* xb = x + b * 32 + j;
+        const float4 lo0 = f4(xb), lo1 = f4(xb + 4), hi0 = f4(xb + 16), hi1 = f4(xb + 20);
+        for (int r = 0; r < GLU_ROWS; r++) {
+            if ((r & 1) >= nrows) continue;
+            device const u8* row = ((r >> 1) ? wu : w) + (row0 + (r & 1)) * row_bytes;
+            const uint2 q = *reinterpret_cast<device const uint2*>(row + b * 16 + j);
+            const float dot = nibble_dot8(q, 0, lo0, lo1) + nibble_dot8(q, 4, hi0, hi1) -
+                              8.0f * ((lo0.x + lo0.y) + (lo0.z + lo0.w) + (lo1.x + lo1.y) + (lo1.z + lo1.w) +
+                                      (hi0.x + hi0.y) + (hi0.z + hi0.w) + (hi1.x + hi1.y) + (hi1.z + hi1.w));
+            sum[r] += q4_0_scale(row, blocks, b) * dot;
+        }
+    }
+    MATVEC_STORE_GLU
+}
+
+kernel void matvec_glu_q4_k(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_GLU
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * 144;
+    const int sub = lane >> 4, pair = (lane & 15) >> 2, part = (lane & 3) * 8;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        device const float* xb = x + b * 256 + pair * 64 + part;
+        const float4 a1 = f4(xb), b1 = f4(xb + 4), a2 = f4(xb + 32), b2 = f4(xb + 36);
+        const float x1 = (a1.x + a1.y) + (a1.z + a1.w) + (b1.x + b1.y) + (b1.z + b1.w);
+        const float x2 = (a2.x + a2.y) + (a2.z + a2.w) + (b2.x + b2.y) + (b2.z + b2.w);
+        for (int r = 0; r < GLU_ROWS; r++) {
+            if ((r & 1) >= nrows) continue;
+            device const u8* block = ((r >> 1) ? wu : w) + (row0 + (r & 1)) * row_bytes + b * 144;
+            const uint4 head = *reinterpret_cast<device const uint4*>(block);
+            float s1, m1, s2, m2;
+            q4_k_scale_min_w(2 * pair, head.y, head.z, head.w, s1, m1);
+            q4_k_scale_min_w(2 * pair + 1, head.y, head.z, head.w, s2, m2);
+            const float d = half_lo(head.x), dmin = half_hi(head.x);
+            const uint2 q = *reinterpret_cast<device const uint2*>(block + 16 + pair * 32 + part);
+            sum[r] += d * s1 * nibble_dot8(q, 0, a1, b1) - dmin * m1 * x1 + d * s2 * nibble_dot8(q, 4, a2, b2) -
+                      dmin * m2 * x2;
+        }
+    }
+    MATVEC_STORE_GLU
+}
+
+kernel void matvec_glu_q5_k(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_GLU
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * 176;
+    const int sub = lane >> 4, pair = (lane & 15) >> 2, part = (lane & 3) * 8;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        device const float* xb = x + b * 256 + pair * 64 + part;
+        const float4 a1 = f4(xb), b1 = f4(xb + 4), a2 = f4(xb + 32), b2 = f4(xb + 36);
+        const float x1 = (a1.x + a1.y) + (a1.z + a1.w) + (b1.x + b1.y) + (b1.z + b1.w);
+        const float x2 = (a2.x + a2.y) + (a2.z + a2.w) + (b2.x + b2.y) + (b2.z + b2.w);
+        for (int r = 0; r < GLU_ROWS; r++) {
+            if ((r & 1) >= nrows) continue;
+            device const u8* block = ((r >> 1) ? wu : w) + (row0 + (r & 1)) * row_bytes + b * 176;
+            const uint4 head = *reinterpret_cast<device const uint4*>(block);
+            float s1, m1, s2, m2;
+            q4_k_scale_min_w(2 * pair, head.y, head.z, head.w, s1, m1);
+            q4_k_scale_min_w(2 * pair + 1, head.y, head.z, head.w, s2, m2);
+            const float d = half_lo(head.x), dmin = half_hi(head.x);
+            const uint2 q = *reinterpret_cast<device const uint2*>(block + 48 + pair * 32 + part);
+            const uint2 qh = *reinterpret_cast<device const uint2*>(block + 16 + part);
+            const float dot1 = nibble_dot8(q, 0, a1, b1) + 16.0f * bit_dot8(qh, 2 * pair, a1, b1);
+            const float dot2 = nibble_dot8(q, 4, a2, b2) + 16.0f * bit_dot8(qh, 2 * pair + 1, a2, b2);
+            sum[r] += d * s1 * dot1 - dmin * m1 * x1 + d * s2 * dot2 - dmin * m2 * x2;
+        }
+    }
+    MATVEC_STORE_GLU
+}
+
+kernel void matvec_glu_q6_k(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_GLU
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * Q6K_BYTES;
+    const int sub = lane >> 4, hf = (lane & 15) >> 3, l = (lane & 7) * 4;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        device const float* xb = x + b * 256 + hf * 128 + l;
+        float4 xv[4];
+        for (int k = 0; k < 4; k++) xv[k] = f4(xb + k * 32);
+        for (int r = 0; r < GLU_ROWS; r++) {
+            if ((r & 1) >= nrows) continue;
+            device const u8* block = ((r >> 1) ? wu : w) + (row0 + (r & 1)) * row_bytes + b * Q6K_BYTES;
+            const float d = half_at(block + 208);
+            const u32 ql0 = u32_at2(block + hf * 64 + l), ql1 = u32_at2(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at2(block + 128 + hf * 32 + l);
+            device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
+            float bsum = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const u32 low = ((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4);
+                const float q0 = small_int((low & 0xF) | (((qh >> (2 * k)) & 3) << 4), 32.0f);
+                const float q1 = small_int(((low >> 8) & 0xF) | (((qh >> (8 + 2 * k)) & 3) << 4), 32.0f);
+                const float q2 = small_int(((low >> 16) & 0xF) | (((qh >> (16 + 2 * k)) & 3) << 4), 32.0f);
+                const float q3 = small_int(((low >> 24) & 0xF) | (((qh >> (24 + 2 * k)) & 3) << 4), 32.0f);
+                bsum += (float)sc[2 * k] * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
+            }
+            sum[r] += d * bsum;
+        }
+    }
+    MATVEC_STORE_GLU
+}
+
 // ---- Matrix-matrix products: Y = X Wᵀ for many tokens at once ------------------------
 
 enum { K_F32, K_F16, K_Q4_0, K_Q8_0, K_Q4_K, K_Q5_K, K_Q6_K };
@@ -1235,6 +1400,122 @@ template [[host_name("attention_decode_f16_64_1")]] kernel void attention_decode
 template [[host_name("attention_decode_f16_128_1")]] kernel void attention_decode<half, 128, 1>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_f16_256_1")]] kernel void attention_decode<half, 256, 1>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_f16_512_1")]] kernel void attention_decode<half, 512, 1>(ARGS, KP, uint, uint);
+
+// One token's attention for wide heads (256, 512): attention_decode with the work laid
+// out the other way. A SIMD group takes one position at a time (the 8 groups take every
+// 8th), its 32 lanes each holding D / 32 of the head: the key row is read once,
+// coalesced, the score is one simd_sum, and the online softmax is the group's (the same
+// for every lane). attention_decode gives each lane a position, reading a whole key row
+// alone; for wide heads that was the slow part. Parts and merging as attention_decode's.
+template <typename KV, int D>
+kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    device const float* q = ARG_PTR(const float, 0);
+    device const KV* keys = ARG_PTR(const KV, 1);
+    device const KV* values = ARG_PTR(const KV, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const int* pos = ARG_PTR(const int, 4);
+    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const float scale = ARG_F32(9);
+    device float* partial = ARG_PTR(float, 10);
+    device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
+    constexpr int SG = 8, DPL = D / 32;
+    threadgroup float sm[SG], sl[SG];
+    threadgroup float so[SG][D];
+    threadgroup bool last;
+    const int head = gid.x, part = gid.y, parts = ngrid.y;
+    const int len = *pos + 1;
+    const int first = window > 0 ? max(0, len - window) : 0;
+    const int share = (len - first + parts - 1) / parts;
+    const int lo = first + part * share, hi = min(len, lo + share);
+    const int kv = (head / group) * D + lane * DPL;
+    float qv[DPL];
+    for (int j = 0; j < DPL; j++) qv[j] = q[head * D + lane * DPL + j] * scale;
+
+    float m = -INFINITY, l = 0.0f, o[DPL];
+    for (int j = 0; j < DPL; j++) o[j] = 0.0f;
+    for (int at = lo + (int)sg; at < hi; at += SG) {
+        device const KV* k = keys + (ulong)at * kv_dim + kv;
+        float dot = 0.0f;
+        for (int j = 0; j < DPL; j += 4) {
+            const float4 k4 = load4(k + j);
+            dot += qv[j] * k4.x + qv[j + 1] * k4.y + qv[j + 2] * k4.z + qv[j + 3] * k4.w;
+        }
+        const float s = simd_sum(dot);
+        const float new_max = max(m, s);
+        const float correction = exp(m - new_max);
+        const float p = exp(s - new_max);
+        l = l * correction + p;
+        device const KV* v = values + (ulong)at * kv_dim + kv;
+        for (int j = 0; j < DPL; j += 4) {
+            const float4 v4 = load4(v + j);
+            o[j] = o[j] * correction + p * v4.x;
+            o[j + 1] = o[j + 1] * correction + p * v4.y;
+            o[j + 2] = o[j + 2] * correction + p * v4.z;
+            o[j + 3] = o[j + 3] * correction + p * v4.w;
+        }
+        m = new_max;
+    }
+    if (lane == 0) {
+        sm[sg] = m;
+        sl[sg] = l;
+    }
+    for (int j = 0; j < DPL; j++) so[sg][lane * DPL + j] = o[j];
+    BARRIER;
+    float mx = -INFINITY;
+    for (int g = 0; g < SG; g++) mx = max(mx, sm[g]);
+    float total = 0.0f;
+    for (int g = 0; g < SG; g++)
+        if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
+    device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
+    if (parts > 1 && tid == 0) {
+        mine[0] = mx;
+        mine[1] = total;
+    }
+    for (int d = tid; d < D; d += 256) {
+        float acc = 0.0f;
+        for (int g = 0; g < SG; g++)
+            if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g][d];
+        if (parts == 1)
+            out[head * D + d] = acc / total;
+        else
+            mine[2 + d] = acc;
+    }
+    if (parts == 1) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    BARRIER;
+    if (tid == 0) {
+        const uint done = atomic_fetch_add_explicit(&counters[head], 1u, memory_order_relaxed);
+        last = done == (uint)parts - 1;
+        if (last) atomic_store_explicit(&counters[head], 0u, memory_order_relaxed);
+    }
+    BARRIER;
+    if (!last) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    device const float* all = partial + (ulong)head * parts * (2 + D);
+    float pm = -INFINITY;
+    for (int i = 0; i < parts; i++) pm = max(pm, all[i * (2 + D)]);
+    float pt = 0.0f;
+    for (int i = 0; i < parts; i++) {
+        const float mi = all[i * (2 + D)];
+        if (mi != -INFINITY) pt += exp(mi - pm) * all[i * (2 + D) + 1];
+    }
+    for (int d = tid; d < D; d += 256) {
+        float acc = 0.0f;
+        for (int i = 0; i < parts; i++) {
+            const float mi = all[i * (2 + D)];
+            if (mi != -INFINITY) acc += exp(mi - pm) * all[i * (2 + D) + 2 + d];
+        }
+        out[head * D + d] = acc / pt;
+    }
+}
+
+template [[host_name("attention_decode_wide_f32_128")]] kernel void attention_decode_wide<float, 128>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_f32_256")]] kernel void attention_decode_wide<float, 256>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_f32_512")]] kernel void attention_decode_wide<float, 512>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_f16_128")]] kernel void attention_decode_wide<half, 128>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_f16_256")]] kernel void attention_decode_wide<half, 256>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_f16_512")]] kernel void attention_decode_wide<half, 512>(ARGS, KP, uint, uint);
 
 // A prompt's attention, tiled (see attention_tiled in vireo.cu).
 template <typename KV, int LANES, int PER, int CHUNK>

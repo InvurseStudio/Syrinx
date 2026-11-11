@@ -572,11 +572,18 @@ impl<'a> Qwen35Cuda<'a> {
             )
             .map_err(e)?;
 
-            let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
-            layer.gate.mul(&h, s.gate.ptr())?;
-            layer.up.mul(&h, s.up.ptr())?;
-            g.swiglu(s.gate.ptr(), s.up.ptr(), c.ffn_dim, c.ffn_dim, t)
-                .map_err(e)?;
+            // One token on the Mac: gate, up and the activation in one dispatch.
+            #[cfg(target_os = "macos")]
+            let fused = t == 1 && layer.gate.mul_glu(g, &layer.up, s.h.ptr(), s.gate.ptr(), false)?;
+            #[cfg(not(target_os = "macos"))]
+            let fused = false;
+            if !fused {
+                let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
+                layer.gate.mul(&h, s.gate.ptr())?;
+                layer.up.mul(&h, s.up.ptr())?;
+                g.swiglu(s.gate.ptr(), s.up.ptr(), c.ffn_dim, c.ffn_dim, t)
+                    .map_err(e)?;
+            }
             layer.down.mul(
                 &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
                 s.mixed.ptr(),
