@@ -100,6 +100,11 @@ impl Gemma4CudaSession {
         self.capacity
     }
 
+    /// The GPU memory each position takes in this session's caches (keys and values).
+    pub fn cache_bytes_per_position(&self) -> usize {
+        self.cache_buffers().iter().map(|(b, _)| b.len_bytes()).sum::<usize>() / self.capacity.max(1)
+    }
+
     /// Forgets every position from `len` on (nothing, if the session is shorter), so the
     /// next tokens run from there: the keys and values before it stay as they are. For
     /// continuing a chat whose new prompt starts with the tokens already read.
