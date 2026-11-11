@@ -15,10 +15,12 @@
 //!   POST   /api/agent/client-tool-result a PC tool's result, from the app
 //!   GET    /api/skill-library/commands no skills
 //!   GET    /api/assistant/approvals    and /activity: empty
+//!   POST   /api/upload                 an attachment (multipart) → {path, docId, extractedText}
 //!   POST   /api/chat/completions       the reply as server-sent events
 //!   POST   /api/chat/runs/{id}/stop    stops a reply
 //! Anything else answers 404, which the app takes as "not on this server".
 
+mod attach;
 mod chat;
 mod files;
 mod http;
@@ -220,6 +222,9 @@ fn main() -> ExitCode {
         runs: Mutex::new(HashMap::new()),
         next_run: AtomicU64::new(1),
         tool_results: Arc::default(),
+        uploads: attach::Uploads {
+            dir: store::data_dir().join("uploads"),
+        },
     });
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
@@ -242,6 +247,8 @@ struct Shared {
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_run: AtomicU64,
     tool_results: ToolWaits,
+    /// Attachments, and the text read from them.
+    uploads: attach::Uploads,
 }
 
 /// The platform reported to the app, as the Python server names it.
@@ -328,7 +335,7 @@ fn error(detail: &str) -> String {
 fn serve(mut stream: TcpStream, shared: &Shared) {
     let request = match http::read_request(&stream) {
         Ok(r) => r,
-        Err(e) => return http::respond(&mut stream, 400, &error(&e)),
+        Err((status, e)) => return http::respond(&mut stream, status, &error(&e)),
     };
     let method = request.method.as_str();
     let path = request.path.trim_end_matches('/');
@@ -427,6 +434,16 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         ("GET", "/api/assistant/activity") => {
             http::respond(&mut stream, 200, "{\"latest\":0,\"entries\":[]}")
         }
+        ("POST", "/api/upload") => {
+            let id = format!("{:016x}", random_u64());
+            let (status, body) = attach::upload(
+                request.content_type.as_deref(),
+                &request.body,
+                &shared.uploads,
+                &id,
+            );
+            http::respond(&mut stream, status, &body);
+        }
         ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
         ("POST", "/api/agent/client-tool-result") => {
             let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
@@ -469,16 +486,24 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     };
     let mut messages = Vec::new();
     let mut system = body.str("systemPrompt").map(str::to_string);
+    // The documents attached to user messages: the message's index, the file's name and text.
+    let mut documents: Vec<(usize, String, String)> = Vec::new();
     for m in body.array("messages") {
         let (Some(role), Some(content)) = (m.str("role"), m.str("content")) else {
             continue;
         };
         match role {
             "system" => system = Some(content.to_string()),
-            "user" => messages.push(Message {
-                role: "user".into(),
-                content: content.to_string(),
-            }),
+            "user" => {
+                // The app sends each message's attachment path every turn.
+                if let Some((name, text)) = m.str("image").and_then(|p| shared.uploads.by_path(p)) {
+                    documents.push((messages.len(), name, text));
+                }
+                messages.push(Message {
+                    role: "user".into(),
+                    content: content.to_string(),
+                });
+            }
             "assistant" => messages.push(Message {
                 role: "assistant".into(),
                 content: chat::without_thinking(content),
@@ -497,6 +522,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     let max_tokens = generation
         .and_then(|g| g.num("max_tokens"))
         .map_or(DEFAULT_MAX_TOKENS, |v| v.max(1.0) as usize);
+    add_documents(shared, &body, &mut messages, documents, max_tokens);
 
     let run_id = format!("run-{}", shared.next_run.fetch_add(1, Ordering::Relaxed));
     let stop = Arc::new(AtomicBool::new(false));
@@ -542,6 +568,46 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     }
     stream_reply(&mut stream, &run_id, &events, &stop);
     shared.runs.lock().unwrap().remove(&run_id);
+}
+
+/// Writes the attached documents into their messages. The last message's comes from
+/// what was kept of its upload, else the request's `extractedText` or `docId`. They share
+/// what the context has room for after the reply, the system prompt, tools and messages:
+/// the newest document first, and earlier ones are cut, or left out with a note.
+fn add_documents(
+    shared: &Shared,
+    body: &Value,
+    messages: &mut [Message],
+    mut documents: Vec<(usize, String, String)>,
+    max_tokens: usize,
+) {
+    let last = messages.len() - 1;
+    if documents.last().is_none_or(|d| d.0 != last) {
+        let name = body
+            .str("image")
+            .and_then(|p| p.rsplit('/').next())
+            .map(|f| f.split_once('-').map_or(f, |(_, n)| n).to_string())
+            .unwrap_or_default();
+        if let Some(text) = body.str("extractedText").filter(|t| !t.trim().is_empty()) {
+            documents.push((last, name, text.to_string()));
+        } else if let Some((name, text)) = body.str("docId").and_then(|id| shared.uploads.by_id(id))
+        {
+            documents.push((last, name, text));
+        }
+    }
+    if documents.is_empty() {
+        return;
+    }
+    // About three bytes of text a token, kept on the safe side.
+    let context = shared.info.context;
+    let room = context.saturating_sub(max_tokens.min(context / 2) + 2048) * 3;
+    let others: usize = messages.iter().map(|m| m.content.len()).sum();
+    let mut budget = room.saturating_sub(others);
+    for (i, name, text) in documents.iter().rev() {
+        let message = &mut messages[*i];
+        message.content = attach::with_document(&message.content, name, text, budget);
+        budget = budget.saturating_sub(text.len().min(budget));
+    }
 }
 
 fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, stop: &AtomicBool) {

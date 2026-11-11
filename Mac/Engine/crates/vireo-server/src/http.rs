@@ -10,19 +10,37 @@ pub struct Request {
     pub path: String,
     pub query: String,
     pub bearer: Option<String>,
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
-/// The largest body read (uploads aren't served, so requests stay small).
+/// The largest body read: an attachment (up to 30 MB) and its form.
 const MAX_BODY: usize = 32 << 20;
 
-pub fn read_request(stream: &TcpStream) -> Result<Request, String> {
+/// A request that can't be read: the status to answer and why.
+pub type Refusal = (u16, String);
+
+fn bad(e: impl ToString) -> Refusal {
+    (400, e.to_string())
+}
+
+fn too_large() -> Refusal {
+    (
+        413,
+        "The request is too large: attachments can be up to 30 MB.".into(),
+    )
+}
+
+pub fn read_request(stream: &TcpStream) -> Result<Request, Refusal> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    reader.read_line(&mut line).map_err(bad)?;
     let mut parts = line.split_whitespace();
-    let method = parts.next().ok_or("empty request")?.to_string();
-    let target = parts.next().ok_or("no path")?.to_string();
+    let method = parts
+        .next()
+        .ok_or_else(|| bad("empty request"))?
+        .to_string();
+    let target = parts.next().ok_or_else(|| bad("no path"))?.to_string();
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
@@ -30,9 +48,10 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, String> {
     let mut length = 0usize;
     let mut chunked = false;
     let mut bearer = None;
+    let mut content_type = None;
     loop {
         let mut header = String::new();
-        if reader.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+        if reader.read_line(&mut header).map_err(bad)? == 0 {
             break;
         }
         let header = header.trim_end();
@@ -44,22 +63,24 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, String> {
         };
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            length = value.parse().map_err(|_| "bad Content-Length")?;
+            length = value.parse().map_err(|_| bad("bad Content-Length"))?;
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             // .NET's PostAsJsonAsync sends its body in chunks, with no length up front.
             chunked = value.to_ascii_lowercase().contains("chunked");
         } else if name.eq_ignore_ascii_case("authorization") {
             bearer = value.strip_prefix("Bearer ").map(|t| t.trim().to_string());
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.to_string());
         }
     }
     let body = if chunked {
         read_chunks(&mut reader)?
     } else {
         if length > MAX_BODY {
-            return Err("request too large".into());
+            return Err(too_large());
         }
         let mut body = vec![0; length];
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+        reader.read_exact(&mut body).map_err(bad)?;
         body
     };
     Ok(Request {
@@ -67,39 +88,36 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, String> {
         path,
         query,
         bearer,
+        content_type,
         body,
     })
 }
 
 /// A chunked body: hex sizes, each chunk, a zero-sized last one, then any trailers.
-fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, Refusal> {
     let mut body = Vec::new();
     loop {
         let mut size = String::new();
-        reader.read_line(&mut size).map_err(|e| e.to_string())?;
+        reader.read_line(&mut size).map_err(bad)?;
         let hex = size.trim().split(';').next().unwrap_or("");
-        let n = usize::from_str_radix(hex, 16).map_err(|_| "bad chunk size")?;
+        let n = usize::from_str_radix(hex, 16).map_err(|_| bad("bad chunk size"))?;
         if n == 0 {
             // Trailers, up to a blank line.
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0
-                    || line.trim().is_empty()
-                {
+                if reader.read_line(&mut line).map_err(bad)? == 0 || line.trim().is_empty() {
                     return Ok(body);
                 }
             }
         }
         if body.len() + n > MAX_BODY {
-            return Err("request too large".into());
+            return Err(too_large());
         }
         let start = body.len();
         body.resize(start + n, 0);
-        reader
-            .read_exact(&mut body[start..])
-            .map_err(|e| e.to_string())?;
+        reader.read_exact(&mut body[start..]).map_err(bad)?;
         let mut end = [0u8; 2];
-        reader.read_exact(&mut end).map_err(|e| e.to_string())?; // the chunk's CRLF
+        reader.read_exact(&mut end).map_err(bad)?; // the chunk's CRLF
     }
 }
 
@@ -110,6 +128,9 @@ pub fn respond(stream: &mut TcpStream, status: u16, json: &str) {
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Content",
         _ => "Error",
     };
     let head = format!(
@@ -143,5 +164,11 @@ mod tests {
     fn reads_chunked_bodies() {
         let mut input: &[u8] = b"5\r\nhello\r\n7;x=1\r\n, world\r\n0\r\n\r\n";
         assert_eq!(read_chunks(&mut input).unwrap(), b"hello, world");
+    }
+
+    #[test]
+    fn refuses_bodies_past_the_limit() {
+        let mut input: &[u8] = b"2000001\r\n";
+        assert_eq!(read_chunks(&mut input).unwrap_err().0, 413);
     }
 }
