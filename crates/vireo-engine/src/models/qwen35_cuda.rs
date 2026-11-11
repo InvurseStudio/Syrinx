@@ -4,9 +4,12 @@
 //! recorded graph, as in `llama_cuda.rs`. A batch's DeltaNet steps still go token by
 //! token (each needs the state the last one left), but inside one kernel launch.
 
-use super::gpu::{GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, q8_room, record, row};
+use super::gpu::{
+    GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, load_state, q8_room, record, row,
+    save_state,
+};
 use super::qwen35::Config;
-use super::{DEFAULT_BATCH, Logits, Precision, Result, matrix, vector};
+use super::{DEFAULT_BATCH, Logits, Precision, Result, SavedState, matrix, vector};
 use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{self, Buffer, Gpu, Graph, Q8, QkvPrep};
@@ -108,6 +111,50 @@ impl Qwen35CudaSession {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The session at checkpoint `cp` (made from it, and still valid for it: see
+    /// `Qwen35Cuda::restore`) copied to system memory: the attention layers' keys and
+    /// values up to there, and the DeltaNet layers as saved there.
+    pub fn export(&self, cp: &Qwen35Checkpoint) -> Result<SavedState> {
+        assert!(cp.len <= self.len, "a checkpoint ahead of its session");
+        let whole: Vec<&Buffer> = cp.saved.iter().flat_map(|(h, s)| [h, s]).collect();
+        save_state(&self.attention_buffers(), self.capacity, cp.len, &whole)
+    }
+
+    /// Loads a state `export` made from a session of the same model and precision, in
+    /// place of what this session held: it goes on from the saved position. (Save a
+    /// checkpoint there to come back to it.)
+    pub fn import(&mut self, saved: &SavedState) -> Result<()> {
+        load_state(
+            saved,
+            saved.len(),
+            &self.attention_buffers(),
+            self.capacity,
+            &self.delta_buffers(),
+        )?;
+        self.len = saved.len();
+        Ok(())
+    }
+
+    fn attention_buffers(&self) -> Vec<&Buffer> {
+        self.memory
+            .iter()
+            .flat_map(|m| match m {
+                Memory::Attention { keys, values } => vec![keys, values],
+                Memory::DeltaNet { .. } => vec![],
+            })
+            .collect()
+    }
+
+    fn delta_buffers(&self) -> Vec<&Buffer> {
+        self.memory
+            .iter()
+            .flat_map(|m| match m {
+                Memory::DeltaNet { history, state } => vec![history, state],
+                Memory::Attention { .. } => vec![],
+            })
+            .collect()
     }
 }
 

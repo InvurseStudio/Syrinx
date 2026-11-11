@@ -6,9 +6,12 @@
 //! token's launches, recorded once per session as a CUDA graph; only the token's
 //! embedding and position go up, and the logits come back.
 
-use super::gpu::{GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, q8_room, record, row};
+use super::gpu::{
+    GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, load_state, q8_room, record, row,
+    save_state,
+};
 use super::llama::Config;
-use super::{DEFAULT_BATCH, Logits, Precision, Result, matrix, vector};
+use super::{DEFAULT_BATCH, Logits, Precision, Result, SavedState, matrix, vector};
 use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{Buffer, Gpu, Graph, Q8, QkvPrep};
@@ -88,6 +91,24 @@ impl CudaSession {
     /// continuing a chat whose new prompt starts with the tokens already read.
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
+    }
+
+    /// The keys and values of every position so far, copied to system memory.
+    pub fn export(&self) -> Result<SavedState> {
+        save_state(&self.cache_buffers(), self.capacity, self.len, &[])
+    }
+
+    /// Loads the first `upto` positions of a state `export` made from a session of the
+    /// same model and precision (of any capacity is fine as long as `upto` fits), in
+    /// place of what this session held.
+    pub fn import(&mut self, saved: &SavedState, upto: usize) -> Result<()> {
+        load_state(saved, upto, &self.cache_buffers(), self.capacity, &[])?;
+        self.len = upto;
+        Ok(())
+    }
+
+    fn cache_buffers(&self) -> Vec<&Buffer> {
+        self.keys.iter().chain(&self.values).collect()
     }
 }
 
