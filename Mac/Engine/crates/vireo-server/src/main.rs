@@ -1,14 +1,18 @@
 //! `vireo-server`: serves one GGUF model on this PC over the part of the Vireo app's API
-//! that plain chats use, with Vireo's own engine on the GPU. The prototype app pairs with
-//! it as it would with the Mac (address `localhost`, the code this prints) and chats
-//! with it. No tools, files or skills yet: those come with the rest of phase 3.
+//! that chats use, with Vireo's own engine on the GPU. The prototype app pairs with it as
+//! it would with the Mac (address `localhost`, the code this prints) and chats with it.
+//! Replies can call the tools that change nothing (reading and finding files, Git's
+//! status and diff, which the app runs on the PC, and the date and time), each call
+//! written under its grammar (`tools.rs`). Tools that change things, files and skills
+//! come next.
 //!
 //! The routes, as `server/api_server.py` answers them:
 //!   POST   /api/pairing/claim          {code, name} → {token}
 //!   GET    /api/pairing/status         {paired, device: {name}}
 //!   DELETE /api/pairing/device         unpairs the caller
 //!   GET    /api/metrics                {model, runtime, contextLimit}
-//!   GET    /api/capabilities           no tools
+//!   GET    /api/capabilities           the tools
+//!   POST   /api/agent/client-tool-result a PC tool's result, from the app
 //!   GET    /api/skill-library/commands no skills
 //!   GET    /api/assistant/approvals    and /activity: empty
 //!   POST   /api/chat/completions       the reply as server-sent events
@@ -20,6 +24,7 @@ mod http;
 mod json;
 mod sample;
 mod store;
+mod tools;
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -34,6 +39,7 @@ use chat::{Family, Message};
 use json::Value;
 use sample::Sampler;
 use vireo_engine::cuda::Gpu;
+use vireo_engine::grammar::{Grammar, TokenTrie};
 use vireo_engine::models::gemma4_cuda::Gemma4Cuda;
 use vireo_engine::models::llama_cuda::LlamaCuda;
 use vireo_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
@@ -43,6 +49,7 @@ use vireo_engine::{GgufFile, Tokenizer};
 const USAGE: &str = "\
 Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact]
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
+                    [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -56,6 +63,25 @@ The app starts it itself with --port 0, --token (a token it accepts without pair
 and --with-app (stop when the app does: when its end of standard input closes), and
 reads the address from the \"Listening on\" line.";
 
+/// How replies use the tools, from the command line: features the eval turns on and off.
+#[derive(Debug, Default)]
+struct Options {
+    /// A tool's name chosen by scoring each whole name (`--score-choices on`), not a
+    /// token at a time.
+    score_choices: bool,
+    /// Token healing for forced text (`--heal off` to measure without it).
+    heal: bool,
+    /// Only the tool groups a request needs, picked by scoring (`--tools-shown scored`),
+    /// in place of every tool (`all`).
+    scored_groups: bool,
+}
+
+static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
+
+fn options() -> &'static Options {
+    OPTIONS.get_or_init(Options::default)
+}
+
 /// The longest reply when the app doesn't say.
 const DEFAULT_MAX_TOKENS: usize = 2048;
 
@@ -68,6 +94,9 @@ fn main() -> ExitCode {
     let mut app_token = None;
     let mut with_app = false;
     let mut chat_cache = Some(None);
+    let mut score_choices = false;
+    let mut scored_groups = false;
+    let mut heal = true;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -94,6 +123,18 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "--with-app" => with_app = true,
+            "--heal" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                heal = value.unwrap() == "on";
+                i += 1;
+            }
+            "--tools-shown" if matches!(value.map(String::as_str), Some("all" | "scored")) => {
+                scored_groups = value.unwrap() == "scored";
+                i += 1;
+            }
+            "--score-choices" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                score_choices = value.unwrap() == "on";
+                i += 1;
+            }
             "--chat-cache" if value.is_some() => {
                 let v = value.unwrap();
                 chat_cache = if v == "off" {
@@ -120,6 +161,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let _ = OPTIONS.set(Options {
+        score_choices,
+        heal,
+        scored_groups,
+    });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
     if with_app {
@@ -172,6 +218,7 @@ fn main() -> ExitCode {
         jobs: Mutex::new(jobs),
         runs: Mutex::new(HashMap::new()),
         next_run: AtomicU64::new(1),
+        tool_results: Arc::default(),
     });
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
@@ -193,10 +240,14 @@ struct Shared {
     /// Replies under way, by run id: set to stop one.
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_run: AtomicU64,
+    tool_results: ToolWaits,
 }
 
 /// The platform reported to the app, as the Python server names it.
 const PLATFORM: &str = if cfg!(target_os = "macos") { "macOS" } else { "windows" };
+
+/// Calls waiting for the app to run a tool, by request id: where its result goes.
+type ToolWaits = Arc<Mutex<HashMap<String, Sender<Result<String, String>>>>>;
 
 // ---- Pairing ---------------------------------------------------------------------------
 
@@ -354,9 +405,10 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 &mut stream,
                 200,
                 &format!(
-                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":{},\"tools\":[]}}",
+                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":{},\"tools\":{}}}",
                     json::string(&device),
-                    json::string(PLATFORM)
+                    json::string(PLATFORM),
+                    tools::capabilities_json(PLATFORM)
                 ),
             );
         }
@@ -371,6 +423,28 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             http::respond(&mut stream, 200, "{\"latest\":0,\"entries\":[]}")
         }
         ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
+        ("POST", "/api/agent/client-tool-result") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            let Some(id) = body.str("id") else {
+                return http::respond(&mut stream, 400, &error("No id."));
+            };
+            let result = if matches!(body.get("ok"), Some(Value::Bool(true))) {
+                Ok(body.str("output").unwrap_or("").to_string())
+            } else {
+                Err(body.str("error").unwrap_or("The tool failed.").to_string())
+            };
+            match shared.tool_results.lock().unwrap().remove(id) {
+                Some(waiting) => {
+                    let _ = waiting.send(result);
+                    http::respond(&mut stream, 200, "{\"ok\":true}");
+                }
+                None => http::respond(
+                    &mut stream,
+                    404,
+                    &error("No call is waiting for that result."),
+                ),
+            }
+        }
         ("POST", p) if p.starts_with("/api/chat/runs/") && p.ends_with("/stop") => {
             let id = &p["/api/chat/runs/".len()..p.len() - "/stop".len()];
             if let Some(stop) = shared.runs.lock().unwrap().get(id) {
@@ -427,6 +501,14 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         .unwrap()
         .insert(run_id.clone(), stop.clone());
     let (out, events) = channel();
+    let client_tools = body
+        .array("clientTools")
+        .iter()
+        .filter_map(|t| match t {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
     let job = Job {
         system,
         messages,
@@ -434,6 +516,8 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         max_tokens,
         stop: stop.clone(),
         out,
+        client_tools,
+        tool_results: shared.tool_results.clone(),
     };
     if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
         shared.runs.lock().unwrap().remove(&run_id);
@@ -460,6 +544,7 @@ fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, st
     for event in events {
         match event {
             Out::Text(text) => send(&format!("{{\"content\":{}}}", json::string(&text))),
+            Out::Event(event) => send(&event),
             Out::Done { tokens, seconds } => {
                 let tps = if seconds > 0.0 {
                     tokens as f64 / seconds
@@ -491,11 +576,19 @@ struct Job {
     max_tokens: usize,
     stop: Arc<AtomicBool>,
     out: Sender<Out>,
+    /// The tools the app runs on the PC (its `clientTools`).
+    client_tools: Vec<String>,
+    tool_results: ToolWaits,
 }
 
 enum Out {
     Text(String),
-    Done { tokens: usize, seconds: f64 },
+    /// An event as it's sent: a tool call, a request for the app to run one, its result.
+    Event(String),
+    Done {
+        tokens: usize,
+        seconds: f64,
+    },
     Error(String),
 }
 
@@ -520,6 +613,11 @@ struct Kept {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
     checkpoint: Option<Qwen35Checkpoint>,
+    /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
+    scratch: Option<Qwen35Checkpoint>,
+    /// A small session apart, for questions the server asks the model itself (which tools a
+    /// request needs), so the chat's own cache is left as it is.
+    picker: Option<Session>,
     /// Where the last prompt's history ends (its tokens are still the session's first):
     /// Gemma's chat is saved up to there, which the next turn and a retry both start with,
     /// since its saved state can only be loaded whole.
@@ -569,6 +667,17 @@ impl Model {
         Ok(n)
     }
 
+    /// Empties a session (the picker's, before each question).
+    fn empty(&self, s: &mut Session) -> Result<(), String> {
+        match (self, s) {
+            (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(0),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m.reset(s).map_err(|e| e.to_string())?,
+            _ => unreachable!("a session belongs to its model"),
+        }
+        Ok(())
+    }
+
     fn cache_bytes_per_position(&self, s: &Session) -> usize {
         match s {
             Session::Llama(s) => s.cache_bytes_per_position(),
@@ -602,6 +711,51 @@ impl Model {
         };
         r.map_err(|e| e.to_string())?
             .ok_or_else(|| "no logits".into())
+    }
+
+    /// Reads `ids`; every one's logits, a row each.
+    fn read_all(&self, s: &mut Session, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let r = match (self, s) {
+            (Model::Llama(m), Session::Llama(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
+            (Model::Gemma4(m), Session::Gemma4(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
+            _ => unreachable!("a session belongs to its model"),
+        };
+        r.map_err(|e| e.to_string())?
+            .ok_or_else(|| "no logits".into())
+    }
+
+    /// How likely the model finds `ids` next, given `logits` for the first of them: the
+    /// sum of each token's log-probability. The session is left as it was.
+    fn score(&self, kept: &mut Kept, logits: &[f32], ids: &[u32]) -> Result<f64, String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let mut total = log_probability(logits, ids[0]);
+        if ids.len() > 1 {
+            let len = kept.tokens.len();
+            if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &kept.session) {
+                m.save(s, &mut kept.scratch).map_err(e)?;
+            }
+            let rows = self.read_all(&mut kept.session, &ids[..ids.len() - 1])?;
+            let vocab = logits.len();
+            for (i, &id) in ids[1..].iter().enumerate() {
+                total += log_probability(&rows[i * vocab..(i + 1) * vocab], id);
+            }
+            match (self, &mut kept.session) {
+                (Model::Llama(_), Session::Llama(s)) => s.truncate(len),
+                (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(len),
+                (Model::Qwen35(m), Session::Qwen35(s)) => {
+                    m.restore(s, kept.scratch.as_ref().unwrap()).map_err(e)?
+                }
+                _ => unreachable!("a session belongs to its model"),
+            }
+        }
+        Ok(total)
     }
 
     /// Reads `ids` (the history, then from `mark` on the reply's opened turn) into the
@@ -658,6 +812,13 @@ impl Model {
         kept.tokens.extend_from_slice(&ids[from..]);
         kept.history_end = mark;
         Ok((logits, from))
+    }
+
+    /// Reads `ids` after what the session holds; the last one's logits.
+    fn feed(&self, kept: &mut Kept, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let logits = self.read(&mut kept.session, ids)?;
+        kept.tokens.extend_from_slice(ids);
+        Ok(logits)
     }
 
     /// How many of `ids` `continue_with` would keep from the session in use.
@@ -862,6 +1023,8 @@ fn engine(
                 session,
                 tokens: Vec::new(),
                 checkpoint: None,
+                scratch: None,
+                picker: None,
                 history_end: 0,
             })
         }
@@ -878,6 +1041,12 @@ fn engine(
         context,
     }));
 
+    // The vocabulary as a byte trie, for writing tool calls under their grammars.
+    let extra: Vec<u32> = tools::call_tokens(family)
+        .iter()
+        .filter_map(|t| tokenizer.token_id(t))
+        .collect();
+    let trie = TokenTrie::with_extra(&tokenizer, &extra);
     let mut store = chat_cache.map(|dir| {
         let key = store::model_key(std::path::Path::new(path), mode);
         let dir = dir.unwrap_or_else(|| store::default_dir(&key));
@@ -908,6 +1077,8 @@ fn engine(
                         session,
                         tokens: Vec::new(),
                         checkpoint: None,
+                        scratch: None,
+                        picker: None,
                         history_end: 0,
                     })
                 }
@@ -922,6 +1093,7 @@ fn engine(
             kept.as_mut().unwrap(),
             store.as_mut(),
             &tokenizer,
+            &trie,
             family,
             context,
             seed,
@@ -1009,6 +1181,7 @@ fn reply(
     kept: &mut Kept,
     store: Option<&mut store::Store>,
     tokenizer: &Tokenizer,
+    trie: &TokenTrie,
     family: Family,
     context: usize,
     seed: u64,
@@ -1016,16 +1189,35 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
+    let mut offered = tools::offered(&job.client_tools);
+    if options().scored_groups
+        && !offered.is_empty()
+        && let Some(request) = job.messages.last()
+    {
+        let groups = pick_groups(model, kept, tokenizer, family, &request.content)?;
+        offered.retain(|t| groups.contains(&t.group));
+    }
+    let declared = tools::declarations(family, &offered);
+    // With tools, the system prompt opens with what they're for.
+    let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
+        (true, s) => s.map(str::to_string),
+        (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
+        (false, _) => Some(tools::PREAMBLE.to_string()),
+    };
     // The chat's latest messages that fit with room for the reply.
     let mut first = 0;
     let opening = tokenizer.encode(chat::opening(family), false, true);
     let (ids, mark) = loop {
         let text = chat::history(
             family,
-            job.system.as_deref(),
+            system.as_deref(),
+            &declared,
             &job.messages[first..],
             &today,
         );
+        if std::env::var_os("VIREO_DEBUG_PROMPT").is_some() {
+            eprintln!("[prompt] {text}{}", chat::opening(family));
+        }
         let mut ids = tokenizer.encode(&text, false, true);
         let mark = ids.len();
         ids.extend_from_slice(&opening);
@@ -1062,11 +1254,122 @@ fn reply(
     let mut generated: Vec<u32> = Vec::new();
     let mut pending = Vec::new();
     let started = Instant::now();
-    while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+    // Tool calls: the grammar they're written under, and how one starts.
+    let grammar = Grammar::new(&tools::call_grammar(family, &offered));
+    let start = tools::call_start(family);
+    let start_token = tokenizer.token_id(start.token);
+    let mut last_call: Option<tools::Call> = None;
+    let (mut calls, mut call_tokens) = (0usize, 0usize);
+    let mut turn_start = true;
+    // Once calls are used up (or the model repeats one), it may only answer: the tokens
+    // that start a call are taken away from it.
+    let mut may_call = !offered.is_empty();
+    let mut brace_tokens: Option<Vec<u32>> = None;
+    while generated.len() + call_tokens < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        if !may_call && !offered.is_empty() {
+            if let Some(t) = start_token {
+                logits[t as usize] = f32::NEG_INFINITY;
+            }
+            if start.brace && turn_start {
+                let braces = brace_tokens.get_or_insert_with(|| {
+                    let mut b = Vec::new();
+                    (0..tokenizer.vocab_size() as u32)
+                        .filter(|&id| {
+                            b.clear();
+                            tokenizer.token_bytes(id, false, &mut b);
+                            b.first() == Some(&b'{')
+                        })
+                        .collect()
+                });
+                for &t in braces.iter() {
+                    logits[t as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
         let next = sampler.pick(&logits, &generated);
         if tokenizer.is_end_of_generation(next) {
             break;
         }
+        if debug_calls() && turn_start {
+            eprintln!(
+                "[calls] turn starts with {:?}",
+                tokenizer.decode(&[next], true)
+            );
+        }
+        let by_token = Some(next) == start_token;
+        let by_brace = start.brace && turn_start && {
+            let mut b = Vec::new();
+            tokenizer.token_bytes(next, false, &mut b);
+            b.first() == Some(&b'{')
+        };
+        let opens_call = may_call && (by_token || by_brace);
+        if opens_call {
+            flush_text(job, &mut pending);
+            if by_token {
+                // The call's own start token is the model's; Llama's brace is the grammar's.
+                model.next(&mut kept.session, next, &mut logits)?;
+                kept.tokens.push(next);
+                call_tokens += 1;
+            }
+            let call_started = Instant::now();
+            let text = write_call(
+                model,
+                kept,
+                tokenizer,
+                trie,
+                &grammar,
+                &mut logits,
+                &mut call_tokens,
+                context,
+            )?;
+            let call = tools::parse_call(family, &text)
+                .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
+            calls += 1;
+            let args = call.args_json();
+            let written = call_started.elapsed();
+            let _ = job.out.send(Out::Event(format!(
+                "{{\"type\":\"tool_call\",\"tool\":{},\"args\":{args}}}",
+                json::string(&call.tool)
+            )));
+            // The same call again, with the same arguments, would get the same answer: a
+            // small model can loop on one. It isn't run again, and the model must answer.
+            let repeated = last_call.as_ref() == Some(&call);
+            let result = if repeated {
+                "This is the same call as the last one, and its result is above. Answer the user from it now."
+                    .to_string()
+            } else {
+                match run_tool(&call, &offered, job) {
+                    Some(r) => r,
+                    None => break, // stopped while the app ran it
+                }
+            };
+            if repeated || calls == MAX_CALLS {
+                may_call = false;
+            }
+            last_call = Some(call.clone());
+            eprintln!(
+                "Tool: {} {args} (written in {:.0} ms), {} characters back.",
+                call.tool,
+                written.as_secs_f64() * 1000.0,
+                result.len()
+            );
+            let _ = job.out.send(Out::Event(format!(
+                "{{\"type\":\"tool_result\",\"tool\":{},\"result\":{}}}",
+                json::string(&call.tool),
+                json::string(&preview(&result))
+            )));
+            let (before, body, after) = tools::after_call(family, &call.tool, &shaped(&result));
+            let mut ids = tokenizer.encode(&before, false, true);
+            ids.extend(tokenizer.encode(&body, false, false));
+            ids.extend(tokenizer.encode(&after, false, true));
+            if kept.tokens.len() + ids.len() + 64 > context {
+                return Err("The tool's result doesn't fit in this chat's context.".into());
+            }
+            logits = model.feed(kept, &ids)?;
+            turn_start = true;
+            continue;
+        }
+        turn_start = false;
         generated.push(next);
         if Some(next) == channel.0 {
             in_channel = true;
@@ -1091,19 +1394,15 @@ fn reply(
         model.next(&mut kept.session, next, &mut logits)?;
         kept.tokens.push(next);
     }
-    if !pending.is_empty() {
-        let _ = job
-            .out
-            .send(Out::Text(String::from_utf8_lossy(&pending).into_owned()));
-    }
+    flush_text(job, &mut pending);
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s){}.",
+        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}.",
         ids.len(),
         ids.len() - reused,
         (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),
-        generated.len(),
-        generated.len() as f64 / seconds.max(1e-9),
+        generated.len() + call_tokens,
+        (generated.len() + call_tokens) as f64 / seconds.max(1e-9),
         if job.stop.load(Ordering::Relaxed) {
             ", stopped"
         } else {
@@ -1111,8 +1410,305 @@ fn reply(
         }
     );
     let _ = job.out.send(Out::Done {
-        tokens: generated.len(),
+        tokens: generated.len() + call_tokens,
         seconds,
     });
     Ok(())
+}
+
+/// The tool groups a request needs, asked of the model in its picker session: one pass
+/// over a short multiple-choice question, its answer letters scored. Groups at least
+/// `GROUP_SHARE` likely are offered (the likeliest always, unless it's "none").
+fn pick_groups(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    family: Family,
+    request: &str,
+) -> Result<Vec<tools::Group>, String> {
+    const GROUP_SHARE: f64 = 0.15;
+    let question = Message {
+        role: "user".into(),
+        content: tools::group_question(request),
+    };
+    // The answer opens with the examples' "Needs:", so its next token is the letter.
+    let text = chat::history(family, None, "", &[question], &chat::today())
+        + chat::opening(family)
+        + "Needs:";
+    let ids = tokenizer.encode(&text, false, true);
+    if kept.picker.is_none() {
+        kept.picker = Some(model.session(1024)?);
+    }
+    let session = kept.picker.as_mut().unwrap();
+    model.empty(session)?;
+    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let scores: Vec<f64> = tools::GROUP_CHOICES
+        .iter()
+        .map(|(letter, _)| {
+            let id = tokenizer.encode(&format!(" {letter}"), false, false)[0];
+            f64::from(logits[id as usize])
+        })
+        .collect();
+    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+    let shares: Vec<f64> = scores.iter().map(|s| (s - max).exp() / sum).collect();
+    if debug_calls() {
+        eprintln!(
+            "[calls] groups: files {:.2}, git {:.2}, time {:.2}, none {:.2}",
+            shares[0], shares[1], shares[2], shares[3]
+        );
+    }
+    let top = (0..shares.len())
+        .max_by(|&a, &b| shares[a].total_cmp(&shares[b]))
+        .unwrap();
+    let mut groups: Vec<tools::Group> = tools::GROUP_CHOICES
+        .iter()
+        .zip(&shares)
+        .filter(|(_, share)| **share >= GROUP_SHARE)
+        .filter_map(|((_, group), _)| *group)
+        .collect();
+    if let Some(group) = tools::GROUP_CHOICES[top].1
+        && !groups.contains(&group)
+    {
+        groups.push(group);
+    }
+    // No tools only when that's clear: hiding a tool a request needs costs more than
+    // showing one it doesn't.
+    if tools::GROUP_CHOICES[top].1.is_none() && shares[top] >= 0.7 {
+        groups.clear();
+    } else if groups.is_empty() {
+        let best = (0..3)
+            .max_by(|&a, &b| shares[a].total_cmp(&shares[b]))
+            .unwrap();
+        groups.extend(tools::GROUP_CHOICES[best].1);
+    }
+    Ok(groups)
+}
+
+/// `ln p(id)` under `logits`.
+fn log_probability(logits: &[f32], id: u32) -> f64 {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+    let sum: f64 = logits.iter().map(|&x| f64::from(x - max).exp()).sum();
+    f64::from(logits[id as usize] - max) - sum.ln()
+}
+
+/// Whether to log how tool calls are written (VIREO_DEBUG_CALLS=1).
+fn debug_calls() -> bool {
+    std::env::var_os("VIREO_DEBUG_CALLS").is_some()
+}
+
+/// The most tool calls one reply makes.
+const MAX_CALLS: usize = 6;
+/// The most tokens one call may take: a path or a search, not an essay.
+const MAX_CALL_TOKENS: usize = 1024;
+/// The most of a tool's result the model reads, in characters (about 2,000 tokens).
+const MAX_RESULT: usize = 8000;
+
+/// Sends the text held back so far (only whole characters are sent as they come).
+fn flush_text(job: &Job, pending: &mut Vec<u8>) {
+    if !pending.is_empty() {
+        let _ = job
+            .out
+            .send(Out::Text(String::from_utf8_lossy(pending).into_owned()));
+        pending.clear();
+    }
+}
+
+/// Writes a tool call under `grammar`: what the grammar forces goes in without asking the
+/// model (read in one pass), and elsewhere the model's likeliest allowed token. The
+/// call's text, from just after its start.
+#[allow(clippy::too_many_arguments)]
+fn write_call(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    trie: &TokenTrie,
+    grammar: &Grammar,
+    logits: &mut Vec<f32>,
+    tokens: &mut usize,
+    context: usize,
+) -> Result<String, String> {
+    let mut m = grammar.matcher();
+    let mut text = Vec::new();
+    let first = *tokens;
+    let room = |kept: &Kept, n: usize| {
+        if kept.tokens.len() + n + 64 > context {
+            Err("The tool call doesn't fit in this chat's context.".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    loop {
+        let forced = m.forced();
+        // Token healing: forced text's last token is left for the model to write, under
+        // the grammar, so it can merge it with what follows as its training did (Qwen's
+        // "=read", not "=" then "read"). Tokens no text of the model's would contain
+        // otherwise push it off course: Qwen 3.5 9B read files with git_diff.
+        let mut held: Vec<u8> = Vec::new();
+        if !forced.is_empty() {
+            let ids = tokenizer.encode(&String::from_utf8_lossy(&forced), false, true);
+            let ends = {
+                let mut t = m;
+                t.advance_all(&forced) && t.is_complete()
+            };
+            let mut keep = if ends || !options().heal {
+                ids.len()
+            } else {
+                ids.len() - 1
+            };
+            let mut fed_bytes = Vec::new();
+            for &id in &ids[..keep] {
+                tokenizer.token_bytes(id, true, &mut fed_bytes);
+            }
+            if !forced.starts_with(&fed_bytes) {
+                // Tokens that don't spell the text exactly: write it all.
+                keep = ids.len();
+                fed_bytes = forced.clone();
+            }
+            held = forced[fed_bytes.len()..].to_vec();
+            if keep > 0 {
+                m.advance_all(&fed_bytes);
+                text.extend_from_slice(&fed_bytes);
+                room(kept, keep)?;
+                *logits = model.feed(kept, &ids[..keep])?;
+                *tokens += keep;
+            }
+        }
+        if m.is_complete() {
+            break;
+        }
+        // A branch (a tool's name): each option scored whole, and the likeliest written.
+        // (Each is scored with the text held back by healing before it, read as one.)
+        let ahead = {
+            let mut t = m;
+            t.advance_all(&held);
+            t
+        };
+        if options().score_choices
+            && let Some(choices) = ahead.scored_options().filter(|c| c.len() > 1)
+        {
+            let mut best: Option<(f64, Vec<u8>, Vec<u32>)> = None;
+            for option in choices {
+                let bytes = [held.as_slice(), &option].concat();
+                let ids = tokenizer.encode(&String::from_utf8_lossy(&bytes), false, true);
+                if ids.is_empty() {
+                    continue;
+                }
+                let score = model.score(kept, logits, &ids)?;
+                if debug_calls() {
+                    eprintln!(
+                        "[calls] score {score:8.3} for {:?}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+                if best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((score, bytes, ids));
+                }
+            }
+            let (_, bytes, ids) = best.ok_or("No option of a choice could be written.")?;
+            if !m.advance_all(&bytes) {
+                return Err("A scored option didn't fit its grammar.".into());
+            }
+            text.extend_from_slice(&bytes);
+            room(kept, ids.len())?;
+            *logits = model.feed(kept, &ids)?;
+            *tokens += ids.len();
+            continue;
+        }
+        let allowed = m.allowed(trie);
+        let next = (0..logits.len() as u32)
+            .filter(|&id| allowed[id as usize / 64] >> (id % 64) & 1 == 1)
+            .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]))
+            .ok_or("The tool call's grammar left no way on.")?;
+        if debug_calls() {
+            let free = (0..logits.len() as u32)
+                .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]))
+                .unwrap_or(0);
+            eprintln!(
+                "[calls] after {:?}: the model's {:?}, the grammar's {:?}",
+                String::from_utf8_lossy(&text),
+                tokenizer.decode(&[free], true),
+                tokenizer.decode(&[next], true)
+            );
+        }
+        let mut bytes = Vec::new();
+        tokenizer.token_bytes(next, false, &mut bytes);
+        if !m.advance_all(&bytes) {
+            return Err("A token the grammar allowed didn't fit it.".into());
+        }
+        text.extend_from_slice(&bytes);
+        room(kept, 1)?;
+        model.next(&mut kept.session, next, logits)?;
+        kept.tokens.push(next);
+        *tokens += 1;
+        if *tokens - first > MAX_CALL_TOKENS {
+            return Err("A tool call ran too long.".into());
+        }
+    }
+    String::from_utf8(text).map_err(|_| "A tool call wasn't text.".to_string())
+}
+
+/// Runs a call: the server's own tools here, the PC's by asking the app and waiting for
+/// its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
+/// model should read it. `None` if the reply was stopped meanwhile.
+fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<String> {
+    let runs = offered
+        .iter()
+        .find(|t| t.name == call.tool)
+        .map(|t| t.runs)?;
+    let result = match runs {
+        tools::Runs::Server => tools::run_here(call),
+        tools::Runs::App => {
+            let id = format!("call-{:016x}", random_u64());
+            let (tx, rx) = channel();
+            job.tool_results.lock().unwrap().insert(id.clone(), tx);
+            let _ = job.out.send(Out::Event(format!(
+                "{{\"type\":\"client_tool_request\",\"id\":{},\"tool\":{},\"args\":{}}}",
+                json::string(&id),
+                json::string(&call.tool),
+                call.args_json()
+            )));
+            let asked = Instant::now();
+
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(r) => break r,
+                    Err(_) if job.stop.load(Ordering::Relaxed) => {
+                        job.tool_results.lock().unwrap().remove(&id);
+                        return None;
+                    }
+                    Err(_) if asked.elapsed().as_secs() > 120 => {
+                        job.tool_results.lock().unwrap().remove(&id);
+                        break Err("The PC didn't answer within two minutes.".into());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    };
+    Some(result.unwrap_or_else(|e| format!("Error: {e}")))
+}
+
+/// A tool's result as the model reads it: at most `MAX_RESULT` characters, saying how much
+/// was left out.
+fn shaped(result: &str) -> String {
+    let chars = result.chars().count();
+    if chars <= MAX_RESULT {
+        return result.to_string();
+    }
+    let kept: String = result.chars().take(MAX_RESULT).collect();
+    format!(
+        "{kept}\n[... {} more characters not shown]",
+        chars - MAX_RESULT
+    )
+}
+
+/// A result's first few hundred characters, for the step the app shows.
+fn preview(result: &str) -> String {
+    let short: String = result.chars().take(300).collect();
+    if short.len() < result.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
 }

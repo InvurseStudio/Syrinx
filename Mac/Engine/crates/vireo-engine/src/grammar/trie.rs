@@ -20,16 +20,40 @@ pub struct TokenTrie {
     longest_plain: u32,
     /// The other tokens, with their bytes, tried one by one inside a free string.
     others: Vec<(u32, Box<[u8]>)>,
+    /// Every token with its bytes, for raw text's sets below.
+    all: Vec<(u32, Box<[u8]>)>,
+    /// Per first byte of a raw text's end: the tokens that fit anywhere in such text
+    /// (whole characters, no control bytes but newline and tab, not that byte), the
+    /// others' indexes in `all`, and the longest that fits. Made when first needed.
+    text_sets: std::sync::Mutex<std::collections::HashMap<u8, std::sync::Arc<TextSet>>>,
+}
+
+struct TextSet {
+    plain: Vec<u64>,
+    others: Vec<u32>,
+    longest: u32,
 }
 
 impl TokenTrie {
     /// Every token a constrained generation may use: text tokens, not control tokens
     /// (they end turns and calls, which the caller allows itself) or hand-added ones.
     pub fn new(tokenizer: &Tokenizer) -> Self {
+        Self::with_extra(tokenizer, &[])
+    }
+
+    /// The same, plus these special tokens as the text they're written as: ones a format
+    /// uses inside a call, such as Gemma 4's `<|"|>` quote.
+    pub fn with_extra(tokenizer: &Tokenizer, extra: &[u32]) -> Self {
         let vocab = tokenizer.vocab_size();
         let mut tokens: Vec<(Vec<u8>, u32)> = Vec::with_capacity(vocab);
         let mut bytes = Vec::new();
         for id in 0..vocab as u32 {
+            if extra.contains(&id) {
+                if let Some(text) = tokenizer.token_text(id) {
+                    tokens.push((text.as_bytes().to_vec(), id));
+                }
+                continue;
+            }
             if !matches!(
                 tokenizer.token_type(id),
                 Some(TokenType::Normal | TokenType::Byte)
@@ -57,6 +81,11 @@ impl TokenTrie {
             plain: vec![0; vocab.div_ceil(64)],
             longest_plain: 0,
             others: Vec::new(),
+            all: tokens
+                .iter()
+                .map(|(b, id)| (*id, b.clone().into_boxed_slice()))
+                .collect(),
+            text_sets: Default::default(),
         };
         for (bytes, id) in &tokens {
             if is_plain(bytes) {
@@ -110,6 +139,32 @@ impl TokenTrie {
         self.vocab
     }
 
+    fn text_set(&self, end: u8) -> std::sync::Arc<TextSet> {
+        let mut sets = self.text_sets.lock().unwrap();
+        sets.entry(end)
+            .or_insert_with(|| {
+                let mut set = TextSet {
+                    plain: vec![0; self.vocab.div_ceil(64)],
+                    others: Vec::new(),
+                    longest: 0,
+                };
+                for (i, (id, bytes)) in self.all.iter().enumerate() {
+                    let fits = !bytes.contains(&end)
+                        && std::str::from_utf8(bytes).is_ok_and(|t| {
+                            t.chars().all(|c| c == '\n' || c == '\t' || !c.is_control())
+                        });
+                    if fits {
+                        set.plain[*id as usize / 64] |= 1 << (id % 64);
+                        set.longest = set.longest.max(bytes.len() as u32);
+                    } else {
+                        set.others.push(i as u32);
+                    }
+                }
+                std::sync::Arc::new(set)
+            })
+            .clone()
+    }
+
     fn walk(&self, node: u32, m: &Matcher, out: &mut [u64]) {
         let n = node as usize;
         for &id in &self.ends[self.end_start[n] as usize..self.end_start[n + 1] as usize] {
@@ -138,6 +193,19 @@ impl Matcher<'_> {
     /// The tokens of `trie` that may come next, one bit per token id (64 a word).
     pub fn allowed(&self, trie: &TokenTrie) -> Vec<u64> {
         let mut out = vec![0u64; trie.vocab.div_ceil(64)];
+        if let Some((end, room)) = self.in_plain_text() {
+            let set = trie.text_set(end);
+            if room >= set.longest {
+                out.copy_from_slice(&set.plain);
+                for &i in &set.others {
+                    let (id, bytes) = &trie.all[i as usize];
+                    if self.allows(bytes) {
+                        out[*id as usize / 64] |= 1 << (id % 64);
+                    }
+                }
+                return out;
+            }
+        }
         if self.in_plain_string(trie.longest_plain) {
             out.copy_from_slice(&trie.plain);
             for (id, bytes) in &trie.others {
