@@ -39,6 +39,8 @@ pub struct Gemma4Cuda<'a> {
     per_layer_embedding: Matrix<'a>,
     output: GpuMatrix,
     per_layer_model_proj: GpuMatrix,
+    /// The same rounded to Q8_0, for 8-bit mode (it's F16 in Gemma's files).
+    per_layer_model_proj_q8: Option<GpuMatrix>,
     /// per_layer_proj_norm / sqrt(2), as llama.cpp folds it.
     per_layer_proj_norm: Buffer,
     rope_factors: Option<Buffer>,
@@ -173,6 +175,10 @@ impl<'a> Gemma4Cuda<'a> {
                 dim,
                 pl * c.layers,
             )?)?,
+            per_layer_model_proj_q8: GpuMatrix::upload_q8_0(
+                &gpu,
+                &matrix(file, "per_layer_model_proj.weight", dim, pl * c.layers)?,
+            )?,
             per_layer_proj_norm: up(proj_norm)?,
             rope_factors,
             output_norm: up(vector(file, "output_norm.weight", dim)?)?,
@@ -461,7 +467,11 @@ impl<'a> Gemma4Cuda<'a> {
         let g = &self.gpu;
         let e = gpu_error;
         let (dim, pl, eps) = (c.dim, c.per_layer_dim, c.norm_eps);
-        self.per_layer_model_proj.mul(
+        let proj = match (&self.per_layer_model_proj_q8, self.precision) {
+            (Some(q8), Precision::Int8) => q8,
+            _ => &self.per_layer_model_proj,
+        };
+        proj.mul(
             &Input::new(g, s.x.ptr(), t, s.q8.as_ref()),
             s.per_layer_proj.ptr(),
         )?;
