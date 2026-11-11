@@ -37,9 +37,36 @@ pub struct Run {
     pub tokens: usize,
     /// Whether the case was one of the harder ones.
     pub hard: bool,
+    /// Whether it was one of the cases that change files (`change_cases.rs`).
+    pub changes: bool,
+    /// The tools the reply asked the user to approve, in order.
+    pub asked: Vec<String>,
+    /// The stand-in PC as the reply left it.
+    pub pc: Pc,
 }
 
+/// The tools that change files: they ask the user first.
+pub const CHANGE_TOOLS: [&str; 4] = ["write_file", "rename_file", "move_file", "delete_file"];
+
 impl Run {
+    /// The calls to change files that took effect: their result isn't an error (a
+    /// declined approval, or a change the app's check refused).
+    pub(crate) fn changes_done(&self) -> usize {
+        self.calls
+            .iter()
+            .zip(&self.results)
+            .filter(|(c, r)| CHANGE_TOOLS.contains(&c.tool.as_str()) && !r.starts_with("Error"))
+            .count()
+    }
+
+    /// The calls that change files.
+    pub(crate) fn changes_made(&self) -> Vec<&Call> {
+        self.calls
+            .iter()
+            .filter(|c| CHANGE_TOOLS.contains(&c.tool.as_str()))
+            .collect()
+    }
+
     pub(crate) fn called(&self, tool: &str) -> Vec<&Call> {
         self.calls.iter().filter(|c| c.tool == tool).collect()
     }
@@ -71,6 +98,9 @@ pub struct Case {
     pub check: fn(&Run) -> Result<(), String>,
     /// One of the harder cases (several steps, long results, follow-ups, recovering).
     pub hard: bool,
+    /// One of the cases about changing files (`change_cases.rs`), counted apart. Any
+    /// other case fails if the reply changes a file: nobody asked it to.
+    pub changes: bool,
 }
 
 pub(crate) fn need(ok: bool, why: &str) -> Result<(), String> {
@@ -87,10 +117,12 @@ const WEEKDAYS: [&str; 7] = [
     "Sunday",
 ];
 
-/// Every case: the easy ones, then the harder ones (`hard_cases.rs`).
+/// Every case: the easy ones, the harder ones (`hard_cases.rs`), then the ones that
+/// change files (`change_cases.rs`).
 pub fn all() -> Vec<Case> {
     let mut all = easy();
     all.extend(crate::hard_cases::all());
+    all.extend(crate::change_cases::all());
     all
 }
 
@@ -104,6 +136,7 @@ fn easy() -> Vec<Case> {
             prompt: "What day of the week is it today?".into(),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default(),
             check: |r| {
                 need(!r.called("get_current_datetime").is_empty(), "didn't check the date")?;
@@ -123,6 +156,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Read {docs}\notes.txt and tell me the code word."),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default().file(
                 &format!(r"{docs}\notes.txt"),
                 "Shopping: eggs, flour, milk.\nThe code word for Friday is PELICAN.\n",
@@ -140,6 +174,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Which files are in {docs}\Invoices?"),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default()
                 .file(&format!(r"{docs}\Invoices\acme-november.pdf"), "Acme invoice")
                 .file(&format!(r"{docs}\Invoices\globex-october.pdf"), "Globex invoice")
@@ -160,6 +195,7 @@ fn easy() -> Vec<Case> {
             prompt: "What is 17 times 23?".into(),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default(),
             check: |r| {
                 r.only(&[])?;
@@ -172,6 +208,7 @@ fn easy() -> Vec<Case> {
             prompt: "Write a two-line poem about rain.".into(),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default(),
             check: |r| {
                 r.only(&[])?;
@@ -184,6 +221,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"One of the files in {projects} mentions a code word. Find it and tell me the code word."),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default()
                 .file(&format!(r"{projects}\vireo\README.md"), "# Vireo\nA chat app.")
                 .file(&format!(r"{projects}\vireo\docs\secret.txt"), "Remember: the code word is HERON.")
@@ -201,6 +239,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Is there a file called budget.xlsx in {docs}?"),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default()
                 .file(&format!(r"{docs}\budget-2025.xlsx"), "old budget")
                 .file(&format!(r"{docs}\notes.txt"), "notes"),
@@ -220,6 +259,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Which files have I changed in my project at {projects}\vireo?"),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default()
                 .file(&format!(r"{projects}\vireo\src\main.rs"), "fn main() {}")
                 .git(&format!(r"{projects}\vireo"), " M src/main.rs\n?? notes.md"),
@@ -235,6 +275,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"What does {docs}\minutes.txt say?"),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default().file(&format!(r"{docs}\notes.txt"), "notes"),
             check: |r| {
                 need(r.calls.iter().any(|c| c.tool == "read_file"), "didn't try to read it")?;
@@ -250,6 +291,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Read {docs}\groceries.txt and tell me what it all costs in total."),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default().file(&format!(r"{docs}\groceries.txt"), "apples $3\npears $4\nbread $5\n"),
             check: |r| {
                 need(r.calls.iter().any(|c| c.tool == "read_file" && c.points_at("path", "groceries.txt")), "didn't read it")?;
@@ -262,6 +304,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Which is bigger: the number in {docs}\a.txt or the one in {docs}\b.txt?"),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default()
                 .file(&format!(r"{docs}\a.txt"), "1450")
                 .file(&format!(r"{docs}\b.txt"), "1209"),
@@ -278,6 +321,7 @@ fn easy() -> Vec<Case> {
             prompt: format!(r"Sum up {docs}\email.txt in one sentence."),
             history: vec![],
             hard: false,
+            changes: false,
             pc: Pc::default()
                 .file(
                     &format!(r"{docs}\email.txt"),

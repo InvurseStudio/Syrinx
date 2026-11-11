@@ -32,8 +32,8 @@ cargo run --release -p vireo-eval -- --out evals/latest.json
 ```
 
 `--models a.gguf,b.gguf` runs only some; `--cases read,git` only some cases. Compare
-against `evals/not-found-hints.json` (and `run-not-found-hints.txt`, the same run as
-printed), the latest run with today's defaults; `evals/baseline.json` is the first,
+against `evals/changes.json` (and `run-changes.txt`, the same run as printed), the
+latest run with today's defaults, all 30 cases; `evals/baseline.json` is the first,
 which the earlier switches were measured against. Replies
 are greedy, so the same model on the same build should give the same scores; on the Mac
 the GPU backend differs, so small differences in wording are possible.
