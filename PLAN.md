@@ -94,6 +94,7 @@ git), for checking our output and speed.
 | 2026-11-11 | The small kernels: Qwen's convolution in registers (it had gone to local memory), `qkv_prep` with a thread per number and 8 tokens a block, Gemma's F16 per-layer projection as Q8_0 in 8-bit mode (see "Tenth round") | Llama and Qwen: 8-bit perplexity and generated tokens unchanged to every digit. Gemma: the same tokens; perplexity per chunk within 0.3% of before and nearer exact on average (0.14% from it, 0.27% before); next-token probabilities nearer exact too (20.04% against exact 20.67%, before 22.12%). 75 engine tests pass |
 | 2026-11-11 | Qwen's DeltaNet for a prompt in chunks of 64 tokens, the WY form (`delta_chunk_prep`, `delta_chunk_scan`; see "Eleventh round") | Exact perplexity the same as token by token to every digit at 2,048 tokens (chunk 1: 16.2601 against 16.2602 on the first build, then identical); 8-bit within 0.25% per chunk, nearer exact on average. A new test case reads Qwen in batches of 200 (across chunks, ending in part of one) against one token at a time: logits within 1e-4 of 31 exact. 75 engine tests pass |
 | 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52 → 0.07 s, Qwen 1.33 → 0.10 s, Gemma 1.06 → 0.05 s at turn 5). 76 engine tests pass |
+| 2026-11-11 | A saved cache per chat: a session's keys and values (and Qwen's DeltaNet at its checkpoint) copied to system memory and back (`export`, `import`, `SavedState`); vireo-server saves the chat in use when a prompt would throw much of it away, or when the app closes, to `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\` (a file per chat, written on a thread of its own; 4 GB per model, the oldest go first), and loads the saved chat that shares the most of a new prompt. Llama and Gemma can load part of one (a shared start); Qwen's loads whole | A new GPU test: an imported session goes on to the bit as the one it came from, whole and in part, exact and 8-bit. Two chats about 3,500- and 4,400-token documents taking turns, then a restart: going back to a chat or reopening it loads its cache in 17-66 ms, the first word in 0.06-0.13 s, against 0.8-1.4 s reading it again, on all three models. 77 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -382,6 +383,30 @@ Reading a ~1,900–2,200-token prompt (the first 7,000 characters of this file) 
   ninth and tenth rounds; this round ~9%), ~10,000 tokens 2,731 → 3,162 (+16%).
   `llama-bench -p 2048` right after: 4,740, so ~79%.
 
+**Long chats (2026-11-11):** vireo-server's context is now automatic by default: as
+many tokens as the GPU's free memory holds once the model is loaded (leaving 1 GB and a
+tenth of what's free), up to the model's trained length and 32,768, the length checked
+below. On the RTX 5060 all three test models get 32,768 (cache 1.1 GB for Llama, 0.6 GB
+for Gemma, 0.4 GB for Qwen). The prototype app's Settings › Your Host has the choice
+(Automatic, or 4K to 32K).
+
+| Model | Perplexity, one 32K window: Vireo / llama.cpp | at 4K | Reading ~25K tokens: Vireo / llama.cpp (tokens/s) | Generating 25K deep: Vireo / llama.cpp |
+|---|---|---|---|---|
+| Llama 3.2 1B | 18.3595 / 18.3520 (+0.04%) | 24.2976 / 24.2865 (+0.05%) | 1,702 / 2,318 (73%) | ~31 / 49 (63%) |
+| Qwen 3.5 0.8B | 12.6015 / 12.6022 (-0.01%) | 17.8125 / 17.7922 (+0.11%) | 2,371 / 3,511 (68%) | ~62 / 85 (73%) |
+| Gemma 4 E2B | 23.7043 / 23.6904 (+0.06%) | 31.9485 / 31.9462 (+0.01%) | 2,596 / 3,635 (71%) | ~29 / 56 (52%) |
+
+(Perplexity: the repository's own docs and Python, `vireo-cli perplexity -c 32768 --chunks 1
+--gpu` against `llama-perplexity -c 32768 --chunks 1 -ngl 99`, both 8-bit. Speeds:
+vireo-server's own log for a ~25K-token chat against `llama-bench -p 25000 -n 64 -d 0,25000
+-fa 1`.) Accuracy holds at 32K: no further from llama.cpp than at 4K. Reading a long
+prompt keeps the same share of llama.cpp's speed as a short one; the first reply of a
+25K-token chat starts after 10-15 s, and the next ones in 0.1-0.2 s (the kept cache).
+Generating deep in a long chat falls behind, though: short chats are 19-25% ahead of
+llama.cpp, a 25K-token one 27-48% behind. That's one token's attention
+(`attention_part_*`), which reads the whole cache per token and needs tuning for long
+contexts before the automatic limit goes past 32K.
+
 **What limits speed now, and what's next:**
 
 - **Reading a prompt** is at about 70% (Llama), 79% (Qwen) and 89% (Gemma) of llama.cpp.
@@ -394,7 +419,26 @@ Reading a ~1,900–2,200-token prompt (the first 7,000 characters of this file) 
   reads, still not overlapped (cp.async into a second buffer would avoid the
   registers). Then the smaller kernels: `quantize_q8` (~4%) could be folded into the
   norms and `swiglu` that make its input.
-- **Generating** is 19–25% ahead of llama.cpp on all three.
+- **Generating** is 19–25% ahead of llama.cpp on all three in short chats, but 27–48%
+  behind 25K tokens deep (see "Long chats"): one token's attention (`attention_part_*`)
+  reads the whole cache per token and needs tuning for long contexts, before the
+  automatic context goes past 32K.
+- **The chat cache, for later passes** (alongside this tuning):
+  - Saved files: smaller still. Keys and values saved in 8 bits (half of f16; lossy, so
+    measured first), or a saved chat written as what it adds to its last save instead
+    of the whole chat again each time. A size limit per file (a 32K-token Llama chat is
+    1 GB, a quarter of the 4 GB budget).
+  - Qwen: a DeltaNet checkpoint at the system prompt's end too, so a new chat with the
+    same system prompt loads it (Llama and Gemma already do), and a checkpoint at a
+    retry's start as well as the history's end.
+  - Gemma: positions kept from a window before the history's end, so a saved chat loads
+    in part (an edited earlier message) and not only whole.
+  - More than one chat in GPU memory when there's room, so switching between two needs no
+    copy at all; saved states in pinned memory for faster copies.
+  - The keys and values on the GPU in 8 bits, which would double the context the same
+    memory holds.
+  - Measure what switching and saving cost in the app (copy, disk, first word), and
+    how big the budget should be by default.
 - **For larger models**: splitting a model between GPU and system memory (Muse Glimmer
   30B), mixture-of-experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), more than one GPU.
 - Nsight Compute: the counters are open on this PC now (all users); set them back to
@@ -688,8 +732,13 @@ kernels while keeping everything above them ours).
 
 ### 2. Vireo-only engine features
 
-Started 2026-11-11 with the KV cache kept between turns (see Progress). One chat at a time:
-switching chats reads the other one's history again, until a saved cache per chat.
+Started 2026-11-11: the KV cache kept between turns, then a saved cache per chat that
+lasts across restarts, and chats as long as the GPU has room for (see Progress and "Long
+chats"). Still to do: grammar-constrained tool calls and the scheduler. Further cache work
+(Qwen's shared prompt start, smaller saves, more than one chat on the GPU) is listed with
+the tuning under "What limits speed now". A saved state only fits the model file and precision that
+made it (the folder is per model), and a Llama 3.2 1B chat of 4,000 tokens takes 128 MB
+on disk.
 
 The shared prompt start loaded at launch, a saved KV cache per chat, grammar-constrained
 tool calls, the scheduler.
