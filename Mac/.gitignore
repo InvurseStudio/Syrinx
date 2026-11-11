@@ -1,0 +1,12 @@
+# Rust build output
+/Engine/target/
+
+# Test models: large, fetched again on any machine
+/Engine/models/
+*.gguf
+
+# Reference builds (llama.cpp)
+/Engine/reference/
+
+# Built app
+/App/release/
