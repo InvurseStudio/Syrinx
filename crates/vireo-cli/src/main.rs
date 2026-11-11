@@ -16,6 +16,9 @@ use vireo_engine::models::qwen35::{self, Qwen35};
 use vireo_engine::models::qwen35_cuda::{Qwen35Cuda, Qwen35CudaSession};
 use vireo_engine::{GgufFile, Tokenizer};
 
+mod json;
+mod serve;
+
 const USAGE: &str = "\
 Usage:
   vireo-cli inspect <model.gguf> [--tensors]   Show a GGUF file's metadata and tensors
@@ -36,6 +39,18 @@ Usage:
   vireo-cli perplexity <model.gguf> <text-file> [-c <context>] [--chunks <n>] [--gpu]
                                                How well the model predicts the text, scored
                                                as llama.cpp's llama-perplexity scores it
+  vireo-cli serve <model.gguf> [options]       Keep the model loaded and answer chats on
+                                               http://127.0.0.1 (for the Windows app)
+      --port <n>      Port to listen on (default 39281)
+      --token <t>     Answer only requests that carry this bearer token
+      --gpu           Run on the NVIDIA GPU
+      --threads <n>   CPU threads (default: every core)
+      --context <n>   Context length in tokens (default 16384, capped by the model's)
+      --temperature <t> --top-p <p> --top-k <k> --min-p <m> --presence-penalty <p>
+                      Sampling defaults; a chat's own settings win
+      --no-thinking   Answer without thinking first (Qwen, Gemma)
+      --thinking-budget <n>
+                      Close the thinking after this many tokens
   vireo-cli --version                          Show the version";
 
 fn main() -> ExitCode {
@@ -58,6 +73,13 @@ fn main() -> ExitCode {
         }
         ["generate", path, prompt, rest @ ..] => match GenerateOptions::parse(rest) {
             Some(options) => generate(path, prompt, &options),
+            None => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        ["serve", path, rest @ ..] => match serve::ServeOptions::parse(rest) {
+            Some(options) => serve::serve(path, options),
             None => {
                 eprintln!("{USAGE}");
                 ExitCode::from(2)
