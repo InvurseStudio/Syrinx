@@ -33,6 +33,38 @@ impl GpuMatrix {
         })
     }
 
+    /// The matrix rounded to Q8_0 on the way up (as llama.cpp's `quantize_row_q8_0`: a
+    /// scale of max|w| / 127 per 32, in f16), so it runs on the 8-bit kernels. For
+    /// unquantized weights in 8-bit mode; `None` for other kinds.
+    pub fn upload_q8_0(gpu: &Gpu, m: &Matrix) -> Result<Option<Self>> {
+        use crate::TensorType;
+        if !matches!(m.kind, TensorType::F16 | TensorType::BF16 | TensorType::F32)
+            || !m.cols.is_multiple_of(32)
+        {
+            return Ok(None);
+        }
+        let row_bytes = m.row_bytes();
+        let mut out = Vec::with_capacity(m.rows * m.cols / 32 * 34);
+        let mut row = vec![0f32; m.cols];
+        for r in 0..m.rows {
+            crate::quant::dequantize_row(m.kind, &m.data[r * row_bytes..][..row_bytes], &mut row);
+            for block in row.as_chunks::<32>().0 {
+                let amax = block.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let d = amax / 127.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                out.extend_from_slice(&crate::half::f32_to_f16(d).to_le_bytes());
+                out.extend(block.iter().map(|v| (v * id).round() as i8 as u8));
+            }
+        }
+        let q = Matrix {
+            kind: TensorType::Q8_0,
+            rows: m.rows,
+            cols: m.cols,
+            data: &out,
+        };
+        Self::upload(gpu, q).map(Some)
+    }
+
     /// `y = W x` for each of the input's rows of `x` into the rows of `y`: with 8-bit
     /// activations when the input has room for them and the weights have kernels.
     pub fn mul(&self, input: &Input, y: CuDevicePtr) -> Result<()> {
@@ -143,6 +175,19 @@ impl LogitsBuffer {
         }
         Ok(&self.buffer)
     }
+}
+
+/// Which of a batch's tokens need the last layer's output, for their logits. The last
+/// layer leaves nothing for later tokens but its keys and values, so the rest of it runs
+/// only for the tokens whose logits are wanted (as llama.cpp does).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Outputs {
+    /// Every token (scoring a text, and one token at a time).
+    All,
+    /// The batch's last token, whose output ends up in row 0.
+    Last,
+    /// None: the last layer only writes its keys and values.
+    None,
 }
 
 /// The address of row `row` of a buffer with rows of `width` f32s.

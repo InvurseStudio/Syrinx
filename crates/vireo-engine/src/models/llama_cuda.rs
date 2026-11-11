@@ -6,7 +6,7 @@
 //! token's launches, recorded once per session as a CUDA graph; only the token's
 //! embedding and position go up, and the logits come back.
 
-use super::gpu::{GpuMatrix, Input, LogitsBuffer, gpu_error, q8_room, record, row};
+use super::gpu::{GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, q8_room, record, row};
 use super::llama::Config;
 use super::{DEFAULT_BATCH, Logits, Precision, Result, matrix, vector};
 use crate::GgufFile;
@@ -48,6 +48,8 @@ pub struct CudaSession {
     embedding: Vec<f32>,
     /// The position of the first token being run, read by the kernels.
     pos: Buffer,
+    /// The position of the batch's last token (for the last layer's `Outputs::Last`).
+    pos_last: Buffer,
     // A row per token of the batch:
     x: Buffer,
     h: Buffer,
@@ -179,6 +181,7 @@ impl<'a> LlamaCuda<'a> {
             batch,
             embedding: vec![0.0; batch * c.dim],
             pos: f32s(1)?,
+            pos_last: f32s(1)?,
             x: f32s(batch * c.dim)?,
             h: f32s(batch * c.dim)?,
             q: f32s(batch * c.heads * c.head_dim)?,
@@ -202,13 +205,15 @@ impl<'a> LlamaCuda<'a> {
     }
 
     /// Queues every layer for the `tokens` tokens in `s.x` (at positions `*s.pos` on),
-    /// leaving the final norm of each in `s.h`.
-    fn queue_layers(&self, s: &CudaSession, tokens: usize) -> Result<()> {
+    /// leaving the final norm of each token in `outputs` in `s.h` (`Outputs::Last`: in
+    /// row 0; that needs `*s.pos_last` set to the last token's position).
+    fn queue_layers(&self, s: &CudaSession, tokens: usize, outputs: Outputs) -> Result<()> {
         let c = &self.config;
         let g = &self.gpu;
         let e = gpu_error;
         let (hd, kv_dim) = (c.head_dim, c.kv_heads * c.head_dim);
-        let t = tokens;
+        let mut t = tokens;
+        let mut pos = s.pos.ptr();
         g.residual_norm(
             s.x.ptr(),
             None,
@@ -252,13 +257,29 @@ impl<'a> LlamaCuda<'a> {
                 t,
             )
             .map_err(e)?;
+            if l + 1 == self.layers.len() && outputs != Outputs::All {
+                // The last layer's keys and values are in the cache; the rest of it only
+                // makes outputs, so it runs for the last token alone, or not at all.
+                if outputs == Outputs::None {
+                    break;
+                }
+                if t > 1 {
+                    let q_dim = c.heads * hd;
+                    g.copy(s.q.ptr(), row(&s.q, t - 1, q_dim), q_dim * 4)
+                        .map_err(e)?;
+                    g.copy(s.x.ptr(), row(&s.x, t - 1, c.dim), c.dim * 4)
+                        .map_err(e)?;
+                }
+                t = 1;
+                pos = s.pos_last.ptr();
+            }
             g.attention(
                 s.half_cache,
                 s.q.ptr(),
                 s.keys[l].ptr(),
                 s.values[l].ptr(),
                 s.attention.ptr(),
-                s.pos.ptr(),
+                pos,
                 0,
                 c.heads,
                 t,
@@ -337,7 +358,7 @@ impl<'a> LlamaCuda<'a> {
         s.x.write_f32(&s.embedding[..c.dim]).map_err(e)?;
         s.pos.write_i32(&[s.len as i32]).map_err(e)?;
         if s.graph.is_none() {
-            let graph = record(&self.gpu, || self.queue_layers(s, 1))?;
+            let graph = record(&self.gpu, || self.queue_layers(s, 1, Outputs::All))?;
             s.graph = Some(graph);
         }
         s.graph.as_ref().unwrap().launch().map_err(e)?;
@@ -388,7 +409,16 @@ impl<'a> LlamaCuda<'a> {
             }
             s.x.write_f32(&s.embedding[..t * c.dim]).map_err(e)?;
             s.pos.write_i32(&[s.len as i32]).map_err(e)?;
-            self.queue_layers(s, t)?;
+            let last_chunk = b * batch + t == tokens.len();
+            let outputs = match logits {
+                Logits::All => Outputs::All,
+                Logits::Last if last_chunk => {
+                    s.pos_last.write_i32(&[(s.len + t - 1) as i32]).map_err(e)?;
+                    Outputs::Last
+                }
+                _ => Outputs::None,
+            };
+            self.queue_layers(s, t, outputs)?;
             s.len += t;
             match logits {
                 Logits::All => {
@@ -403,10 +433,10 @@ impl<'a> LlamaCuda<'a> {
                     out.read_f32(&mut s.logits[start..start + t * c.vocab])
                         .map_err(e)?;
                 }
-                Logits::Last if b * batch + t == tokens.len() => {
+                Logits::Last if last_chunk => {
                     let out = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;
                     self.output.mul(
-                        &Input::new(&self.gpu, row(&s.h, t - 1, c.dim), 1, s.q8.as_ref()),
+                        &Input::new(&self.gpu, s.h.ptr(), 1, s.q8.as_ref()),
                         out.ptr(),
                     )?;
                     s.logits.resize(c.vocab, 0.0);

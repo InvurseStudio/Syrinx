@@ -4,7 +4,7 @@
 //! recorded graph, as in `llama_cuda.rs`. A batch's DeltaNet steps still go token by
 //! token (each needs the state the last one left), but inside one kernel launch.
 
-use super::gpu::{GpuMatrix, Input, LogitsBuffer, gpu_error, q8_room, record, row};
+use super::gpu::{GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, q8_room, record, row};
 use super::qwen35::Config;
 use super::{DEFAULT_BATCH, Logits, Precision, Result, matrix, vector};
 use crate::GgufFile;
@@ -84,6 +84,8 @@ pub struct Qwen35CudaSession {
     beta: Buffer,
     alpha: Buffer,
     heads_out: Buffer,
+    /// A prompt's DeltaNet chunks (Gpu::delta_scratch_floats).
+    delta_scratch: Buffer,
     gate: Buffer,
     up: Buffer,
     logits_gpu: LogitsBuffer,
@@ -250,6 +252,7 @@ impl<'a> Qwen35Cuda<'a> {
             beta: f32s(batch * c.v_heads)?,
             alpha: f32s(batch * c.v_heads)?,
             heads_out: f32s(batch * value_dim)?,
+            delta_scratch: f32s(Gpu::delta_scratch_floats(batch, c.v_heads, c.state))?,
             gate: f32s(batch * c.ffn_dim)?,
             up: f32s(batch * c.ffn_dim)?,
             logits_gpu: LogitsBuffer::new(g, c.vocab)?,
@@ -269,11 +272,34 @@ impl<'a> Qwen35Cuda<'a> {
     }
 
     /// Queues every layer for the `t` tokens in `s.x` (at positions `*s.pos` on),
-    /// leaving the final norm of each in `s.h`.
-    fn queue_layers(&self, s: &Qwen35CudaSession, t: usize) -> Result<()> {
+    /// leaving the final norm of each token in `outputs` in `s.h` (`Outputs::Last`: in
+    /// row 0).
+    fn queue_layers(&self, s: &Qwen35CudaSession, t: usize, outputs: Outputs) -> Result<()> {
         let c = &self.config;
         let g = &self.gpu;
         let e = gpu_error;
+        let mut t = t;
+        // The last layer's mixer runs for every token (it leaves keys and values, or the
+        // DeltaNet state, for later ones); the rest of it only makes outputs, so from its
+        // output projection on it runs for the last token alone, or not at all. `mixed`
+        // is the mixer's output, rows of `width`.
+        let last_layer = self.layers.len() - 1;
+        let cut = |l: usize, t: &mut usize, mixed: &Buffer, width: usize| -> Result<bool> {
+            if l != last_layer || outputs == Outputs::All {
+                return Ok(true);
+            }
+            if outputs == Outputs::None {
+                return Ok(false);
+            }
+            if *t > 1 {
+                g.copy(mixed.ptr(), row(mixed, *t - 1, width), width * 4)
+                    .map_err(e)?;
+                g.copy(s.x.ptr(), row(&s.x, *t - 1, c.dim), c.dim * 4)
+                    .map_err(e)?;
+            }
+            *t = 1;
+            Ok(true)
+        };
         let (hd, n) = (c.head_dim, c.state);
         let kv_dim = c.kv_heads * hd;
         let key_dim = c.k_heads * n;
@@ -341,6 +367,9 @@ impl<'a> Qwen35Cuda<'a> {
                     .map_err(e)?;
                     g.apply_gate(s.attention.ptr(), s.query_gate.ptr(), t * c.heads, hd)
                         .map_err(e)?;
+                    if !cut(l, &mut t, &s.attention, c.heads * hd)? {
+                        break;
+                    }
                     a.o.mul(
                         &Input::new(g, s.attention.ptr(), t, s.q8.as_ref()),
                         s.mixed.ptr(),
@@ -379,10 +408,14 @@ impl<'a> Qwen35Cuda<'a> {
                             n,
                             k_heads: c.k_heads,
                             eps: c.norm_eps,
+                            scratch: s.delta_scratch.ptr(),
                         },
                         t,
                     )
                     .map_err(e)?;
+                    if !cut(l, &mut t, &s.heads_out, c.v_heads * n)? {
+                        break;
+                    }
                     d.out.mul(
                         &Input::new(g, s.heads_out.ptr(), t, s.q8.as_ref()),
                         s.mixed.ptr(),
@@ -455,7 +488,7 @@ impl<'a> Qwen35Cuda<'a> {
         s.x.write_f32(&s.embedding[..c.dim]).map_err(e)?;
         s.pos.write_i32(&[s.len as i32]).map_err(e)?;
         if s.graph.is_none() {
-            let graph = record(&self.gpu, || self.queue_layers(s, 1))?;
+            let graph = record(&self.gpu, || self.queue_layers(s, 1, Outputs::All))?;
             s.graph = Some(graph);
         }
         s.graph.as_ref().unwrap().launch().map_err(e)?;
@@ -506,7 +539,13 @@ impl<'a> Qwen35Cuda<'a> {
             }
             s.x.write_f32(&s.embedding[..t * c.dim]).map_err(e)?;
             s.pos.write_i32(&[s.len as i32]).map_err(e)?;
-            self.queue_layers(s, t)?;
+            let last_chunk = b * batch + t == tokens.len();
+            let outputs = match logits {
+                Logits::All => Outputs::All,
+                Logits::Last if last_chunk => Outputs::Last,
+                _ => Outputs::None,
+            };
+            self.queue_layers(s, t, outputs)?;
             s.len += t;
             match logits {
                 Logits::All => {
@@ -521,10 +560,10 @@ impl<'a> Qwen35Cuda<'a> {
                     out.read_f32(&mut s.logits[start..start + t * c.vocab])
                         .map_err(e)?;
                 }
-                Logits::Last if b * batch + t == tokens.len() => {
+                Logits::Last if last_chunk => {
                     let out = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;
                     self.output.mul(
-                        &Input::new(&self.gpu, row(&s.h, t - 1, c.dim), 1, s.q8.as_ref()),
+                        &Input::new(&self.gpu, s.h.ptr(), 1, s.q8.as_ref()),
                         out.ptr(),
                     )?;
                     s.logits.resize(c.vocab, 0.0);

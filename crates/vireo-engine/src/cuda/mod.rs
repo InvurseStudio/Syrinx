@@ -271,6 +271,9 @@ struct Kernels {
     delta_net_wide: CuFunction,
     delta_l2: CuFunction,
     delta_scan: CuFunction,
+    /// A prompt's DeltaNet in chunks: with its dynamic shared memory for n = 128.
+    delta_chunk_prep: (CuFunction, u32),
+    delta_chunk_scan: CuFunction,
     delta_out: CuFunction,
     quantize_q8: CuFunction,
     /// 8-bit activations, in the order of `KINDS_8`.
@@ -510,6 +513,18 @@ impl Gpu {
                 delta_net_wide: function("delta_net_wide")?,
                 delta_l2: function("delta_l2")?,
                 delta_scan: function("delta_scan")?,
+                delta_chunk_prep: {
+                    let f = function("delta_chunk_prep")?;
+                    let bytes = delta_chunk_prep_bytes(128);
+                    let r = (context.driver.cuFuncSetAttribute)(
+                        f,
+                        FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        bytes as i32,
+                    );
+                    context.check("cuFuncSetAttribute", r)?;
+                    (f, bytes)
+                },
+                delta_chunk_scan: function("delta_chunk_scan")?,
                 delta_out: function("delta_out")?,
                 quantize_q8: function("quantize_q8")?,
                 matvec8: {
@@ -874,12 +889,17 @@ impl Gpu {
             Arg::Ptr(p.pos),
             Arg::F32(p.eps),
             Arg::I32(p.half_cache as i32),
+            Arg::I32(tokens as i32),
         ];
         let slots = p.heads + if kv { 2 * p.kv_heads } else { 0 };
+        // A thread per number of a head, up to 256 (Llama's 64-wide heads left 3 in 4
+        // idle). The sums come out the same: block_sum counts missing warps as zeros.
+        // A block per head and run of 8 tokens (QKV_TOKENS in the kernel).
+        let threads = (p.head_dim.div_ceil(32) * 32).min(256) as u32;
         self.run(
             self.kernels.qkv_prep,
-            (slots as u32, tokens as u32),
-            256,
+            (slots as u32, (tokens as u32).div_ceil(8)),
+            threads,
             &args,
         )
     }
@@ -1108,7 +1128,12 @@ impl Gpu {
                 Arg::I32(kernel as i32),
                 Arg::I32(tokens as i32),
             ];
-            self.run_per_number(self.kernels.conv_silu_parallel, tokens * channels, &conv)?;
+            // A thread per channel and run of 16 tokens (CONV_TOKENS in the kernel).
+            let grid = (
+                (channels as u32).div_ceil(256),
+                (tokens as u32).div_ceil(16),
+            );
+            self.run(self.kernels.conv_silu_parallel, grid, 256, &conv)?;
             let shift = [
                 Arg::Ptr(current),
                 Arg::Ptr(history),
@@ -1132,6 +1157,14 @@ impl Gpu {
 
     /// Gated DeltaNet for `tokens` tokens in order, `v_heads` heads with states of
     /// `n` × `n` (n ≤ 256): see [`DeltaNet`].
+    /// Scratch for a prompt's DeltaNet in chunks ([`DeltaNet::scratch`]), in f32s, for up
+    /// to `tokens` tokens at a time.
+    pub fn delta_scratch_floats(tokens: usize, v_heads: usize, n: usize) -> usize {
+        tokens.div_ceil(DELTA_CHUNK)
+            * v_heads
+            * (4 * DELTA_CHUNK * n + DELTA_CHUNK * DELTA_CHUNK + 4)
+    }
+
     pub fn delta_net(&self, d: &DeltaNet, tokens: usize) -> Result<()> {
         let n = d.n;
         assert!(
@@ -1155,6 +1188,60 @@ impl Gpu {
             Arg::F32(d.eps),
             Arg::I32(tokens as i32),
         ];
+        if tokens > 1 && n <= 128 && n.is_multiple_of(32) && d.scratch != 0 {
+            // A prompt in chunks of 64 tokens (delta_chunk_prep and delta_chunk_scan in
+            // vireo.cu), between the norms for every token at once.
+            let rows = (tokens * 2 * d.k_heads) as u32;
+            let l2 = [
+                Arg::Ptr(d.conv),
+                Arg::I32(d.channels as i32),
+                Arg::I32(d.k_heads as i32),
+                Arg::I32(n as i32),
+                Arg::F32(d.eps),
+            ];
+            self.run(self.kernels.delta_l2, (rows, 1), n as u32, &l2)?;
+            let prep = [
+                Arg::Ptr(d.conv),
+                Arg::I32(d.channels as i32),
+                Arg::I32(d.key_dim as i32),
+                Arg::Ptr(d.beta_raw),
+                Arg::Ptr(d.alpha_raw),
+                Arg::Ptr(d.dt_bias),
+                Arg::Ptr(d.a),
+                Arg::Ptr(d.scratch),
+                Arg::I32(n as i32),
+                Arg::I32(d.k_heads as i32),
+                Arg::I32(tokens as i32),
+            ];
+            let chunks = tokens.div_ceil(DELTA_CHUNK) as u32;
+            let (prep_kernel, _) = self.kernels.delta_chunk_prep;
+            self.run_3d(
+                prep_kernel,
+                (d.v_heads as u32, chunks, 1),
+                256,
+                delta_chunk_prep_bytes(n),
+                &prep,
+            )?;
+            let scan = [
+                Arg::Ptr(d.scratch),
+                Arg::Ptr(d.state),
+                Arg::Ptr(d.out),
+                Arg::I32(n as i32),
+                Arg::I32(tokens as i32),
+            ];
+            // 16 columns of the state a block (DSC_COLS in vireo.cu).
+            let grid = (d.v_heads as u32, (n / 16) as u32);
+            self.run(self.kernels.delta_chunk_scan, grid, 64, &scan)?;
+            let out = [
+                Arg::Ptr(d.out),
+                Arg::Ptr(d.z),
+                Arg::Ptr(d.norm),
+                Arg::I32(n as i32),
+                Arg::F32(d.eps),
+            ];
+            let rows = (tokens * d.v_heads) as u32;
+            return self.run(self.kernels.delta_out, (rows, 1), n as u32, &out);
+        }
         if tokens > 1 && n <= 128 && n.is_multiple_of(32) {
             // A prompt: the norms for every token at once, the state update split over
             // blocks of 16 columns, then the output norm for every token at once.
@@ -1385,6 +1472,19 @@ pub struct DeltaNet {
     pub n: usize,
     pub k_heads: usize,
     pub eps: f32,
+    /// Room for a prompt in chunks ([`Gpu::delta_scratch_floats`]), or 0 to run it token
+    /// by token.
+    pub scratch: CuDevicePtr,
+}
+
+/// Tokens per chunk of a prompt's DeltaNet (DC in vireo.cu).
+const DELTA_CHUNK: usize = 64;
+
+/// delta_chunk_prep's shared memory: the chunk's k (rows of n + 4), which A (rows of
+/// DELTA_CHUNK + 1) then takes the place of, the cumulative log decays and β.
+fn delta_chunk_prep_bytes(n: usize) -> u32 {
+    let c = DELTA_CHUNK;
+    ((c * (n + 4)).max(c * (c + 1)) * 4 + 2 * c * 4) as u32
 }
 
 /// Activations rounded to 8 bits ([`Gpu::quantize`]): per row of `cols`, `cols` signed
