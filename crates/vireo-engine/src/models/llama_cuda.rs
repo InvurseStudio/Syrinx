@@ -7,8 +7,8 @@
 //! embedding and position go up, and the logits come back.
 
 use super::gpu::{
-    GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, load_state, q8_room, record, row,
-    save_state,
+    GpuMatrix, Input, LogitsBuffer, Outputs, Positions, gpu_error, load_state, q8_room, record,
+    row, save_state,
 };
 use super::llama::Config;
 use super::{DEFAULT_BATCH, Logits, Precision, Result, SavedState, matrix, vector};
@@ -107,8 +107,12 @@ impl CudaSession {
         Ok(())
     }
 
-    fn cache_buffers(&self) -> Vec<&Buffer> {
-        self.keys.iter().chain(&self.values).collect()
+    fn cache_buffers(&self) -> Vec<Positions<'_>> {
+        self.keys
+            .iter()
+            .chain(&self.values)
+            .map(|b| (b, None))
+            .collect()
     }
 }
 
