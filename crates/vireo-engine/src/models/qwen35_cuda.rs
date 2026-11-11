@@ -115,7 +115,11 @@ impl Qwen35CudaSession {
 
     /// The GPU memory each position takes in this session's caches (keys and values).
     pub fn cache_bytes_per_position(&self) -> usize {
-        self.attention_buffers().iter().map(|(b, _)| b.len_bytes()).sum::<usize>() / self.capacity.max(1)
+        self.attention_buffers()
+            .iter()
+            .map(|(b, _)| b.len_bytes())
+            .sum::<usize>()
+            / self.capacity.max(1)
     }
 
     /// The session at checkpoint `cp` (made from it, and still valid for it: see
