@@ -48,7 +48,8 @@ Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free por
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
 prints. --context is the most tokens a chat keeps: auto (the default) is as many as the
 GPU's free memory holds once the model is loaded, up to the model's own limit; --exact runs f32
-arithmetic. Chats' caches are saved in %LOCALAPPDATA%\\VireoPrototype\\chat-cache (or
+arithmetic. Chats' caches are saved in the prototype's folder's chat-cache (on the Mac,
+~/Library/Application Support/VireoPrototype; elsewhere %LOCALAPPDATA%\\VireoPrototype) (or
 --chat-cache's folder; off for none), so going back to a chat reads only what's new.
 
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
@@ -194,6 +195,9 @@ struct Shared {
     next_run: AtomicU64,
 }
 
+/// The platform reported to the app, as the Python server names it.
+const PLATFORM: &str = if cfg!(target_os = "macos") { "macOS" } else { "windows" };
+
 // ---- Pairing ---------------------------------------------------------------------------
 
 /// The code shown when the server starts, and the tokens it has given out, kept in
@@ -217,9 +221,7 @@ fn random_u64() -> u64 {
 
 impl Pairing {
     fn file() -> PathBuf {
-        let base =
-            std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-        base.join("VireoPrototype").join("server-pairings.txt")
+        store::data_dir().join("server-pairings.txt")
     }
 
     fn load() -> Self {
@@ -346,14 +348,15 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 .query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("device="))
-                .unwrap_or("windows")
+                .unwrap_or(PLATFORM)
                 .to_string();
             http::respond(
                 &mut stream,
                 200,
                 &format!(
-                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":\"windows\",\"tools\":[]}}",
-                    json::string(&device)
+                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":{},\"tools\":[]}}",
+                    json::string(&device),
+                    json::string(PLATFORM)
                 ),
             );
         }
@@ -819,8 +822,11 @@ fn engine(
     let name = std::path::Path::new(path)
         .file_stem()
         .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned());
+    // The default mode: 8-bit activations on CUDA, f16 on the Mac's neural accelerators.
     let mode = if precision == Precision::Exact {
         "exact"
+    } else if cfg!(target_os = "macos") {
+        "f16"
     } else {
         "8-bit"
     };
