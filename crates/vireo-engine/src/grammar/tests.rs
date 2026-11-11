@@ -383,3 +383,58 @@ fn raw_text_values_and_other_punctuation() {
     }
     assert!(m.is_complete());
 }
+
+#[test]
+fn a_branch_offers_its_options_to_score() {
+    let g = Grammar::new(&tools());
+    let mut m = g.matcher();
+    assert!(
+        m.scored_options().is_none(),
+        "the literal before the name isn't a choice"
+    );
+    let forced = m.forced();
+    assert!(m.advance_all(&forced));
+    let options: Vec<String> = m
+        .scored_options()
+        .unwrap()
+        .into_iter()
+        .map(|b| String::from_utf8(b).unwrap())
+        .collect();
+    assert_eq!(options.len(), 3);
+    // The forced text took the quote all the names start with.
+    assert!(
+        options.contains(&r#"read_file", "arguments": "#.to_string()),
+        "{options:?}"
+    );
+    assert!(m.advance_all(b"get_"));
+    let rest = m.scored_options().unwrap();
+    assert_eq!(
+        rest,
+        vec![br#"current_datetime", "arguments": "#.to_vec()],
+        "from where it is"
+    );
+    let one = Grammar::new(&Schema::OneOf(vec!["a".into(), "b".into()]));
+    assert!(
+        one.matcher().scored_options().is_none(),
+        "only branches are scored"
+    );
+}
+
+#[test]
+fn a_branch_right_after_a_literal_is_offered_before_its_first_byte() {
+    // Qwen's form: "\n<function=" then the name, in a sequence.
+    let s = Schema::Seq(vec![
+        Schema::Literal("\n<function=".into()),
+        Schema::Branch(vec![
+            ("git_diff>".into(), Schema::Literal("x".into())),
+            ("get_current_datetime>".into(), Schema::Literal("x".into())),
+        ]),
+    ]);
+    let g = Grammar::new(&s);
+    let mut m = g.matcher();
+    let forced = m.forced();
+    assert_eq!(forced, b"\n<function=g");
+    assert!(m.advance_all(b"\n<function="));
+    let options = m.scored_options().expect("the branch is next");
+    assert_eq!(options.len(), 2);
+}

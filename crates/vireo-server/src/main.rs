@@ -49,6 +49,7 @@ use vireo_engine::{GgufFile, Tokenizer};
 const USAGE: &str = "\
 Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact]
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
+                    [--score-choices on|off] [--tools-shown all|scored]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -60,6 +61,23 @@ arithmetic. Chats' caches are saved in %LOCALAPPDATA%\\VireoPrototype\\chat-cach
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
 and --with-app (stop when the app does: when its end of standard input closes), and
 reads the address from the \"Listening on\" line.";
+
+/// How replies use the tools, from the command line: features the eval turns on and off.
+#[derive(Debug, Default)]
+struct Options {
+    /// A tool's name chosen by scoring each whole name (`--score-choices on`), not a
+    /// token at a time.
+    score_choices: bool,
+    /// Only the tool groups a request needs, picked by scoring (`--tools-shown scored`),
+    /// in place of every tool (`all`).
+    scored_groups: bool,
+}
+
+static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
+
+fn options() -> &'static Options {
+    OPTIONS.get_or_init(Options::default)
+}
 
 /// The longest reply when the app doesn't say.
 const DEFAULT_MAX_TOKENS: usize = 2048;
@@ -73,6 +91,8 @@ fn main() -> ExitCode {
     let mut app_token = None;
     let mut with_app = false;
     let mut chat_cache = Some(None);
+    let mut score_choices = false;
+    let mut scored_groups = false;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -99,6 +119,14 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "--with-app" => with_app = true,
+            "--tools-shown" if matches!(value.map(String::as_str), Some("all" | "scored")) => {
+                scored_groups = value.unwrap() == "scored";
+                i += 1;
+            }
+            "--score-choices" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                score_choices = value.unwrap() == "on";
+                i += 1;
+            }
             "--chat-cache" if value.is_some() => {
                 let v = value.unwrap();
                 chat_cache = if v == "off" {
@@ -125,6 +153,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let _ = OPTIONS.set(Options {
+        score_choices,
+        scored_groups,
+    });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
     if with_app {
@@ -570,6 +602,11 @@ struct Kept {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
     checkpoint: Option<Qwen35Checkpoint>,
+    /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
+    scratch: Option<Qwen35Checkpoint>,
+    /// A small session apart, for questions the server asks the model itself (which tools a
+    /// request needs), so the chat's own cache is left as it is.
+    picker: Option<Session>,
     /// Where the last prompt's history ends (its tokens are still the session's first):
     /// Gemma's chat is saved up to there, which the next turn and a retry both start with,
     /// since its saved state can only be loaded whole.
@@ -619,6 +656,17 @@ impl Model {
         Ok(n)
     }
 
+    /// Empties a session (the picker's, before each question).
+    fn empty(&self, s: &mut Session) -> Result<(), String> {
+        match (self, s) {
+            (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(0),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m.reset(s).map_err(|e| e.to_string())?,
+            _ => unreachable!("a session belongs to its model"),
+        }
+        Ok(())
+    }
+
     fn cache_bytes_per_position(&self, s: &Session) -> usize {
         match s {
             Session::Llama(s) => s.cache_bytes_per_position(),
@@ -652,6 +700,51 @@ impl Model {
         };
         r.map_err(|e| e.to_string())?
             .ok_or_else(|| "no logits".into())
+    }
+
+    /// Reads `ids`; every one's logits, a row each.
+    fn read_all(&self, s: &mut Session, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let r = match (self, s) {
+            (Model::Llama(m), Session::Llama(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
+            (Model::Gemma4(m), Session::Gemma4(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
+            _ => unreachable!("a session belongs to its model"),
+        };
+        r.map_err(|e| e.to_string())?
+            .ok_or_else(|| "no logits".into())
+    }
+
+    /// How likely the model finds `ids` next, given `logits` for the first of them: the
+    /// sum of each token's log-probability. The session is left as it was.
+    fn score(&self, kept: &mut Kept, logits: &[f32], ids: &[u32]) -> Result<f64, String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let mut total = log_probability(logits, ids[0]);
+        if ids.len() > 1 {
+            let len = kept.tokens.len();
+            if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &kept.session) {
+                m.save(s, &mut kept.scratch).map_err(e)?;
+            }
+            let rows = self.read_all(&mut kept.session, &ids[..ids.len() - 1])?;
+            let vocab = logits.len();
+            for (i, &id) in ids[1..].iter().enumerate() {
+                total += log_probability(&rows[i * vocab..(i + 1) * vocab], id);
+            }
+            match (self, &mut kept.session) {
+                (Model::Llama(_), Session::Llama(s)) => s.truncate(len),
+                (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(len),
+                (Model::Qwen35(m), Session::Qwen35(s)) => {
+                    m.restore(s, kept.scratch.as_ref().unwrap()).map_err(e)?
+                }
+                _ => unreachable!("a session belongs to its model"),
+            }
+        }
+        Ok(total)
     }
 
     /// Reads `ids` (the history, then from `mark` on the reply's opened turn) into the
@@ -916,6 +1009,8 @@ fn engine(
                 session,
                 tokens: Vec::new(),
                 checkpoint: None,
+                scratch: None,
+                picker: None,
                 history_end: 0,
             })
         }
@@ -968,6 +1063,8 @@ fn engine(
                         session,
                         tokens: Vec::new(),
                         checkpoint: None,
+                        scratch: None,
+                        picker: None,
                         history_end: 0,
                     })
                 }
@@ -1078,7 +1175,14 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
-    let offered = tools::offered(&job.client_tools);
+    let mut offered = tools::offered(&job.client_tools);
+    if options().scored_groups
+        && !offered.is_empty()
+        && let Some(request) = job.messages.last()
+    {
+        let groups = pick_groups(model, kept, tokenizer, family, &request.content)?;
+        offered.retain(|t| groups.contains(&t.group));
+    }
     let declared = tools::declarations(family, &offered);
     // With tools, the system prompt opens with what they're for.
     let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
@@ -1295,6 +1399,82 @@ fn reply(
     Ok(())
 }
 
+/// The tool groups a request needs, asked of the model in its picker session: one pass
+/// over a short multiple-choice question, its answer letters scored. Groups at least
+/// `GROUP_SHARE` likely are offered (the likeliest always, unless it's "none").
+fn pick_groups(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    family: Family,
+    request: &str,
+) -> Result<Vec<tools::Group>, String> {
+    const GROUP_SHARE: f64 = 0.15;
+    let question = Message {
+        role: "user".into(),
+        content: tools::group_question(request),
+    };
+    // The answer opens with the examples' "Needs:", so its next token is the letter.
+    let text = chat::history(family, None, "", &[question], &chat::today())
+        + chat::opening(family)
+        + "Needs:";
+    let ids = tokenizer.encode(&text, false, true);
+    if kept.picker.is_none() {
+        kept.picker = Some(model.session(1024)?);
+    }
+    let session = kept.picker.as_mut().unwrap();
+    model.empty(session)?;
+    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let scores: Vec<f64> = tools::GROUP_CHOICES
+        .iter()
+        .map(|(letter, _)| {
+            let id = tokenizer.encode(&format!(" {letter}"), false, false)[0];
+            f64::from(logits[id as usize])
+        })
+        .collect();
+    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+    let shares: Vec<f64> = scores.iter().map(|s| (s - max).exp() / sum).collect();
+    if debug_calls() {
+        eprintln!(
+            "[calls] groups: files {:.2}, git {:.2}, time {:.2}, none {:.2}",
+            shares[0], shares[1], shares[2], shares[3]
+        );
+    }
+    let top = (0..shares.len())
+        .max_by(|&a, &b| shares[a].total_cmp(&shares[b]))
+        .unwrap();
+    let mut groups: Vec<tools::Group> = tools::GROUP_CHOICES
+        .iter()
+        .zip(&shares)
+        .filter(|(_, share)| **share >= GROUP_SHARE)
+        .filter_map(|((_, group), _)| *group)
+        .collect();
+    if let Some(group) = tools::GROUP_CHOICES[top].1
+        && !groups.contains(&group)
+    {
+        groups.push(group);
+    }
+    // No tools only when that's clear: hiding a tool a request needs costs more than
+    // showing one it doesn't.
+    if tools::GROUP_CHOICES[top].1.is_none() && shares[top] >= 0.7 {
+        groups.clear();
+    } else if groups.is_empty() {
+        let best = (0..3)
+            .max_by(|&a, &b| shares[a].total_cmp(&shares[b]))
+            .unwrap();
+        groups.extend(tools::GROUP_CHOICES[best].1);
+    }
+    Ok(groups)
+}
+
+/// `ln p(id)` under `logits`.
+fn log_probability(logits: &[f32], id: u32) -> f64 {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+    let sum: f64 = logits.iter().map(|&x| f64::from(x - max).exp()).sum();
+    f64::from(logits[id as usize] - max) - sum.ln()
+}
+
 /// Whether to log how tool calls are written (VIREO_DEBUG_CALLS=1).
 fn debug_calls() -> bool {
     std::env::var_os("VIREO_DEBUG_CALLS").is_some()
@@ -1353,6 +1533,37 @@ fn write_call(
         }
         if m.is_complete() {
             break;
+        }
+        // A branch (a tool's name): each option scored whole, and the likeliest written.
+        if options().score_choices
+            && let Some(choices) = m.scored_options().filter(|c| c.len() > 1)
+        {
+            let mut best: Option<(f64, Vec<u8>, Vec<u32>)> = None;
+            for bytes in choices {
+                let ids = tokenizer.encode(&String::from_utf8_lossy(&bytes), false, true);
+                if ids.is_empty() {
+                    continue;
+                }
+                let score = model.score(kept, logits, &ids)?;
+                if debug_calls() {
+                    eprintln!(
+                        "[calls] score {score:8.3} for {:?}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+                if best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((score, bytes, ids));
+                }
+            }
+            let (_, bytes, ids) = best.ok_or("No option of a choice could be written.")?;
+            if !m.advance_all(&bytes) {
+                return Err("A scored option didn't fit its grammar.".into());
+            }
+            text.extend_from_slice(&bytes);
+            room(kept, ids.len())?;
+            *logits = model.feed(kept, &ids)?;
+            *tokens += ids.len();
+            continue;
         }
         let allowed = m.allowed(trie);
         let next = (0..logits.len() as u32)

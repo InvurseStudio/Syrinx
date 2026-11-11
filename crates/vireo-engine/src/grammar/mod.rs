@@ -53,7 +53,8 @@ pub enum Schema {
     /// These one after another.
     Seq(Vec<Schema>),
     /// One of these texts, then what follows it: a tool's name, then that tool's
-    /// arguments. No text may be the start of another.
+    /// arguments. No text may be the start of another. A branch is a decision worth
+    /// making whole: [`Matcher::scored_options`] offers its texts to be scored.
     Branch(Vec<(String, Schema)>),
 }
 
@@ -180,6 +181,8 @@ struct Options {
     /// Per node: the option that ends there.
     ends: Vec<Option<u16>>,
     then: Vec<Then>,
+    /// A decision to score whole (a branch), not to take a token at a time.
+    scored: bool,
 }
 
 impl Options {
@@ -188,6 +191,7 @@ impl Options {
             edges: vec![Vec::new()],
             ends: vec![None],
             then: Vec::new(),
+            scored: false,
         };
         for (k, (bytes, then)) in options.into_iter().enumerate() {
             let mut at = 0usize;
@@ -314,7 +318,9 @@ impl Grammar {
                     .iter()
                     .map(|(text, rest)| (text.as_bytes().to_vec(), Then::Push(self.add(rest))))
                     .collect();
-                self.choice(compiled)
+                let mut options = Options::new(compiled);
+                options.scored = true;
+                self.push(Node::Choice(options))
             }
             Schema::Array { items, max_items } => {
                 let item = self.add(items);
@@ -612,6 +618,53 @@ impl<'g> Matcher<'g> {
             }
         }
         out
+    }
+
+    /// When the next part is a branch (a tool's name), the rest of each of its texts:
+    /// the options to score whole and choose between, rather than a token at a time.
+    pub fn scored_options(&self) -> Option<Vec<Vec<u8>>> {
+        // Parts not yet entered (a sequence's next) are entered here, as the next byte
+        // would enter them.
+        let mut m = *self;
+        while let Some(Frame::Seq { node, next }) = m.stack.top().copied() {
+            let Node::Seq(parts) = &self.grammar.nodes[node as usize] else {
+                unreachable!()
+            };
+            if next as usize >= parts.len() {
+                return None;
+            }
+            *m.stack.top().unwrap() = Frame::Seq {
+                node,
+                next: next + 1,
+            };
+            if !m.stack.push(Frame::new(self.grammar, parts[next as usize])) {
+                return None;
+            }
+        }
+        let top = m.stack.len.checked_sub(1).map(|i| m.stack.frames[i])?;
+        let Frame::Choice { node, at } = top else {
+            return None;
+        };
+        let Node::Choice(options) = &self.grammar.nodes[node as usize] else {
+            unreachable!()
+        };
+        if !options.scored {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![(at, Vec::new())];
+        while let Some((n, bytes)) = stack.pop() {
+            if options.ends[n as usize].is_some() {
+                out.push(bytes);
+                continue;
+            }
+            for &(b, child) in options.edges[n as usize].iter().rev() {
+                let mut next = bytes.clone();
+                next.push(b);
+                stack.push((child, next));
+            }
+        }
+        Some(out)
     }
 
     /// Pops frames that are finished without more input (a number at the end, a sequence

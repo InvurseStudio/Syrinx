@@ -38,12 +38,53 @@ pub enum Runs {
     Server,
 }
 
+/// What a tool is for: a reply can be offered only the groups its request needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Group {
+    Files,
+    Git,
+    Time,
+}
+
+/// The question that picks a request's groups (`--tools-shown scored`), each answer's
+/// letter with the group it stands for; `None` is "no tools".
+pub const GROUP_CHOICES: [(&str, Option<Group>); 4] = [
+    ("A", Some(Group::Files)),
+    ("B", Some(Group::Git)),
+    ("C", Some(Group::Time)),
+    ("D", None),
+];
+
+/// The question, with worked examples (small models sort far better from examples than
+/// from a description), ending where the answer's letter goes. The examples are worded
+/// apart from the eval's cases.
+pub fn group_question(request: &str) -> String {
+    let request = request.trim().replace('\n', " ");
+    format!(
+        "Sort each request to an assistant on a PC by what answering it needs.\n\
+         A = files or folders on the PC (reading, listing, finding or checking one)\n\
+         B = a Git project (its status, changes or diff)\n\
+         C = the date or the time now\n\
+         D = nothing: it can be answered directly\n\n\
+         Request: What's in D:\\Work\\report-q3.docx?\nNeeds: A\n\n\
+         Request: What's 15% of 80?\nNeeds: D\n\n\
+         Request: Did I commit everything in my website repo?\nNeeds: B\n\n\
+         Request: What's the date next Tuesday?\nNeeds: C\n\n\
+         Request: Write a haiku about autumn.\nNeeds: D\n\n\
+         Request: Find my tax return somewhere in Documents.\nNeeds: A\n\n\
+         Request: Do I have a file named plan.pdf on the Desktop?\nNeeds: A\n\n\
+         Request: What time is it?\nNeeds: C\n\n\
+         Request: {request}\nNeeds:"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub params: Vec<Param>,
     pub runs: Runs,
+    pub group: Group,
 }
 
 const fn text(name: &'static str, description: &'static str) -> Param {
@@ -68,6 +109,7 @@ fn catalog() -> Vec<Tool> {
                 "The file's path: a full path, or one relative to the home folder (Documents/report.pdf). Don't make one up.",
             )],
             runs: Runs::App,
+            group: Group::Files,
         },
         Tool {
             name: "list_directory",
@@ -77,6 +119,7 @@ fn catalog() -> Vec<Tool> {
                 "The folder's path: a full path, or one relative to the home folder (Documents).",
             )],
             runs: Runs::App,
+            group: Group::Files,
         },
         Tool {
             name: "search_files",
@@ -89,30 +132,35 @@ fn catalog() -> Vec<Tool> {
                 ),
             ],
             runs: Runs::App,
+            group: Group::Files,
         },
         Tool {
             name: "file_exists",
             description: "Check whether a file or folder exists on this PC, and which it is.",
             params: vec![text("path", "The path to check.")],
             runs: Runs::App,
+            group: Group::Files,
         },
         Tool {
             name: "git_status",
             description: "Show a Git project's status (changed and new files) without changing anything.",
             params: vec![text("path", "The project's folder.")],
             runs: Runs::App,
+            group: Group::Git,
         },
         Tool {
             name: "git_diff",
             description: "Show a Git project's or file's changes without changing anything.",
             params: vec![text("path", "The project's folder, or a file in it.")],
             runs: Runs::App,
+            group: Group::Git,
         },
         Tool {
             name: "get_current_datetime",
             description: "Get the current date, time and day of the week.",
             params: vec![],
             runs: Runs::Server,
+            group: Group::Time,
         },
     ]
 }
