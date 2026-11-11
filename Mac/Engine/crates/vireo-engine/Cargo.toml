@@ -6,3 +6,10 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+
+# The Metal backend (src/metal): Apple's GPU API through objc2's thin bindings, as
+# PLAN.md's "What we write and what we borrow" planned.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
