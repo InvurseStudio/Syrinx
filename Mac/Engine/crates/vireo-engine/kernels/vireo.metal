@@ -1090,9 +1090,13 @@ kernel void attention_combine(ARGS, KP) {
 // last of a head's parts to finish (counted in `counters`, with device-scope fences) merges
 // them, so no second dispatch is needed. Exact for any context: up to rounding, the same
 // softmax as attention_part + attention_combine.
-template <typename KV, int D>
+template <typename KV, int D, int HG>
 kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
+    // HG query heads of one key/value head per threadgroup (gid.x × HG..), each key and
+    // value read once for all of them: a lane scores its position against each head's
+    // query and adds the value row into each head's output. Built for HG = 1 only: more
+    // was slower on the M5 Max (the repeated reads come from the cache).
     device const float* q = ARG_PTR(const float, 0);
     device const KV* keys = ARG_PTR(const KV, 1);
     device const KV* values = ARG_PTR(const KV, 2);
@@ -1102,118 +1106,135 @@ kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
-    constexpr int SG = 8, DPL = D / 32;  // SIMD groups; output numbers per lane
-    threadgroup float qs[D];
+    constexpr int SG = 8, DPL = D / 32;  // SIMD groups; output numbers per lane and head
+    threadgroup float qs[HG][D];
     threadgroup float sm[SG], sl[SG];
     threadgroup float so[SG][D];
     threadgroup bool last;
-    const int head = gid.x, part = gid.y, parts = ngrid.y;
+    const int head0 = gid.x * HG, part = gid.y, parts = ngrid.y;
     const int len = *pos + 1;
     const int first = window > 0 ? max(0, len - window) : 0;
     const int share = (len - first + parts - 1) / parts;
     const int lo = first + part * share, hi = min(len, lo + share);
-    const int kv = (head / group) * D;
-    for (int d = tid; d < D; d += 256) qs[d] = q[head * D + d];
+    const int kv = (head0 / group) * D;
+    for (int i = tid; i < HG * D; i += 256) qs[i / D][i % D] = q[head0 * D + i];
     BARRIER;
 
-    float m = -INFINITY, l = 0.0f, o[DPL];
-    for (int j = 0; j < DPL; j++) o[j] = 0.0f;
+    float m[HG], l[HG], o[HG][DPL];
+    for (int h = 0; h < HG; h++) {
+        m[h] = -INFINITY;
+        l[h] = 0.0f;
+        for (int j = 0; j < DPL; j++) o[h][j] = 0.0f;
+    }
     for (int base = lo + (int)sg * 32; base < hi; base += SG * 32) {
         const int at = base + (int)lane;
-        float s = -INFINITY;
+        float s[HG];
+        for (int h = 0; h < HG; h++) s[h] = 0.0f;
         if (at < hi) {
             device const KV* k = keys + (ulong)at * kv_dim + kv;
-            float dot = 0.0f;
             for (int d = 0; d < D; d += 4) {
                 const float4 k4 = load4(k + d);
-                const float4 q4 = *reinterpret_cast<threadgroup const float4*>(qs + d);
-                dot += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+                for (int h = 0; h < HG; h++) {
+                    const float4 q4 = *reinterpret_cast<threadgroup const float4*>(&qs[h][d]);
+                    s[h] += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+                }
             }
-            s = dot * scale;
         }
-        const float new_max = max(m, simd_max(s));
-        const float correction = exp(m - new_max);  // 0 on the group's first block
-        const float p = at < hi ? exp(s - new_max) : 0.0f;
-        l = l * correction + simd_sum(p);
-        for (int j = 0; j < DPL; j++) o[j] *= correction;
+        float p[HG];
+        for (int h = 0; h < HG; h++) {
+            const float sc = at < hi ? s[h] * scale : -INFINITY;
+            const float new_max = max(m[h], simd_max(sc));
+            const float correction = exp(m[h] - new_max);  // 0 on the group's first block
+            p[h] = at < hi ? exp(sc - new_max) : 0.0f;
+            l[h] = l[h] * correction + simd_sum(p[h]);
+            for (int j = 0; j < DPL; j++) o[h][j] *= correction;
+            m[h] = new_max;
+        }
         const int count = min(32, hi - base);
         device const KV* v = values + (ulong)base * kv_dim + kv + lane * DPL;
         for (int i = 0; i < count; i++) {
-            const float pi = simd_shuffle(p, (ushort)i);
             device const KV* vr = v + (ulong)i * kv_dim;
-            for (int j = 0; j < DPL; j++) o[j] += pi * load1(vr + j);
+            float vv[DPL];
+            for (int j = 0; j < DPL; j++) vv[j] = load1(vr + j);
+            for (int h = 0; h < HG; h++) {
+                const float pi = simd_shuffle(p[h], (ushort)i);
+                for (int j = 0; j < DPL; j++) o[h][j] += pi * vv[j];
+            }
         }
-        m = new_max;
     }
-    if (lane == 0) {
-        sm[sg] = m;
-        sl[sg] = l;
-    }
-    for (int j = 0; j < DPL; j++) so[sg][lane * DPL + j] = o[j];
-    BARRIER;
-    // Merge the SIMD groups: this threadgroup's maximum, sum and output.
-    float mx = -INFINITY;
-    for (int g = 0; g < SG; g++) mx = max(mx, sm[g]);
-    float total = 0.0f;
-    for (int g = 0; g < SG; g++)
-        if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
-    if (parts == 1) {
+
+    // Each head in turn: merge the SIMD groups, then write it out (one part) or leave the
+    // part's maximum, sum and output in `partial`.
+    for (int h = 0; h < HG; h++) {
+        const int head = head0 + h;
+        BARRIER;  // the last head is done with sm, sl and so
+        if (lane == 0) {
+            sm[sg] = m[h];
+            sl[sg] = l[h];
+        }
+        for (int j = 0; j < DPL; j++) so[sg][lane * DPL + j] = o[h][j];
+        BARRIER;
+        float mx = -INFINITY;
+        for (int g = 0; g < SG; g++) mx = max(mx, sm[g]);
+        float total = 0.0f;
+        for (int g = 0; g < SG; g++)
+            if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
+        device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
+        if (parts > 1 && tid == 0) {
+            mine[0] = mx;  // -inf for an empty part
+            mine[1] = total;
+        }
         for (int d = tid; d < D; d += 256) {
             float acc = 0.0f;
             for (int g = 0; g < SG; g++)
                 if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g][d];
-            out[head * D + d] = acc / total;
+            if (parts == 1)
+                out[head * D + d] = acc / total;
+            else
+                mine[2 + d] = acc;
         }
-        return;
     }
-    device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
-    if (tid == 0) {
-        mine[0] = mx;  // -inf for an empty part
-        mine[1] = total;
-    }
-    for (int d = tid; d < D; d += 256) {
-        float acc = 0.0f;
-        for (int g = 0; g < SG; g++)
-            if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g][d];
-        mine[2 + d] = acc;
-    }
-    // The last part of this head to get here merges them all.
+    if (parts == 1) return;
+    // The last part of these heads to get here merges them all.
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     BARRIER;
     if (tid == 0) {
-        const uint done = atomic_fetch_add_explicit(&counters[head], 1u, memory_order_relaxed);
+        const uint done = atomic_fetch_add_explicit(&counters[gid.x], 1u, memory_order_relaxed);
         last = done == (uint)parts - 1;
-        if (last) atomic_store_explicit(&counters[head], 0u, memory_order_relaxed);
+        if (last) atomic_store_explicit(&counters[gid.x], 0u, memory_order_relaxed);
     }
     BARRIER;
     if (!last) return;
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    device const float* all = partial + (ulong)head * parts * (2 + D);
-    float pm = -INFINITY;
-    for (int i = 0; i < parts; i++) pm = max(pm, all[i * (2 + D)]);
-    float pt = 0.0f;
-    for (int i = 0; i < parts; i++) {
-        const float mi = all[i * (2 + D)];
-        if (mi != -INFINITY) pt += exp(mi - pm) * all[i * (2 + D) + 1];
-    }
-    for (int d = tid; d < D; d += 256) {
-        float acc = 0.0f;
+    for (int h = 0; h < HG; h++) {
+        const int head = head0 + h;
+        device const float* all = partial + (ulong)head * parts * (2 + D);
+        float pm = -INFINITY;
+        for (int i = 0; i < parts; i++) pm = max(pm, all[i * (2 + D)]);
+        float pt = 0.0f;
         for (int i = 0; i < parts; i++) {
             const float mi = all[i * (2 + D)];
-            if (mi != -INFINITY) acc += exp(mi - pm) * all[i * (2 + D) + 2 + d];
+            if (mi != -INFINITY) pt += exp(mi - pm) * all[i * (2 + D) + 1];
         }
-        out[head * D + d] = acc / pt;
+        for (int d = tid; d < D; d += 256) {
+            float acc = 0.0f;
+            for (int i = 0; i < parts; i++) {
+                const float mi = all[i * (2 + D)];
+                if (mi != -INFINITY) acc += exp(mi - pm) * all[i * (2 + D) + 2 + d];
+            }
+            out[head * D + d] = acc / pt;
+        }
     }
 }
 
-template [[host_name("attention_decode_f32_64")]] kernel void attention_decode<float, 64>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f32_128")]] kernel void attention_decode<float, 128>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f32_256")]] kernel void attention_decode<float, 256>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f32_512")]] kernel void attention_decode<float, 512>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f16_64")]] kernel void attention_decode<half, 64>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f16_128")]] kernel void attention_decode<half, 128>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f16_256")]] kernel void attention_decode<half, 256>(ARGS, KP, uint, uint);
-template [[host_name("attention_decode_f16_512")]] kernel void attention_decode<half, 512>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_64_1")]] kernel void attention_decode<float, 64, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_128_1")]] kernel void attention_decode<float, 128, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_256_1")]] kernel void attention_decode<float, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_512_1")]] kernel void attention_decode<float, 512, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_64_1")]] kernel void attention_decode<half, 64, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_128_1")]] kernel void attention_decode<half, 128, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_256_1")]] kernel void attention_decode<half, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_512_1")]] kernel void attention_decode<half, 512, 1>(ARGS, KP, uint, uint);
 
 // A prompt's attention, tiled (see attention_tiled in vireo.cu).
 template <typename KV, int LANES, int PER, int CHUNK>
