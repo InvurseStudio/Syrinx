@@ -4,6 +4,9 @@
 //! scores the reply: the tools it called, their arguments, and the answer. Replies are
 //! greedy (temperature 0), so a run gives the same scores every time.
 //!
+//! Twelve easy cases (`cases.rs`) and twelve harder ones (`hard_cases.rs`), counted
+//! apart in the report.
+//!
 //!   vireo-eval [--models a.gguf,b.gguf] [--cases read,git] [--out results.json]
 //!              [--server-arg <arg>]...
 //!
@@ -11,6 +14,7 @@
 //! `--server-arg` passes an argument on to vireo-server, to compare a feature on and off.
 
 mod cases;
+mod hard_cases;
 #[path = "../../vireo-server/src/json.rs"]
 #[allow(dead_code)]
 mod json;
@@ -136,8 +140,13 @@ fn main() -> ExitCode {
         let passed = runs.iter().filter(|r| r.1.is_ok()).count();
         let seconds: f64 = runs.iter().map(|r| r.2.seconds).sum();
         let calls: usize = runs.iter().map(|r| r.2.calls.len()).sum();
+        let part = |hard: bool| {
+            let of: Vec<_> = runs.iter().filter(|r| r.2.hard == hard).collect();
+            (of.iter().filter(|r| r.1.is_ok()).count(), of.len())
+        };
+        let ((easy_passed, easy), (hard_passed, hard)) = (part(false), part(true));
         println!(
-            "  {passed}/{} passed, {:.1} s a case on average, {calls} tool calls",
+            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard), {:.1} s a case on average, {calls} tool calls",
             runs.len(),
             seconds / runs.len().max(1) as f64
         );
@@ -170,8 +179,9 @@ fn results_json(report: &Report, server_args: &[String]) -> String {
                         .map(|c| format!("{{\"tool\":{},\"args\":{}}}", json::string(&c.tool), to_json(&c.args)))
                         .collect();
                     format!(
-                        "{{\"id\":{},\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
+                        "{{\"id\":{},\"hard\":{},\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
                         json::string(id),
+                        run.hard,
                         verdict.is_ok(),
                         verdict.as_ref().err().map_or("null".into(), |p| json::string(p)),
                         tools.join(","),
@@ -296,9 +306,24 @@ fn ask(port: u16, case: &Case) -> Run {
     let started = Instant::now();
     let mut run = Run::default();
     let tools: Vec<String> = CLIENT_TOOLS.iter().map(|t| json::string(t)).collect();
+    run.hard = case.hard;
+    // The earlier turns, then the prompt.
+    let messages: Vec<String> = case
+        .history
+        .iter()
+        .map(|(role, text)| (*role, text.as_str()))
+        .chain([("user", case.prompt.as_str())])
+        .map(|(role, text)| {
+            format!(
+                "{{\"role\":{},\"content\":{}}}",
+                json::string(role),
+                json::string(text)
+            )
+        })
+        .collect();
     let body = format!(
-        "{{\"messages\":[{{\"role\":\"user\",\"content\":{}}}],\"clientTools\":[{}],\"generation\":{{\"max_tokens\":400,\"temperature\":0}}}}",
-        json::string(&case.prompt),
+        "{{\"messages\":[{}],\"clientTools\":[{}],\"generation\":{{\"max_tokens\":400,\"temperature\":0}}}}",
+        messages.join(","),
         tools.join(",")
     );
     let stream = match request(port, "/api/chat/completions", &body) {
