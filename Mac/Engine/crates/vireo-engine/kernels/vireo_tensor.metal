@@ -36,8 +36,8 @@ kernel void matmul_tc(ARGS, KP) {
     const ulong row_bytes = mm_row_bytes<KIND>(cols);
     threadgroup half sa[TC_ROWS * TC_K];  // the weights' tile: [row][k]
     const int row0 = gid.x * TC_ROWS, tok0 = gid.y * TC_TOKENS;
-    // Decoding: the tile's runs of 8 numbers (TC_K / 8 a row) shared out among the threads.
-    constexpr int RUNS = TC_K / 8, PER = TC_ROWS * RUNS / TC_THREADS;
+    // Decoding: the tile's runs of 32 numbers (TC_K / 32 a row) shared out among the threads.
+    constexpr int RUNS = TC_K / 32, PER = (TC_ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
 
     // C (tokens × rows) = X (tokens × k) · Wᵀ; extents list the contiguous dimension first.
     mpp::tensor_ops::matmul2d<
@@ -51,15 +51,15 @@ kernel void matmul_tc(ARGS, KP) {
     for (uint16_t i = 0; i < acc.get_capacity(); i++) acc[i] = 0.0f;
 
     for (int k0 = 0; k0 < cols; k0 += TC_K) {
-        float v[8];
         for (int part = 0; part < PER; part++) {
-            const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 8;
+            const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
+            if (lr >= TC_ROWS) break;
+            threadgroup half* dst = sa + lr * TC_K + lk;
             if (row0 + lr < rows && k0 + lk < cols) {
-                decode8<KIND>(w + (ulong)(row0 + lr) * row_bytes, cols / 32, k0 + lk, v);
+                decode32<KIND>(w + (ulong)(row0 + lr) * row_bytes, cols / 32, k0 + lk, dst);
             } else {
-                for (int i = 0; i < 8; i++) v[i] = 0.0f;
+                for (int i = 0; i < 32; i++) dst[i] = half(0.0f);
             }
-            for (int i = 0; i < 8; i++) sa[lr * TC_K + lk + i] = half(v[i]);
         }
         BARRIER;
         const int k_len = min(TC_K, cols - k0);
