@@ -99,6 +99,7 @@ git), for checking our output and speed.
 | 2026-11-11 | Tools, step 2: vireo-server's tool loop. Each family's own form, from its template: declarations in the system turn, Qwen's `<tool_call><function=...><parameter=...>`, Llama's JSON (opened with `<|python_tag|>` or `{`), Gemma 4's `<|tool_call>call:name{key:<|"|>value<|"|>}`; the grammar gained raw text up to an end mark and other punctuation for objects. The model writes freely until a call starts, the grammar writes the call, the app runs the PC's tools (`client_tool_request`, `/api/agent/client-tool-result`) and the server its own (the date), and the result goes back in the family's form, all in the kept cache. A repeated call isn't run again; used-up calls leave the model only an answer. Read-only tools so far | Unit tests for each family's calls and declarations. A first baseline, five chats (read a file, list a folder, the date, 17 × 23 with no tool, find then read): Gemma 4 E2B 4/5, Qwen 3.5 0.8B 2/5, Llama 3.2 1B 1/5. Every call parses and reaches its tool; what's left is the small models choosing the tool (Qwen reaches for `git_*` when unsure, Llama calls one more than needed). In the installed app, Gemma reads a README through the app's own `read_file` and sums it up |
 | 2026-11-11 | Tools, step 3: `vireo-eval`, our own eval. It starts vireo-server with each model and stands in for the app: a PC of a few files, folders and a Git project in memory (`pc.rs`), answering the app's tools as `PcTools` does, so any sensible route gets real answers and every run the same ones. Twelve cases (`cases.rs`): the date, reading, listing, finding then reading, whether a file is there, Git status, two without tools, a missing file, adding up a file's numbers, two files, and an instruction planted in a file; each checks the tools, their arguments and the answer. `--server-arg` compares a server feature on and off. Baseline in `evals/baseline.json` | Gemma 4 E2B 12/12 (one call per step needed), Qwen 3.5 0.8B 8/12 (it reaches for `git_diff` when unsure: the date, listing, finding), Llama 3.2 1B 1/12 (24 calls for 12 cases: extra and wrong ones, and answers that drop what the tool said). 0.8 s a case on average. The fake PC's own tests pass |
 | 2026-11-11 | Tools, step 4, first round, both behind switches and measured: `--score-choices on` scores each tool's whole name (the grammar offers a branch's options; each is read and rolled back, Qwen through a scratch DeltaNet checkpoint) instead of a token at a time; `--tools-shown scored` asks the model, in a small session of its own, which groups a request needs (files, Git, the date, none: a multiple-choice question with eight worked examples, its letters scored in one pass) and declares only those (no tools only when "none" is 0.7 likely or more) | Eval (baseline / names scored / fewer tools): Gemma 4 E2B 12 / 12 / 12, Qwen 3.5 0.8B 8 / 8 / 8, Llama 3.2 1B 1 / 2 / 4. Scored names change nothing for Qwen: it really does rank `git_status` above `get_current_datetime` for the date (log-probability -0.44 against -2.26), so the tool's name isn't the problem; scoring costs 0.4-0.6 s a case. The picker is sharp on Gemma (0.99-1.00, all right, after the examples: without them it took "What does minutes.txt say?" as needing nothing) and near chance on Qwen 0.8B and Llama 1B, yet Llama gains from the shorter menu. Both stay off by default; fewer tools is the first per-model setting worth having (Llama 3.2 1B) |
+| 2026-11-11 | More test models, and token healing. Added Gemma 4 E4B (Google's Q4_0), Qwen 3.5 4B and 9B (Q4_K_M); Llama 3.2 1B left the eval's default set (2024, superseded; still the engine tests' reference). Qwen 3.5 9B scored 4/12, worse than the 0.8B, calling `git_diff` to read a file: forced text was written as its own tokens, so Qwen saw `\n<function=` end in a lone `=`, where its training merges `=` with the name (`=read`). Token healing (on by default, `--heal off`): forced text's last token is left to the model, under the grammar | Perplexity against llama.cpp, 2,048 tokens: E4B 22.81 / 22.85, 4B 11.274 / 11.272, 9B 9.948 / 9.947. The 9B's score for `read_file` went from -2.66 to -0.000 (`git_diff` -12). Eval (healing off / on / + names scored / + fewer tools): Gemma E2B 12/12/12/12, E4B 11/11/11/12, Qwen 0.8B 8/10/10/9, 4B 8/11/11/12, 9B 4/12/12/12 (and 11.7 to 5.0 s a case). Most of what looked like small models choosing badly was this. Scored names help nowhere and stay off; fewer tools is +1 on E4B and 4B, -1 on 0.8B, so a per-model setting, off for now |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -489,6 +490,11 @@ small model tests the same code the 27B or 30B will run.
 | 2 | **Qwen 3.5 0.8B** (unsloth, Q4_K_M), then 2B | `qwen35` | Qwen 3.5, 3.6 and 3.8 (Qwen3.8-27B is the same `qwen3_5` architecture) | 0.53 GB | Qwen's tokenizer, `<think>` thinking, and whatever layers `qwen35` adds (check with `vireo-cli inspect`) |
 | 3 | **Gemma 4 E2B** (Google's own QAT Q4_0) | `gemma4` | Gemma 4 E4B, 12B, 26B-A4B, 31B | 3.35 GB (+ 0.99 GB vision) | SentencePiece-style tokenizer, Q4_0, sliding-window layers, Gemma's norms and its thinking channel |
 | 4 | **Muse Glimmer 30B** (Meta, Q4_K_M) | `muse-glimmer` | itself: there's no smaller one | 16.8 GB | Splitting a model between the GPU and system memory: it doesn't fit in 8 GB of VRAM |
+| 5 (2026-11-11) | **Gemma 4 E4B** (Google's own QAT Q4_0), **Qwen 3.5 4B and 9B** (unsloth, Q4_K_M) | `gemma4`, `qwen35` | the larger sizes of each, for the tools eval | 5.15, 2.74, 5.68 GB | Nothing new: the same code, larger shapes (perplexity matches llama.cpp, see Progress) |
+
+The tools eval (`vireo-eval`) runs Gemma 4 E2B and E4B and Qwen 3.5 0.8B, 4B and 9B:
+models people choose today. Llama 3.2 1B stays the engine tests' reference, but isn't in
+the eval's default set: it's from 2024, and no one picks it over these.
 
 There's no small Qwen 3.8: Qwen has released it at 27B, 2.4T-A95B and Flash-Next (180B)
 only, and Qwen 3.6 at 27B and 35B-A3B. Qwen 3.5's 0.8B–9B are the smallest of the
@@ -701,13 +707,11 @@ counts arguments as well as tools.
    gauntlet (several steps, long results, near-miss tool names) come with the next
    features, so there's room to measure them on capable models too.
 4. Copying constraints, scored choices, compact tool text. First round done 2026-11-11
-   (see Progress): scored names and fewer tools are switches, measured; what's left for
-   the tiniest models is knowing what each tool is for, which neither fixes. Next to
-   try, each against the eval: worked examples of calls in the system prompt (cached, so
-   free after the first turn), the tools' text and names as the model sees them (the
-   server can show its own names and map them back to the app's), and more test models
-   between 1B and 4B (Llama 3.2 3B, Qwen 3.5 2B/4B, Gemma 4 E4B) to see where each
-   feature stops mattering.
+   (see Progress): token healing was the fix that mattered (Qwen 3.5 9B 4/12 to 12/12);
+   scored names and fewer tools are switches, measured, off by default. The eval is now
+   too easy for the 9B and both Gemmas: harder cases next (several steps, long results,
+   tools with near names, the tools that change things), then worked examples of calls
+   and the tools' text as the model sees them, measured on them.
 5. Compiled skills (above), then the per-model guidance settings from the eval.
 
 ### Compiled skills
