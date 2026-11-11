@@ -56,7 +56,7 @@ pub struct Message {
 /// Special tokens are written as text, for `encode(.., parse_special: true)`.
 #[cfg(test)]
 pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today: &str) -> String {
-    history(family, system, messages, today) + opening(family)
+    history(family, system, "", messages, today) + opening(family)
 }
 
 /// The turn for the model's reply, opened: what `prompt` adds after `history`. It
@@ -72,16 +72,28 @@ pub fn opening(family: Family) -> &'static str {
     }
 }
 
-/// The system prompt and `messages`, without the reply's turn.
-pub fn history(family: Family, system: Option<&str>, messages: &[Message], today: &str) -> String {
+/// The system prompt, the tools' declarations (`tools::declarations`, or "" for none) and
+/// `messages`, without the reply's turn. The declarations go where each template puts
+/// them, in the system turn, so a chat's prompts all start the same way.
+pub fn history(
+    family: Family,
+    system: Option<&str>,
+    tools: &str,
+    messages: &[Message],
+    today: &str,
+) -> String {
     let system = system.map(str::trim).filter(|s| !s.is_empty());
     let mut out = String::new();
     match family {
         Family::Llama => {
             out.push_str("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n");
+            if !tools.is_empty() {
+                out.push_str("Environment: ipython\n");
+            }
             out.push_str("Cutting Knowledge Date: December 2023\nToday Date: ");
             out.push_str(today);
             out.push_str("\n\n");
+            out.push_str(tools);
             out.push_str(system.unwrap_or(""));
             out.push_str("<|eot_id|>");
             for m in messages {
@@ -93,7 +105,15 @@ pub fn history(family: Family, system: Option<&str>, messages: &[Message], today
             }
         }
         Family::Qwen35 => {
-            if let Some(s) = system {
+            if !tools.is_empty() {
+                out.push_str("<|im_start|>system\n");
+                out.push_str(tools);
+                if let Some(s) = system {
+                    out.push_str("\n\n");
+                    out.push_str(s);
+                }
+                out.push_str("<|im_end|>\n");
+            } else if let Some(s) = system {
                 out.push_str("<|im_start|>system\n");
                 out.push_str(s);
                 out.push_str("<|im_end|>\n");
@@ -108,9 +128,10 @@ pub fn history(family: Family, system: Option<&str>, messages: &[Message], today
         }
         Family::Gemma4 => {
             out.push_str("<bos>");
-            if let Some(s) = system {
+            if system.is_some() || !tools.is_empty() {
                 out.push_str("<|turn>system\n");
-                out.push_str(s);
+                out.push_str(system.unwrap_or(""));
+                out.push_str(tools);
                 out.push_str("<turn|>\n");
             }
             for m in messages {

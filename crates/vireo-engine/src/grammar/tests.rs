@@ -230,3 +230,156 @@ fn allowed_tokens_match_trying_every_token() {
     }
     assert!(m.is_complete());
 }
+
+/// Qwen 3.5's form: `<parameter=key>` lines, raw values ended by `</parameter>`.
+fn qwen_call() -> Schema {
+    let end = "\n</parameter>\n";
+    let style = RecordStyle {
+        open: String::new(),
+        key_open: "<parameter=".into(),
+        key_close: ">\n".into(),
+        separator: String::new(),
+        close: "</function>\n".into(),
+        json_keys: false,
+    };
+    let text = || Schema::Text {
+        until: end.into(),
+        max_bytes: None,
+    };
+    Schema::Seq(vec![
+        Schema::Literal("\n<function=".into()),
+        Schema::Branch(vec![(
+            "read_file>\n".into(),
+            Schema::Record {
+                fields: vec![
+                    Property::required("path", text()),
+                    Property::optional(
+                        "max_lines",
+                        Schema::Seq(vec![Schema::Integer, Schema::Literal(end.into())]),
+                    ),
+                ],
+                style,
+            },
+        )]),
+    ])
+}
+
+#[test]
+fn raw_text_values_and_other_punctuation() {
+    let q = qwen_call();
+    assert!(accepts(
+        &q,
+        "\n<function=read_file>\n<parameter=path>\nC:\\Users\\me\\notes.txt\n</parameter>\n</function>\n"
+    ));
+    assert!(
+        accepts(
+            &q,
+            "\n<function=read_file>\n<parameter=path>\nline one\nline two </parameter> \"quoted\"\n</parameter>\n<parameter=max_lines>\n20\n</parameter>\n</function>\n"
+        ),
+        "a value may hold newlines, quotes and most of its end"
+    );
+    assert!(
+        !accepts(&q, "\n<function=read_file>\n</function>\n"),
+        "path is required"
+    );
+
+    // Gemma 4's form: call:name{key:<|"|>text<|"|>,n:3}, keys in alphabetical order.
+    let quote = "<|\"|>";
+    let gemma = Schema::Seq(vec![
+        Schema::Literal("call:".into()),
+        Schema::Branch(vec![(
+            "read_file".into(),
+            Schema::Record {
+                fields: vec![
+                    Property::optional("max_lines", Schema::Integer),
+                    Property::required(
+                        "path",
+                        Schema::Seq(vec![
+                            Schema::Literal(quote.into()),
+                            Schema::Text {
+                                until: quote.into(),
+                                max_bytes: None,
+                            },
+                        ]),
+                    ),
+                ],
+                style: RecordStyle {
+                    open: "{".into(),
+                    key_open: String::new(),
+                    key_close: ":".into(),
+                    separator: ",".into(),
+                    close: "}".into(),
+                    json_keys: false,
+                },
+            },
+        )]),
+    ]);
+    assert!(accepts(
+        &gemma,
+        "call:read_file{path:<|\"|>a \"b\" <|c<|\"|>}"
+    ));
+    assert!(accepts(
+        &gemma,
+        "call:read_file{max_lines:5,path:<|\"|>x<|\"|>}"
+    ));
+    assert!(
+        !accepts(&gemma, "call:read_file{path:<|\"|>x<|\"|>,max_lines:5}"),
+        "order"
+    );
+
+    // The trie's tokens, against trying each, through a raw value.
+    let words = [
+        "\n",
+        "\n<",
+        "<",
+        "</",
+        "parameter",
+        ">\n",
+        "</parameter>",
+        "\n</parameter>\n",
+        "<parameter=",
+        "path",
+        "C:\\",
+        "Users",
+        "\\me",
+        "\\notes",
+        ".txt",
+        "line",
+        " two",
+        "function",
+        "</function>\n",
+        "\t",
+        "\"",
+        "x\n",
+        "\u{e9}",
+        "read_file",
+        ">",
+    ];
+    let mut tokens: Vec<(Vec<u8>, u32)> = words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.as_bytes().to_vec(), i as u32))
+        .collect();
+    tokens.push((vec![0xC3], tokens.len() as u32));
+    let trie = TokenTrie::from_tokens(tokens.len(), tokens.clone());
+    let g = Grammar::new(&q);
+    let text = "\n<function=read_file>\n<parameter=path>\nC:\\Users\\me\\caf\u{e9}\n</para\tx\n</parameter>\n</function>\n".as_bytes();
+    let mut m = g.matcher();
+    for i in 0..=text.len() {
+        let allowed = m.allowed(&trie);
+        for (bytes, id) in &tokens {
+            let got = allowed[*id as usize / 64] >> (id % 64) & 1 == 1;
+            assert_eq!(
+                got,
+                m.allows(bytes),
+                "token {:?} after {:?}",
+                String::from_utf8_lossy(bytes),
+                String::from_utf8_lossy(&text[..i])
+            );
+        }
+        if i < text.len() {
+            assert!(m.advance(text[i]), "at {i}");
+        }
+    }
+    assert!(m.is_complete());
+}

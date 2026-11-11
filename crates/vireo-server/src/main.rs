@@ -1,14 +1,18 @@
 //! `vireo-server`: serves one GGUF model on this PC over the part of the Vireo app's API
-//! that plain chats use, with Vireo's own engine on the GPU. The prototype app pairs with
-//! it as it would with the Mac (address `localhost`, the code this prints) and chats
-//! with it. No tools, files or skills yet: those come with the rest of phase 3.
+//! that chats use, with Vireo's own engine on the GPU. The prototype app pairs with it as
+//! it would with the Mac (address `localhost`, the code this prints) and chats with it.
+//! Replies can call the tools that change nothing (reading and finding files, Git's
+//! status and diff, which the app runs on the PC, and the date and time), each call
+//! written under its grammar (`tools.rs`). Tools that change things, files and skills
+//! come next.
 //!
 //! The routes, as `server/api_server.py` answers them:
 //!   POST   /api/pairing/claim          {code, name} → {token}
 //!   GET    /api/pairing/status         {paired, device: {name}}
 //!   DELETE /api/pairing/device         unpairs the caller
 //!   GET    /api/metrics                {model, runtime, contextLimit}
-//!   GET    /api/capabilities           no tools
+//!   GET    /api/capabilities           the tools
+//!   POST   /api/agent/client-tool-result a PC tool's result, from the app
 //!   GET    /api/skill-library/commands no skills
 //!   GET    /api/assistant/approvals    and /activity: empty
 //!   POST   /api/chat/completions       the reply as server-sent events
@@ -20,6 +24,7 @@ mod http;
 mod json;
 mod sample;
 mod store;
+mod tools;
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -34,6 +39,7 @@ use chat::{Family, Message};
 use json::Value;
 use sample::Sampler;
 use vireo_engine::cuda::Gpu;
+use vireo_engine::grammar::{Grammar, TokenTrie};
 use vireo_engine::models::gemma4_cuda::Gemma4Cuda;
 use vireo_engine::models::llama_cuda::LlamaCuda;
 use vireo_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
@@ -171,6 +177,7 @@ fn main() -> ExitCode {
         jobs: Mutex::new(jobs),
         runs: Mutex::new(HashMap::new()),
         next_run: AtomicU64::new(1),
+        tool_results: Arc::default(),
     });
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
@@ -192,7 +199,11 @@ struct Shared {
     /// Replies under way, by run id: set to stop one.
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_run: AtomicU64,
+    tool_results: ToolWaits,
 }
+
+/// Calls waiting for the app to run a tool, by request id: where its result goes.
+type ToolWaits = Arc<Mutex<HashMap<String, Sender<Result<String, String>>>>>;
 
 // ---- Pairing ---------------------------------------------------------------------------
 
@@ -352,8 +363,9 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 &mut stream,
                 200,
                 &format!(
-                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":\"windows\",\"tools\":[]}}",
-                    json::string(&device)
+                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":\"windows\",\"tools\":{}}}",
+                    json::string(&device),
+                    tools::capabilities_json()
                 ),
             );
         }
@@ -368,6 +380,28 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             http::respond(&mut stream, 200, "{\"latest\":0,\"entries\":[]}")
         }
         ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
+        ("POST", "/api/agent/client-tool-result") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            let Some(id) = body.str("id") else {
+                return http::respond(&mut stream, 400, &error("No id."));
+            };
+            let result = if matches!(body.get("ok"), Some(Value::Bool(true))) {
+                Ok(body.str("output").unwrap_or("").to_string())
+            } else {
+                Err(body.str("error").unwrap_or("The tool failed.").to_string())
+            };
+            match shared.tool_results.lock().unwrap().remove(id) {
+                Some(waiting) => {
+                    let _ = waiting.send(result);
+                    http::respond(&mut stream, 200, "{\"ok\":true}");
+                }
+                None => http::respond(
+                    &mut stream,
+                    404,
+                    &error("No call is waiting for that result."),
+                ),
+            }
+        }
         ("POST", p) if p.starts_with("/api/chat/runs/") && p.ends_with("/stop") => {
             let id = &p["/api/chat/runs/".len()..p.len() - "/stop".len()];
             if let Some(stop) = shared.runs.lock().unwrap().get(id) {
@@ -424,6 +458,14 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         .unwrap()
         .insert(run_id.clone(), stop.clone());
     let (out, events) = channel();
+    let client_tools = body
+        .array("clientTools")
+        .iter()
+        .filter_map(|t| match t {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
     let job = Job {
         system,
         messages,
@@ -431,6 +473,8 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         max_tokens,
         stop: stop.clone(),
         out,
+        client_tools,
+        tool_results: shared.tool_results.clone(),
     };
     if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
         shared.runs.lock().unwrap().remove(&run_id);
@@ -457,6 +501,7 @@ fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, st
     for event in events {
         match event {
             Out::Text(text) => send(&format!("{{\"content\":{}}}", json::string(&text))),
+            Out::Event(event) => send(&event),
             Out::Done { tokens, seconds } => {
                 let tps = if seconds > 0.0 {
                     tokens as f64 / seconds
@@ -488,11 +533,19 @@ struct Job {
     max_tokens: usize,
     stop: Arc<AtomicBool>,
     out: Sender<Out>,
+    /// The tools the app runs on the PC (its `clientTools`).
+    client_tools: Vec<String>,
+    tool_results: ToolWaits,
 }
 
 enum Out {
     Text(String),
-    Done { tokens: usize, seconds: f64 },
+    /// An event as it's sent: a tool call, a request for the app to run one, its result.
+    Event(String),
+    Done {
+        tokens: usize,
+        seconds: f64,
+    },
     Error(String),
 }
 
@@ -655,6 +708,13 @@ impl Model {
         kept.tokens.extend_from_slice(&ids[from..]);
         kept.history_end = mark;
         Ok((logits, from))
+    }
+
+    /// Reads `ids` after what the session holds; the last one's logits.
+    fn feed(&self, kept: &mut Kept, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let logits = self.read(&mut kept.session, ids)?;
+        kept.tokens.extend_from_slice(ids);
+        Ok(logits)
     }
 
     /// How many of `ids` `continue_with` would keep from the session in use.
@@ -872,6 +932,12 @@ fn engine(
         context,
     }));
 
+    // The vocabulary as a byte trie, for writing tool calls under their grammars.
+    let extra: Vec<u32> = tools::call_tokens(family)
+        .iter()
+        .filter_map(|t| tokenizer.token_id(t))
+        .collect();
+    let trie = TokenTrie::with_extra(&tokenizer, &extra);
     let mut store = chat_cache.map(|dir| {
         let key = store::model_key(std::path::Path::new(path), mode);
         let dir = dir.unwrap_or_else(|| store::default_dir(&key));
@@ -916,6 +982,7 @@ fn engine(
             kept.as_mut().unwrap(),
             store.as_mut(),
             &tokenizer,
+            &trie,
             family,
             context,
             seed,
@@ -1003,6 +1070,7 @@ fn reply(
     kept: &mut Kept,
     store: Option<&mut store::Store>,
     tokenizer: &Tokenizer,
+    trie: &TokenTrie,
     family: Family,
     context: usize,
     seed: u64,
@@ -1010,13 +1078,22 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
+    let offered = tools::offered(&job.client_tools);
+    let declared = tools::declarations(family, &offered);
+    // With tools, the system prompt opens with what they're for.
+    let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
+        (true, s) => s.map(str::to_string),
+        (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
+        (false, _) => Some(tools::PREAMBLE.to_string()),
+    };
     // The chat's latest messages that fit with room for the reply.
     let mut first = 0;
     let opening = tokenizer.encode(chat::opening(family), false, true);
     let (ids, mark) = loop {
         let text = chat::history(
             family,
-            job.system.as_deref(),
+            system.as_deref(),
+            &declared,
             &job.messages[first..],
             &today,
         );
@@ -1056,11 +1133,122 @@ fn reply(
     let mut generated: Vec<u32> = Vec::new();
     let mut pending = Vec::new();
     let started = Instant::now();
-    while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+    // Tool calls: the grammar they're written under, and how one starts.
+    let grammar = Grammar::new(&tools::call_grammar(family, &offered));
+    let start = tools::call_start(family);
+    let start_token = tokenizer.token_id(start.token);
+    let mut last_call: Option<tools::Call> = None;
+    let (mut calls, mut call_tokens) = (0usize, 0usize);
+    let mut turn_start = true;
+    // Once calls are used up (or the model repeats one), it may only answer: the tokens
+    // that start a call are taken away from it.
+    let mut may_call = !offered.is_empty();
+    let mut brace_tokens: Option<Vec<u32>> = None;
+    while generated.len() + call_tokens < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        if !may_call && !offered.is_empty() {
+            if let Some(t) = start_token {
+                logits[t as usize] = f32::NEG_INFINITY;
+            }
+            if start.brace && turn_start {
+                let braces = brace_tokens.get_or_insert_with(|| {
+                    let mut b = Vec::new();
+                    (0..tokenizer.vocab_size() as u32)
+                        .filter(|&id| {
+                            b.clear();
+                            tokenizer.token_bytes(id, false, &mut b);
+                            b.first() == Some(&b'{')
+                        })
+                        .collect()
+                });
+                for &t in braces.iter() {
+                    logits[t as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
         let next = sampler.pick(&logits, &generated);
         if tokenizer.is_end_of_generation(next) {
             break;
         }
+        if debug_calls() && turn_start {
+            eprintln!(
+                "[calls] turn starts with {:?}",
+                tokenizer.decode(&[next], true)
+            );
+        }
+        let by_token = Some(next) == start_token;
+        let by_brace = start.brace && turn_start && {
+            let mut b = Vec::new();
+            tokenizer.token_bytes(next, false, &mut b);
+            b.first() == Some(&b'{')
+        };
+        let opens_call = may_call && (by_token || by_brace);
+        if opens_call {
+            flush_text(job, &mut pending);
+            if by_token {
+                // The call's own start token is the model's; Llama's brace is the grammar's.
+                model.next(&mut kept.session, next, &mut logits)?;
+                kept.tokens.push(next);
+                call_tokens += 1;
+            }
+            let call_started = Instant::now();
+            let text = write_call(
+                model,
+                kept,
+                tokenizer,
+                trie,
+                &grammar,
+                &mut logits,
+                &mut call_tokens,
+                context,
+            )?;
+            let call = tools::parse_call(family, &text)
+                .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
+            calls += 1;
+            let args = call.args_json();
+            let written = call_started.elapsed();
+            let _ = job.out.send(Out::Event(format!(
+                "{{\"type\":\"tool_call\",\"tool\":{},\"args\":{args}}}",
+                json::string(&call.tool)
+            )));
+            // The same call again, with the same arguments, would get the same answer: a
+            // small model can loop on one. It isn't run again, and the model must answer.
+            let repeated = last_call.as_ref() == Some(&call);
+            let result = if repeated {
+                "This is the same call as the last one, and its result is above. Answer the user from it now."
+                    .to_string()
+            } else {
+                match run_tool(&call, &offered, job) {
+                    Some(r) => r,
+                    None => break, // stopped while the app ran it
+                }
+            };
+            if repeated || calls == MAX_CALLS {
+                may_call = false;
+            }
+            last_call = Some(call.clone());
+            eprintln!(
+                "Tool: {} {args} (written in {:.0} ms), {} characters back.",
+                call.tool,
+                written.as_secs_f64() * 1000.0,
+                result.len()
+            );
+            let _ = job.out.send(Out::Event(format!(
+                "{{\"type\":\"tool_result\",\"tool\":{},\"result\":{}}}",
+                json::string(&call.tool),
+                json::string(&preview(&result))
+            )));
+            let (before, body, after) = tools::after_call(family, &call.tool, &shaped(&result));
+            let mut ids = tokenizer.encode(&before, false, true);
+            ids.extend(tokenizer.encode(&body, false, false));
+            ids.extend(tokenizer.encode(&after, false, true));
+            if kept.tokens.len() + ids.len() + 64 > context {
+                return Err("The tool's result doesn't fit in this chat's context.".into());
+            }
+            logits = model.feed(kept, &ids)?;
+            turn_start = true;
+            continue;
+        }
+        turn_start = false;
         generated.push(next);
         if Some(next) == channel.0 {
             in_channel = true;
@@ -1085,19 +1273,15 @@ fn reply(
         model.next(&mut kept.session, next, &mut logits)?;
         kept.tokens.push(next);
     }
-    if !pending.is_empty() {
-        let _ = job
-            .out
-            .send(Out::Text(String::from_utf8_lossy(&pending).into_owned()));
-    }
+    flush_text(job, &mut pending);
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s){}.",
+        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}.",
         ids.len(),
         ids.len() - reused,
         (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),
-        generated.len(),
-        generated.len() as f64 / seconds.max(1e-9),
+        generated.len() + call_tokens,
+        (generated.len() + call_tokens) as f64 / seconds.max(1e-9),
         if job.stop.load(Ordering::Relaxed) {
             ", stopped"
         } else {
@@ -1105,8 +1289,165 @@ fn reply(
         }
     );
     let _ = job.out.send(Out::Done {
-        tokens: generated.len(),
+        tokens: generated.len() + call_tokens,
         seconds,
     });
     Ok(())
+}
+
+/// Whether to log how tool calls are written (VIREO_DEBUG_CALLS=1).
+fn debug_calls() -> bool {
+    std::env::var_os("VIREO_DEBUG_CALLS").is_some()
+}
+
+/// The most tool calls one reply makes.
+const MAX_CALLS: usize = 6;
+/// The most tokens one call may take: a path or a search, not an essay.
+const MAX_CALL_TOKENS: usize = 1024;
+/// The most of a tool's result the model reads, in characters (about 2,000 tokens).
+const MAX_RESULT: usize = 8000;
+
+/// Sends the text held back so far (only whole characters are sent as they come).
+fn flush_text(job: &Job, pending: &mut Vec<u8>) {
+    if !pending.is_empty() {
+        let _ = job
+            .out
+            .send(Out::Text(String::from_utf8_lossy(pending).into_owned()));
+        pending.clear();
+    }
+}
+
+/// Writes a tool call under `grammar`: what the grammar forces goes in without asking the
+/// model (read in one pass), and elsewhere the model's likeliest allowed token. The
+/// call's text, from just after its start.
+#[allow(clippy::too_many_arguments)]
+fn write_call(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    trie: &TokenTrie,
+    grammar: &Grammar,
+    logits: &mut Vec<f32>,
+    tokens: &mut usize,
+    context: usize,
+) -> Result<String, String> {
+    let mut m = grammar.matcher();
+    let mut text = Vec::new();
+    let first = *tokens;
+    let room = |kept: &Kept, n: usize| {
+        if kept.tokens.len() + n + 64 > context {
+            Err("The tool call doesn't fit in this chat's context.".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    loop {
+        let forced = m.forced();
+        if !forced.is_empty() {
+            let ids = tokenizer.encode(&String::from_utf8_lossy(&forced), false, true);
+            m.advance_all(&forced);
+            text.extend_from_slice(&forced);
+            room(kept, ids.len())?;
+            *logits = model.feed(kept, &ids)?;
+            *tokens += ids.len();
+        }
+        if m.is_complete() {
+            break;
+        }
+        let allowed = m.allowed(trie);
+        let next = (0..logits.len() as u32)
+            .filter(|&id| allowed[id as usize / 64] >> (id % 64) & 1 == 1)
+            .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]))
+            .ok_or("The tool call's grammar left no way on.")?;
+        if debug_calls() {
+            let free = (0..logits.len() as u32)
+                .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]))
+                .unwrap_or(0);
+            eprintln!(
+                "[calls] after {:?}: the model's {:?}, the grammar's {:?}",
+                String::from_utf8_lossy(&text),
+                tokenizer.decode(&[free], true),
+                tokenizer.decode(&[next], true)
+            );
+        }
+        let mut bytes = Vec::new();
+        tokenizer.token_bytes(next, false, &mut bytes);
+        if !m.advance_all(&bytes) {
+            return Err("A token the grammar allowed didn't fit it.".into());
+        }
+        text.extend_from_slice(&bytes);
+        room(kept, 1)?;
+        model.next(&mut kept.session, next, logits)?;
+        kept.tokens.push(next);
+        *tokens += 1;
+        if *tokens - first > MAX_CALL_TOKENS {
+            return Err("A tool call ran too long.".into());
+        }
+    }
+    String::from_utf8(text).map_err(|_| "A tool call wasn't text.".to_string())
+}
+
+/// Runs a call: the server's own tools here, the PC's by asking the app and waiting for
+/// its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
+/// model should read it. `None` if the reply was stopped meanwhile.
+fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<String> {
+    let runs = offered
+        .iter()
+        .find(|t| t.name == call.tool)
+        .map(|t| t.runs)?;
+    let result = match runs {
+        tools::Runs::Server => tools::run_here(call),
+        tools::Runs::App => {
+            let id = format!("call-{:016x}", random_u64());
+            let (tx, rx) = channel();
+            job.tool_results.lock().unwrap().insert(id.clone(), tx);
+            let _ = job.out.send(Out::Event(format!(
+                "{{\"type\":\"client_tool_request\",\"id\":{},\"tool\":{},\"args\":{}}}",
+                json::string(&id),
+                json::string(&call.tool),
+                call.args_json()
+            )));
+            let asked = Instant::now();
+
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(r) => break r,
+                    Err(_) if job.stop.load(Ordering::Relaxed) => {
+                        job.tool_results.lock().unwrap().remove(&id);
+                        return None;
+                    }
+                    Err(_) if asked.elapsed().as_secs() > 120 => {
+                        job.tool_results.lock().unwrap().remove(&id);
+                        break Err("The PC didn't answer within two minutes.".into());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    };
+    Some(result.unwrap_or_else(|e| format!("Error: {e}")))
+}
+
+/// A tool's result as the model reads it: at most `MAX_RESULT` characters, saying how much
+/// was left out.
+fn shaped(result: &str) -> String {
+    let chars = result.chars().count();
+    if chars <= MAX_RESULT {
+        return result.to_string();
+    }
+    let kept: String = result.chars().take(MAX_RESULT).collect();
+    format!(
+        "{kept}\n[... {} more characters not shown]",
+        chars - MAX_RESULT
+    )
+}
+
+/// A result's first few hundred characters, for the step the app shows.
+fn preview(result: &str) -> String {
+    let short: String = result.chars().take(300).collect();
+    if short.len() < result.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
 }
