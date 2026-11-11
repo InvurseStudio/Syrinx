@@ -54,7 +54,26 @@ pub struct Message {
 
 /// The prompt for `messages` (oldest first) with the turn for the model's reply opened.
 /// Special tokens are written as text, for `encode(.., parse_special: true)`.
+#[cfg(test)]
 pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today: &str) -> String {
+    history(family, system, messages, today) + opening(family)
+}
+
+/// The turn for the model's reply, opened: what `prompt` adds after `history`. It
+/// starts with a special token on every family, so the two can be tokenized apart.
+/// The next turn's prompt writes the reply differently (Qwen's empty thought isn't
+/// kept), so a chat's prompts can share their history and nothing after it.
+pub fn opening(family: Family) -> &'static str {
+    match family {
+        Family::Llama => "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        // Thinking off: the template's empty thought.
+        Family::Qwen35 => "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        Family::Gemma4 => "<|turn>model\n",
+    }
+}
+
+/// The system prompt and `messages`, without the reply's turn.
+pub fn history(family: Family, system: Option<&str>, messages: &[Message], today: &str) -> String {
     let system = system.map(str::trim).filter(|s| !s.is_empty());
     let mut out = String::new();
     match family {
@@ -72,7 +91,6 @@ pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today:
                 out.push_str(m.content.trim());
                 out.push_str("<|eot_id|>");
             }
-            out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
         }
         Family::Qwen35 => {
             if let Some(s) = system {
@@ -87,8 +105,6 @@ pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today:
                 out.push_str(m.content.trim());
                 out.push_str("<|im_end|>\n");
             }
-            // Thinking off: the template's empty thought.
-            out.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
         }
         Family::Gemma4 => {
             out.push_str("<bos>");
@@ -109,7 +125,6 @@ pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today:
                 out.push_str(m.content.trim());
                 out.push_str("<turn|>\n");
             }
-            out.push_str("<|turn>model\n");
         }
     }
     out

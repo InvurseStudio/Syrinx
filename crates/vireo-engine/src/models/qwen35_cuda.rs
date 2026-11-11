@@ -111,6 +111,27 @@ impl Qwen35CudaSession {
     }
 }
 
+/// A session's DeltaNet layers (their convolution history and state) at one position,
+/// saved by [`Qwen35Cuda::save`]. Unlike the attention layers' keys and values, which
+/// later tokens add to but never change, a DeltaNet state is rewritten by every token,
+/// so going back to an earlier position needs a copy made there.
+pub struct Qwen35Checkpoint {
+    len: usize,
+    /// (history, state) per DeltaNet layer, in layer order.
+    saved: Vec<(Buffer, Buffer)>,
+}
+
+impl Qwen35Checkpoint {
+    /// The position it was saved at.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 impl<'a> Qwen35Cuda<'a> {
     pub fn load(file: &'a GgufFile, gpu: Gpu) -> Result<Self> {
         let c = Config::from_gguf(file)?;
@@ -190,6 +211,65 @@ impl<'a> Qwen35Cuda<'a> {
 
     pub fn precision(&self) -> Precision {
         self.precision
+    }
+
+    /// Saves `s`'s DeltaNet layers at its current position into `into`, reusing its GPU
+    /// memory when it holds an earlier checkpoint of a session of this model.
+    pub fn save(&self, s: &Qwen35CudaSession, into: &mut Option<Qwen35Checkpoint>) -> Result<()> {
+        let g = &self.gpu;
+        let deltas = s.memory.iter().filter_map(|m| match m {
+            Memory::DeltaNet { history, state } => Some((history, state)),
+            Memory::Attention { .. } => None,
+        });
+        if into.is_none() {
+            let copy = |b: &Buffer| g.alloc(b.len_bytes()).map_err(gpu_error);
+            let saved = deltas
+                .clone()
+                .map(|(h, st)| Ok((copy(h)?, copy(st)?)))
+                .collect::<Result<Vec<_>>>()?;
+            *into = Some(Qwen35Checkpoint { len: 0, saved });
+        }
+        let cp = into.as_mut().unwrap();
+        for ((history, state), (h, st)) in deltas.zip(&cp.saved) {
+            g.copy(h.ptr(), history.ptr(), history.len_bytes())
+                .map_err(gpu_error)?;
+            g.copy(st.ptr(), state.ptr(), state.len_bytes())
+                .map_err(gpu_error)?;
+        }
+        cp.len = s.len;
+        Ok(())
+    }
+
+    /// Takes `s` back to where `cp` was saved. Valid only while `s` still holds the same
+    /// tokens up to there: it went on from the checkpoint, or went back to it, but never
+    /// further back (`reset`) or to another checkpoint before it.
+    pub fn restore(&self, s: &mut Qwen35CudaSession, cp: &Qwen35Checkpoint) -> Result<()> {
+        assert!(cp.len <= s.len, "a checkpoint ahead of its session");
+        let g = &self.gpu;
+        let deltas = s.memory.iter().filter_map(|m| match m {
+            Memory::DeltaNet { history, state } => Some((history, state)),
+            Memory::Attention { .. } => None,
+        });
+        for ((history, state), (h, st)) in deltas.zip(&cp.saved) {
+            g.copy(history.ptr(), h.ptr(), history.len_bytes())
+                .map_err(gpu_error)?;
+            g.copy(state.ptr(), st.ptr(), state.len_bytes())
+                .map_err(gpu_error)?;
+        }
+        s.len = cp.len;
+        Ok(())
+    }
+
+    /// Empties `s`, as a new session would be.
+    pub fn reset(&self, s: &mut Qwen35CudaSession) -> Result<()> {
+        for m in &s.memory {
+            if let Memory::DeltaNet { history, state } = m {
+                self.gpu.zero(history).map_err(gpu_error)?;
+                self.gpu.zero(state).map_err(gpu_error)?;
+            }
+        }
+        s.len = 0;
+        Ok(())
     }
 
     pub fn session(&self, capacity: usize) -> Result<Qwen35CudaSession> {
