@@ -9,7 +9,7 @@ use super::gpu::{GpuMatrix, Input, LogitsBuffer, gpu_error, q8_room, record, row
 use super::{DEFAULT_BATCH, Error, Logits, Precision, Result, matrix, vector};
 use crate::GgufFile;
 use crate::cpu::Matrix;
-use crate::cuda::{Buffer, Gpu, Graph, Q8, QkvPrep};
+use crate::cuda::{Buffer, CuDevicePtr, Gpu, Graph, Q8, QkvPrep};
 
 struct Layer {
     attn_norm: Buffer,
@@ -56,6 +56,8 @@ pub struct Gemma4CudaSession {
     embedding: Vec<f32>,
     per_layer_host: Vec<f32>,
     pos: Buffer,
+    /// The last token's position, for running the shared-KV layers on it alone.
+    pos_last: Buffer,
     // A row per token of the batch:
     x: Buffer,
     h: Buffer,
@@ -235,6 +237,7 @@ impl<'a> Gemma4Cuda<'a> {
             embedding: vec![0.0; batch * c.dim],
             per_layer_host: vec![0.0; batch * per_layer],
             pos: f32s(1)?,
+            pos_last: f32s(1)?,
             x: f32s(batch * c.dim)?,
             h: f32s(batch * c.dim)?,
             projected: f32s(batch * c.dim)?,
@@ -291,43 +294,25 @@ impl<'a> Gemma4Cuda<'a> {
         s.pos.write_i32(&[s.len as i32]).map_err(e)
     }
 
-    /// Queues the per-layer inputs and every layer for the `t` tokens in `s.x` (at
-    /// positions `*s.pos` on), leaving the final norm of each in `s.h`.
-    fn queue_layers(&self, s: &Gemma4CudaSession, t: usize) -> Result<()> {
+    /// Queues layers `layers` for the `t` tokens in `s.x` (at positions `*pos` on),
+    /// leaving each token's input to the next layer (after the last, the final norm) in
+    /// `s.h`. Starting at layer 0, the per-layer inputs too.
+    fn queue_layers(
+        &self,
+        s: &Gemma4CudaSession,
+        t: usize,
+        layers: std::ops::Range<usize>,
+        pos: CuDevicePtr,
+    ) -> Result<()> {
         let c = &self.config;
         let g = &self.gpu;
         let e = gpu_error;
         let (dim, pl, eps) = (c.dim, c.per_layer_dim, c.norm_eps);
-
-        self.per_layer_model_proj.mul(
-            &Input::new(g, s.x.ptr(), t, s.q8.as_ref()),
-            s.per_layer_proj.ptr(),
-        )?;
-        g.rms_norm_rows(
-            s.per_layer_proj.ptr(),
-            self.per_layer_proj_norm.ptr(),
-            s.per_layer_proj.ptr(),
-            t * c.layers,
-            pl,
-            eps * dim as f32,
-        )
-        .map_err(e)?;
-        g.add(s.per_layer.ptr(), s.per_layer_proj.ptr(), t * c.layers * pl)
-            .map_err(e)?;
-
-        g.residual_norm(
-            s.x.ptr(),
-            None,
-            None,
-            1.0,
-            Some(&self.layers[0].attn_norm),
-            s.h.ptr(),
-            t,
-            dim,
-            eps,
-        )
-        .map_err(e)?;
-        for (l, layer) in self.layers.iter().enumerate() {
+        if layers.start == 0 {
+            self.queue_inputs(s, t)?;
+        }
+        for l in layers {
+            let layer = &self.layers[l];
             let hd = c.head_dim_of(l);
             let kv_dim = c.kv_heads * hd;
             let (base, factors) = if c.is_swa[l] {
@@ -365,7 +350,7 @@ impl<'a> Gemma4Cuda<'a> {
                     rope_base: base,
                     rope_factors: factors,
                     neox: true,
-                    pos: s.pos.ptr(),
+                    pos,
                     eps,
                     half_cache: s.half_cache,
                 },
@@ -386,7 +371,7 @@ impl<'a> Gemma4Cuda<'a> {
                 keys.ptr(),
                 values.ptr(),
                 s.attention.ptr(),
-                s.pos.ptr(),
+                pos,
                 if c.is_swa[l] { c.sliding_window } else { 0 },
                 c.heads,
                 t,
@@ -470,6 +455,41 @@ impl<'a> Gemma4Cuda<'a> {
         Ok(())
     }
 
+    /// Queues the per-layer inputs for the `t` tokens in `s.x`, and layer 0's input norm.
+    fn queue_inputs(&self, s: &Gemma4CudaSession, t: usize) -> Result<()> {
+        let c = &self.config;
+        let g = &self.gpu;
+        let e = gpu_error;
+        let (dim, pl, eps) = (c.dim, c.per_layer_dim, c.norm_eps);
+        self.per_layer_model_proj.mul(
+            &Input::new(g, s.x.ptr(), t, s.q8.as_ref()),
+            s.per_layer_proj.ptr(),
+        )?;
+        g.rms_norm_rows(
+            s.per_layer_proj.ptr(),
+            self.per_layer_proj_norm.ptr(),
+            s.per_layer_proj.ptr(),
+            t * c.layers,
+            pl,
+            eps * dim as f32,
+        )
+        .map_err(e)?;
+        g.add(s.per_layer.ptr(), s.per_layer_proj.ptr(), t * c.layers * pl)
+            .map_err(e)?;
+        g.residual_norm(
+            s.x.ptr(),
+            None,
+            None,
+            1.0,
+            Some(&self.layers[0].attn_norm),
+            s.h.ptr(),
+            t,
+            dim,
+            eps,
+        )
+        .map_err(e)
+    }
+
     /// The logits of the `rows` tokens in `s.h` from row `first` on, into `out`.
     fn logits_into(
         &self,
@@ -508,7 +528,8 @@ impl<'a> Gemma4Cuda<'a> {
         );
         self.upload_inputs(s, &[token])?;
         if s.graph.is_none() {
-            let graph = record(&self.gpu, || self.queue_layers(s, 1))?;
+            let all = 0..self.config.layers;
+            let graph = record(&self.gpu, || self.queue_layers(s, 1, all, s.pos.ptr()))?;
             s.graph = Some(graph);
         }
         s.graph.as_ref().unwrap().launch().map_err(gpu_error)?;
@@ -545,19 +566,43 @@ impl<'a> Gemma4Cuda<'a> {
             },
             0.0,
         );
+        let c = &self.config;
+        let (all, shared) = (0..c.layers, c.first_shared_layer..c.layers);
         let batch = s.batch;
         for (b, chunk) in tokens.chunks(batch).enumerate() {
             let t = chunk.len();
+            let last_chunk = b * batch + t == tokens.len();
             self.upload_inputs(s, chunk)?;
-            self.queue_layers(s, t)?;
-            s.len += t;
-            match logits {
-                Logits::All => self.logits_into(s, 0, t, b * batch * vocab)?,
-                Logits::Last if b * batch + t == tokens.len() => {
-                    self.logits_into(s, t - 1, 1, 0)?
-                }
-                _ => {}
+            if logits == Logits::All {
+                self.queue_layers(s, t, all.clone(), s.pos.ptr())?;
+                s.len += t;
+                self.logits_into(s, 0, t, b * batch * vocab)?;
+                continue;
             }
+            // The layers that share an earlier layer's keys and values leave nothing for
+            // later tokens: a token's pass through them only makes its own logits. So
+            // they run for the one token whose logits are wanted, and for no other.
+            self.queue_layers(s, t, 0..c.first_shared_layer, s.pos.ptr())?;
+            if logits == Logits::Last && last_chunk {
+                if t > 1 {
+                    // The last token's state to row 0, where a one-token pass reads it.
+                    let g = &self.gpu;
+                    let (dim, pl) = (c.dim, c.per_layer_dim * c.layers);
+                    let e = gpu_error;
+                    g.copy(s.x.ptr(), row(&s.x, t - 1, dim), dim * 4)
+                        .map_err(e)?;
+                    g.copy(s.h.ptr(), row(&s.h, t - 1, dim), dim * 4)
+                        .map_err(e)?;
+                    g.copy(s.per_layer.ptr(), row(&s.per_layer, t - 1, pl), pl * 4)
+                        .map_err(e)?;
+                }
+                s.pos_last
+                    .write_i32(&[(s.len + t - 1) as i32])
+                    .map_err(gpu_error)?;
+                self.queue_layers(s, 1, shared.clone(), s.pos_last.ptr())?;
+                self.logits_into(s, 0, 1, 0)?;
+            }
+            s.len += t;
         }
         Ok(match logits {
             Logits::None => None,

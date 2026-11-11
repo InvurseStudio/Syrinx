@@ -17,6 +17,21 @@ typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 
+// Small whole numbers in each byte as signed bytes, minus their offset: 4-bit n (0..15) as
+// n − 8 and 6-bit n (0..63) as n − 32. n ^ 8 (n ^ 32) is the answer in 4-bit (6-bit) two's
+// complement; copying its sign bit into the byte's top bits (a multiply with no carries
+// between bytes) widens it. What __vsubss4 computes, in 3 instructions instead of the ~8
+// it compiles to.
+__device__ __forceinline__ u32 sext4(u32 n) {
+    const u32 t = n ^ 0x08080808u;
+    return t | ((t & 0x08080808u) * 0x1Eu);
+}
+
+__device__ __forceinline__ u32 sext6(u32 n) {
+    const u32 t = n ^ 0x20202020u;
+    return t | ((t & 0x20202020u) * 0x06u);
+}
+
 __device__ __forceinline__ float half_at(const u8* p) {
     return __half2float(*reinterpret_cast<const __half*>(p));
 }
@@ -95,6 +110,10 @@ __device__ __forceinline__ size_t q4_0_row_bytes(int cols) {
 __device__ __forceinline__ float q4_0_scale(const u8* row, int blocks, int b) {
     return half_at(row + (size_t)blocks * 16 + b * 2);
 }
+
+// Q6_K on the GPU: GGUF's 210-byte blocks padded to 224, so each starts 16-byte aligned
+// (Gpu::upload_weights). The contents are as in GGUF.
+#define Q6K_BYTES 224
 
 // ---- Matrix-vector products: y = W x, one warp per row of W -------------------------
 //
@@ -310,13 +329,14 @@ extern "C" __global__ void matvec_q5_k(const u8* w, const float* x, float* y, in
     MATVEC_STORE
 }
 
-// Q6_K: blocks of 256 in 210 bytes (ql 128, qh 64, 16 int8 scales, f16 d). Each half
+// Q6_K: blocks of 256 in 210 bytes (ql 128, qh 64, 16 int8 scales, f16 d), padded to
+// Q6K_BYTES on the GPU so they start 16-byte aligned (Gpu::upload_weights). Each half
 // of a block is 4 runs of 32 numbers. 16 lanes per block: lane j takes 4 positions of
 // one half (16 numbers, one from each run). A warp takes 2 blocks per step.
 extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, int rows, int cols) {
     MATVEC_ROWS
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * 210;
+    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
     const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
     for (int b = sub; b < blocks; b += 2) {
         const float* xb = x + b * 256 + half * 128 + l;
@@ -326,7 +346,7 @@ extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, in
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 210;
+            const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
             const float d = half_at(block + 208);
             const u32 ql0 = u32_at2(block + half * 64 + l), ql1 = u32_at2(block + half * 64 + 32 + l);
             const u32 qh = u32_at2(block + 128 + half * 32 + l);
@@ -419,7 +439,7 @@ __device__ __forceinline__ void decode8<K_Q5_K>(const u8* row, int k, float* v) 
 
 template <>
 __device__ __forceinline__ void decode8<K_Q6_K>(const u8* row, int k, float* v) {
-    const u8* block = row + (k / 256) * 210;
+    const u8* block = row + (k / 256) * Q6K_BYTES;
     const int n = k % 256, half = n / 128, run = (n % 128) / 32, l = n % 32;
     const float d = half_at(block + 208);
     const u8* ql = block + half * 64 + (run & 1) * 32 + l;
@@ -532,7 +552,7 @@ MATMUL(matmul_q4_0, K_Q4_0, q4_0_row_bytes(cols))
 MATMUL(matmul_q8_0, K_Q8_0, cols / 32 * 34)
 MATMUL(matmul_q4_k, K_Q4_K, cols / 256 * 144)
 MATMUL(matmul_q5_k, K_Q5_K, cols / 256 * 176)
-MATMUL(matmul_q6_k, K_Q6_K, cols / 256 * 210)
+MATMUL(matmul_q6_k, K_Q6_K, cols / 256 * Q6K_BYTES)
 
 // ---- 8-bit activations: faster, not exact ---------------------------------------------
 //
@@ -602,10 +622,10 @@ extern "C" __global__ void matvec8_q4_0(const u8* w, const signed char* xq, cons
             if (r >= nrows) break;
             const u8* row = w + (row0 + r) * row_bytes;
             const uint2 q = *reinterpret_cast<const uint2*>(row + b * 16 + j);
-            int dot = __dp4a((int)__vsubss4(q.x & 0x0F0F0F0Fu, 0x08080808u), lo.x, 0);
-            dot = __dp4a((int)__vsubss4(q.y & 0x0F0F0F0Fu, 0x08080808u), lo.y, dot);
-            dot = __dp4a((int)__vsubss4((q.x >> 4) & 0x0F0F0F0Fu, 0x08080808u), hi.x, dot);
-            dot = __dp4a((int)__vsubss4((q.y >> 4) & 0x0F0F0F0Fu, 0x08080808u), hi.y, dot);
+            int dot = __dp4a((int)sext4(q.x & 0x0F0F0F0Fu), lo.x, 0);
+            dot = __dp4a((int)sext4(q.y & 0x0F0F0F0Fu), lo.y, dot);
+            dot = __dp4a((int)sext4((q.x >> 4) & 0x0F0F0F0Fu), hi.x, dot);
+            dot = __dp4a((int)sext4((q.y >> 4) & 0x0F0F0F0Fu), hi.y, dot);
             sum[r] += q4_0_scale(row, blocks, b) * dx * (float)dot;
         }
     }
@@ -690,7 +710,7 @@ extern "C" __global__ void matvec8_q6_k(const u8* w, const signed char* xq, cons
                                         int cols) {
     MATVEC_ROWS
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * 210;
+    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
     const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
     for (int b = sub; b < blocks; b += 2) {
         const signed char* xb = xq + b * 256 + half * 128 + l;
@@ -704,7 +724,7 @@ extern "C" __global__ void matvec8_q6_k(const u8* w, const signed char* xq, cons
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 210;
+            const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
             const float d = half_at(block + 208);
             const u32 ql0 = u32_at2(block + half * 64 + l), ql1 = u32_at2(block + half * 64 + 32 + l);
             const u32 qh = u32_at2(block + 128 + half * 32 + l);
@@ -714,7 +734,7 @@ extern "C" __global__ void matvec8_q6_k(const u8* w, const signed char* xq, cons
             for (int k = 0; k < 4; k++) {
                 const u32 low = (((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
                 const u32 q = low | (((qh >> (2 * k)) & 0x03030303u) << 4);
-                const int dot = __dp4a((int)__vsubss4(q, 0x20202020u), xv[k], 0);
+                const int dot = __dp4a((int)sext6(q), xv[k], 0);
                 block_sum += (float)sc[2 * k] * dx[k] * (float)dot;
             }
             sum[r] += d * block_sum;
@@ -768,10 +788,10 @@ __device__ __forceinline__ void unpack16_q4_0(const u8* row, int blocks, int k, 
     const int b = k / 32;
     const int shift = (k % 32) ? 4 : 0;  // the first 16 numbers are the low nibbles
     const uint4 w = *reinterpret_cast<const uint4*>(row + b * 16);
-    q = make_uint4(__vsubss4((w.x >> shift) & 0x0F0F0F0Fu, 0x08080808u),
-                   __vsubss4((w.y >> shift) & 0x0F0F0F0Fu, 0x08080808u),
-                   __vsubss4((w.z >> shift) & 0x0F0F0F0Fu, 0x08080808u),
-                   __vsubss4((w.w >> shift) & 0x0F0F0F0Fu, 0x08080808u));
+    q = make_uint4(sext4((w.x >> shift) & 0x0F0F0F0Fu),
+                   sext4((w.y >> shift) & 0x0F0F0F0Fu),
+                   sext4((w.z >> shift) & 0x0F0F0F0Fu),
+                   sext4((w.w >> shift) & 0x0F0F0F0Fu));
     scale = q4_0_scale(row, blocks, b);
 }
 
@@ -810,7 +830,7 @@ __device__ __forceinline__ void unpack16<K_Q5_K>(const u8* row, int k, uint4& q,
 
 template <>
 __device__ __forceinline__ void unpack16<K_Q6_K>(const u8* row, int k, uint4& q, float& scale, float& min) {
-    const u8* block = row + (k / 256) * 210;
+    const u8* block = row + (k / 256) * Q6K_BYTES;
     const int n = k % 256, half = n / 128, run = (n % 128) / 32, l = n % 32;
     const u8* ql = block + half * 64 + (run & 1) * 32 + l;
     const u8* qh = block + 128 + half * 32 + l;
@@ -819,7 +839,7 @@ __device__ __forceinline__ void unpack16<K_Q6_K>(const u8* row, int k, uint4& q,
     for (int i = 0; i < 4; i++) {
         const u32 low = (u32_at2(ql + 4 * i) >> shift) & 0x0F0F0F0Fu;
         const u32 high = ((u32_at2(qh + 4 * i) >> (2 * run)) & 0x03030303u) << 4;
-        out[i] = __vsubss4(low | high, 0x20202020u);
+        out[i] = sext6(low | high);
     }
     q = make_uint4(out[0], out[1], out[2], out[3]);
     scale = half_at(block + 208) * (float)reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16 + 2 * run)[0];
@@ -831,6 +851,16 @@ __device__ __forceinline__ void mma_s8(int (&c)[4], u32 a0, u32 a1, u32 b0) {
         "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
         : "r"(a0), "r"(a1), "r"(b0));
+}
+
+// 16 rows × 8 tokens × 32 columns: A's registers hold columns tig*4.. and 16 + tig*4.. of
+// rows gid and gid + 8; B's, columns tig*4.. and 16 + tig*4.. of token gid.
+__device__ __forceinline__ void mma_s8_k32(int (&c)[4], const u32 (&a)[4], const u32 (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
 template <int KIND, int GROUP>
@@ -852,6 +882,91 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     const int xd_cols = cols / 32, xs_cols = cols / 16;
 
     for (int k0 = 0; k0 < cols; k0 += K) {
+        if (KIND == K_Q4_K || KIND == K_Q5_K) {
+            // The weights by pairs of sub-blocks: 128 rows × 2 pairs, one a thread. A pair's
+            // 32 bytes hold 32 numbers of one sub-block (low nibbles) and 32 of the next
+            // (high), so two 16-byte loads and one scale header give 64 numbers.
+            const int r = tid >> 1, p = tid & 1, k = k0 + p * 64;
+            uint4 lo[2] = {}, hi[2] = {};
+            float s1 = 0.0f, m1 = 0.0f, s2 = 0.0f, m2 = 0.0f;
+            if (row0 + r < rows && k < cols) {
+                constexpr int bytes = KIND == K_Q4_K ? 144 : 176, qs = KIND == K_Q4_K ? 16 : 48;
+                const u8* block = w + (size_t)(row0 + r) * row_bytes + (k / 256) * bytes;
+                const int j = (k % 256) / 32;  // the pair's first sub-block (even)
+                const uint4 head = *reinterpret_cast<const uint4*>(block);
+                q4_k_scale_min_w(j, head.y, head.z, head.w, s1, m1);
+                q4_k_scale_min_w(j + 1, head.y, head.z, head.w, s2, m2);
+                const float d = half_lo(head.x), dmin = half_hi(head.x);
+                s1 *= d;
+                s2 *= d;
+                m1 *= dmin;
+                m2 *= dmin;
+                for (int i = 0; i < 2; i++) {
+                    const uint4 v = *reinterpret_cast<const uint4*>(block + qs + (j / 2) * 32 + i * 16);
+                    lo[i] = make_uint4(v.x & 0x0F0F0F0Fu, v.y & 0x0F0F0F0Fu, v.z & 0x0F0F0F0Fu, v.w & 0x0F0F0F0Fu);
+                    hi[i] = make_uint4((v.x >> 4) & 0x0F0F0F0Fu, (v.y >> 4) & 0x0F0F0F0Fu, (v.z >> 4) & 0x0F0F0F0Fu,
+                                       (v.w >> 4) & 0x0F0F0F0Fu);
+                    if (KIND == K_Q5_K) {
+                        // Fifth bits: bit j of qh[l] for the first sub-block, j + 1 for the next.
+                        const uint4 h = *reinterpret_cast<const uint4*>(block + 16 + i * 16);
+                        lo[i].x |= ((h.x >> j) & 0x01010101u) << 4;
+                        lo[i].y |= ((h.y >> j) & 0x01010101u) << 4;
+                        lo[i].z |= ((h.z >> j) & 0x01010101u) << 4;
+                        lo[i].w |= ((h.w >> j) & 0x01010101u) << 4;
+                        hi[i].x |= ((h.x >> (j + 1)) & 0x01010101u) << 4;
+                        hi[i].y |= ((h.y >> (j + 1)) & 0x01010101u) << 4;
+                        hi[i].z |= ((h.z >> (j + 1)) & 0x01010101u) << 4;
+                        hi[i].w |= ((h.w >> (j + 1)) & 0x01010101u) << 4;
+                    }
+                }
+            }
+            *reinterpret_cast<uint4*>(&wq[r][p * 64]) = lo[0];
+            *reinterpret_cast<uint4*>(&wq[r][p * 64 + 16]) = lo[1];
+            *reinterpret_cast<uint4*>(&wq[r][p * 64 + 32]) = hi[0];
+            *reinterpret_cast<uint4*>(&wq[r][p * 64 + 48]) = hi[1];
+            w_scale[r][2 * p] = s1;
+            w_min[r][2 * p] = m1;
+            w_scale[r][2 * p + 1] = s2;
+            w_min[r][2 * p + 1] = m2;
+        } else if (KIND == K_Q6_K) {
+            // Q6_K: a step of 128 columns is half a block, 4 runs of 32. One thread per row
+            // and pair of runs (p and p + 2), which share their 4-bit bytes (low and high
+            // nibbles) and all the high bits: 16-byte loads, as the blocks are padded to be
+            // aligned (Q6K_BYTES).
+            const int r = tid >> 1, p = tid & 1;
+            uint4 lo[2] = {}, hi[2] = {};
+            float sc[4] = {};
+            if (row0 + r < rows && k0 < cols) {
+                const u8* block = w + (size_t)(row0 + r) * row_bytes + (k0 / 256) * Q6K_BYTES;
+                const int half = (k0 % 256) / 128;
+                const float d = half_at(block + 208);
+                const signed char* scales = reinterpret_cast<const signed char*>(block + 192 + half * 8);
+                sc[0] = d * (float)scales[2 * p];
+                sc[1] = d * (float)scales[2 * p + 1];
+                sc[2] = d * (float)scales[2 * (p + 2)];
+                sc[3] = d * (float)scales[2 * (p + 2) + 1];
+                for (int i = 0; i < 2; i++) {
+                    const uint4 l = *reinterpret_cast<const uint4*>(block + half * 64 + p * 32 + i * 16);
+                    const uint4 h = *reinterpret_cast<const uint4*>(block + 128 + half * 32 + i * 16);
+                    const u32 lw[4] = {l.x, l.y, l.z, l.w}, hw[4] = {h.x, h.y, h.z, h.w};
+                    u32 a[4], b[4];
+                    for (int x = 0; x < 4; x++) {
+                        a[x] = sext6((lw[x] & 0x0F0F0F0Fu) | (((hw[x] >> (2 * p)) & 0x03030303u) << 4));
+                        b[x] = sext6(((lw[x] >> 4) & 0x0F0F0F0Fu) | (((hw[x] >> (2 * p + 4)) & 0x03030303u) << 4));
+                    }
+                    lo[i] = make_uint4(a[0], a[1], a[2], a[3]);
+                    hi[i] = make_uint4(b[0], b[1], b[2], b[3]);
+                }
+            }
+            *reinterpret_cast<uint4*>(&wq[r][p * 32]) = lo[0];
+            *reinterpret_cast<uint4*>(&wq[r][p * 32 + 16]) = lo[1];
+            *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32]) = hi[0];
+            *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32 + 16]) = hi[1];
+            w_scale[r][2 * p] = sc[0];
+            w_scale[r][2 * p + 1] = sc[1];
+            w_scale[r][2 * (p + 2)] = sc[2];
+            w_scale[r][2 * (p + 2) + 1] = sc[3];
+        } else
         // The weights: 128 rows × 8 runs of 16, 4 runs a thread.
         for (int c = tid; c < M8_ROWS * 8; c += 256) {
             const int r = c >> 3, h = c & 7, k = k0 + h * 16;
@@ -889,21 +1004,47 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
 #pragma unroll
         for (int g = 0; g < NG; g++) {
             int c[2][4][4] = {};
-#pragma unroll
-            for (int kk = g * GROUP; kk < (g + 1) * GROUP; kk += 16) {
-                u32 a[2][2], b[4];
+            if (GROUP == 32) {
+                // A whole group in one product a tile (mma.m16n8k32). (Loading the
+                // fragments with ldmatrix measured 2% slower than these loads.)
+                const int kk = g * 32;
+                u32 a[2][4], b[4][2];
 #pragma unroll
                 for (int mi = 0; mi < 2; mi++) {
-                    a[mi][0] = *reinterpret_cast<const u32*>(&wq[wr + mi * 16 + gid][kk + tig * 4]);
-                    a[mi][1] = *reinterpret_cast<const u32*>(&wq[wr + mi * 16 + gid + 8][kk + tig * 4]);
+                    const u8* r0 = &wq[wr + mi * 16 + gid][kk + tig * 4];
+                    const u8* r1 = &wq[wr + mi * 16 + gid + 8][kk + tig * 4];
+                    a[mi][0] = *reinterpret_cast<const u32*>(r0);
+                    a[mi][1] = *reinterpret_cast<const u32*>(r1);
+                    a[mi][2] = *reinterpret_cast<const u32*>(r0 + 16);
+                    a[mi][3] = *reinterpret_cast<const u32*>(r1 + 16);
                 }
 #pragma unroll
-                for (int ni = 0; ni < 4; ni++)
-                    b[ni] = *reinterpret_cast<const u32*>(&xqs[wt + ni * 8 + gid][kk + tig * 4]);
+                for (int ni = 0; ni < 4; ni++) {
+                    const u8* t = &xqs[wt + ni * 8 + gid][kk + tig * 4];
+                    b[ni][0] = *reinterpret_cast<const u32*>(t);
+                    b[ni][1] = *reinterpret_cast<const u32*>(t + 16);
+                }
 #pragma unroll
                 for (int mi = 0; mi < 2; mi++)
 #pragma unroll
-                    for (int ni = 0; ni < 4; ni++) mma_s8(c[mi][ni], a[mi][0], a[mi][1], b[ni]);
+                    for (int ni = 0; ni < 4; ni++) mma_s8_k32(c[mi][ni], a[mi], b[ni]);
+            } else {
+#pragma unroll
+                for (int kk = g * GROUP; kk < (g + 1) * GROUP; kk += 16) {
+                    u32 a[2][2], b[4];
+#pragma unroll
+                    for (int mi = 0; mi < 2; mi++) {
+                        a[mi][0] = *reinterpret_cast<const u32*>(&wq[wr + mi * 16 + gid][kk + tig * 4]);
+                        a[mi][1] = *reinterpret_cast<const u32*>(&wq[wr + mi * 16 + gid + 8][kk + tig * 4]);
+                    }
+#pragma unroll
+                    for (int ni = 0; ni < 4; ni++)
+                        b[ni] = *reinterpret_cast<const u32*>(&xqs[wt + ni * 8 + gid][kk + tig * 4]);
+#pragma unroll
+                    for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+                        for (int ni = 0; ni < 4; ni++) mma_s8(c[mi][ni], a[mi][0], a[mi][1], b[ni]);
+                }
             }
             // Scale this group's whole-number sums into the results, reading each row's and
             // token's scales once.
@@ -962,7 +1103,7 @@ MATMUL8(matmul8_q4_0, K_Q4_0, 32, q4_0_row_bytes(cols), 2)
 MATMUL8(matmul8_q8_0, K_Q8_0, 32, cols / 32 * 34, 2)
 MATMUL8(matmul8_q4_k, K_Q4_K, 32, cols / 256 * 144, 1)
 MATMUL8(matmul8_q5_k, K_Q5_K, 32, cols / 256 * 176, 1)
-MATMUL8(matmul8_q6_k, K_Q6_K, 16, cols / 256 * 210, 2)
+MATMUL8(matmul8_q6_k, K_Q6_K, 16, cols / 256 * Q6K_BYTES, 2)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //

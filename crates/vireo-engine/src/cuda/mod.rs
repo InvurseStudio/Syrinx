@@ -542,7 +542,8 @@ impl Gpu {
 
     /// A weight matrix of `rows` × `cols` numbers of type `kind` (GGUF's layout) in GPU
     /// memory, in the layout the kernels read: as it is, except Q4_0, whose 18-byte blocks
-    /// are split into each row's 4-bit numbers (16-byte aligned) and then its scales.
+    /// are split into each row's 4-bit numbers (16-byte aligned) and then its scales, and
+    /// Q6_K, whose 210-byte blocks are padded to 224 (16-byte aligned).
     pub fn upload_weights(
         &self,
         kind: TensorType,
@@ -550,6 +551,19 @@ impl Gpu {
         rows: usize,
         cols: usize,
     ) -> Result<Buffer> {
+        if kind == TensorType::Q6_K {
+            // Q6_K: each 210-byte block padded to 224, so blocks start 16-byte aligned.
+            let mut out = vec![0u8; data.len() / 210 * 224];
+            for (src, dst) in data
+                .as_chunks::<210>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<224>().0)
+            {
+                dst[..210].copy_from_slice(src);
+            }
+            return self.upload(&out);
+        }
         if kind != TensorType::Q4_0 {
             return self.upload(data);
         }
@@ -573,6 +587,13 @@ impl Gpu {
         let buffer = self.alloc(data.len() * 4)?;
         buffer.write_f32(data)?;
         Ok(buffer)
+    }
+
+    /// Copies `bytes` within GPU memory, after the work already queued.
+    pub fn copy(&self, to: CuDevicePtr, from: CuDevicePtr, bytes: usize) -> Result<()> {
+        let c = &self.context;
+        let r = unsafe { (c.driver.cuMemcpyDtoDAsync_v2)(to, from, bytes, c.stream) };
+        c.check("cuMemcpyDtoDAsync", r)
     }
 
     /// Waits for all queued GPU work, and reports any error a kernel hit.
