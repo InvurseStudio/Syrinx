@@ -18,7 +18,15 @@
 //! - chat templates
 
 pub mod cpu;
+/// The GPU backend. On macOS it's the Metal one (`src/metal`), with the CUDA backend's
+/// types and methods, so everything that runs on the GPU (`models::*_cuda`, the CLI, the
+/// server) is the same code on both.
+#[cfg(not(target_os = "macos"))]
 pub mod cuda;
+#[cfg(target_os = "macos")]
+#[path = "metal/mod.rs"]
+pub mod cuda;
+#[cfg(not(target_os = "macos"))]
 mod dylib;
 pub mod gguf;
 pub mod grammar;

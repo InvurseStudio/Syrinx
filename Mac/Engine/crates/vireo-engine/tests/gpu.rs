@@ -667,6 +667,11 @@ fn check_8bit(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
     let tokens = 100;
     for &name in names {
         let w = matrix(file, name);
+        if !Gpu::supports_8bit(w.kind) {
+            // The Metal backend has no 8-bit kernels.
+            eprintln!("skipped: {name} ({}) has no 8-bit kernels on this GPU", w.kind);
+            continue;
+        }
         let x: Vec<f32> = (0..w.cols * tokens)
             .map(|c| ((c * 7919) % 1000) as f32 / 250.0 - 2.0)
             .collect();
