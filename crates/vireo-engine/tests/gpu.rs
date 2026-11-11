@@ -904,3 +904,122 @@ fn attention_over_an_f16_cache_matches_f64() {
         assert!(batch <= largest * 2e-3, "batch: {batch}");
     }
 }
+
+/// How far `got`'s logits are from `want`'s, as a share of `want`'s largest, and whether
+/// both pick the same next token.
+fn compare_logits(name: &str, got: &[f32], want: &[f32], tolerance: f32) {
+    let worst = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let largest = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let pick = |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap();
+    eprintln!("{name}: worst logit difference {worst:.2e} of {largest:.1}");
+    assert!(worst <= largest * tolerance, "{name}: {worst} of {largest}");
+    assert_eq!(pick(got), pick(want), "{name}: a different next token");
+}
+
+/// A chat's next turn read on top of the last one (the session cut back to the tokens
+/// both share, or Qwen's DeltaNet taken back to a checkpoint) gives the logits a new
+/// session reading the whole prompt gives. The last turn's own tail (a reply the next
+/// prompt writes differently) is thrown away first, as the server does.
+#[test]
+fn continuing_a_session_matches_reading_from_the_start() {
+    for (precision, tolerance) in [(Precision::Exact, 1e-4), (Precision::Int8, 0.05)] {
+        let label = |model: &str| format!("{model}, {precision:?}");
+        // The shared start, the last turn's tail (thrown away) and the new turn.
+        let split = |ids: &[u32]| (ids.len() / 2, ids.len() * 3 / 4);
+        if let Some(file) = model("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, false);
+            let (shared, tail) = split(&ids);
+            let mut m = LlamaCuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut s = m.session(ids.len() + 64).unwrap();
+            m.forward_batch(&mut s, &ids[..tail], Logits::Last).unwrap();
+            for &id in &ids[..8] {
+                m.forward(&mut s, id, true).unwrap(); // a reply, thrown away
+            }
+            s.truncate(shared);
+            let got = m
+                .forward_batch(&mut s, &ids[shared..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let mut fresh = m.session(ids.len()).unwrap();
+            let want = m
+                .forward_batch(&mut fresh, &ids, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            compare_logits(&label("Llama"), &got, &want, tolerance);
+        }
+        if let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, false);
+            let (shared, tail) = split(&ids);
+            let mut m = Qwen35Cuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut s = m.session(ids.len() + 64).unwrap();
+            let mut cp = None;
+            m.forward_batch(&mut s, &ids[..shared], Logits::None)
+                .unwrap();
+            m.save(&s, &mut cp).unwrap();
+            m.forward_batch(&mut s, &ids[shared..tail], Logits::Last)
+                .unwrap();
+            for &id in &ids[..8] {
+                m.forward(&mut s, id, true).unwrap();
+            }
+            m.restore(&mut s, cp.as_ref().unwrap()).unwrap();
+            let got = m
+                .forward_batch(&mut s, &ids[shared..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let mut fresh = m.session(ids.len()).unwrap();
+            let want = m
+                .forward_batch(&mut fresh, &ids, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            compare_logits(&label("Qwen 3.5"), &got, &want, tolerance);
+            // And from empty again, after a reset.
+            m.reset(&mut s).unwrap();
+            let again = m
+                .forward_batch(&mut s, &ids, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            compare_logits(&label("Qwen 3.5 after a reset"), &again, &want, 1e-6);
+        }
+        if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, true);
+            let (shared, tail) = split(&ids);
+            let mut m = Gemma4Cuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut s = m.session(ids.len() + 64).unwrap();
+            m.forward_batch(&mut s, &ids[..tail], Logits::Last).unwrap();
+            for &id in &ids[..8] {
+                m.forward(&mut s, id, true).unwrap();
+            }
+            s.truncate(shared);
+            let got = m
+                .forward_batch(&mut s, &ids[shared..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let mut fresh = m.session(ids.len()).unwrap();
+            let want = m
+                .forward_batch(&mut fresh, &ids, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            compare_logits(&label("Gemma 4"), &got, &want, tolerance);
+        }
+    }
+}

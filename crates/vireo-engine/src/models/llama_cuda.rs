@@ -82,6 +82,13 @@ impl CudaSession {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Forgets every position from `len` on (nothing, if the session is shorter), so the
+    /// next tokens run from there: the keys and values before it stay as they are. For
+    /// continuing a chat whose new prompt starts with the tokens already read.
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
 }
 
 impl<'a> LlamaCuda<'a> {
