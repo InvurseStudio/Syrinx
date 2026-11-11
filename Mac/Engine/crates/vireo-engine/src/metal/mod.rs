@@ -484,8 +484,9 @@ struct Kernels {
     matvec: [Pso; 7],
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
     matmul_sg: [Pso; 7],
-    /// On the neural accelerators (f16 weights), where the GPU has them.
-    matmul_tc: Option<[Pso; 7]>,
+    /// On the neural accelerators (f16 weights and activations), where the GPU has them,
+    /// with the kernel that rounds the activations.
+    matmul_tc: Option<([Pso; 7], Pso)>,
     rms_norm: Pso,
     residual_norm: Pso,
     qkv_prep: Pso,
@@ -629,7 +630,7 @@ impl Gpu {
             matvec: per_kind("matvec")?,
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
-                Some(per_kind("matmul_tc")?)
+                Some((per_kind("matmul_tc")?, pipeline("to_half")?))
             } else {
                 None
             },
@@ -1398,22 +1399,35 @@ impl Gpu {
         TENSOR_OPS.load(Ordering::Relaxed) && KINDS.contains(&kind)
     }
 
-    /// The default mode's input to the matrix products. On Metal it's the f32 activations
-    /// themselves (the kernels round the weights instead), so this takes no memory.
-    pub fn alloc_q8(&self, _tokens: usize, _cols: usize) -> Result<Q8> {
+    /// Room for the default mode's input to the matrix products: `tokens` rows of up to
+    /// `cols` activations in f16 (see [`Q8`]).
+    pub fn alloc_q8(&self, tokens: usize, cols: usize) -> Result<Q8> {
+        let half = if self.kernels.matmul_tc.is_some() && tokens > 1 {
+            Some(self.alloc(tokens * cols * 2)?)
+        } else {
+            None
+        };
         Ok(Q8 {
             x: AtomicU64::new(0),
+            half,
         })
     }
 
-    /// Readies `x` as the input of [`Gpu::matmul_8bit`]: it's read as it is (see
-    /// [`Q8`]), so this only notes where.
-    pub fn quantize(&self, x: CuDevicePtr, q8: &Q8, _tokens: usize, cols: usize) -> Result<()> {
+    /// Readies `tokens` rows of `cols` activations at `x` as the input of
+    /// [`Gpu::matmul_8bit`]: a prompt's rounded to f16 for the neural accelerators, after
+    /// the work already queued; one token's used as it is.
+    pub fn quantize(&self, x: CuDevicePtr, q8: &Q8, tokens: usize, cols: usize) -> Result<()> {
         assert!(
             cols.is_multiple_of(32),
             "rows of {cols} aren't whole blocks of 32"
         );
         q8.x.store(x, Ordering::Relaxed);
+        if let (Some((_, to_half)), Some(half), true) = (&self.kernels.matmul_tc, &q8.half, tokens > 1) {
+            let n = tokens * cols;
+            assert!(n * 2 <= half.len_bytes(), "the f16 buffer is too small");
+            let args = [Arg::Ptr(x), Arg::Ptr(half.ptr()), Arg::I32(n as i32)];
+            self.run(to_half, ((n as u32 / 4).div_ceil(256), 1), 256, &args)?;
+        }
         Ok(())
     }
 
@@ -1431,8 +1445,8 @@ impl Gpu {
         tokens: usize,
     ) -> Result<()> {
         let x = q8.x.load(Ordering::Relaxed);
-        let kernels = match &self.kernels.matmul_tc {
-            Some(k) if tokens > 1 && cols.is_multiple_of(32) => k,
+        let (kernels, half) = match (&self.kernels.matmul_tc, &q8.half) {
+            (Some((k, _)), Some(half)) if tokens > 1 && cols.is_multiple_of(32) => (k, half),
             _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
         };
         let grid = (
@@ -1441,7 +1455,7 @@ impl Gpu {
         );
         let args = [
             Arg::Ptr(w),
-            Arg::Ptr(x),
+            Arg::Ptr(half.ptr()),
             Arg::Ptr(y),
             Arg::I32(rows as i32),
             Arg::I32(cols as i32),
@@ -1532,12 +1546,12 @@ pub struct DeltaNet {
 /// the prep's threadgroup memory fits Metal's 32 KB).
 const DELTA_CHUNK: usize = 32;
 
-/// The default mode's input to the matrix products ([`Gpu::quantize`]). The tensor
-/// kernels read the f32 activations as they are, so it holds only their address: noted
-/// when the products' input is ready, read when they're queued, as CUDA's rounded copy
-/// would be.
+/// The default mode's input to the matrix products ([`Gpu::quantize`]): where the f32
+/// activations are (one token's are read as they are), and for a prompt, room for them
+/// rounded to f16, as CUDA's 8-bit copy.
 pub struct Q8 {
     x: AtomicU64,
+    half: Option<Buffer>,
 }
 
 /// A kernel argument, by type.
