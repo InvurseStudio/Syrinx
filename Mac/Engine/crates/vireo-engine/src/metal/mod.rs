@@ -12,9 +12,10 @@
 //!   plus an offset, which the models do arithmetic on. Kernels take them as raw pointers,
 //!   so every buffer is kept resident through one residency set, and Metal's hazard
 //!   tracking is off (the work runs in order, as on one CUDA stream).
-//! - **The stream.** Work is encoded, in order, into one compute encoder; it's committed
-//!   and waited for when results are read ([`Gpu::synchronize`], [`Buffer::read_f32`] and
-//!   the like). The encoder lets dispatches overlap, as a CUDA stream doesn't, so the
+//! - **The stream.** Work is encoded, in order, into a compute encoder, committed every
+//!   128 dispatches so the GPU starts while the rest is encoded (a fence orders each
+//!   encoder after the last), and waited for when results are read ([`Gpu::synchronize`],
+//!   [`Buffer::read_f32`] and the like). The encoder lets dispatches overlap, as a CUDA stream doesn't, so the
 //!   backend puts a memory barrier before each dispatch that touches a buffer an earlier
 //!   one since the last barrier wrote (or writes one it read): it knows which of each
 //!   kernel's arguments it writes ([`written_args`]) and which buffer each address falls
@@ -142,15 +143,18 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
     })
 }
 
-/// The command buffer being filled, and its encoder.
+/// The command buffer being filled, its encoder, and how many dispatches are in it.
 struct Open {
     commands: CommandBuffer,
     encoder: Encoder,
+    count: usize,
 }
 
 #[derive(Default)]
 struct State {
     open: Option<Open>,
+    /// Command buffers committed while more work was being encoded, not yet waited for.
+    inflight: Vec<CommandBuffer>,
     /// What the dispatches since the encoder's last barrier read and wrote (see
     /// [`Dispatch::access`]); `blocked` when one of them is unknown.
     pending: Vec<(u64, bool)>,
@@ -176,6 +180,12 @@ struct Context {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     copy: Pso,
+    /// Orders each encoder after the one before (the buffers are untracked): updated at
+    /// the end of each, waited for at the start of the next.
+    fence: Retained<ProtocolObject<dyn objc2_metal::MTLFence>>,
+    /// Commit the command buffer being filled every this many dispatches (0: only when
+    /// results are read), so the GPU starts on them while the rest is encoded.
+    commit_every: usize,
     state: Mutex<State>,
     /// Each pipeline's kernel name, by its address, for the profile.
     names: HashMap<usize, String>,
@@ -279,7 +289,12 @@ impl Context {
                     code: 0,
                     name: "no encoder".into(),
                 })?;
-            state.open = Some(Open { commands, encoder });
+            encoder.waitForFence(&self.fence);
+            state.open = Some(Open {
+                commands,
+                encoder,
+                count: 0,
+            });
             state.pending.clear();
             state.blocked = false;
         }
@@ -330,7 +345,27 @@ impl Context {
                 depth: 1,
             },
         );
+        let open = state.open.as_mut().unwrap();
+        open.count += 1;
+        if self.commit_every > 0 && open.count >= self.commit_every {
+            self.commit_open(state);
+        }
         Ok(())
+    }
+
+    /// Ends and commits the command buffer being filled, without waiting for it.
+    fn commit_open(&self, state: &mut State) {
+        let Some(open) = state.open.take() else {
+            return;
+        };
+        open.encoder.updateFence(&self.fence);
+        open.encoder.endEncoding();
+        if state.residency_dirty {
+            self.residency.commit();
+            state.residency_dirty = false;
+        }
+        open.commands.commit();
+        state.inflight.push(open.commands);
     }
 
     /// With profiling on: runs what's queued (just `d`) and adds its GPU time to the profile.
@@ -338,7 +373,13 @@ impl Context {
         if state.profile.is_none() {
             return Ok(());
         }
-        let commands = state.open.as_ref().unwrap().commands.clone();
+        let commands = match &state.open {
+            Some(open) => open.commands.clone(),
+            None => match state.inflight.last() {
+                Some(c) => c.clone(),
+                None => return Ok(()),
+            },
+        };
         self.finish(state)?;
         let seconds = commands.GPUEndTime() - commands.GPUStartTime();
         let name = self
@@ -373,36 +414,33 @@ impl Context {
         self.profile_step(&mut state, &d)
     }
 
-    /// Commits the queued work and waits for it.
+    /// Commits the queued work and waits for it all.
     fn finish(&self, state: &mut State) -> Result<()> {
-        let Some(open) = state.open.take() else {
-            return Ok(());
-        };
-        open.encoder.endEncoding();
-        if state.residency_dirty {
-            self.residency.commit();
-            state.residency_dirty = false;
-        }
         let committed = std::time::Instant::now();
-        open.commands.commit();
-        open.commands.waitUntilCompleted();
+        self.commit_open(state);
+        let mut result = Ok(());
+        for commands in std::mem::take(&mut state.inflight) {
+            commands.waitUntilCompleted();
+            if let Some(t) = state.timing.as_mut() {
+                t.0 += commands.GPUEndTime() - commands.GPUStartTime();
+                t.2 += 1;
+            }
+            if commands.status() == MTLCommandBufferStatus::Error && result.is_ok() {
+                result = Err(match commands.error() {
+                    Some(e) => driver_error("running the queued work", &e),
+                    None => Error::Driver {
+                        call: "running the queued work",
+                        code: 0,
+                        name: "unknown error".into(),
+                    },
+                });
+            }
+        }
         if let Some(t) = state.timing.as_mut() {
-            t.0 += open.commands.GPUEndTime() - open.commands.GPUStartTime();
             t.1 += committed.elapsed().as_secs_f64();
-            t.2 += 1;
         }
         state.staging.clear();
-        if open.commands.status() == MTLCommandBufferStatus::Error {
-            return Err(match open.commands.error() {
-                Some(e) => driver_error("running the queued work", &e),
-                None => Error::Driver {
-                    call: "running the queued work",
-                    code: 0,
-                    name: "unknown error".into(),
-                },
-            });
-        }
-        Ok(())
+        result
     }
 
     fn synchronize(&self) -> Result<()> {
@@ -420,7 +458,7 @@ impl Context {
             state.recording.is_none(),
             "copying to the GPU while recording"
         );
-        if state.open.is_none() {
+        if state.open.is_none() && state.inflight.is_empty() {
             // Nothing queued: the GPU is done with the buffer.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -883,6 +921,11 @@ impl Gpu {
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
+        let fence = device.newFence().ok_or(Error::Driver {
+            call: "newFence",
+            code: 0,
+            name: "no fence".into(),
+        })?;
         let names = names.into_inner();
         let writes = names
             .iter()
@@ -912,6 +955,12 @@ impl Gpu {
             queue,
             residency,
             copy,
+            fence,
+            // Every 128 dispatches (a few layers): on the M5 Max prompts were read 6–8%
+            // faster and tokens generated 2–3% faster than committing only when results
+            // are read, the GPU starting while the CPU encodes the rest (64 and 256 were
+            // a little slower).
+            commit_every: 128,
             state: Mutex::new(State {
                 profile: std::env::var_os("VIREO_METAL_PROFILE").map(|_| HashMap::new()),
                 timing: std::env::var_os("VIREO_METAL_TIMING").map(|_| (0.0, 0.0, 0)),
