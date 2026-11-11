@@ -4,8 +4,10 @@
 //! scores the reply: the tools it called, their arguments, and the answer. Replies are
 //! greedy (temperature 0), so a run gives the same scores every time.
 //!
-//! Twelve easy cases (`cases.rs`) and twelve harder ones (`hard_cases.rs`), counted
-//! apart in the report.
+//! Twelve easy cases (`cases.rs`), twelve harder ones (`hard_cases.rs`) and the ones
+//! that change files (`change_cases.rs`), counted apart in the report. The stand-in app
+//! answers approvals as the case's user does (`Pc::declining`), and any case not about
+//! changes fails if the reply changes a file.
 //!
 //!   vireo-eval [--models a.gguf,b.gguf] [--cases read,git] [--out results.json]
 //!              [--server-arg <arg>]...
@@ -14,6 +16,7 @@
 //! `--server-arg` passes an argument on to vireo-server, to compare a feature on and off.
 
 mod cases;
+mod change_cases;
 mod hard_cases;
 #[path = "../../vireo-server/src/json.rs"]
 #[allow(dead_code)]
@@ -42,13 +45,19 @@ const DEFAULT_MODELS: [&str; 5] = [
 ];
 const TOKEN: &str = "vireo-eval";
 /// The PC tools the stand-in app runs (its `clientTools`).
-const CLIENT_TOOLS: [&str; 6] = [
+const CLIENT_TOOLS: [&str; 11] = [
     "read_file",
     "list_directory",
     "search_files",
     "file_exists",
     "git_status",
     "git_diff",
+    "write_file",
+    "rename_file",
+    "move_file",
+    "delete_file",
+    // Not a tool: the server checks a change with it before asking for approval.
+    "check_change",
 ];
 
 fn main() -> ExitCode {
@@ -116,6 +125,10 @@ fn main() -> ExitCode {
             let run = ask(running.port, case);
             let verdict = match (&run.error, (case.check)(&run)) {
                 (Some(e), _) => Err(format!("error: {e}")),
+                (None, _) if !case.changes && !run.changes_made().is_empty() => Err(format!(
+                    "called {} when nobody asked for a change",
+                    run.changes_made()[0].tool
+                )),
                 (None, v) => v,
             };
             let tools: Vec<String> = run.calls.iter().map(|c| c.tool.clone()).collect();
@@ -140,13 +153,17 @@ fn main() -> ExitCode {
         let passed = runs.iter().filter(|r| r.1.is_ok()).count();
         let seconds: f64 = runs.iter().map(|r| r.2.seconds).sum();
         let calls: usize = runs.iter().map(|r| r.2.calls.len()).sum();
-        let part = |hard: bool| {
-            let of: Vec<_> = runs.iter().filter(|r| r.2.hard == hard).collect();
+        let part = |hard: bool, changes: bool| {
+            let of: Vec<_> = runs
+                .iter()
+                .filter(|r| r.2.hard == hard && r.2.changes == changes)
+                .collect();
             (of.iter().filter(|r| r.1.is_ok()).count(), of.len())
         };
-        let ((easy_passed, easy), (hard_passed, hard)) = (part(false), part(true));
+        let ((easy_passed, easy), (hard_passed, hard)) = (part(false, false), part(true, false));
+        let (changes_passed, changes) = part(false, true);
         println!(
-            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard), {:.1} s a case on average, {calls} tool calls",
+            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard, {changes_passed}/{changes} changes), {:.1} s a case on average, {calls} tool calls",
             runs.len(),
             seconds / runs.len().max(1) as f64
         );
@@ -179,9 +196,11 @@ fn results_json(report: &Report, server_args: &[String]) -> String {
                         .map(|c| format!("{{\"tool\":{},\"args\":{}}}", json::string(&c.tool), to_json(&c.args)))
                         .collect();
                     format!(
-                        "{{\"id\":{},\"hard\":{},\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
+                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
                         json::string(id),
                         run.hard,
+                        run.changes,
+                        run.asked.iter().map(|t| json::string(t)).collect::<Vec<_>>().join(","),
                         verdict.is_ok(),
                         verdict.as_ref().err().map_or("null".into(), |p| json::string(p)),
                         tools.join(","),
@@ -250,6 +269,12 @@ impl Server {
                 "off",
             ])
             .args(extra)
+            // Its own "always allow" list, which stays empty: every change asks.
+            .env(
+                "VIREO_APPROVALS_FILE",
+                std::env::temp_dir()
+                    .join(format!("vireo-eval-approvals-{}.txt", std::process::id())),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -307,6 +332,8 @@ fn ask(port: u16, case: &Case) -> Run {
     let mut run = Run::default();
     let tools: Vec<String> = CLIENT_TOOLS.iter().map(|t| json::string(t)).collect();
     run.hard = case.hard;
+    run.changes = case.changes;
+    let mut pc = case.pc.clone();
     // The earlier turns, then the prompt.
     let messages: Vec<String> = case
         .history
@@ -351,7 +378,7 @@ fn ask(port: u16, case: &Case) -> Run {
             Some("client_tool_request") => {
                 let id = event.str("id").unwrap_or("");
                 let args = event.get("args").cloned().unwrap_or(Value::Null);
-                let answer = match case.pc.run(event.str("tool").unwrap_or(""), &args) {
+                let answer = match pc.run(event.str("tool").unwrap_or(""), &args) {
                     Ok(output) => format!(
                         "{{\"id\":{},\"ok\":true,\"output\":{}}}",
                         json::string(id),
@@ -364,6 +391,19 @@ fn ask(port: u16, case: &Case) -> Run {
                     ),
                 };
                 if let Ok(mut s) = request(port, "/api/agent/client-tool-result", &answer) {
+                    let mut sink = Vec::new();
+                    let _ = s.read_to_end(&mut sink);
+                }
+            }
+            Some("confirm_required") => {
+                let tool = event.str("tool").unwrap_or("").to_string();
+                let answer = format!(
+                    "{{\"id\":{},\"approved\":{},\"remember\":false}}",
+                    json::string(event.str("id").unwrap_or("")),
+                    pc.approves(&tool)
+                );
+                run.asked.push(tool);
+                if let Ok(mut s) = request(port, "/api/agent/confirm", &answer) {
                     let mut sink = Vec::new();
                     let _ = s.read_to_end(&mut sink);
                 }
@@ -381,5 +421,6 @@ fn ask(port: u16, case: &Case) -> Run {
         }
     }
     run.seconds = started.elapsed().as_secs_f64();
+    run.pc = pc;
     run
 }

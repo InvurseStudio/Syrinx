@@ -5,8 +5,9 @@
 //! what it was trained on.
 //!
 //! The app runs the PC's tools (`PcTools` in the Windows app) when the server asks
-//! (`client_tool_request`); the server runs its own (the date and time). Only tools that
-//! change nothing so far: the ones that do come with approvals.
+//! (`client_tool_request`); the server runs its own (the date and time). A tool that
+//! changes something (`asks`) waits for the user's approval first, as the Mac's server
+//! asks for it (`confirm_required`, answered at `/api/agent/confirm`).
 
 use vireo_engine::grammar::{Property, RecordStyle, Schema, json_string};
 
@@ -62,7 +63,7 @@ pub fn group_question(request: &str) -> String {
     let request = request.trim().replace('\n', " ");
     format!(
         "Sort each request to an assistant on a PC by what answering it needs.\n\
-         A = files or folders on the PC (reading, listing, finding or checking one)\n\
+         A = files or folders on the PC (reading, listing, finding, checking or changing one)\n\
          B = a Git project (its status, changes or diff)\n\
          C = the date or the time now\n\
          D = nothing: it can be answered directly\n\n\
@@ -78,6 +79,28 @@ pub fn group_question(request: &str) -> String {
     )
 }
 
+/// The question that decides whether a request's reply may call the tools that change
+/// files, with worked examples (worded apart from the eval's cases), ending where the
+/// answer goes: " yes" or " no".
+pub fn change_question(request: &str) -> String {
+    let request = request.trim().replace('\n', " ");
+    format!(
+        "Does each request to an assistant on a PC ask it to create, change, rename, move or \
+         delete a file or folder? Reading, finding, explaining, suggesting or writing an answer \
+         in the chat is no.\n\n\
+         Request: Put these meeting notes in a file on my Desktop.\nChanges: yes\n\n\
+         Request: What does budget.xlsx in Documents say about travel?\nChanges: no\n\n\
+         Request: Rename the scans in Pictures so they start with the date.\nChanges: yes\n\n\
+         Request: Write me a short story about a fox.\nChanges: no\n\n\
+         Request: Get rid of the old backup zip in Downloads.\nChanges: yes\n\n\
+         Request: Which of my folders holds the tax forms?\nChanges: no\n\n\
+         Request: Put 'renew passport' on the list in Documents/errands.md.\nChanges: yes\n\n\
+         Request: Suggest a clearer title for my essay, but leave the file alone.\nChanges: no\n\n\
+         Request: Move the screenshots off my Desktop into a Screenshots folder.\nChanges: yes\n\n\
+         Request: {request}\nChanges:"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct Tool {
     pub name: &'static str,
@@ -85,6 +108,31 @@ pub struct Tool {
     pub params: Vec<Param>,
     pub runs: Runs,
     pub group: Group,
+    /// Set for a tool that changes something: it runs only once the user approves.
+    pub asks: Option<Ask>,
+}
+
+/// How a tool that changes something is approved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ask {
+    /// What it does, as the app's Settings and approvals name it ("Rename files").
+    pub label: &'static str,
+    /// Whether the user may always allow it ("Don't ask again to rename files"). Deleting
+    /// always asks, as on the Mac.
+    pub rememberable: bool,
+}
+
+impl Ask {
+    /// The approval's "always allow" choice, as the Mac's server words it.
+    pub fn remember_label(&self) -> String {
+        let mut chars = self.label.chars();
+        let first = chars.next().map(|c| c.to_lowercase().to_string());
+        format!(
+            "Don't ask again to {}{}",
+            first.unwrap_or_default(),
+            chars.as_str()
+        )
+    }
 }
 
 const fn text(name: &'static str, description: &'static str) -> Param {
@@ -110,6 +158,7 @@ fn catalog() -> Vec<Tool> {
             )],
             runs: Runs::App,
             group: Group::Files,
+            asks: None,
         },
         Tool {
             name: "list_directory",
@@ -120,6 +169,7 @@ fn catalog() -> Vec<Tool> {
             )],
             runs: Runs::App,
             group: Group::Files,
+            asks: None,
         },
         Tool {
             name: "search_files",
@@ -133,6 +183,7 @@ fn catalog() -> Vec<Tool> {
             ],
             runs: Runs::App,
             group: Group::Files,
+            asks: None,
         },
         Tool {
             name: "file_exists",
@@ -140,6 +191,7 @@ fn catalog() -> Vec<Tool> {
             params: vec![text("path", "The path to check.")],
             runs: Runs::App,
             group: Group::Files,
+            asks: None,
         },
         Tool {
             name: "git_status",
@@ -147,6 +199,7 @@ fn catalog() -> Vec<Tool> {
             params: vec![text("path", "The project's folder.")],
             runs: Runs::App,
             group: Group::Git,
+            asks: None,
         },
         Tool {
             name: "git_diff",
@@ -154,6 +207,7 @@ fn catalog() -> Vec<Tool> {
             params: vec![text("path", "The project's folder, or a file in it.")],
             runs: Runs::App,
             group: Group::Git,
+            asks: None,
         },
         Tool {
             name: "get_current_datetime",
@@ -161,8 +215,92 @@ fn catalog() -> Vec<Tool> {
             params: vec![],
             runs: Runs::Server,
             group: Group::Time,
+            asks: None,
+        },
+        // The tools that change files, as the app's PcTools runs them (its undo journal
+        // keeps what each reply changed). Their descriptions say they ask, as the Mac's do,
+        // so a model calls them when asked instead of asking again in the chat.
+        Tool {
+            name: "write_file",
+            description: "Create a text file on this PC, or replace one's whole text. Asks the user for approval.",
+            params: vec![
+                text(
+                    "path",
+                    "The file's path: a full path, or one relative to the home folder.",
+                ),
+                text("content", "The file's whole new text."),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Create or edit files",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "rename_file",
+            description: "Rename a file or folder on this PC, keeping it where it is. Asks the user for approval.",
+            params: vec![
+                text("path", "The file's or folder's path."),
+                text(
+                    "new_name",
+                    "The new name only, not a path (notes-2026.txt).",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Rename files",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "move_file",
+            description: "Move a file or folder on this PC to another folder. Asks the user for approval.",
+            params: vec![
+                text("source", "The file's or folder's path now."),
+                text(
+                    "destination",
+                    "Its full new path, name included (Documents/Invoices/acme.pdf).",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Move files",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "delete_file",
+            description: "Delete a file on this PC (it goes to the Recycle Bin). Asks the user for approval.",
+            params: vec![text("path", "The file's path.")],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Delete files",
+                rememberable: false,
+            }),
         },
     ]
+}
+
+/// What the approval says the call will do, one line for the app's sheet (which shows the
+/// arguments, a written file's text among them, below it). `exists` tells whether a path
+/// is there now.
+pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
+    let arg = |name: &str| call.text(name).unwrap_or("").trim().to_string();
+    match call.tool.as_str() {
+        "write_file" => {
+            let path = arg("path");
+            let verb = if exists(&path) { "Replace" } else { "Create" };
+            format!("{verb} {path}")
+        }
+        "rename_file" => format!("Rename {} to {}", arg("path"), arg("new_name")),
+        "move_file" => format!("Move {} to {}", arg("source"), arg("destination")),
+        "delete_file" => format!("Move {} to the Recycle Bin", arg("path")),
+        other => format!("Run {other}"),
+    }
 }
 
 /// The tools a reply offers: the server's own, and those of the app's that it runs.
@@ -178,10 +316,17 @@ pub fn capabilities_json() -> String {
     let items: Vec<String> = catalog()
         .iter()
         .map(|t| {
+            let (label, category) = match t.asks {
+                // The Mac's categories: changes that ask are "automatic" there too (the
+                // approval is per call); deleting is "restricted".
+                Some(ask) if !ask.rememberable => (ask.label.to_string(), "restricted"),
+                Some(ask) => (ask.label.to_string(), "automatic"),
+                None => (t.name.replace('_', " "), "automatic"),
+            };
             format!(
-                "{{\"name\":{},\"label\":{},\"description\":{},\"category\":\"automatic\",\"platforms\":[\"windows\"],\"available\":true}}",
+                "{{\"name\":{},\"label\":{},\"description\":{},\"category\":\"{category}\",\"platforms\":[\"windows\"],\"available\":true}}",
                 json::string(t.name),
-                json::string(&t.name.replace('_', " ")),
+                json::string(&label),
                 json::string(t.description)
             )
         })
@@ -568,6 +713,14 @@ pub struct Call {
 
 impl Call {
     /// The arguments as a JSON object.
+    /// A text argument, if the call has it.
+    pub fn text(&self, name: &str) -> Option<&str> {
+        self.args.iter().find_map(|(k, v)| match v {
+            Arg::Text(s) if k == name => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn args_json(&self) -> String {
         let parts: Vec<String> = self
             .args
@@ -863,5 +1016,72 @@ mod tests {
     fn the_date_reads_like_the_macs() {
         let n = now();
         assert!(n.ends_with("(local time)") && n.contains(", 20"), "{n}");
+    }
+
+    #[test]
+    fn changes_ask_as_the_macs_do() {
+        let all: Vec<String> = [
+            "read_file",
+            "write_file",
+            "rename_file",
+            "move_file",
+            "delete_file",
+        ]
+        .map(String::from)
+        .to_vec();
+        let tools = offered(&all);
+        let ask = |name: &str| tools.iter().find(|t| t.name == name).unwrap().asks;
+        assert_eq!(ask("read_file"), None);
+        assert_eq!(
+            ask("rename_file").unwrap().remember_label(),
+            "Don't ask again to rename files"
+        );
+        assert!(
+            !ask("delete_file").unwrap().rememberable,
+            "deleting always asks"
+        );
+        // Only what the app runs is offered.
+        assert!(
+            offered(&["read_file".into()])
+                .iter()
+                .all(|t| t.asks.is_none())
+        );
+
+        let call = |tool: &str, args: &[(&str, &str)]| Call {
+            tool: tool.into(),
+            args: args
+                .iter()
+                .map(|(k, v)| (k.to_string(), Arg::Text(v.to_string())))
+                .collect(),
+        };
+        let write = call(
+            "write_file",
+            &[("path", "Documents/a.txt"), ("content", "x")],
+        );
+        assert_eq!(
+            approval_preview(&write, |_| false),
+            "Create Documents/a.txt"
+        );
+        assert_eq!(
+            approval_preview(&write, |_| true),
+            "Replace Documents/a.txt"
+        );
+        assert_eq!(
+            approval_preview(
+                &call(
+                    "move_file",
+                    &[("source", "a.pdf"), ("destination", "Invoices/a.pdf")]
+                ),
+                |_| true
+            ),
+            "Move a.pdf to Invoices/a.pdf"
+        );
+        // Each family declares them and writes a call to one, content and all.
+        for family in [Family::Qwen35, Family::Llama, Family::Gemma4] {
+            let declared = declarations(family, &tools);
+            assert!(
+                declared.contains("new_name") && declared.contains("Asks the user for approval")
+            );
+        }
     }
 }
