@@ -1178,3 +1178,87 @@ fn an_exported_session_goes_on_as_the_original() {
         }
     }
 }
+
+/// A prompt's Gated DeltaNet in chunks (the WY form) gives what reading it token by token
+/// does, for prompts shorter than a chunk, of whole chunks and in between: on random
+/// inputs shaped as Qwen 3.5 0.8B's (16 value heads of 128, 16 key heads), from a state
+/// that isn't zero.
+#[test]
+fn delta_net_in_chunks_matches_token_by_token() {
+    use vireo_engine::cuda::DeltaNet;
+    let Some(gpu) = open_gpu() else { return };
+    let (v_heads, k_heads, n) = (16, 16, 128);
+    let key_dim = k_heads * n;
+    let channels = 2 * key_dim + v_heads * n;
+    let mut seed = 12345u64;
+    let mut random = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+    };
+    for tokens in [7, 32, 33, 100] {
+        let conv: Vec<f32> = (0..tokens * channels).map(|_| random()).collect();
+        let beta: Vec<f32> = (0..tokens * v_heads).map(|_| random()).collect();
+        let alpha: Vec<f32> = (0..tokens * v_heads).map(|_| random()).collect();
+        let dt: Vec<f32> = (0..v_heads).map(|_| random()).collect();
+        let a: Vec<f32> = (0..v_heads).map(|_| -random().abs() - 0.1).collect();
+        let z: Vec<f32> = (0..tokens * v_heads * n).map(|_| random()).collect();
+        let norm: Vec<f32> = (0..n).map(|_| 1.0 + 0.1 * random()).collect();
+        let state0: Vec<f32> = (0..v_heads * n * n).map(|_| 0.1 * random()).collect();
+        let run = |chunked: bool| -> (Vec<f32>, Vec<f32>) {
+            let up = |v: &[f32]| gpu.upload_f32(v).unwrap();
+            let (c, b, al, d, aa, zz, nn, st) = (
+                up(&conv),
+                up(&beta),
+                up(&alpha),
+                up(&dt),
+                up(&a),
+                up(&z),
+                up(&norm),
+                up(&state0),
+            );
+            let out = gpu.alloc(tokens * v_heads * n * 4).unwrap();
+            let scratch = gpu
+                .alloc(Gpu::delta_scratch_floats(tokens, v_heads, n) * 4)
+                .unwrap();
+            gpu.delta_net(
+                &DeltaNet {
+                    conv: c.ptr(),
+                    channels,
+                    key_dim,
+                    beta_raw: b.ptr(),
+                    alpha_raw: al.ptr(),
+                    dt_bias: d.ptr(),
+                    a: aa.ptr(),
+                    state: st.ptr(),
+                    z: zz.ptr(),
+                    norm: nn.ptr(),
+                    out: out.ptr(),
+                    v_heads,
+                    n,
+                    k_heads,
+                    eps: 1e-6,
+                    scratch: if chunked { scratch.ptr() } else { 0 },
+                },
+                tokens,
+            )
+            .unwrap();
+            let mut o = vec![0.0; tokens * v_heads * n];
+            out.read_f32(&mut o).unwrap();
+            let mut s = vec![0.0; v_heads * n * n];
+            st.read_f32(&mut s).unwrap();
+            (o, s)
+        };
+        let (o1, s1) = run(false);
+        let (o2, s2) = run(true);
+        let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let scale = |a: &[f32]| a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let (wo, ws) = (worst(&o1, &o2), worst(&s1, &s2));
+        eprintln!(
+            "{tokens} tokens: output differs by {wo:.2e} (largest {:.2}), state by {ws:.2e} (largest {:.2})",
+            scale(&o1),
+            scale(&s1)
+        );
+        assert!(wo <= 1e-4 * scale(&o1).max(1.0), "{tokens} tokens: outputs differ by {wo}");
+        assert!(ws <= 1e-4 * scale(&s1).max(1.0), "{tokens} tokens: states differ by {ws}");
+    }
+}
