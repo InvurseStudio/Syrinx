@@ -1,0 +1,8 @@
+[package]
+name = "vireo-engine"
+description = "Vireo's inference engine: GGUF models on our own kernels"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

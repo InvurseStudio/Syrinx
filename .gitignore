@@ -1,0 +1,9 @@
+# Rust build output
+/target/
+
+# Models downloaded for testing: large, and fetched again on any machine
+/models/
+*.gguf
+
+# Reference builds (llama.cpp) for checking our output and speed
+/reference/
