@@ -201,6 +201,47 @@ impl Drop for Graph {
     }
 }
 
+/// The tensor-core attention kernels' shapes, as `kernels/vireo.cu` builds them: (head
+/// size, rows of 16 tokens per block, warps per row, key/value positions per chunk).
+const ATTENTION_MMA: [(u32, u32, u32, u32); 4] = [
+    (64, 4, 1, 32),
+    (128, 4, 1, 32),
+    (256, 4, 1, 32),
+    (512, 2, 2, 16),
+];
+
+/// Shared memory for a tensor-core attention kernel: the queries, a chunk of keys and a
+/// chunk of values in f16 (rows padded by 8), and with warps splitting a head, their
+/// parts of S in f32.
+fn attention_mma_bytes(d: u32, rows: u32, split: u32, chunk: u32) -> u32 {
+    let halves = (16 * rows + 2 * chunk) * (d + 8);
+    let parts = if split > 1 {
+        rows * split * chunk / 8 * 4 * 32 * 4
+    } else {
+        0
+    };
+    halves * 2 + parts
+}
+
+#[derive(Clone, Copy)]
+struct AttentionMma {
+    function: CuFunction,
+    shared: u32,
+    rows: u32,
+    threads: u32,
+}
+
+impl Default for AttentionMma {
+    fn default() -> Self {
+        Self {
+            function: std::ptr::null_mut(),
+            shared: 0,
+            rows: 0,
+            threads: 0,
+        }
+    }
+}
+
 struct Kernels {
     matvec: [CuFunction; 7],
     matmul: [CuFunction; 7],
@@ -213,9 +254,9 @@ struct Kernels {
     /// One token's attention split along the context, f32 and f16 caches, and the merge.
     attention_part: [CuFunction; 2],
     attention_combine: CuFunction,
-    /// On the tensor cores over an f16 cache, for head sizes 64, 128, 256 and 512, with
-    /// their shared memory: only on compute capability 8.0 and later.
-    attention_mma: Option<[(CuFunction, u32); 4]>,
+    /// On the tensor cores over an f16 cache, for head sizes 64, 128, 256 and 512:
+    /// only on compute capability 8.0 and later.
+    attention_mma: Option<[AttentionMma; 4]>,
     /// For head sizes 64, 128, 256 and 512.
     attention_tiled: [CuFunction; 4],
     swiglu: CuFunction,
@@ -430,24 +471,22 @@ impl Gpu {
                 ],
                 attention_combine: function("attention_combine")?,
                 attention_mma: if tensor_cores {
-                    let mut out = [(std::ptr::null_mut(), 0); 4];
-                    for (slot, (d, dv, warps)) in out.iter_mut().zip([
-                        (64, 64, 4),
-                        (128, 128, 4),
-                        (256, 256, 4),
-                        (512, 256, 2),
-                    ]) {
+                    let mut out = [AttentionMma::default(); 4];
+                    for (slot, &(d, rows, split, chunk)) in out.iter_mut().zip(&ATTENTION_MMA) {
                         let f = function(&format!("attention_mma_{d}"))?;
-                        // The queries, a chunk of keys, and a chunk of values transposed, in
-                        // f16 (as attention_mma lays them out).
-                        let bytes = (16 * warps * (d + 8) + 32 * (d + 8) + dv * 40) * 2;
+                        let bytes = attention_mma_bytes(d, rows, split, chunk);
                         let r = (context.driver.cuFuncSetAttribute)(
                             f,
                             FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            bytes,
+                            bytes as i32,
                         );
                         context.check("cuFuncSetAttribute", r)?;
-                        *slot = (f, bytes as u32);
+                        *slot = AttentionMma {
+                            function: f,
+                            shared: bytes,
+                            rows: 16 * rows,
+                            threads: 32 * rows * split,
+                        };
                     }
                     Some(out)
                 } else {
@@ -924,13 +963,11 @@ impl Gpu {
                 _ => None,
             };
             if let (true, Some(kernels), Some(i)) = (tokens > 1, self.kernels.attention_mma, wide) {
-                let (kernel, shared) = kernels[i];
-                let (rows, splits) = if head_dim == 512 { (32, 2) } else { (64, 1) };
+                let k = kernels[i];
                 let mut args = args.to_vec();
                 args.push(Arg::I32(tokens as i32));
-                let grid = (heads as u32, (tokens as u32).div_ceil(rows), splits);
-                let threads = if head_dim == 512 { 64 } else { 128 };
-                return self.run_3d(kernel, grid, threads, shared, &args);
+                let grid = (heads as u32, (tokens as u32).div_ceil(k.rows), 1);
+                return self.run_3d(k.function, grid, k.threads, k.shared, &args);
             }
             return self.run(
                 self.kernels.attention_h,
