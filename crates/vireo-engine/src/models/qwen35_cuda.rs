@@ -1,19 +1,15 @@
 //! Qwen 3.5 on an NVIDIA GPU: the same steps as `qwen35.rs`, with every weight, the
 //! attention layers' keys and values, and the DeltaNet layers' convolution history and
-//! states in GPU memory.
+//! states in GPU memory. Prompts go through in batches and generated tokens replay a
+//! recorded graph, as in `llama_cuda.rs`. A batch's DeltaNet steps still go token by
+//! token (each needs the state the last one left), but inside one kernel launch.
 
+use super::gpu::{GpuMatrix, Input, LogitsBuffer, gpu_error, q8_room, record, row};
 use super::qwen35::Config;
-use super::{Error, Result, matrix, vector};
+use super::{DEFAULT_BATCH, Logits, Precision, Result, matrix, vector};
 use crate::GgufFile;
 use crate::cpu::Matrix;
-use crate::cuda::{self, Buffer, Gpu};
-
-struct GpuMatrix {
-    kind: crate::TensorType,
-    rows: usize,
-    cols: usize,
-    data: Buffer,
-}
+use crate::cuda::{self, Buffer, Gpu, Graph, Q8, QkvPrep};
 
 struct Attention {
     q: GpuMatrix,
@@ -53,6 +49,7 @@ struct Layer {
 pub struct Qwen35Cuda<'a> {
     pub config: Config,
     gpu: Gpu,
+    precision: Precision,
     embedding: Matrix<'a>,
     output: GpuMatrix,
     output_norm: Buffer,
@@ -64,18 +61,23 @@ enum Memory {
     DeltaNet { history: Buffer, state: Buffer },
 }
 
+/// One conversation's state on the GPU. Use it only with the model that made it.
 pub struct Qwen35CudaSession {
     memory: Vec<Memory>,
     len: usize,
     capacity: usize,
+    batch: usize,
     embedding: Vec<f32>,
+    pos: Buffer,
+    // A row per token of the batch:
     x: Buffer,
     h: Buffer,
     mixed: Buffer,
     query_gate: Buffer,
     q: Buffer,
+    k_new: Buffer,
+    v_new: Buffer,
     attention: Buffer,
-    scores: Buffer,
     qkv: Buffer,
     conv: Buffer,
     z: Buffer,
@@ -84,8 +86,13 @@ pub struct Qwen35CudaSession {
     heads_out: Buffer,
     gate: Buffer,
     up: Buffer,
-    logits_gpu: Buffer,
+    logits_gpu: LogitsBuffer,
     logits: Vec<f32>,
+    /// The batch's activations in 8 bits, unless the model is exact.
+    q8: Option<Q8>,
+    /// Keys and values in f16 (8-bit mode) rather than f32.
+    half_cache: bool,
+    graph: Option<Graph>,
 }
 
 impl Qwen35CudaSession {
@@ -102,25 +109,11 @@ impl Qwen35CudaSession {
     }
 }
 
-fn gpu_error(e: cuda::Error) -> Error {
-    Error::Unsupported(format!("Running on the GPU ({e})"))
-}
-
 impl<'a> Qwen35Cuda<'a> {
     pub fn load(file: &'a GgufFile, gpu: Gpu) -> Result<Self> {
         let c = Config::from_gguf(file)?;
         let dim = c.dim;
-        let upload = |m: Matrix| -> Result<GpuMatrix> {
-            if !Gpu::supports(m.kind) {
-                return Err(gpu_error(cuda::Error::Unsupported(m.kind)));
-            }
-            Ok(GpuMatrix {
-                kind: m.kind,
-                rows: m.rows,
-                cols: m.cols,
-                data: gpu.upload(m.data).map_err(gpu_error)?,
-            })
-        };
+        let upload = |m: Matrix| GpuMatrix::upload(&gpu, m);
         let up = |v: Vec<f32>| gpu.upload_f32(&v).map_err(gpu_error);
         let conv_dim = 2 * c.k_heads * c.state + c.v_heads * c.state;
         let value_dim = c.v_heads * c.state;
@@ -173,6 +166,7 @@ impl<'a> Qwen35Cuda<'a> {
         };
         let output = upload(matrix(file, output_name, dim, c.vocab)?)?;
         Ok(Self {
+            precision: Precision::default(),
             output_norm: up(vector(file, "output_norm.weight", dim)?)?,
             config: c,
             embedding,
@@ -186,10 +180,33 @@ impl<'a> Qwen35Cuda<'a> {
         &self.gpu
     }
 
+    /// How the matrix products are done: 8-bit activations (the default) or exact f32.
+    /// Sessions take it when they're made.
+    pub fn set_precision(&mut self, precision: Precision) {
+        self.precision = precision;
+    }
+
+    pub fn precision(&self) -> Precision {
+        self.precision
+    }
+
     pub fn session(&self, capacity: usize) -> Result<Qwen35CudaSession> {
+        self.session_with_batch(capacity, DEFAULT_BATCH)
+    }
+
+    /// A new, empty conversation that reads up to `batch` tokens at once.
+    pub fn session_with_batch(&self, capacity: usize, batch: usize) -> Result<Qwen35CudaSession> {
         let c = &self.config;
         let g = &self.gpu;
+        let batch = batch.clamp(1, capacity.max(1));
         let f32s = |n: usize| g.alloc(n * 4).map_err(gpu_error);
+        // Keys and values: f16 in 8-bit mode (half the memory), f32 when exact.
+        let cache_bytes = if self.precision == Precision::Int8 {
+            2
+        } else {
+            4
+        };
+        let cache = |n: usize| g.alloc(n * cache_bytes).map_err(gpu_error);
         let zeros = |n: usize| -> Result<Buffer> {
             let b = f32s(n)?;
             g.zero(&b).map_err(gpu_error)?;
@@ -202,8 +219,8 @@ impl<'a> Qwen35Cuda<'a> {
         for l in 0..c.layers {
             memory.push(if c.is_full_attention(l) {
                 Memory::Attention {
-                    keys: f32s(capacity * kv_dim)?,
-                    values: f32s(capacity * kv_dim)?,
+                    keys: cache(capacity * kv_dim)?,
+                    values: cache(capacity * kv_dim)?,
                 }
             } else {
                 Memory::DeltaNet {
@@ -216,132 +233,125 @@ impl<'a> Qwen35Cuda<'a> {
             memory,
             len: 0,
             capacity,
-            embedding: vec![0.0; c.dim],
-            x: f32s(c.dim)?,
-            h: f32s(c.dim)?,
-            mixed: f32s(c.dim)?,
-            query_gate: f32s(2 * c.heads * c.head_dim)?,
-            q: f32s(c.heads * c.head_dim)?,
-            attention: f32s(c.heads * c.head_dim)?,
-            scores: f32s(c.heads * capacity)?,
-            qkv: f32s(conv_dim)?,
-            conv: f32s(conv_dim)?,
-            z: f32s(value_dim)?,
-            beta: f32s(c.v_heads)?,
-            alpha: f32s(c.v_heads)?,
-            heads_out: f32s(value_dim)?,
-            gate: f32s(c.ffn_dim)?,
-            up: f32s(c.ffn_dim)?,
-            logits_gpu: f32s(c.vocab)?,
+            batch,
+            embedding: vec![0.0; batch * c.dim],
+            pos: f32s(1)?,
+            x: f32s(batch * c.dim)?,
+            h: f32s(batch * c.dim)?,
+            mixed: f32s(batch * c.dim)?,
+            query_gate: f32s(batch * 2 * c.heads * c.head_dim)?,
+            q: f32s(batch * c.heads * c.head_dim)?,
+            k_new: f32s(batch * kv_dim)?,
+            v_new: f32s(batch * kv_dim)?,
+            attention: f32s(batch * c.heads * c.head_dim)?,
+            qkv: f32s(batch * conv_dim)?,
+            conv: f32s(batch * conv_dim)?,
+            z: f32s(batch * value_dim)?,
+            beta: f32s(batch * c.v_heads)?,
+            alpha: f32s(batch * c.v_heads)?,
+            heads_out: f32s(batch * value_dim)?,
+            gate: f32s(batch * c.ffn_dim)?,
+            up: f32s(batch * c.ffn_dim)?,
+            logits_gpu: LogitsBuffer::new(g, c.vocab)?,
             logits: vec![0.0; c.vocab],
+            q8: q8_room(
+                &self.gpu,
+                self.precision,
+                batch,
+                c.dim
+                    .max(c.heads * c.head_dim)
+                    .max(value_dim)
+                    .max(c.ffn_dim),
+            )?,
+            half_cache: self.precision == Precision::Int8,
+            graph: None,
         })
     }
 
-    pub fn forward<'s>(
-        &self,
-        s: &'s mut Qwen35CudaSession,
-        token: u32,
-        want_logits: bool,
-    ) -> Result<Option<&'s [f32]>> {
+    /// Queues every layer for the `t` tokens in `s.x` (at positions `*s.pos` on),
+    /// leaving the final norm of each in `s.h`.
+    fn queue_layers(&self, s: &Qwen35CudaSession, t: usize) -> Result<()> {
         let c = &self.config;
-        let pos = s.len;
-        assert!(
-            pos < s.capacity,
-            "the session is full ({} positions)",
-            s.capacity
-        );
-        assert!(
-            (token as usize) < c.vocab,
-            "token {token} is past the vocabulary"
-        );
         let g = &self.gpu;
         let e = gpu_error;
-        let mv = |m: &GpuMatrix, x: u64, y: u64| {
-            g.matvec(m.kind, m.data.ptr(), x, y, m.rows, m.cols)
-                .map_err(e)
-        };
         let (hd, n) = (c.head_dim, c.state);
         let kv_dim = c.kv_heads * hd;
         let key_dim = c.k_heads * n;
-
-        self.embedding.decode_row(token as usize, &mut s.embedding);
-        s.x.write_f32(&s.embedding).map_err(e)?;
+        let channels = 2 * key_dim + c.v_heads * n;
+        g.residual_norm(
+            s.x.ptr(),
+            None,
+            None,
+            1.0,
+            Some(&self.layers[0].attn_norm),
+            s.h.ptr(),
+            t,
+            c.dim,
+            c.norm_eps,
+        )
+        .map_err(e)?;
         for (l, layer) in self.layers.iter().enumerate() {
-            g.rms_norm(
-                s.x.ptr(),
-                layer.attn_norm.ptr(),
-                s.h.ptr(),
-                c.dim,
-                c.norm_eps,
-            )
-            .map_err(e)?;
             match (&layer.mixer, &s.memory[l]) {
                 (Mixer::Attention(a), Memory::Attention { keys, values }) => {
-                    let (k_slot, v_slot) = (keys.f32_at(pos * kv_dim), values.f32_at(pos * kv_dim));
-                    mv(&a.q, s.h.ptr(), s.query_gate.ptr())?;
-                    mv(&a.k, s.h.ptr(), k_slot)?;
-                    mv(&a.v, s.h.ptr(), v_slot)?;
-                    g.split_query(s.query_gate.ptr(), s.q.ptr(), c.heads, hd)
-                        .map_err(e)?;
-                    g.rms_norm_rows(
-                        s.q.ptr(),
-                        a.q_norm.ptr(),
-                        s.q.ptr(),
-                        c.heads,
-                        hd,
-                        c.norm_eps,
-                    )
-                    .map_err(e)?;
-                    g.rms_norm_rows(k_slot, a.k_norm.ptr(), k_slot, c.kv_heads, hd, c.norm_eps)
-                        .map_err(e)?;
-                    g.rope(
-                        s.q.ptr(),
-                        c.heads,
-                        hd,
-                        c.rope_dims,
-                        pos,
-                        c.rope_base,
-                        0,
-                        true,
-                    )
-                    .map_err(e)?;
-                    g.rope(
-                        k_slot,
-                        c.kv_heads,
-                        hd,
-                        c.rope_dims,
-                        pos,
-                        c.rope_base,
-                        0,
-                        true,
+                    let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
+                    a.q.mul(&h, s.query_gate.ptr())?;
+                    a.k.mul(&h, s.k_new.ptr())?;
+                    a.v.mul(&h, s.v_new.ptr())?;
+                    g.qkv_prep(
+                        &QkvPrep {
+                            q: s.query_gate.ptr(),
+                            q_stride: 2 * c.heads * hd,
+                            q_head_stride: 2 * hd,
+                            q_norm: Some(a.q_norm.ptr()),
+                            q_out: s.q.ptr(),
+                            k: s.k_new.ptr(),
+                            k_norm: Some(a.k_norm.ptr()),
+                            v: s.v_new.ptr(),
+                            v_norm: false,
+                            cache: Some((keys.ptr(), values.ptr())),
+                            heads: c.heads,
+                            kv_heads: c.kv_heads,
+                            head_dim: hd,
+                            rope_dims: c.rope_dims,
+                            rope_base: c.rope_base,
+                            rope_factors: None,
+                            neox: true,
+                            pos: s.pos.ptr(),
+                            eps: c.norm_eps,
+                            half_cache: s.half_cache,
+                        },
+                        t,
                     )
                     .map_err(e)?;
                     g.attention(
+                        s.half_cache,
                         s.q.ptr(),
                         keys.ptr(),
                         values.ptr(),
                         s.attention.ptr(),
-                        s.scores.ptr(),
-                        c.heads,
+                        s.pos.ptr(),
                         0,
-                        pos + 1,
+                        c.heads,
+                        t,
                         hd,
                         kv_dim,
                         c.heads / c.kv_heads,
-                        s.capacity,
                         1.0 / (hd as f32).sqrt(),
                     )
                     .map_err(e)?;
-                    g.apply_gate(s.attention.ptr(), s.query_gate.ptr(), c.heads, hd)
+                    g.apply_gate(s.attention.ptr(), s.query_gate.ptr(), t * c.heads, hd)
                         .map_err(e)?;
-                    mv(&a.o, s.attention.ptr(), s.mixed.ptr())?;
+                    a.o.mul(
+                        &Input::new(g, s.attention.ptr(), t, s.q8.as_ref()),
+                        s.mixed.ptr(),
+                    )?;
                 }
                 (Mixer::DeltaNet(d), Memory::DeltaNet { history, state }) => {
-                    let channels = 2 * key_dim + c.v_heads * n;
-                    mv(&d.qkv, s.h.ptr(), s.qkv.ptr())?;
-                    mv(&d.gate, s.h.ptr(), s.z.ptr())?;
-                    mv(&d.beta, s.h.ptr(), s.beta.ptr())?;
-                    mv(&d.alpha, s.h.ptr(), s.alpha.ptr())?;
+                    let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
+                    d.qkv.mul(&h, s.qkv.ptr())?;
+                    d.gate.mul(&h, s.z.ptr())?;
+                    d.beta.mul(&h, s.beta.ptr())?;
+                    d.alpha.mul(&h, s.alpha.ptr())?;
                     g.conv_silu(
                         s.qkv.ptr(),
                         history.ptr(),
@@ -349,64 +359,183 @@ impl<'a> Qwen35Cuda<'a> {
                         s.conv.ptr(),
                         channels,
                         c.conv_kernel,
+                        t,
                     )
                     .map_err(e)?;
-                    // q and k sit next to each other: 2 × k_heads rows of n to normalize.
-                    g.l2_norm_rows(s.conv.ptr(), 2 * c.k_heads, n, c.norm_eps)
-                        .map_err(e)?;
                     g.delta_net(
-                        s.conv.ptr(),
-                        s.conv.f32_at(key_dim),
-                        s.conv.f32_at(2 * key_dim),
-                        s.beta.ptr(),
-                        s.alpha.ptr(),
-                        d.dt_bias.ptr(),
-                        d.a.ptr(),
-                        state.ptr(),
-                        s.z.ptr(),
-                        d.norm.ptr(),
-                        s.heads_out.ptr(),
-                        c.v_heads,
-                        n,
-                        c.k_heads,
-                        c.norm_eps,
+                        &cuda::DeltaNet {
+                            conv: s.conv.ptr(),
+                            channels,
+                            key_dim,
+                            beta_raw: s.beta.ptr(),
+                            alpha_raw: s.alpha.ptr(),
+                            dt_bias: d.dt_bias.ptr(),
+                            a: d.a.ptr(),
+                            state: state.ptr(),
+                            z: s.z.ptr(),
+                            norm: d.norm.ptr(),
+                            out: s.heads_out.ptr(),
+                            v_heads: c.v_heads,
+                            n,
+                            k_heads: c.k_heads,
+                            eps: c.norm_eps,
+                        },
+                        t,
                     )
                     .map_err(e)?;
-                    mv(&d.out, s.heads_out.ptr(), s.mixed.ptr())?;
+                    d.out.mul(
+                        &Input::new(g, s.heads_out.ptr(), t, s.q8.as_ref()),
+                        s.mixed.ptr(),
+                    )?;
                 }
                 _ => unreachable!("each layer's memory matches its kind"),
             }
-            g.add(s.x.ptr(), s.mixed.ptr(), c.dim).map_err(e)?;
-
-            g.rms_norm(
+            g.residual_norm(
                 s.x.ptr(),
-                layer.ffn_norm.ptr(),
+                Some(s.mixed.ptr()),
+                None,
+                1.0,
+                Some(&layer.ffn_norm),
                 s.h.ptr(),
+                t,
                 c.dim,
                 c.norm_eps,
             )
             .map_err(e)?;
-            mv(&layer.gate, s.h.ptr(), s.gate.ptr())?;
-            mv(&layer.up, s.h.ptr(), s.up.ptr())?;
-            g.swiglu(s.gate.ptr(), s.up.ptr(), c.ffn_dim).map_err(e)?;
-            mv(&layer.down, s.gate.ptr(), s.mixed.ptr())?;
-            g.add(s.x.ptr(), s.mixed.ptr(), c.dim).map_err(e)?;
-        }
-        s.len += 1;
 
+            let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
+            layer.gate.mul(&h, s.gate.ptr())?;
+            layer.up.mul(&h, s.up.ptr())?;
+            g.swiglu(s.gate.ptr(), s.up.ptr(), c.ffn_dim, c.ffn_dim, t)
+                .map_err(e)?;
+            layer.down.mul(
+                &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
+                s.mixed.ptr(),
+            )?;
+            let next = match self.layers.get(l + 1) {
+                Some(next) => &next.attn_norm,
+                None => &self.output_norm,
+            };
+            g.residual_norm(
+                s.x.ptr(),
+                Some(s.mixed.ptr()),
+                None,
+                1.0,
+                Some(next),
+                s.h.ptr(),
+                t,
+                c.dim,
+                c.norm_eps,
+            )
+            .map_err(e)?;
+        }
+        Ok(())
+    }
+
+    /// Runs `token` at the session's next position, replaying the recorded layers.
+    pub fn forward<'s>(
+        &self,
+        s: &'s mut Qwen35CudaSession,
+        token: u32,
+        want_logits: bool,
+    ) -> Result<Option<&'s [f32]>> {
+        let c = &self.config;
+        assert!(
+            s.len < s.capacity,
+            "the session is full ({} positions)",
+            s.capacity
+        );
+        assert!(
+            (token as usize) < c.vocab,
+            "token {token} is past the vocabulary"
+        );
+        let e = gpu_error;
+        self.embedding
+            .decode_row(token as usize, &mut s.embedding[..c.dim]);
+        s.x.write_f32(&s.embedding[..c.dim]).map_err(e)?;
+        s.pos.write_i32(&[s.len as i32]).map_err(e)?;
+        if s.graph.is_none() {
+            let graph = record(&self.gpu, || self.queue_layers(s, 1))?;
+            s.graph = Some(graph);
+        }
+        s.graph.as_ref().unwrap().launch().map_err(e)?;
+        s.len += 1;
         if !want_logits {
             return Ok(None);
         }
-        g.rms_norm(
-            s.x.ptr(),
-            self.output_norm.ptr(),
-            s.h.ptr(),
-            c.dim,
-            c.norm_eps,
-        )
-        .map_err(e)?;
-        mv(&self.output, s.h.ptr(), s.logits_gpu.ptr())?;
-        s.logits_gpu.read_f32(&mut s.logits).map_err(e)?;
+        let logits = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;
+        self.output.mul(
+            &Input::new(&self.gpu, s.h.ptr(), 1, s.q8.as_ref()),
+            logits.ptr(),
+        )?;
+        s.logits.resize(c.vocab, 0.0);
+        logits.read_f32(&mut s.logits).map_err(e)?;
         Ok(Some(&s.logits))
+    }
+
+    /// Runs `tokens` at the session's next positions, a batch at a time, and hands back
+    /// the logits asked for: the last token's, or a row for every token.
+    pub fn forward_batch<'s>(
+        &self,
+        s: &'s mut Qwen35CudaSession,
+        tokens: &[u32],
+        logits: Logits,
+    ) -> Result<Option<&'s [f32]>> {
+        let c = &self.config;
+        assert!(
+            s.len + tokens.len() <= s.capacity,
+            "{} more tokens don't fit in the session ({} of {} positions used)",
+            tokens.len(),
+            s.len,
+            s.capacity
+        );
+        let e = gpu_error;
+        if logits == Logits::All {
+            s.logits.resize(tokens.len() * c.vocab, 0.0);
+        }
+        let batch = s.batch;
+        for (b, chunk) in tokens.chunks(batch).enumerate() {
+            let t = chunk.len();
+            for (i, &token) in chunk.iter().enumerate() {
+                assert!(
+                    (token as usize) < c.vocab,
+                    "token {token} is past the vocabulary"
+                );
+                self.embedding
+                    .decode_row(token as usize, &mut s.embedding[i * c.dim..(i + 1) * c.dim]);
+            }
+            s.x.write_f32(&s.embedding[..t * c.dim]).map_err(e)?;
+            s.pos.write_i32(&[s.len as i32]).map_err(e)?;
+            self.queue_layers(s, t)?;
+            s.len += t;
+            match logits {
+                Logits::All => {
+                    let out = s
+                        .logits_gpu
+                        .rows(&self.gpu, batch.min(tokens.len()), c.vocab)?;
+                    self.output.mul(
+                        &Input::new(&self.gpu, s.h.ptr(), t, s.q8.as_ref()),
+                        out.ptr(),
+                    )?;
+                    let start = b * batch * c.vocab;
+                    out.read_f32(&mut s.logits[start..start + t * c.vocab])
+                        .map_err(e)?;
+                }
+                Logits::Last if b * batch + t == tokens.len() => {
+                    let out = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;
+                    self.output.mul(
+                        &Input::new(&self.gpu, row(&s.h, t - 1, c.dim), 1, s.q8.as_ref()),
+                        out.ptr(),
+                    )?;
+                    s.logits.resize(c.vocab, 0.0);
+                    out.read_f32(&mut s.logits).map_err(e)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(match logits {
+            Logits::None => None,
+            _ => Some(&s.logits),
+        })
     }
 }
