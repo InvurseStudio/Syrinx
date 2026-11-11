@@ -1,8 +1,9 @@
 //! Turns text into token ids and back, using the vocabulary inside a GGUF file.
 //!
 //! Supported so far: byte-level BPE (`tokenizer.ggml.model` = "gpt2"), which Llama 3 and
-//! Qwen 2/3 use, with their pre-tokenizers. SentencePiece ("llama", used by Gemma) comes
-//! with the first Gemma model.
+//! Qwen 2/3/3.5 use, with their pre-tokenizers; and Gemma 4's BPE ("gemma4"), which
+//! works on the text's own UTF-8 characters with spaces written as "▁", splits only at
+//! newlines, and falls back to `<0xXX>` byte tokens for characters not in the vocabulary.
 //!
 //! Encoding, as llama.cpp does it:
 //! 1. With `parse_special`, special tokens written in the text (such as
@@ -82,7 +83,9 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Text of control tokens that end a model's turn, across the model families Vireo runs.
+/// Text of tokens that end a model's turn, across the model families Vireo runs. As in
+/// llama.cpp, a token found by its text here becomes a control token if the file didn't
+/// already mark it so: it's then read from text only with `parse_special`.
 const END_OF_GENERATION_TEXTS: &[&str] = &[
     "<|eot_id|>",
     "<|eom_id|>",
@@ -91,6 +94,9 @@ const END_OF_GENERATION_TEXTS: &[&str] = &[
     "<|endoftext|>",
     "<end_of_turn>",
     "<|end|>",
+    "<eos>",            // Gemma 4
+    "<turn|>",          // Gemma 4
+    "<|tool_response>", // Gemma 4
 ];
 
 pub struct Tokenizer {
@@ -104,6 +110,10 @@ pub struct Tokenizer {
     pre: PreTokenizer,
     /// Use a word's own token when it has one, before merging (Llama 3).
     ignore_merges: bool,
+    /// Gemma 4's style: UTF-8 characters, spaces as "▁", `<0xXX>` byte fallback.
+    metaspace: bool,
+    /// The `<0xXX>` token for each byte, in `metaspace` vocabularies.
+    byte_fallback: [Option<u32>; 256],
     /// Special and user-defined tokens, longest first.
     specials: Vec<u32>,
     bos: Option<u32>,
@@ -119,12 +129,18 @@ impl Tokenizer {
         let model = gguf
             .get_str("tokenizer.ggml.model")
             .ok_or(Error::Missing("tokenizer (tokenizer.ggml.model)"))?;
-        if model != "gpt2" {
-            return Err(Error::Unsupported(format!("The \"{model}\" tokenizer")));
-        }
-        let pre_name = gguf.get_str("tokenizer.ggml.pre").unwrap_or("default");
-        let pre = PreTokenizer::from_gguf_name(pre_name)
-            .ok_or_else(|| Error::Unsupported(format!("The \"{pre_name}\" pre-tokenizer")))?;
+        let metaspace = match model {
+            "gpt2" => false,
+            "gemma4" => true,
+            other => return Err(Error::Unsupported(format!("The \"{other}\" tokenizer"))),
+        };
+        let pre = if metaspace {
+            PreTokenizer::Gemma4
+        } else {
+            let pre_name = gguf.get_str("tokenizer.ggml.pre").unwrap_or("default");
+            PreTokenizer::from_gguf_name(pre_name)
+                .ok_or_else(|| Error::Unsupported(format!("The \"{pre_name}\" pre-tokenizer")))?
+        };
 
         let tokens: Vec<String> = string_array(gguf, "tokenizer.ggml.tokens")?
             .ok_or(Error::Missing("vocabulary (tokenizer.ggml.tokens)"))?;
@@ -171,7 +187,8 @@ impl Tokenizer {
         // llama.cpp's defaults for each pre-tokenizer, then the file's own settings.
         let (default_add_bos, ignore_merges) = match pre {
             PreTokenizer::Llama3 => (true, true),
-            PreTokenizer::Qwen2 => (false, false),
+            PreTokenizer::Qwen2 | PreTokenizer::Qwen35 => (false, false),
+            PreTokenizer::Gemma4 => (true, false),
         };
         let flag =
             |key: &str, default: bool| gguf.get(key).and_then(Value::as_bool).unwrap_or(default);
@@ -179,14 +196,29 @@ impl Tokenizer {
         let add_eos = flag("tokenizer.ggml.add_eos_token", false);
 
         let mut tokenizer = Self::bpe(tokens, types, &merges, pre, ignore_merges)?;
-        for text in END_OF_GENERATION_TEXTS {
-            if let Some(&id) = tokenizer.ids.get(*text)
-                && tokenizer.types[id as usize] == TokenType::Control
-                && !end_of_generation.contains(&id)
-            {
-                end_of_generation.push(id);
+        if metaspace {
+            tokenizer.metaspace = true;
+            for (b, slot) in tokenizer.byte_fallback.iter_mut().enumerate() {
+                *slot = tokenizer.ids.get(&format!("<0x{b:02X}>")).copied();
             }
         }
+        for text in END_OF_GENERATION_TEXTS {
+            if let Some(&id) = tokenizer.ids.get(*text) {
+                tokenizer.types[id as usize] = TokenType::Control;
+                if !end_of_generation.contains(&id) {
+                    end_of_generation.push(id);
+                }
+            }
+        }
+        // Gemma 4 (llama.cpp does the same): with a tool-response token, "</s>" is
+        // ordinary text and doesn't end a turn.
+        if tokenizer.ids.contains_key("<|tool_response>")
+            && let Some(&id) = tokenizer.ids.get("</s>")
+        {
+            tokenizer.types[id as usize] = TokenType::Normal;
+            end_of_generation.retain(|&e| e != id);
+        }
+        tokenizer.refresh_specials();
         tokenizer.bos = bos;
         tokenizer.eos = eos;
         tokenizer.add_bos = add_bos && bos.is_some();
@@ -243,12 +275,7 @@ impl Tokenizer {
                 .copied();
         }
 
-        let mut specials: Vec<u32> = (0..tokens.len() as u32)
-            .filter(|&i| types[i as usize].is_special() && !tokens[i as usize].is_empty())
-            .collect();
-        specials.sort_by_key(|&i| (std::cmp::Reverse(tokens[i as usize].len()), i));
-
-        Ok(Self {
+        let mut tokenizer = Self {
             tokens,
             types,
             ids,
@@ -257,13 +284,27 @@ impl Tokenizer {
             byte_tokens,
             pre,
             ignore_merges,
-            specials,
+            metaspace: false,
+            byte_fallback: [None; 256],
+            specials: Vec::new(),
             bos: None,
             eos: None,
             add_bos: false,
             add_eos: false,
             end_of_generation: Vec::new(),
-        })
+        };
+        tokenizer.refresh_specials();
+        Ok(tokenizer)
+    }
+
+    /// The special and user-defined tokens to look for in text, longest first.
+    fn refresh_specials(&mut self) {
+        let (tokens, types) = (&self.tokens, &self.types);
+        let mut specials: Vec<u32> = (0..tokens.len() as u32)
+            .filter(|&i| types[i as usize].is_special() && !tokens[i as usize].is_empty())
+            .collect();
+        specials.sort_by_key(|&i| (std::cmp::Reverse(tokens[i as usize].len()), i));
+        self.specials = specials;
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -361,6 +402,9 @@ impl Tokenizer {
     }
 
     fn encode_text(&self, text: &str, out: &mut Vec<u32>) {
+        if self.metaspace {
+            return self.encode_metaspace(text, out);
+        }
         let mut words = Vec::new();
         self.pre.split(text, &mut words);
         let mut symbols = Vec::new();
@@ -380,6 +424,46 @@ impl Tokenizer {
         }
     }
 
+    /// Gemma 4: spaces become "▁"; a run of newlines that is a token is that token; the
+    /// rest is merged from one symbol per character. A character with no token of its own
+    /// (it can't be part of any merge) becomes its UTF-8 bytes' `<0xXX>` tokens.
+    fn encode_metaspace(&self, text: &str, out: &mut Vec<u32>) {
+        let escaped = text.replace(' ', "\u{2581}");
+        let mut words = Vec::new();
+        self.pre.split(&escaped, &mut words);
+        let vocab = self.tokens.len() as u32;
+        let mut symbols = Vec::new();
+        for word in words {
+            if word.bytes().all(|b| b == b'\n')
+                && let Some(&id) = self.ids.get(word)
+            {
+                out.push(id);
+                continue;
+            }
+            symbols.clear();
+            let mut buf = [0u8; 4];
+            // A character outside the vocabulary gets an id past its end, which no merge
+            // can match: vocab + its code point.
+            symbols.extend(word.chars().map(|c| {
+                self.ids
+                    .get(&*c.encode_utf8(&mut buf))
+                    .copied()
+                    .unwrap_or(vocab + c as u32)
+            }));
+            bpe::merge(&mut symbols, &self.merges);
+            for &id in &symbols {
+                if id < vocab {
+                    out.push(id);
+                } else {
+                    let c = char::from_u32(id - vocab).expect("made from a char");
+                    for &b in c.encode_utf8(&mut buf).as_bytes() {
+                        out.extend(self.byte_fallback[b as usize]);
+                    }
+                }
+            }
+        }
+    }
+
     /// Appends the bytes a token stands for. A token can be part of a character, so
     /// stream generated text through bytes and turn them into text when they're whole.
     /// Control tokens are left out unless `include_special`.
@@ -395,6 +479,18 @@ impl Tokenizer {
             }
             TokenType::UserDefined => out.extend_from_slice(text.as_bytes()),
             TokenType::Unused => {}
+            TokenType::Normal | TokenType::Byte if self.metaspace => {
+                // "<0xXX>" is one raw byte; anything else is text with "▁" for spaces.
+                let hex = text
+                    .strip_prefix("<0x")
+                    .and_then(|t| t.strip_suffix('>'))
+                    .filter(|h| h.len() == 2)
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match hex {
+                    Some(b) => out.push(b),
+                    None => out.extend_from_slice(text.replace('\u{2581}', " ").as_bytes()),
+                }
+            }
             TokenType::Normal | TokenType::Byte => {
                 for c in text.chars() {
                     match self.bytes.byte_of(c) {

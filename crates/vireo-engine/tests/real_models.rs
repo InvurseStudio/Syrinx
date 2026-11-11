@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use vireo_engine::cpu::{self, Pool};
+use vireo_engine::models::gemma4::Gemma4;
 use vireo_engine::models::llama::Llama;
+use vireo_engine::models::qwen35::Qwen35;
 use vireo_engine::{GgufFile, TensorType, Tokenizer};
 
 /// Text that exercises the tokenizer: code, numbers, contractions, other scripts,
@@ -233,6 +235,120 @@ fn llama_3_2_1b_instruct_forward_pass_matches_llama_cpp() {
 
     // Greedy generation finishes the answer and stops at <|eot_id|>.
     let mut next = 791u32;
+    let mut answer = vec![next];
+    while !tokenizer.is_end_of_generation(next) && answer.len() < 20 {
+        let logits = model.forward(&mut session, next, true).unwrap();
+        next = (0..logits.len())
+            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+            .unwrap() as u32;
+        answer.push(next);
+    }
+    assert_eq!(
+        tokenizer.decode(&answer, false),
+        "The capital of France is Paris."
+    );
+}
+
+/// Qwen 3.5 0.8B (the `qwen35` architecture Qwen 3.6–3.8 use too) against llama.cpp
+/// b12262: llama-server on the CPU, f32 cache, on an F32 copy of the Q4_K_M file.
+/// llama.cpp runs a prompt's DeltaNet layers in chunks, a different order of the same
+/// arithmetic, so the two agree to about 0.0005 points rather than every digit.
+/// (Perplexity on the same 4 chunks of text: 25.1818 here, 25.1817 for llama.cpp.)
+#[test]
+fn qwen35_0_8b_forward_pass_matches_llama_cpp() {
+    let Some(path) = model("Qwen3.5-0.8B-Q4_K_M.gguf") else {
+        return;
+    };
+    let file = GgufFile::open(&path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+    let model = Qwen35::load(&file, Pool::with_all_cores()).unwrap();
+    let prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sentence.<|im_end|>\n\
+                  <|im_start|>assistant\n<think>\n\n</think>\n\n";
+    let ids = tokenizer.encode(prompt, true, true);
+    assert_eq!(ids.len(), 24, "Qwen adds no BOS token");
+
+    let mut session = model.session(64);
+    let mut logits = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        if let Some(l) = model.forward(&mut session, id, i + 1 == ids.len()) {
+            logits = l.to_vec();
+        }
+    }
+    let mut probs = logits;
+    cpu::softmax(&mut probs);
+    // llama.cpp: "The" 56.6133%, "Paris" 35.0073%, "France" 0.8957%, "London" 0.6041%.
+    for (id, percent) in [
+        (760, 56.6133),
+        (57590, 35.0073),
+        (47358, 0.8957),
+        (38261, 0.6041),
+    ] {
+        let ours = probs[id] as f64 * 100.0;
+        assert!(
+            (ours - percent).abs() < 0.002,
+            "token {id}: {ours:.4}% vs llama.cpp's {percent}%"
+        );
+    }
+
+    let mut next = 760u32;
+    let mut answer = vec![next];
+    while !tokenizer.is_end_of_generation(next) && answer.len() < 20 {
+        let logits = model.forward(&mut session, next, true).unwrap();
+        next = (0..logits.len())
+            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+            .unwrap() as u32;
+        answer.push(next);
+    }
+    assert_eq!(
+        tokenizer.decode(&answer, false),
+        "The capital of France is Paris."
+    );
+}
+
+/// Gemma 4 E2B against llama.cpp b12262: llama-server on the CPU, f32 cache, on an F32
+/// copy of Google's QAT Q4_0 file. The two agree to within 0.0002 points here, and on
+/// perplexity to 0.005% (30.8273 against 30.8287 over two chunks): a small remaining
+/// difference in some operation, noted in PLAN.md.
+#[test]
+fn gemma4_e2b_forward_pass_matches_llama_cpp() {
+    let Some(path) = model("gemma-4-E2B_q4_0-it.gguf") else {
+        return;
+    };
+    let file = GgufFile::open(&path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+    let model = Gemma4::load(&file, Pool::with_all_cores()).unwrap();
+    let prompt = "<|turn>user
+What is the capital of France? Answer in one sentence.<turn|>
+<|turn>model
+";
+    let ids = tokenizer.encode(prompt, true, true);
+    assert_eq!(ids.len(), 21);
+    assert_eq!(ids[0], tokenizer.bos().unwrap());
+
+    let mut session = model.session(64);
+    let mut logits = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        if let Some(l) = model.forward(&mut session, id, i + 1 == ids.len()) {
+            logits = l.to_vec();
+        }
+    }
+    let mut probs = logits;
+    cpu::softmax(&mut probs);
+    // llama.cpp: "The" 99.7068%, "Paris" 0.2201%, "**" 0.0387%, "France" 0.0049%.
+    for (id, percent) in [
+        (818, 99.7068),
+        (50429, 0.2201),
+        (1018, 0.0387),
+        (31756, 0.0049),
+    ] {
+        let ours = probs[id] as f64 * 100.0;
+        assert!(
+            (ours - percent).abs() < 0.001,
+            "token {id}: {ours:.4}% vs llama.cpp's {percent}%"
+        );
+    }
+
+    let mut next = 818u32;
     let mut answer = vec![next];
     while !tokenizer.is_end_of_generation(next) && answer.len() < 20 {
         let logits = model.forward(&mut session, next, true).unwrap();

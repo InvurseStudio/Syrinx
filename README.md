@@ -13,7 +13,7 @@ Nothing here is used by the shipping apps.
 
 | Folder | What it is |
 |---|---|
-| `crates/vireo-engine/` | The inference engine (a library). So far: the GGUF reader, the tokenizer (byte-level BPE for Llama 3 and Qwen), and the CPU reference backend with the Llama forward pass. |
+| `crates/vireo-engine/` | The inference engine (a library). So far: the GGUF reader, the tokenizers (Llama 3, Qwen 3.5, Gemma 4), and Llama, Qwen 3.5 and Gemma 4 on the CPU and on NVIDIA GPUs (`--gpu`). |
 | `tools/` | Scripts that generate engine source, such as the Unicode tables |
 | `models/` | Test models (not in git; see `crates/vireo-engine/tests/real_models.rs` for which) |
 | `crates/vireo-cli/` | Runs the engine from the command line, for testing and benchmarks |

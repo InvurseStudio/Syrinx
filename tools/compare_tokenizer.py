@@ -60,6 +60,7 @@ POOL = [
     " ", "  ", "   ", "\t", "\n", "\n\n", "\r\n", "\r", " \n", " ", "　", " ", "​",
     "́", "ा", "\u0000", "\u001f", "\u007f", "﻿", "<|eot_id|>", "<|start_header_id|>",
     "<|end_header_id|>", "<|begin_of_text|>", "<|im_start|>", "<|im_end|>", "<|eot_id", "|>",
+    "<|turn>", "<turn|>", "<bos>", "<eos>", "<|channel>", "<channel|>", "▁", "▁▁", "</s>",
 ]
 
 

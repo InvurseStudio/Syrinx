@@ -18,8 +18,10 @@ pub fn supports(kind: TensorType) -> bool {
         TensorType::F32
             | TensorType::F16
             | TensorType::BF16
+            | TensorType::Q4_0
             | TensorType::Q8_0
             | TensorType::Q4_K
+            | TensorType::Q5_K
             | TensorType::Q6_K
     )
 }
@@ -34,8 +36,10 @@ pub fn dequantize_block(kind: TensorType, src: &[u8], dst: &mut [f32]) {
         TensorType::F32 => dst[0] = f32::from_le_bytes(src[..4].try_into().unwrap()),
         TensorType::F16 => dst[0] = read_f16(src),
         TensorType::BF16 => dst[0] = bf16_to_f32(u16::from_le_bytes([src[0], src[1]])),
+        TensorType::Q4_0 => q4_0(src, dst),
         TensorType::Q8_0 => q8_0(src, dst),
         TensorType::Q4_K => q4_k(src, dst),
+        TensorType::Q5_K => q5_k(src, dst),
         TensorType::Q6_K => q6_k(src, dst),
         other => panic!("the CPU reference can't read {other} yet"),
     }
@@ -109,6 +113,16 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+/// Q4_0, 32 numbers in 18 bytes: an f16 scale `d`, then 16 bytes of 4-bit numbers.
+/// x = d × (q − 8). Byte i holds number i (low nibble) and number i + 16 (high).
+fn q4_0(src: &[u8], dst: &mut [f32]) {
+    let d = read_f16(src);
+    for (i, &q) in src[2..18].iter().enumerate() {
+        dst[i] = d * ((q & 0xF) as i32 - 8) as f32;
+        dst[i + 16] = d * ((q >> 4) as i32 - 8) as f32;
+    }
+}
+
 /// Q8_0, 32 numbers in 34 bytes: an f16 scale `d`, then 32 int8s. x = d × q.
 fn q8_0(src: &[u8], dst: &mut [f32]) {
     let d = read_f16(src);
@@ -152,6 +166,32 @@ fn q4_k(src: &[u8], dst: &mut [f32]) {
         for l in 0..32 {
             y[l] = d1 * f32::from(q[l] & 0xF) - min1;
             y[l + 32] = d2 * f32::from(q[l] >> 4) - min2;
+        }
+    }
+}
+
+/// Q5_K, 256 numbers in 176 bytes: Q4_K's layout (f16 `d` and `dmin`, 12 bytes of
+/// scales and minimums) plus 32 bytes of fifth bits (`qh`) before the 128 bytes of low
+/// 4 bits. Number l of sub-block j takes its fifth bit from bit j of `qh[l]`.
+fn q5_k(src: &[u8], dst: &mut [f32]) {
+    let d = read_f16(&src[0..2]);
+    let dmin = read_f16(&src[2..4]);
+    let scales = &src[4..16];
+    let qh = &src[16..48];
+    let qs = &src[48..176];
+    for pair in 0..4 {
+        let (sc1, m1) = q4_k_scale_min(2 * pair, scales);
+        let (sc2, m2) = q4_k_scale_min(2 * pair + 1, scales);
+        let (d1, min1) = (d * f32::from(sc1), dmin * f32::from(m1));
+        let (d2, min2) = (d * f32::from(sc2), dmin * f32::from(m2));
+        let (bit1, bit2) = (1u8 << (2 * pair), 1u8 << (2 * pair + 1));
+        let q = &qs[pair * 32..pair * 32 + 32];
+        let y = &mut dst[pair * 64..pair * 64 + 64];
+        for l in 0..32 {
+            let high1 = if qh[l] & bit1 != 0 { 16.0 } else { 0.0 };
+            let high2 = if qh[l] & bit2 != 0 { 16.0 } else { 0.0 };
+            y[l] = d1 * (f32::from(q[l] & 0xF) + high1) - min1;
+            y[l + 32] = d2 * (f32::from(q[l] >> 4) + high2) - min2;
         }
     }
 }
@@ -252,6 +292,40 @@ mod tests {
             let expected = (j as f32 + 1.0) * q - 0.5 * (2 * j) as f32;
             for i in 0..32 {
                 assert_eq!(y[j * 32 + i], expected, "sub-block {j}, number {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn q4_0_block() {
+        let mut b = HALF.to_vec();
+        b.extend((0..16u8).map(|i| i | ((15 - i) << 4)));
+        let y = decode(TensorType::Q4_0, &b);
+        for i in 0..16 {
+            assert_eq!(y[i], 0.5 * (i as f32 - 8.0), "number {i}");
+            assert_eq!(y[i + 16], 0.5 * (7.0 - i as f32), "number {}", i + 16);
+        }
+    }
+
+    #[test]
+    fn q5_k_block() {
+        // d = 1, dmin = 0.5; sub-block j: scale j + 1, minimum 2j (as in q4_k_block).
+        let pairs: [(u8, u8); 8] = std::array::from_fn(|j| (j as u8 + 1, 2 * j as u8));
+        let mut b = ONE.to_vec();
+        b.extend(HALF);
+        b.extend(pack_q4_k_scales(pairs));
+        // Fifth bits: set for even l in sub-blocks 0, 2, 4, 6 (bits 0, 2, 4, 6).
+        b.extend((0..32).map(|l| if l % 2 == 0 { 0b0101_0101u8 } else { 0 }));
+        b.extend([0xA3u8; 128]); // low nibble 3, high nibble 10
+        let y = decode(TensorType::Q5_K, &b);
+        for j in 0..8 {
+            for l in 0..32 {
+                let mut q = if j % 2 == 0 { 3.0 } else { 10.0 };
+                if j % 2 == 0 && l % 2 == 0 {
+                    q += 16.0;
+                }
+                let expected = (j as f32 + 1.0) * q - 0.5 * (2 * j) as f32;
+                assert_eq!(y[j * 32 + l], expected, "sub-block {j}, number {l}");
             }
         }
     }

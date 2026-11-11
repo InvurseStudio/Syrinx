@@ -13,13 +13,20 @@
 //! |\s+                           any other whitespace
 //! ```
 //!
-//! Qwen 2 and 3 use the same expression with numbers one digit at a time.
+//! Qwen 2 and 3 use the same expression with numbers one digit at a time. Qwen 3.5
+//! ("qwen35") also counts combining marks (\p{M}) as part of words:
+//!
+//! ```text
+//! (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+//! |[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+//! |\s*[\r\n]+|\s+(?!\S)|\s+
+//! ```
 //!
 //! This isn't a regular expression engine: it's a direct port of llama.cpp's hand-written
 //! matcher for this expression (`unicode_regex_split_custom_llama3`), step for step, so
 //! the words are exactly llama.cpp's.
 
-use super::unicode::{is_letter, is_number, is_whitespace};
+use super::unicode::{is_letter, is_mark, is_number, is_whitespace};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreTokenizer {
@@ -27,6 +34,11 @@ pub enum PreTokenizer {
     Llama3,
     /// Qwen 2 and 3 ("qwen2").
     Qwen2,
+    /// Qwen 3.5 to 3.8 ("qwen35"): Qwen 2's split, with combining marks part of words.
+    Qwen35,
+    /// Gemma 4: only newlines split the text (`[^\n]+|[\n]+`); BPE merges run over
+    /// everything between them.
+    Gemma4,
 }
 
 impl PreTokenizer {
@@ -35,6 +47,7 @@ impl PreTokenizer {
         match name {
             "llama3" | "llama-v3" | "llama-bpe" => Some(Self::Llama3),
             "qwen2" | "deepseek-r1-qwen" => Some(Self::Qwen2),
+            "qwen35" => Some(Self::Qwen35),
             _ => None,
         }
     }
@@ -42,12 +55,30 @@ impl PreTokenizer {
     fn max_digits(self) -> usize {
         match self {
             Self::Llama3 => 3,
-            Self::Qwen2 => 1,
+            Self::Qwen2 | Self::Qwen35 | Self::Gemma4 => 1,
         }
+    }
+
+    /// Whether combining marks count as part of words.
+    fn marks_in_words(self) -> bool {
+        self == Self::Qwen35
     }
 
     /// Appends `text`'s words to `out`, in order. Together they are exactly `text`.
     pub fn split<'a>(self, text: &'a str, out: &mut Vec<&'a str>) {
+        if self == Self::Gemma4 {
+            // Runs of newlines, and runs of everything else.
+            let mut rest = text;
+            while let Some(first) = rest.chars().next() {
+                let newline = first == '\n';
+                let end = rest
+                    .find(|c: char| (c == '\n') != newline)
+                    .unwrap_or(rest.len());
+                out.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+            return;
+        }
         let chars: Vec<char> = text.chars().collect();
         let mut byte_at = Vec::with_capacity(chars.len() + 1);
         let mut offset = 0;
@@ -59,11 +90,14 @@ impl PreTokenizer {
 
         let n = chars.len();
         let at = |i: usize| chars.get(i).copied();
-        let letter = |i: usize| at(i).is_some_and(is_letter);
+        // "Letters" are \p{L}, or [\p{L}\p{M}] for Qwen 3.5.
+        let marks = self.marks_in_words();
+        let is_word = |c: char| is_letter(c) || (marks && is_mark(c));
+        let letter = |i: usize| at(i).is_some_and(is_word);
         let number = |i: usize| at(i).is_some_and(is_number);
         let space = |i: usize| at(i).is_some_and(is_whitespace);
         let other =
-            |i: usize| at(i).is_some_and(|c| !is_whitespace(c) && !is_letter(c) && !is_number(c));
+            |i: usize| at(i).is_some_and(|c| !is_whitespace(c) && !is_word(c) && !is_number(c));
         let newline = |i: usize| matches!(at(i), Some('\r' | '\n'));
         let max_digits = self.max_digits();
 
@@ -98,7 +132,7 @@ impl PreTokenizer {
             }
 
             // [^\r\n\p{L}\p{N}]?\p{L}+
-            if !(c == '\r' || c == '\n' || is_number(c)) && (is_letter(c) || letter(pos + 1)) {
+            if !(c == '\r' || c == '\n' || is_number(c)) && (is_word(c) || letter(pos + 1)) {
                 pos += 1;
                 while letter(pos) {
                     pos += 1;
@@ -220,6 +254,27 @@ mod tests {
         assert_eq!(llama("a \n b"), ["a", " \n", " b"]);
         assert_eq!(llama("line\r\nnext"), ["line", "\r\n", "next"]);
         assert_eq!(llama("fn main() {}"), ["fn", " main", "()", " {}"]);
+    }
+
+    #[test]
+    fn gemma4_splits_only_at_newlines() {
+        let gemma = |t| words(PreTokenizer::Gemma4, t);
+        assert_eq!(
+            gemma("Hello▁world!▁It's\n\nnext▁line\n"),
+            ["Hello▁world!▁It's", "\n\n", "next▁line", "\n"]
+        );
+        assert_eq!(gemma("\n"), ["\n"]);
+    }
+
+    #[test]
+    fn qwen35_keeps_marks_in_words() {
+        let qwen35 = |t| words(PreTokenizer::Qwen35, t);
+        assert_eq!(qwen35("हिन्दी पाठ"), ["हिन्दी", " पाठ"]);
+        assert_eq!(
+            qwen35("cafe\u{301} 2026"),
+            ["cafe\u{301}", " ", "2", "0", "2", "6"]
+        );
+        assert_eq!(qwen35("I'M here"), ["I", "'M", " here"]);
     }
 
     #[test]

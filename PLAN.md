@@ -79,24 +79,34 @@ git), for checking our output and speed.
 | 2026-11-10 | GGUF reader (our own memory-mapping, all 32 tensor types) | Unit tests; Llama 3.2 1B Q4_K_M: every tensor lines up with the file |
 | 2026-11-10 | Tokenizer: byte-level BPE, Llama 3 pre-tokenizer, our own Unicode tables | `tools/compare_tokenizer.py`: identical ids to llama.cpp on all 3,484 runs (every text file in the repo plus 400 random texts, as prompts and raw) |
 | 2026-11-10 | CPU reference: F16/BF16/Q8_0/Q4_K/Q6_K decoding, our own thread pool, the Llama forward pass, `vireo-cli generate` and `perplexity` | Llama 3.2 1B: perplexity 38.3242, the same as llama.cpp to every digit (F32 copy of the model, CPU, f32 cache); next-token probabilities equal to 4 decimals. ~25 tokens/s on the CPU |
-
 | 2026-11-10 | CUDA backend: our own driver bindings (loads `nvcuda.dll` at runtime; no CUDA library linked or shipped), kernels in `kernels/vireo.cu` built to PTX by `build.rs`, the whole Llama forward pass on the GPU (`--gpu`) | Matrix-vector kernels equal the CPU reference to f32 rounding (~1e-6) on Llama's real Q4_K and Q6_K weights; perplexity 38.3242 on the GPU, the same as the CPU and llama.cpp |
+| 2026-11-10 | Qwen 3.5 on the CPU: the `qwen35` pre-tokenizer (combining marks in words; our own Unicode marks table), Q5_K and Q4_0 decoding, Gated DeltaNet layers (causal conv1d, L2-normalized q/k, the delta-rule state update, gated RMSNorm), gated attention with partial RoPE in halves | Tokenizer: identical ids to llama.cpp on all 4,310 runs. Qwen 3.5 0.8B: perplexity 25.1818 against llama.cpp's exact 25.1817 (llama.cpp runs a prompt's DeltaNet in chunks: the same arithmetic in another order); next-token probabilities within 0.0005 points |
+| 2026-11-10 | Gemma 4 on the CPU: its tokenizer (UTF-8 BPE with "▁" spaces, newline-only splits, `<0xXX>` byte fallback; end-of-turn tokens made control tokens as llama.cpp does), per-layer embeddings, keys and values shared from earlier layers, sliding-window and global layers with their own head sizes and RoPE bases, the extra norms, layer output scale and logit softcap | Tokenizer: identical ids to llama.cpp on all 4,312 runs (and Llama's and Qwen's re-checked after the end-of-turn change). Gemma 4 E2B: next-token probabilities within 0.0002 points; perplexity 30.8273 against llama.cpp's 30.8287 (0.005%) |
+| 2026-11-10 | Qwen 3.5 and Gemma 4 on the GPU: Q4_0 and Q5_K matrix-vector kernels, RMSNorm per head (with or without a weight), RoPE in halves and on part of a head, sliding-window attention, the DeltaNet convolution, L2 norm and a whole DeltaNet head step in one kernel, gated attention, GELU, softcap. Gemma's two embedding tables stay in system memory (looked up per token) | Every quantized kernel equals the CPU to f32 rounding on real Llama, Qwen and Gemma weights. Perplexity on the GPU: Qwen 25.1818 and Gemma 30.8273, the CPU's numbers to every digit; GPU tests check llama.cpp's probabilities and the answer for all three models |
 
-The Qwen pre-tokenizer is written but not yet compared with llama.cpp: that comes with
-the first Qwen test model.
+There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
+0.8B, so the 0.8B tests the code the 27B runs.
 
-**Speed so far** (RTX 5060 Laptop, Llama 3.2 1B Q4_K_M, tokens/s):
+**Open question, Gemma 4:** a 0.005% perplexity difference from llama.cpp remains
+(Llama matches to every digit, Qwen 3.5 to 0.0001); our CPU and GPU agree with each other
+exactly. GELU is part of it but not all: exact GELU gives 30.8273, GELU through an f16
+table 30.8275, llama.cpp 30.8287. Worth tracking down with a per-layer comparison
+(llama.cpp's `llama-eval-callback`-style tensor dumps).
 
-| | Generating | Reading a prompt |
-|---|---|---|
-| llama.cpp b12262, CUDA (`llama-bench`) | 96 | 4,224 |
-| Vireo, GPU (first, untuned kernels) | ~50 | ~55 |
-| Vireo, CPU reference | ~25 | ~25 |
+**Speed so far** (RTX 5060 Laptop, tokens/s; llama.cpp b12262 CUDA by `llama-bench`):
 
-The kernels reach 37–63 GB/s of the GPU's roughly 380 GB/s. Next for speed, in order:
-read the prompt in batches (matrix-matrix kernels, so a prompt costs one pass over the
-weights, not one per token); wider loads in the matrix-vector kernels; fewer launches
-(fused steps, CUDA graphs).
+| Model | Generating: Vireo GPU / llama.cpp | Reading a prompt: Vireo GPU / llama.cpp | Vireo CPU |
+|---|---|---|---|
+| Llama 3.2 1B Q4_K_M | ~50 / 96 | ~55 / 4,224 | ~25 |
+| Qwen 3.5 0.8B Q4_K_M | ~62 / 118 | ~70 / 4,822 | ~28 |
+| Gemma 4 E2B Q4_0 | ~26 / 62 | ~28 / 5,109 | ~6.5 |
+
+Generation is at about half of llama.cpp's speed with the first, untuned kernels. The
+quantized matrix-vector kernels reach 30–60 GB/s of the GPU's roughly 380 GB/s, while the
+plain F16 one reaches ~200 GB/s, so decoding the blocks is the bottleneck. Next for speed,
+in order: read the prompt in batches (matrix-matrix kernels, so a prompt costs one pass
+over the weights, not one per token); wider loads and cheaper block decoding in the
+matrix-vector kernels; fewer launches (fused steps, CUDA graphs).
 
 **NPU check (2026-11-10):** the AMD NPU's driver is installed and working
 (32.0.203.329), with AMD's XRT runtime (`xrt_coreutil.dll`), but not Ryzen AI Software.

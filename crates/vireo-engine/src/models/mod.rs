@@ -1,9 +1,14 @@
 //! The forward pass for each model architecture.
 //!
-//! So far: Llama (Llama 3 and 3.x), on the CPU reference backend and on NVIDIA GPUs.
+//! So far: Llama (Llama 3 and 3.x), Qwen 3.5 (to 3.8) and Gemma 4, each on the CPU
+//! reference backend and on NVIDIA GPUs.
 
+pub mod gemma4;
+pub mod gemma4_cuda;
 pub mod llama;
 pub mod llama_cuda;
+pub mod qwen35;
+pub mod qwen35_cuda;
 
 use std::fmt;
 
