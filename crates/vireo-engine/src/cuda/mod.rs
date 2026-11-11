@@ -162,6 +162,22 @@ impl Buffer {
         self.read_f32_at(0, out)
     }
 
+    /// Copies `out.len()` bytes from byte `offset` on into `out`, waiting for queued GPU
+    /// work first.
+    pub fn read_bytes_at(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        assert!(offset + out.len() <= self.bytes);
+        self.context
+            .download(out.as_mut_ptr().cast(), self.ptr + offset as u64, out.len())
+    }
+
+    /// Copies `data` to the buffer from byte `offset` on, after the GPU work already
+    /// queued.
+    pub fn write_bytes_at(&self, offset: usize, data: &[u8]) -> Result<()> {
+        assert!(offset + data.len() <= self.bytes);
+        self.context
+            .upload(self.ptr + offset as u64, data.as_ptr().cast(), data.len())
+    }
+
     /// Copies from f32 number `index` on into `out`, waiting for queued GPU work first.
     pub fn read_f32_at(&self, index: usize, out: &mut [f32]) -> Result<()> {
         assert!((index + out.len()) * 4 <= self.bytes);

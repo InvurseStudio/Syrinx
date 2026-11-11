@@ -5,8 +5,11 @@
 //! in batches and generated tokens replay a recorded graph, as in `llama_cuda.rs`.
 
 use super::gemma4::Config;
-use super::gpu::{GpuMatrix, Input, LogitsBuffer, gpu_error, q8_room, record, row};
-use super::{DEFAULT_BATCH, Error, Logits, Precision, Result, matrix, vector};
+use super::gpu::{
+    GpuMatrix, Input, LogitsBuffer, Positions, gpu_error, load_state, q8_room, record, row,
+    save_state,
+};
+use super::{DEFAULT_BATCH, Error, Logits, Precision, Result, SavedState, matrix, vector};
 use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{Buffer, CuDevicePtr, Gpu, Graph, Q8, QkvPrep};
@@ -52,6 +55,8 @@ pub struct Gemma4Cuda<'a> {
 pub struct Gemma4CudaSession {
     keys: Vec<Option<Buffer>>,
     values: Vec<Option<Buffer>>,
+    /// Each layer's sliding window (`None` for a global layer).
+    windows: Vec<Option<usize>>,
     len: usize,
     capacity: usize,
     batch: usize,
@@ -95,11 +100,48 @@ impl Gemma4CudaSession {
         self.capacity
     }
 
+    /// The GPU memory each position takes in this session's caches (keys and values).
+    pub fn cache_bytes_per_position(&self) -> usize {
+        self.cache_buffers().iter().map(|(b, _)| b.len_bytes()).sum::<usize>() / self.capacity.max(1)
+    }
+
     /// Forgets every position from `len` on (nothing, if the session is shorter), so the
     /// next tokens run from there: the keys and values before it stay as they are. For
     /// continuing a chat whose new prompt starts with the tokens already read.
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
+    }
+
+    /// The keys and values of the first `len` positions (no more than the session has),
+    /// copied to system memory: a sliding-window layer's only for the last positions of
+    /// its window, which are all that later tokens read.
+    pub fn export(&self, len: usize) -> Result<SavedState> {
+        assert!(
+            len <= self.len,
+            "{len} positions of a session of {}",
+            self.len
+        );
+        save_state(&self.cache_buffers(), self.capacity, len, &[])
+    }
+
+    /// Loads the first `upto` positions of a state `export` made from a session of the
+    /// same model and precision (of any capacity is fine as long as it fits), in place of
+    /// what this session held. Only all of it once the saved positions outran the
+    /// sliding window (the older ones weren't kept).
+    pub fn import(&mut self, saved: &SavedState, upto: usize) -> Result<()> {
+        load_state(saved, upto, &self.cache_buffers(), self.capacity, &[])?;
+        self.len = upto;
+        Ok(())
+    }
+
+    /// Each layer's keys, then values, that has its own, with the sliding window it reads
+    /// (a saved state keeps only that many of its last positions).
+    fn cache_buffers(&self) -> Vec<Positions<'_>> {
+        let keys = self.keys.iter().zip(&self.windows);
+        let values = self.values.iter().zip(&self.windows);
+        keys.chain(values)
+            .filter_map(|(b, w)| b.as_ref().map(|b| (b, *w)))
+            .collect()
     }
 }
 
@@ -244,6 +286,9 @@ impl<'a> Gemma4Cuda<'a> {
         Ok(Gemma4CudaSession {
             keys,
             values,
+            windows: (0..c.layers)
+                .map(|l| c.is_swa[l].then_some(c.sliding_window))
+                .collect(),
             len: 0,
             capacity,
             batch,

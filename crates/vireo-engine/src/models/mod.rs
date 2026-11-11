@@ -40,6 +40,36 @@ pub enum Precision {
 /// enough to keep the GPU busy, little enough memory to keep sessions cheap.
 pub const DEFAULT_BATCH: usize = 512;
 
+/// A GPU session's contents copied to system memory, to be loaded into a session of the
+/// same model and precision later (`export` and `import` on each model): its keys and
+/// values for `len` positions and, for Qwen 3.5, its DeltaNet layers there. The bytes can
+/// go to a file and come back; they say nothing of the model they belong to.
+pub struct SavedState {
+    len: usize,
+    bytes: Vec<u8>,
+}
+
+impl SavedState {
+    /// The number of positions saved.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// A state read back from `bytes` (as `bytes` gave them) for `len` positions. Checked
+    /// against the session when it's imported.
+    pub fn from_bytes(len: usize, bytes: Vec<u8>) -> Self {
+        Self { len, bytes }
+    }
+}
+
 use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::quant;
