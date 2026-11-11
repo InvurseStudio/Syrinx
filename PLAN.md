@@ -419,7 +419,26 @@ contexts before the automatic limit goes past 32K.
   reads, still not overlapped (cp.async into a second buffer would avoid the
   registers). Then the smaller kernels: `quantize_q8` (~4%) could be folded into the
   norms and `swiglu` that make its input.
-- **Generating** is 19–25% ahead of llama.cpp on all three.
+- **Generating** is 19–25% ahead of llama.cpp on all three in short chats, but 27–48%
+  behind 25K tokens deep (see "Long chats"): one token's attention (`attention_part_*`)
+  reads the whole cache per token and needs tuning for long contexts, before the
+  automatic context goes past 32K.
+- **The chat cache, for later passes** (alongside this tuning):
+  - Saved files: smaller still. Keys and values saved in 8 bits (half of f16; lossy, so
+    measured first), or a saved chat written as what it adds to its last save instead
+    of the whole chat again each time. A size limit per file (a 32K-token Llama chat is
+    1 GB, a quarter of the 4 GB budget).
+  - Qwen: a DeltaNet checkpoint at the system prompt's end too, so a new chat with the
+    same system prompt loads it (Llama and Gemma already do), and a checkpoint at a
+    retry's start as well as the history's end.
+  - Gemma: positions kept from a window before the history's end, so a saved chat loads
+    in part (an edited earlier message) and not only whole.
+  - More than one chat in GPU memory when there's room, so switching between two needs no
+    copy at all; saved states in pinned memory for faster copies.
+  - The keys and values on the GPU in 8 bits, which would double the context the same
+    memory holds.
+  - Measure what switching and saving cost in the app (copy, disk, first word), and
+    how big the budget should be by default.
 - **For larger models**: splitting a model between GPU and system memory (Muse Glimmer
   30B), mixture-of-experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), more than one GPU.
 - Nsight Compute: the counters are open on this PC now (all users); set them back to
@@ -714,10 +733,10 @@ kernels while keeping everything above them ours).
 ### 2. Vireo-only engine features
 
 Started 2026-11-11: the KV cache kept between turns, then a saved cache per chat that
-lasts across restarts (see Progress). Still to do: the shared prompt start for Qwen (Llama
-and Gemma already load it from any saved chat with the same system prompt; Qwen's
-DeltaNet would need a checkpoint at the system prompt's end too), grammar-constrained
-tool calls and the scheduler. A saved state only fits the model file and precision that
+lasts across restarts, and chats as long as the GPU has room for (see Progress and "Long
+chats"). Still to do: grammar-constrained tool calls and the scheduler. Further cache work
+(Qwen's shared prompt start, smaller saves, more than one chat on the GPU) is listed with
+the tuning under "What limits speed now". A saved state only fits the model file and precision that
 made it (the folder is per model), and a Llama 3.2 1B chat of 4,000 tokens takes 128 MB
 on disk.
 
