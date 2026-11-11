@@ -345,6 +345,165 @@ kernel void matvec_q6_k(ARGS, KP) {
     MATVEC_STORE
 }
 
+// The quantized matrix-vector products with each pair of rows split over the
+// threadgroup's MV_SPLIT SIMD groups: each takes every MV_SPLIT-th step of the row's
+// blocks, and their sums meet in threadgroup memory. The arithmetic is the kernels' above;
+// a row then takes a quarter of the sequential steps, which is what limits a small
+// matrix (one token's time is mostly the latency of those steps, not the bandwidth).
+#define MV_SPLIT 4
+#define MATVEC_ROWS_SPLIT                                   \
+    threadgroup float mv_parts[MV_SPLIT][MV_ROWS];          \
+    const int lane = tid & 31, sgi = tid >> 5;              \
+    const int row0 = gid.x * MV_ROWS;                       \
+    if (row0 >= rows) return;                               \
+    const int nrows = min(MV_ROWS, rows - row0);            \
+    float sum[MV_ROWS];                                     \
+    for (int r = 0; r < MV_ROWS; r++) sum[r] = 0.0f;
+
+#define MATVEC_STORE_SPLIT                                  \
+    for (int r = 0; r < MV_ROWS; r++) {                     \
+        const float part = simd_sum(sum[r]);                \
+        if (lane == 0) mv_parts[sgi][r] = part;             \
+    }                                                       \
+    BARRIER;                                                \
+    if ((int)tid < nrows) {                                 \
+        float total = 0.0f;                                 \
+        for (int g = 0; g < MV_SPLIT; g++) total += mv_parts[g][tid]; \
+        y[row0 + tid] = total;                              \
+    }
+
+kernel void matvec_split_q8_0(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_SPLIT
+    const int blocks = cols / 32;
+    const ulong row_bytes = (ulong)blocks * 34;
+    const int sub = lane >> 3, j = (lane & 7) * 4;
+    for (int b = sub + 4 * sgi; b < blocks; b += 4 * MV_SPLIT) {
+        const float4 xv = f4(x + b * 32 + j);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * 34;
+            const u32 q = u32_at2(block + 2 + j);
+            const float dot = small_int((q & 0xFF) ^ 0x80, 128.0f) * xv.x +
+                              small_int(((q >> 8) & 0xFF) ^ 0x80, 128.0f) * xv.y +
+                              small_int(((q >> 16) & 0xFF) ^ 0x80, 128.0f) * xv.z +
+                              small_int((q >> 24) ^ 0x80, 128.0f) * xv.w;
+            sum[r] += half_at(block) * dot;
+        }
+    }
+    MATVEC_STORE_SPLIT
+}
+
+kernel void matvec_split_q4_0(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_SPLIT
+    const int blocks = cols / 32;
+    const ulong row_bytes = q4_0_row_bytes(cols);
+    const int sub = lane >> 1, j = (lane & 1) * 8;
+    for (int b = sub + 16 * sgi; b < blocks; b += 16 * MV_SPLIT) {
+        device const float* xb = x + b * 32 + j;
+        const float4 lo0 = f4(xb), lo1 = f4(xb + 4), hi0 = f4(xb + 16), hi1 = f4(xb + 20);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* row = w + (row0 + r) * row_bytes;
+            const uint2 q = *reinterpret_cast<device const uint2*>(row + b * 16 + j);
+            const float dot = nibble_dot8(q, 0, lo0, lo1) + nibble_dot8(q, 4, hi0, hi1) -
+                              8.0f * ((lo0.x + lo0.y) + (lo0.z + lo0.w) + (lo1.x + lo1.y) + (lo1.z + lo1.w) +
+                                      (hi0.x + hi0.y) + (hi0.z + hi0.w) + (hi1.x + hi1.y) + (hi1.z + hi1.w));
+            sum[r] += q4_0_scale(row, blocks, b) * dot;
+        }
+    }
+    MATVEC_STORE_SPLIT
+}
+
+kernel void matvec_split_q4_k(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_SPLIT
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * 144;
+    const int sub = lane >> 4, pair = (lane & 15) >> 2, part = (lane & 3) * 8;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        device const float* xb = x + b * 256 + pair * 64 + part;
+        const float4 a1 = f4(xb), b1 = f4(xb + 4), a2 = f4(xb + 32), b2 = f4(xb + 36);
+        const float x1 = (a1.x + a1.y) + (a1.z + a1.w) + (b1.x + b1.y) + (b1.z + b1.w);
+        const float x2 = (a2.x + a2.y) + (a2.z + a2.w) + (b2.x + b2.y) + (b2.z + b2.w);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * 144;
+            const uint4 head = *reinterpret_cast<device const uint4*>(block);
+            float s1, m1, s2, m2;
+            q4_k_scale_min_w(2 * pair, head.y, head.z, head.w, s1, m1);
+            q4_k_scale_min_w(2 * pair + 1, head.y, head.z, head.w, s2, m2);
+            const float d = half_lo(head.x), dmin = half_hi(head.x);
+            const uint2 q = *reinterpret_cast<device const uint2*>(block + 16 + pair * 32 + part);
+            sum[r] += d * s1 * nibble_dot8(q, 0, a1, b1) - dmin * m1 * x1 + d * s2 * nibble_dot8(q, 4, a2, b2) -
+                      dmin * m2 * x2;
+        }
+    }
+    MATVEC_STORE_SPLIT
+}
+
+kernel void matvec_split_q5_k(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_SPLIT
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * 176;
+    const int sub = lane >> 4, pair = (lane & 15) >> 2, part = (lane & 3) * 8;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        device const float* xb = x + b * 256 + pair * 64 + part;
+        const float4 a1 = f4(xb), b1 = f4(xb + 4), a2 = f4(xb + 32), b2 = f4(xb + 36);
+        const float x1 = (a1.x + a1.y) + (a1.z + a1.w) + (b1.x + b1.y) + (b1.z + b1.w);
+        const float x2 = (a2.x + a2.y) + (a2.z + a2.w) + (b2.x + b2.y) + (b2.z + b2.w);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * 176;
+            const uint4 head = *reinterpret_cast<device const uint4*>(block);
+            float s1, m1, s2, m2;
+            q4_k_scale_min_w(2 * pair, head.y, head.z, head.w, s1, m1);
+            q4_k_scale_min_w(2 * pair + 1, head.y, head.z, head.w, s2, m2);
+            const float d = half_lo(head.x), dmin = half_hi(head.x);
+            const uint2 q = *reinterpret_cast<device const uint2*>(block + 48 + pair * 32 + part);
+            const uint2 qh = *reinterpret_cast<device const uint2*>(block + 16 + part);
+            const float dot1 = nibble_dot8(q, 0, a1, b1) + 16.0f * bit_dot8(qh, 2 * pair, a1, b1);
+            const float dot2 = nibble_dot8(q, 4, a2, b2) + 16.0f * bit_dot8(qh, 2 * pair + 1, a2, b2);
+            sum[r] += d * s1 * dot1 - dmin * m1 * x1 + d * s2 * dot2 - dmin * m2 * x2;
+        }
+    }
+    MATVEC_STORE_SPLIT
+}
+
+kernel void matvec_split_q6_k(ARGS, KP) {
+    MATVEC_ARGS
+    MATVEC_ROWS_SPLIT
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * Q6K_BYTES;
+    const int sub = lane >> 4, hf = (lane & 15) >> 3, l = (lane & 7) * 4;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        device const float* xb = x + b * 256 + hf * 128 + l;
+        float4 xv[4];
+        for (int k = 0; k < 4; k++) xv[k] = f4(xb + k * 32);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
+            const float d = half_at(block + 208);
+            const u32 ql0 = u32_at2(block + hf * 64 + l), ql1 = u32_at2(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at2(block + 128 + hf * 32 + l);
+            device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
+            float bsum = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const u32 low = ((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4);
+                const float q0 = small_int((low & 0xF) | (((qh >> (2 * k)) & 3) << 4), 32.0f);
+                const float q1 = small_int(((low >> 8) & 0xF) | (((qh >> (8 + 2 * k)) & 3) << 4), 32.0f);
+                const float q2 = small_int(((low >> 16) & 0xF) | (((qh >> (16 + 2 * k)) & 3) << 4), 32.0f);
+                const float q3 = small_int(((low >> 24) & 0xF) | (((qh >> (24 + 2 * k)) & 3) << 4), 32.0f);
+                bsum += (float)sc[2 * k] * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
+            }
+            sum[r] += d * bsum;
+        }
+    }
+    MATVEC_STORE_SPLIT
+}
+
 // ---- Matrix-matrix products: Y = X Wᵀ for many tokens at once ------------------------
 
 enum { K_F32, K_F16, K_Q4_0, K_Q8_0, K_Q4_K, K_Q5_K, K_Q6_K };
@@ -921,6 +1080,162 @@ kernel void attention_combine(ARGS, KP) {
     }
 }
 
+// One new token's attention in one dispatch: threadgroups of 256 (8 SIMD groups) for each
+// query head (gid.x) and part of the context (gid.y; an equal share of first..len, worked
+// out from *pos, so a recorded run fits every length). In a SIMD group each lane takes a
+// position, 32 at a time (its score from q in threadgroup memory), and the group keeps its
+// own online softmax with SIMD reductions, adding the values up with each lane holding
+// D / 32 of the output: no barriers until the 8 groups are merged at the end. With more
+// than one part, each leaves its maximum, sum and unnormalized output in `partial`, and the
+// last of a head's parts to finish (counted in `counters`, with device-scope fences) merges
+// them, so no second dispatch is needed. Exact for any context: up to rounding, the same
+// softmax as attention_part + attention_combine.
+template <typename KV, int D, int HG>
+kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    // HG query heads of one key/value head per threadgroup (gid.x × HG..), each key and
+    // value read once for all of them: a lane scores its position against each head's
+    // query and adds the value row into each head's output. Built for HG = 1 only: more
+    // was slower on the M5 Max (the repeated reads come from the cache).
+    device const float* q = ARG_PTR(const float, 0);
+    device const KV* keys = ARG_PTR(const KV, 1);
+    device const KV* values = ARG_PTR(const KV, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const int* pos = ARG_PTR(const int, 4);
+    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const float scale = ARG_F32(9);
+    device float* partial = ARG_PTR(float, 10);
+    device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
+    constexpr int SG = 8, DPL = D / 32;  // SIMD groups; output numbers per lane and head
+    threadgroup float qs[HG][D];
+    threadgroup float sm[SG], sl[SG];
+    threadgroup float so[SG][D];
+    threadgroup bool last;
+    const int head0 = gid.x * HG, part = gid.y, parts = ngrid.y;
+    const int len = *pos + 1;
+    const int first = window > 0 ? max(0, len - window) : 0;
+    const int share = (len - first + parts - 1) / parts;
+    const int lo = first + part * share, hi = min(len, lo + share);
+    const int kv = (head0 / group) * D;
+    for (int i = tid; i < HG * D; i += 256) qs[i / D][i % D] = q[head0 * D + i];
+    BARRIER;
+
+    float m[HG], l[HG], o[HG][DPL];
+    for (int h = 0; h < HG; h++) {
+        m[h] = -INFINITY;
+        l[h] = 0.0f;
+        for (int j = 0; j < DPL; j++) o[h][j] = 0.0f;
+    }
+    for (int base = lo + (int)sg * 32; base < hi; base += SG * 32) {
+        const int at = base + (int)lane;
+        float s[HG];
+        for (int h = 0; h < HG; h++) s[h] = 0.0f;
+        if (at < hi) {
+            device const KV* k = keys + (ulong)at * kv_dim + kv;
+            for (int d = 0; d < D; d += 4) {
+                const float4 k4 = load4(k + d);
+                for (int h = 0; h < HG; h++) {
+                    const float4 q4 = *reinterpret_cast<threadgroup const float4*>(&qs[h][d]);
+                    s[h] += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+                }
+            }
+        }
+        float p[HG];
+        for (int h = 0; h < HG; h++) {
+            const float sc = at < hi ? s[h] * scale : -INFINITY;
+            const float new_max = max(m[h], simd_max(sc));
+            const float correction = exp(m[h] - new_max);  // 0 on the group's first block
+            p[h] = at < hi ? exp(sc - new_max) : 0.0f;
+            l[h] = l[h] * correction + simd_sum(p[h]);
+            for (int j = 0; j < DPL; j++) o[h][j] *= correction;
+            m[h] = new_max;
+        }
+        const int count = min(32, hi - base);
+        device const KV* v = values + (ulong)base * kv_dim + kv + lane * DPL;
+        for (int i = 0; i < count; i++) {
+            device const KV* vr = v + (ulong)i * kv_dim;
+            float vv[DPL];
+            for (int j = 0; j < DPL; j++) vv[j] = load1(vr + j);
+            for (int h = 0; h < HG; h++) {
+                const float pi = simd_shuffle(p[h], (ushort)i);
+                for (int j = 0; j < DPL; j++) o[h][j] += pi * vv[j];
+            }
+        }
+    }
+
+    // Each head in turn: merge the SIMD groups, then write it out (one part) or leave the
+    // part's maximum, sum and output in `partial`.
+    for (int h = 0; h < HG; h++) {
+        const int head = head0 + h;
+        BARRIER;  // the last head is done with sm, sl and so
+        if (lane == 0) {
+            sm[sg] = m[h];
+            sl[sg] = l[h];
+        }
+        for (int j = 0; j < DPL; j++) so[sg][lane * DPL + j] = o[h][j];
+        BARRIER;
+        float mx = -INFINITY;
+        for (int g = 0; g < SG; g++) mx = max(mx, sm[g]);
+        float total = 0.0f;
+        for (int g = 0; g < SG; g++)
+            if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
+        device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
+        if (parts > 1 && tid == 0) {
+            mine[0] = mx;  // -inf for an empty part
+            mine[1] = total;
+        }
+        for (int d = tid; d < D; d += 256) {
+            float acc = 0.0f;
+            for (int g = 0; g < SG; g++)
+                if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g][d];
+            if (parts == 1)
+                out[head * D + d] = acc / total;
+            else
+                mine[2 + d] = acc;
+        }
+    }
+    if (parts == 1) return;
+    // The last part of these heads to get here merges them all.
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    BARRIER;
+    if (tid == 0) {
+        const uint done = atomic_fetch_add_explicit(&counters[gid.x], 1u, memory_order_relaxed);
+        last = done == (uint)parts - 1;
+        if (last) atomic_store_explicit(&counters[gid.x], 0u, memory_order_relaxed);
+    }
+    BARRIER;
+    if (!last) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    for (int h = 0; h < HG; h++) {
+        const int head = head0 + h;
+        device const float* all = partial + (ulong)head * parts * (2 + D);
+        float pm = -INFINITY;
+        for (int i = 0; i < parts; i++) pm = max(pm, all[i * (2 + D)]);
+        float pt = 0.0f;
+        for (int i = 0; i < parts; i++) {
+            const float mi = all[i * (2 + D)];
+            if (mi != -INFINITY) pt += exp(mi - pm) * all[i * (2 + D) + 1];
+        }
+        for (int d = tid; d < D; d += 256) {
+            float acc = 0.0f;
+            for (int i = 0; i < parts; i++) {
+                const float mi = all[i * (2 + D)];
+                if (mi != -INFINITY) acc += exp(mi - pm) * all[i * (2 + D) + 2 + d];
+            }
+            out[head * D + d] = acc / pt;
+        }
+    }
+}
+
+template [[host_name("attention_decode_f32_64_1")]] kernel void attention_decode<float, 64, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_128_1")]] kernel void attention_decode<float, 128, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_256_1")]] kernel void attention_decode<float, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f32_512_1")]] kernel void attention_decode<float, 512, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_64_1")]] kernel void attention_decode<half, 64, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_128_1")]] kernel void attention_decode<half, 128, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_256_1")]] kernel void attention_decode<half, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_f16_512_1")]] kernel void attention_decode<half, 512, 1>(ARGS, KP, uint, uint);
+
 // A prompt's attention, tiled (see attention_tiled in vireo.cu).
 template <typename KV, int LANES, int PER, int CHUNK>
 kernel void attention_tiled(ARGS, KP) {
@@ -1168,6 +1483,144 @@ template [[host_name("attention_flash_64")]] kernel void attention_flash<64, 32,
 template [[host_name("attention_flash_128")]] kernel void attention_flash<128, 32, 16>(ARGS, KP, uint, uint);
 template [[host_name("attention_flash_256")]] kernel void attention_flash<256, 16, 8>(ARGS, KP, uint, uint);
 template [[host_name("attention_flash_512")]] kernel void attention_flash<512, 8, 8>(ARGS, KP, uint, uint);
+
+// attention_flash with bigger query tiles: the chunk's keys and then its values share one
+// buffer (the scores are worked out before the values come in), wide heads get 8 SIMD
+// groups, and O's results are staged over everything at the end, so twice the tokens fit
+// a threadgroup and each key and value is read half as often (O is written out in P passes
+// of D / P columns, to fit). Same arithmetic.
+template <int D, int QT, int C, int SG, int P>
+kernel void attention_flash2(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    device const float* q = ARG_PTR(const float, 0);
+    device const half* keys = ARG_PTR(const half, 1);
+    device const half* values = ARG_PTR(const half, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const int* pos = ARG_PTR(const int, 4);
+    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const float scale = ARG_F32(9);
+    const int tokens = ARG_INT(10);
+    constexpr int THREADS = 32 * SG, BLOCKS = QT / 8 * (D / 8) / SG;
+    constexpr int ROW_THREADS = THREADS / QT < C ? THREADS / QT : C, PER_THREAD = C / ROW_THREADS;
+    // [Q | keys or values | scores | probabilities], O's results over all of it at the end.
+    constexpr int BYTES_IN = QT * D * 2 + C * D * 2 + QT * C * 4 + QT * C * 2;
+    constexpr int DS = D / P, BYTES = BYTES_IN > QT * DS * 4 ? BYTES_IN : QT * DS * 4;
+    threadgroup float4 mem[BYTES / 16];
+    threadgroup half* sq = reinterpret_cast<threadgroup half*>(mem);
+    threadgroup half* skv = sq + QT * D;
+    threadgroup float* ss = reinterpret_cast<threadgroup float*>(skv + C * D);
+    threadgroup half* sp = reinterpret_cast<threadgroup half*>(ss + QT * C);
+    threadgroup float row_max[QT], row_sum[QT];
+    threadgroup float diag[QT / 8][64];
+    const int head = gid.x, heads = ngrid.x;
+    const int t0 = gid.y * QT, p0 = *pos;
+    const int kv = (head / group) * D;
+    const int last_row = p0 + min(t0 + QT, tokens) - 1;
+    const int lo = window > 0 ? max(0, p0 + t0 + 1 - window) : 0;
+
+    for (int i = tid; i < QT * D; i += THREADS) {
+        const int r = i / D, d = i % D;
+        sq[i] = t0 + r < tokens ? half(q[((ulong)(t0 + r) * heads + head) * D + d]) : half(0.0f);
+    }
+    for (int i = tid; i < QT / 8 * 64; i += THREADS) diag[i / 64][i % 64] = 0.0f;
+    if ((int)tid < QT) {
+        row_max[tid] = -INFINITY;
+        row_sum[tid] = 0.0f;
+    }
+    simdgroup_float8x8 o[BLOCKS];
+    for (int b = 0; b < BLOCKS; b++) o[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const int sr = tid / ROW_THREADS, sc0 = (tid % ROW_THREADS) * PER_THREAD;
+    const int s_at = p0 + t0 + sr;
+    const bool s_live = t0 + sr < tokens;
+    const int s_first = window > 0 ? max(0, s_at + 1 - window) : 0;
+
+    for (int start = lo; start <= last_row; start += C) {
+        const int count = min(C, last_row + 1 - start);
+        BARRIER;  // done with the last chunk's values and probabilities
+        for (int i = tid; i < C * D / 4; i += THREADS) {
+            const int r = (i * 4) / D, d = (i * 4) % D;
+            half4 k4 = half4(0.0h);
+            if (r < count) k4 = *reinterpret_cast<device const half4*>(keys + (ulong)(start + r) * kv_dim + kv + d);
+            *reinterpret_cast<threadgroup half4*>(skv + r * D + d) = k4;
+        }
+        BARRIER;
+        for (int tile = sg; tile < QT / 8 * (C / 8); tile += SG) {
+            const int rb = tile / (C / 8), kb = tile % (C / 8);
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int d = 0; d < D; d += 8) {
+                simdgroup_half8x8 a, b;
+                simdgroup_load(a, sq + rb * 8 * D + d, D);
+                simdgroup_load(b, skv + kb * 8 * D + d, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            simdgroup_store(acc, ss + rb * 8 * C + kb * 8, C);
+        }
+        BARRIER;  // done with the keys: the values go in their place
+        for (int i = tid; i < C * D / 4; i += THREADS) {
+            const int r = (i * 4) / D, d = (i * 4) % D;
+            half4 v4 = half4(0.0h);
+            if (r < count) v4 = *reinterpret_cast<device const half4*>(values + (ulong)(start + r) * kv_dim + kv + d);
+            *reinterpret_cast<threadgroup half4*>(skv + r * D + d) = v4;
+        }
+        if ((int)tid < QT * ROW_THREADS) {
+            float sv[PER_THREAD];
+            float mx = -INFINITY;
+            for (int j = 0; j < PER_THREAD; j++) {
+                const int c = sc0 + j, kpos = start + c;
+                const bool seen = s_live && c < count && kpos <= s_at && kpos >= s_first;
+                sv[j] = seen ? ss[sr * C + c] * scale : -INFINITY;
+                mx = max(mx, sv[j]);
+            }
+            for (int o2 = ROW_THREADS / 2; o2 > 0; o2 >>= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o2));
+            const float old_max = row_max[sr];
+            const float new_max = max(old_max, mx);
+            const float correction = new_max == -INFINITY ? 1.0f : exp(old_max - new_max);
+            float sum = 0.0f;
+            for (int j = 0; j < PER_THREAD; j++) {
+                const float pr = sv[j] == -INFINITY ? 0.0f : exp(sv[j] - new_max);
+                sp[sr * C + sc0 + j] = half(pr);
+                sum += pr;
+            }
+            for (int o2 = ROW_THREADS / 2; o2 > 0; o2 >>= 1) sum += simd_shuffle_xor(sum, (ushort)o2);
+            if (tid % ROW_THREADS == 0) {
+                row_max[sr] = new_max;
+                row_sum[sr] = row_sum[sr] * correction + sum;
+                diag[sr / 8][(sr % 8) * 9] = correction;
+            }
+        }
+        BARRIER;
+        for (int b = 0; b < BLOCKS; b++) {
+            const int block = sg * BLOCKS + b, rb = block / (D / 8), cb = block % (D / 8);
+            simdgroup_float8x8 dg;
+            simdgroup_load(dg, &diag[rb][0], 8);
+            simdgroup_multiply(o[b], dg, o[b]);
+            for (int kc = 0; kc < C; kc += 8) {
+                simdgroup_half8x8 pm, vm;
+                simdgroup_load(pm, sp + rb * 8 * C + kc, C);
+                simdgroup_load(vm, skv + kc * D + cb * 8, D);
+                simdgroup_multiply_accumulate(o[b], pm, vm, o[b]);
+            }
+        }
+    }
+    threadgroup float* so = reinterpret_cast<threadgroup float*>(mem);
+    for (int pass = 0; pass < P; pass++) {
+        BARRIER;  // done with the threadgroup memory (the last pass's results, or the loop's)
+        for (int b = 0; b < BLOCKS; b++) {
+            const int block = sg * BLOCKS + b, rb = block / (D / 8), cb = block % (D / 8);
+            if (cb * 8 / DS == pass) simdgroup_store(o[b], so + rb * 8 * DS + cb * 8 - pass * DS, DS);
+        }
+        BARRIER;
+        for (int i = tid; i < QT * DS; i += THREADS) {
+            const int r = i / DS, d = i % DS;
+            if (t0 + r < tokens) out[((ulong)(t0 + r) * heads + head) * D + pass * DS + d] = so[i] / row_sum[r];
+        }
+    }
+}
+
+template [[host_name("attention_flash2_64")]] kernel void attention_flash2<64, 64, 32, 4, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_flash2_128")]] kernel void attention_flash2<128, 64, 16, 8, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_flash2_256")]] kernel void attention_flash2<256, 32, 8, 8, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_flash2_512")]] kernel void attention_flash2<512, 16, 8, 8, 2>(ARGS, KP, uint, uint);
 
 // ---- Element-wise steps --------------------------------------------------------------
 
