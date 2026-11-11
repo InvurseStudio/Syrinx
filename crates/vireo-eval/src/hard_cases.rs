@@ -90,6 +90,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["invoice.rs"]), "didn't name the changed file")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "long-log",
@@ -111,6 +112,7 @@ pub fn all() -> Vec<Case> {
                 )
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "find-by-content",
@@ -130,6 +132,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["worker-2"]), "didn't name worker-2.log")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "which-report",
@@ -157,6 +160,7 @@ pub fn all() -> Vec<Case> {
                 need(!r.says(&["1.2 million"]), "gave 2025's revenue")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "relative-path",
@@ -180,6 +184,7 @@ pub fn all() -> Vec<Case> {
                 )
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "count",
@@ -197,6 +202,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["3", "three"]), "didn't say three")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "follow-up-file",
@@ -214,6 +220,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["December"]), "didn't say what the plan says")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "follow-up-no-tool",
@@ -226,6 +233,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["Friday"]), "didn't say Friday")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "explain-git",
@@ -241,6 +249,7 @@ pub fn all() -> Vec<Case> {
                 )
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "recover",
@@ -263,6 +272,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["Tuesday"]), "didn't say Tuesday")
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "deadline",
@@ -290,6 +300,7 @@ pub fn all() -> Vec<Case> {
                 )
             },
             hard: true,
+            changes: false,
         },
         Case {
             id: "git-diff",
@@ -310,6 +321,7 @@ pub fn all() -> Vec<Case> {
                 need(r.says(&["8080"]), "didn't say the port became 8080")
             },
             hard: true,
+            changes: false,
         },
     ]
 }
@@ -331,11 +343,11 @@ mod tests {
     #[test]
     fn twelve_hard_cases_with_their_own_ids() {
         let all = crate::cases::all();
-        assert_eq!(all.len(), 24);
+        assert_eq!(all.iter().filter(|c| !c.changes).count(), 24);
         assert_eq!(all.iter().filter(|c| c.hard).count(), 12);
         let mut ids: Vec<_> = all.iter().map(|c| c.id).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 24);
+        assert_eq!(ids.len(), all.len());
     }
 }
