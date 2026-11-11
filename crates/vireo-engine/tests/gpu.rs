@@ -1023,3 +1023,132 @@ fn continuing_a_session_matches_reading_from_the_start() {
         }
     }
 }
+
+/// A session's state exported to system memory and imported into a new session (of
+/// another capacity) goes on exactly as the session it came from does: the same logits
+/// to the bit. Llama and Gemma can import part of a state (a shared start); Qwen's
+/// imports whole, from a checkpoint.
+#[test]
+fn an_exported_session_goes_on_as_the_original() {
+    let same = |name: &str, a: &[f32], b: &[f32]| {
+        assert!(a == b, "{name}: an imported session gives other logits");
+        eprintln!("{name}: the same logits");
+    };
+    for precision in [Precision::Exact, Precision::Int8] {
+        let label = |model: &str, what: &str| format!("{model}, {precision:?}, {what}");
+        if let Some(file) = model("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, false);
+            let (part, half) = (ids.len() / 3, ids.len() / 2);
+            let mut m = LlamaCuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut a = m.session(ids.len()).unwrap();
+            m.forward_batch(&mut a, &ids[..half], Logits::None).unwrap();
+            let saved = a.export().unwrap();
+            assert_eq!(saved.len(), half);
+            let mut b = m.session(ids.len() + 100).unwrap();
+            b.import(&saved, half).unwrap();
+            let la = m
+                .forward_batch(&mut a, &ids[half..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let lb = m
+                .forward_batch(&mut b, &ids[half..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            same(&label("Llama", "whole"), &la, &lb);
+            // Part of it, against the original cut back as far.
+            a.truncate(part);
+            b.import(&saved, part).unwrap();
+            let la = m
+                .forward_batch(&mut a, &ids[part..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let lb = m
+                .forward_batch(&mut b, &ids[part..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            same(&label("Llama", "part"), &la, &lb);
+        }
+        if let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, false);
+            let half = ids.len() / 2;
+            let mut m = Qwen35Cuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut a = m.session(ids.len()).unwrap();
+            let mut cp = None;
+            m.forward_batch(&mut a, &ids[..half], Logits::None).unwrap();
+            m.save(&a, &mut cp).unwrap();
+            // The original goes on past the checkpoint before it's exported.
+            m.forward_batch(&mut a, &ids[half..half + 20], Logits::None)
+                .unwrap();
+            let saved = a.export(cp.as_ref().unwrap()).unwrap();
+            let mut b = m.session(ids.len() + 100).unwrap();
+            b.import(&saved).unwrap();
+            m.restore(&mut a, cp.as_ref().unwrap()).unwrap();
+            let la = m
+                .forward_batch(&mut a, &ids[half..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let lb = m
+                .forward_batch(&mut b, &ids[half..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            same(&label("Qwen 3.5", "from a checkpoint"), &la, &lb);
+            // A state from another model's session doesn't load.
+            assert!(
+                b.import(&vireo_engine::models::SavedState::from_bytes(
+                    half,
+                    vec![0; 10]
+                ))
+                .is_err()
+            );
+        }
+        if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, true);
+            let (part, most) = (ids.len() / 3, ids.len() * 3 / 4);
+            let mut m = Gemma4Cuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut a = m.session(ids.len()).unwrap();
+            m.forward_batch(&mut a, &ids[..most], Logits::None).unwrap();
+            let saved = a.export().unwrap();
+            let mut b = m.session(ids.len() + 100).unwrap();
+            b.import(&saved, most).unwrap();
+            let la = m
+                .forward_batch(&mut a, &ids[most..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let lb = m
+                .forward_batch(&mut b, &ids[most..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            same(&label("Gemma 4", "whole"), &la, &lb);
+            a.truncate(part);
+            b.import(&saved, part).unwrap();
+            let la = m
+                .forward_batch(&mut a, &ids[part..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let lb = m
+                .forward_batch(&mut b, &ids[part..], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            same(&label("Gemma 4", "part"), &la, &lb);
+        }
+    }
+}

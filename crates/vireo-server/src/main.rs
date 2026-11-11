@@ -19,6 +19,7 @@ mod chat;
 mod http;
 mod json;
 mod sample;
+mod store;
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -36,17 +37,18 @@ use vireo_engine::cuda::Gpu;
 use vireo_engine::models::gemma4_cuda::Gemma4Cuda;
 use vireo_engine::models::llama_cuda::LlamaCuda;
 use vireo_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
-use vireo_engine::models::{Logits, Precision};
+use vireo_engine::models::{Logits, Precision, SavedState};
 use vireo_engine::{GgufFile, Tokenizer};
 
 const USAGE: &str = "\
 Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>] [--exact]
-                    [--token <token>] [--with-app]
+                    [--token <token>] [--with-app] [--chat-cache <folder>|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
 prints. --context is the most tokens a chat keeps (8192 by default); --exact runs f32
-arithmetic.
+arithmetic. Chats' caches are saved in %LOCALAPPDATA%\\VireoPrototype\\chat-cache (or
+--chat-cache's folder; off for none), so going back to a chat reads only what's new.
 
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
 and --with-app (stop when the app does: when its end of standard input closes), and
@@ -63,6 +65,7 @@ fn main() -> ExitCode {
     let mut precision = Precision::Int8;
     let mut app_token = None;
     let mut with_app = false;
+    let mut chat_cache = Some(None);
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -81,6 +84,15 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "--with-app" => with_app = true,
+            "--chat-cache" if value.is_some() => {
+                let v = value.unwrap();
+                chat_cache = if v == "off" {
+                    None
+                } else {
+                    Some(Some(PathBuf::from(v)))
+                };
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -98,20 +110,25 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // The engine thread owns the GPU; requests reach it over a channel.
+    let (jobs, job_rx) = channel::<Work>();
     if with_app {
         // The app holds the other end of standard input: when it closes, the app has
-        // gone (however it ended), and so does the server.
-        std::thread::spawn(|| {
+        // gone (however it ended), and so does the server, once the chat in use is
+        // saved (if that takes long, it goes anyway).
+        let jobs = jobs.clone();
+        std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            let (done, saved) = channel();
+            if jobs.send(Work::Shutdown(done)).is_ok() {
+                let _ = saved.recv_timeout(std::time::Duration::from_secs(10));
+            }
             std::process::exit(0);
         });
     }
-
-    // The engine thread owns the GPU; requests reach it over a channel.
-    let (jobs, job_rx) = channel::<Job>();
     let (ready_tx, ready_rx) = channel::<Result<ModelInfo, String>>();
-    std::thread::spawn(move || engine(&path, context, precision, ready_tx, job_rx));
+    std::thread::spawn(move || engine(&path, context, precision, chat_cache, ready_tx, job_rx));
     let info = match ready_rx.recv() {
         Ok(Ok(info)) => info,
         Ok(Err(e)) => {
@@ -162,7 +179,7 @@ struct ModelInfo {
 struct Shared {
     info: ModelInfo,
     pairing: Mutex<Pairing>,
-    jobs: Mutex<Sender<Job>>,
+    jobs: Mutex<Sender<Work>>,
     /// Replies under way, by run id: set to stop one.
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_run: AtomicU64,
@@ -406,7 +423,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         stop: stop.clone(),
         out,
     };
-    if shared.jobs.lock().unwrap().send(job).is_err() {
+    if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
         shared.runs.lock().unwrap().remove(&run_id);
         return http::respond(&mut stream, 500, &error("The engine has stopped."));
     }
@@ -449,6 +466,12 @@ fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, st
 
 // ---- The engine ------------------------------------------------------------------------
 
+enum Work {
+    Reply(Job),
+    /// Save the chat in use, then say so.
+    Shutdown(Sender<()>),
+}
+
 struct Job {
     system: Option<String>,
     messages: Vec<Message>,
@@ -485,6 +508,17 @@ struct Kept {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
     checkpoint: Option<Qwen35Checkpoint>,
+}
+
+/// How many tokens `ids` starts with that `tokens` does too, leaving at least the last of
+/// `ids` to read again (for its logits).
+fn shared_start(tokens: &[u32], ids: &[u32]) -> usize {
+    tokens
+        .iter()
+        .zip(ids)
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(ids.len().saturating_sub(1))
 }
 
 impl Model {
@@ -526,14 +560,7 @@ impl Model {
         mark: usize,
     ) -> Result<(Vec<f32>, usize), String> {
         let e = |e: vireo_engine::models::Error| e.to_string();
-        // At least the last token is read again, for its logits.
-        let shared = kept
-            .tokens
-            .iter()
-            .zip(ids)
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(ids.len() - 1);
+        let shared = shared_start(&kept.tokens, ids);
         let from = match (self, &mut kept.session) {
             (Model::Llama(_), Session::Llama(s)) => {
                 s.truncate(shared);
@@ -576,6 +603,88 @@ impl Model {
         Ok((logits, from))
     }
 
+    /// How many of `ids` `continue_with` would keep from the session in use.
+    fn reusable(&self, kept: &Kept, ids: &[u32]) -> usize {
+        let shared = shared_start(&kept.tokens, ids);
+        match &kept.session {
+            Session::Qwen35(s) if shared != s.len() => kept
+                .checkpoint
+                .as_ref()
+                .map(|c| c.len())
+                .filter(|&n| n <= shared)
+                .unwrap_or(0),
+            _ => shared,
+        }
+    }
+
+    /// How many of the session's tokens `export` would save.
+    fn saveable(&self, kept: &Kept) -> usize {
+        match &kept.session {
+            Session::Qwen35(_) => kept.checkpoint.as_ref().map_or(0, |c| c.len()),
+            _ => kept.tokens.len(),
+        }
+    }
+
+    /// How many of `ids` a saved chat of `tokens` could give: as many as they share, but
+    /// Qwen's only whole (its DeltaNet state is for the end).
+    fn usable(&self, tokens: &[u32], ids: &[u32], context: usize) -> usize {
+        let shared = shared_start(tokens, ids);
+        let n = match self {
+            Model::Qwen35(_) if shared != tokens.len() => 0,
+            _ => shared,
+        };
+        if n > context { 0 } else { n }
+    }
+
+    /// The chat in `kept`, to save: every token (Qwen: up to its checkpoint), and the
+    /// state after them. `None` when there's nothing to save.
+    fn export(&self, kept: &Kept) -> Result<Option<(Vec<u32>, SavedState)>, String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let state = match &kept.session {
+            Session::Llama(s) => s.export().map_err(e)?,
+            Session::Gemma4(s) => s.export().map_err(e)?,
+            Session::Qwen35(s) => match &kept.checkpoint {
+                Some(cp) => s.export(cp).map_err(e)?,
+                None => return Ok(None),
+            },
+        };
+        if state.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((kept.tokens[..state.len()].to_vec(), state)))
+    }
+
+    /// Loads a saved chat's state into `kept` for its first `tokens.len()` positions.
+    fn import(&self, kept: &mut Kept, state: &SavedState, tokens: Vec<u32>) -> Result<(), String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        match (self, &mut kept.session) {
+            (Model::Llama(_), Session::Llama(s)) => s.import(state, tokens.len()).map_err(e)?,
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.import(state, tokens.len()).map_err(e)?,
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                s.import(state).map_err(e)?;
+                m.save(s, &mut kept.checkpoint).map_err(e)?;
+            }
+            _ => unreachable!("a session belongs to its model"),
+        }
+        kept.tokens = tokens;
+        Ok(())
+    }
+
+    /// Empties `kept`.
+    fn clear(&self, kept: &mut Kept) -> Result<(), String> {
+        match (self, &mut kept.session) {
+            (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(0),
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                m.reset(s).map_err(|e| e.to_string())?;
+                kept.checkpoint = None;
+            }
+            _ => unreachable!("a session belongs to its model"),
+        }
+        kept.tokens.clear();
+        Ok(())
+    }
+
     fn next(&self, s: &mut Session, id: u32, logits: &mut [f32]) -> Result<(), String> {
         let r = match (self, s) {
             (Model::Llama(m), Session::Llama(s)) => m
@@ -598,8 +707,9 @@ fn engine(
     path: &str,
     context: usize,
     precision: Precision,
+    chat_cache: Option<Option<PathBuf>>,
     ready: Sender<Result<ModelInfo, String>>,
-    jobs: Receiver<Job>,
+    jobs: Receiver<Work>,
 ) {
     let started = Instant::now();
     let file: &'static GgufFile = match GgufFile::open(path) {
@@ -658,9 +768,29 @@ fn engine(
         context,
     }));
 
+    let mut store = chat_cache.map(|dir| {
+        let key = store::model_key(std::path::Path::new(path), mode);
+        let dir = dir.unwrap_or_else(|| store::default_dir(&key));
+        let s = store::Store::open(dir, store::DISK_BUDGET);
+        if !s.entries().is_empty() {
+            eprintln!("{} saved chats.", s.entries().len());
+        }
+        s
+    });
     let mut seed = random_u64();
     let mut kept: Option<Kept> = None;
-    for job in jobs {
+    for work in jobs {
+        let job = match work {
+            Work::Reply(job) => job,
+            Work::Shutdown(done) => {
+                if let (Some(k), Some(store)) = (kept.as_ref(), store.as_mut()) {
+                    stash(&model, k, store);
+                    store.flush();
+                }
+                let _ = done.send(());
+                return;
+            }
+        };
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         if kept.is_none() {
             match model.session(context) {
@@ -680,6 +810,7 @@ fn engine(
         if let Err(e) = reply(
             &model,
             kept.as_mut().unwrap(),
+            store.as_mut(),
             &tokenizer,
             family,
             context,
@@ -693,9 +824,72 @@ fn engine(
     }
 }
 
+/// Saves the chat in `kept` to `store`, if there's one worth saving.
+fn stash(model: &Model, kept: &Kept, store: &mut store::Store) {
+    match model.export(kept) {
+        Ok(Some((tokens, state))) => store.put(tokens, state),
+        Ok(None) => {}
+        Err(e) => eprintln!("Couldn't save the chat's cache: {e}"),
+    }
+}
+
+/// How many more tokens a saved chat must spare reading, over the session in use, to be
+/// loaded instead: loading one costs about as much as reading a few dozen tokens.
+const SWITCH_GAIN: usize = 128;
+
+/// Before a reply for `ids`: when it would throw away much of the chat in the session
+/// (another chat, or an early message edited), saves that chat first; and when a saved
+/// chat shares more of `ids` than the session does, loads it in the session's place.
+fn switch_chat(
+    model: &Model,
+    kept: &mut Kept,
+    store: &mut store::Store,
+    ids: &[u32],
+    context: usize,
+) -> Result<(), String> {
+    let live = model.reusable(kept, ids);
+    let thrown_away = model.saveable(kept).saturating_sub(live);
+    let best = store
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, model.usable(&e.tokens, ids, context)))
+        .max_by_key(|&(_, n)| n)
+        .filter(|&(_, n)| n >= live + SWITCH_GAIN);
+    let Some((i, usable)) = best else {
+        if thrown_away >= SWITCH_GAIN {
+            stash(model, kept, store);
+        }
+        return Ok(());
+    };
+    let started = Instant::now();
+    let tokens = store.entries()[i].tokens[..usable].to_vec();
+    // The state first: saving the session's chat may reorder the saved ones.
+    let Some(state) = store.get(i) else {
+        return Ok(());
+    };
+    if thrown_away >= SWITCH_GAIN {
+        stash(model, kept, store);
+    }
+    if let Err(e) = model.import(kept, &state, tokens) {
+        // Not this session's kind of state after all: forget it, and start afresh.
+        eprintln!("Couldn't load a saved chat ({e}); reading it again.");
+        store.forget(&state);
+        model.clear(kept)?;
+        return Ok(());
+    }
+    eprintln!(
+        "Loaded {usable} tokens of a saved chat in {:.0} ms.",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // the engine loop's state, which it owns apart
 fn reply(
     model: &Model,
     kept: &mut Kept,
+    store: Option<&mut store::Store>,
     tokenizer: &Tokenizer,
     family: Family,
     context: usize,
@@ -733,6 +927,9 @@ fn reply(
         ));
     }
     let started = Instant::now();
+    if let Some(store) = store {
+        switch_chat(model, kept, store, &ids, context)?;
+    }
     let (mut logits, reused) = model.continue_with(kept, &ids, mark)?;
     let prompt_seconds = started.elapsed().as_secs_f64();
 
@@ -783,7 +980,7 @@ fn reply(
     }
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens ({reused} kept from the last reply, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s){}.",
+        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s){}.",
         ids.len(),
         ids.len() - reused,
         (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),

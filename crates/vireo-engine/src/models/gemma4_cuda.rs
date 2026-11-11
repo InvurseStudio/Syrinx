@@ -5,8 +5,10 @@
 //! in batches and generated tokens replay a recorded graph, as in `llama_cuda.rs`.
 
 use super::gemma4::Config;
-use super::gpu::{GpuMatrix, Input, LogitsBuffer, gpu_error, q8_room, record, row};
-use super::{DEFAULT_BATCH, Error, Logits, Precision, Result, matrix, vector};
+use super::gpu::{
+    GpuMatrix, Input, LogitsBuffer, gpu_error, load_state, q8_room, record, row, save_state,
+};
+use super::{DEFAULT_BATCH, Error, Logits, Precision, Result, SavedState, matrix, vector};
 use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{Buffer, CuDevicePtr, Gpu, Graph, Q8, QkvPrep};
@@ -100,6 +102,24 @@ impl Gemma4CudaSession {
     /// continuing a chat whose new prompt starts with the tokens already read.
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
+    }
+
+    /// The keys and values of every position so far, copied to system memory.
+    pub fn export(&self) -> Result<SavedState> {
+        save_state(&self.cache_buffers(), self.capacity, self.len, &[])
+    }
+
+    /// Loads the first `upto` positions of a state `export` made from a session of the
+    /// same model and precision (of any capacity is fine as long as `upto` fits), in
+    /// place of what this session held.
+    pub fn import(&mut self, saved: &SavedState, upto: usize) -> Result<()> {
+        load_state(saved, upto, &self.cache_buffers(), self.capacity, &[])?;
+        self.len = upto;
+        Ok(())
+    }
+
+    fn cache_buffers(&self) -> Vec<&Buffer> {
+        self.keys.iter().chain(&self.values).flatten().collect()
     }
 }
 

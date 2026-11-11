@@ -94,6 +94,7 @@ git), for checking our output and speed.
 | 2026-11-11 | The small kernels: Qwen's convolution in registers (it had gone to local memory), `qkv_prep` with a thread per number and 8 tokens a block, Gemma's F16 per-layer projection as Q8_0 in 8-bit mode (see "Tenth round") | Llama and Qwen: 8-bit perplexity and generated tokens unchanged to every digit. Gemma: the same tokens; perplexity per chunk within 0.3% of before and nearer exact on average (0.14% from it, 0.27% before); next-token probabilities nearer exact too (20.04% against exact 20.67%, before 22.12%). 75 engine tests pass |
 | 2026-11-11 | Qwen's DeltaNet for a prompt in chunks of 64 tokens, the WY form (`delta_chunk_prep`, `delta_chunk_scan`; see "Eleventh round") | Exact perplexity the same as token by token to every digit at 2,048 tokens (chunk 1: 16.2601 against 16.2602 on the first build, then identical); 8-bit within 0.25% per chunk, nearer exact on average. A new test case reads Qwen in batches of 200 (across chunks, ending in part of one) against one token at a time: logits within 1e-4 of 31 exact. 75 engine tests pass |
 | 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52 → 0.07 s, Qwen 1.33 → 0.10 s, Gemma 1.06 → 0.05 s at turn 5). 76 engine tests pass |
+| 2026-11-11 | A saved cache per chat: a session's keys and values (and Qwen's DeltaNet at its checkpoint) copied to system memory and back (`export`, `import`, `SavedState`); vireo-server saves the chat in use when a prompt would throw much of it away, or when the app closes, to `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\` (a file per chat, written on a thread of its own; 4 GB per model, the oldest go first), and loads the saved chat that shares the most of a new prompt. Llama and Gemma can load part of one (a shared start); Qwen's loads whole | A new GPU test: an imported session goes on to the bit as the one it came from, whole and in part, exact and 8-bit. Two chats about 3,500- and 4,400-token documents taking turns, then a restart: going back to a chat or reopening it loads its cache in 17-66 ms, the first word in 0.06-0.13 s, against 0.8-1.4 s reading it again, on all three models. 77 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -688,8 +689,13 @@ kernels while keeping everything above them ours).
 
 ### 2. Vireo-only engine features
 
-Started 2026-11-11 with the KV cache kept between turns (see Progress). One chat at a time:
-switching chats reads the other one's history again, until a saved cache per chat.
+Started 2026-11-11: the KV cache kept between turns, then a saved cache per chat that
+lasts across restarts (see Progress). Still to do: the shared prompt start for Qwen (Llama
+and Gemma already load it from any saved chat with the same system prompt; Qwen's
+DeltaNet would need a checkpoint at the system prompt's end too), grammar-constrained
+tool calls and the scheduler. A saved state only fits the model file and precision that
+made it (the folder is per model), and a Llama 3.2 1B chat of 4,000 tokens takes 128 MB
+on disk.
 
 The shared prompt start loaded at launch, a saved KV cache per chat, grammar-constrained
 tool calls, the scheduler.

@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 
-use super::{Error, Precision, Result};
+use super::{Error, Precision, Result, SavedState};
 use crate::cpu::Matrix;
 use crate::cuda::{self, Buffer, CuDevicePtr, Gpu, Graph, Q8};
 
@@ -193,4 +193,79 @@ pub(super) enum Outputs {
 /// The address of row `row` of a buffer with rows of `width` f32s.
 pub(super) fn row(buffer: &Buffer, row: usize, width: usize) -> CuDevicePtr {
     buffer.f32_at(row * width)
+}
+
+/// Copies a session's first `len` positions of each of `positions` (buffers that hold
+/// `capacity` positions, each the same size) and the whole of each of `whole` into one
+/// [`SavedState`].
+pub(super) fn save_state(
+    positions: &[&Buffer],
+    capacity: usize,
+    len: usize,
+    whole: &[&Buffer],
+) -> Result<SavedState> {
+    let total = positions
+        .iter()
+        .map(|b| b.len_bytes() / capacity * len)
+        .chain(whole.iter().map(|b| b.len_bytes()))
+        .sum();
+    let mut bytes = vec![0u8; total];
+    let mut at = 0;
+    for b in positions {
+        let n = b.len_bytes() / capacity * len;
+        b.read_bytes_at(0, &mut bytes[at..at + n])
+            .map_err(gpu_error)?;
+        at += n;
+    }
+    for b in whole {
+        let n = b.len_bytes();
+        b.read_bytes_at(0, &mut bytes[at..at + n])
+            .map_err(gpu_error)?;
+        at += n;
+    }
+    Ok(SavedState { len, bytes })
+}
+
+/// Puts the first `upto` positions of `saved` back into `positions` (and, when `whole`
+/// isn't empty, its whole buffers, which hold the state at `saved.len` and nothing
+/// before: then `upto` must be `saved.len`). An error if `saved` came from another
+/// model, precision or layout.
+pub(super) fn load_state(
+    saved: &SavedState,
+    upto: usize,
+    positions: &[&Buffer],
+    capacity: usize,
+    whole: &[&Buffer],
+) -> Result<()> {
+    let expected: usize = positions
+        .iter()
+        .map(|b| b.len_bytes() / capacity * saved.len)
+        .chain(whole.iter().map(|b| b.len_bytes()))
+        .sum();
+    if saved.bytes.len() != expected || upto > saved.len || upto > capacity {
+        return Err(Error::Invalid(format!(
+            "a saved state of {} bytes for {} positions doesn't fit this session",
+            saved.bytes.len(),
+            saved.len
+        )));
+    }
+    if !whole.is_empty() && upto != saved.len {
+        return Err(Error::Invalid(
+            "a saved state with running layers can only be loaded whole".into(),
+        ));
+    }
+    let mut at = 0;
+    for b in positions {
+        let per = b.len_bytes() / capacity;
+        b.write_bytes_at(0, &saved.bytes[at..at + per * upto])
+            .map_err(gpu_error)?;
+        at += per * saved.len;
+    }
+    for b in whole {
+        let n = b.len_bytes();
+        b.write_bytes_at(0, &saved.bytes[at..at + n])
+            .map_err(gpu_error)?;
+        at += n;
+    }
+    Ok(())
 }
