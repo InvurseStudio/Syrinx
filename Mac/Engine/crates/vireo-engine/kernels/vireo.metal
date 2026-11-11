@@ -2475,6 +2475,114 @@ kernel void delta_chunk_scan(ARGS, KP) {
     }
 }
 
+// delta_chunk_scan on SIMD-group matrices: the same chunks in order, for COLS columns of
+// value head gid.x's state a threadgroup (gid.y), 4 SIMD groups. Each chunk's products
+// are 8 × 8 multiplies in f32: δ = U − W S0 (W read from the scratch), O = Q̂ S0 + P δ
+// (written out through threadgroup memory, scaled by 1/√n, only the chunk's real
+// tokens), S = γ S0 + K̂ᵀ δ (γ S0 as diag(γ) S0). n ≤ 128, a multiple of 8.
+template <int COLS>
+kernel void delta_chunk_scan_sg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]]) {
+    device const float* scratch = ARG_PTR(const float, 0);
+    device float* state = ARG_PTR(float, 1);
+    device float* out = ARG_PTR(float, 2);
+    const int n = ARG_INT(3), tokens = ARG_INT(4);
+    constexpr int CB = COLS / 8, SG = 4;
+    threadgroup float Ss[128 * COLS];  // S0[r][c]
+    threadgroup float ds[DC * COLS];   // δ, then O
+    threadgroup float gdiag[64];
+    const int h = gid.x, v_heads = ngrid.x, j0 = gid.y * COLS;
+    const float inv_sqrt_n = 1.0f / sqrt((float)n);
+    for (int idx = tid; idx < n * COLS; idx += tpg.x) {
+        const int c = idx / n, r = idx % n;
+        Ss[r * COLS + c] = state[((ulong)h * n + j0 + c) * n + r];
+    }
+    for (int i = tid; i < 64; i += tpg.x) gdiag[i] = 0.0f;
+    BARRIER;  // zeroed before any chunk writes its γ on the diagonal
+    const int chunks = (tokens + DC - 1) / DC;
+    const int rbs = n / 8;
+    for (int ch = 0; ch < chunks; ch++) {
+        device const float* base = scratch + ((ulong)ch * v_heads + h) * delta_chunk_stride(n);
+        device const float *W = base, *U = W + DC * n, *Qh = U + DC * n, *Kh = Qh + DC * n, *P = Kh + DC * n;
+        const float gamma = P[DC * DC];
+        if (tid < 8) gdiag[tid * 9] = gamma;
+        BARRIER;  // the state is in (or updated)
+
+        // W S0 into ds, then δ = U − W S0.
+        for (int blk = sg; blk < (DC / 8) * CB; blk += SG) {
+            const int ib = blk / CB, cb = blk % CB;
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int kb = 0; kb < rbs; kb++) {
+                simdgroup_float8x8 a, b;
+                simdgroup_load(a, W + ib * 8 * n + kb * 8, n);
+                simdgroup_load(b, Ss + kb * 8 * COLS + cb * 8, COLS);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            simdgroup_store(acc, ds + ib * 8 * COLS + cb * 8, COLS);
+        }
+        BARRIER;
+        for (int e = tid; e < DC * COLS; e += tpg.x) {
+            const int i = e / COLS, c = e % COLS;
+            ds[e] = U[i * n + j0 + c] - ds[e];
+        }
+        BARRIER;
+        // O = Q̂ S0 + P δ, kept in registers until δ is no longer needed.
+        simdgroup_float8x8 o_blk[(DC / 8) * CB / SG > 0 ? (DC / 8) * CB / SG : 1];
+        int nb = 0;
+        for (int blk = sg; blk < (DC / 8) * CB; blk += SG, nb++) {
+            const int ib = blk / CB, cb = blk % CB;
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int kb = 0; kb < rbs; kb++) {
+                simdgroup_float8x8 a, b;
+                simdgroup_load(a, Qh + ib * 8 * n + kb * 8, n);
+                simdgroup_load(b, Ss + kb * 8 * COLS + cb * 8, COLS);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            for (int mb = 0; mb <= ib; mb++) {  // P is 0 past the diagonal
+                simdgroup_float8x8 a, b;
+                simdgroup_load(a, P + ib * 8 * DC + mb * 8, DC);
+                simdgroup_load(b, ds + mb * 8 * COLS + cb * 8, COLS);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            o_blk[nb] = acc;
+        }
+        BARRIER;  // everyone is done reading S0 for O
+        // S = γ S0 + K̂ᵀ δ, each SIMD group updating its own blocks.
+        simdgroup_float8x8 gm;
+        simdgroup_load(gm, gdiag, 8);
+        for (int blk = sg; blk < rbs * CB; blk += SG) {
+            const int rb = blk / CB, cb = blk % CB;
+            simdgroup_float8x8 s0, acc;
+            simdgroup_load(s0, Ss + rb * 8 * COLS + cb * 8, COLS);
+            simdgroup_multiply(acc, gm, s0);
+            for (int mb = 0; mb < DC / 8; mb++) {
+                simdgroup_float8x8 a, b;
+                simdgroup_load(a, Kh + mb * 8 * n + rb * 8, n, ulong2(0, 0), true);
+                simdgroup_load(b, ds + mb * 8 * COLS + cb * 8, COLS);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            simdgroup_store(acc, Ss + rb * 8 * COLS + cb * 8, COLS);
+        }
+        BARRIER;  // done with δ: O goes in its place
+        nb = 0;
+        for (int blk = sg; blk < (DC / 8) * CB; blk += SG, nb++) {
+            const int ib = blk / CB, cb = blk % CB;
+            simdgroup_store(o_blk[nb], ds + ib * 8 * COLS + cb * 8, COLS);
+        }
+        BARRIER;
+        for (int e = tid; e < DC * COLS; e += tpg.x) {
+            const int i = e / COLS, c = e % COLS, t = ch * DC + i;
+            if (t < tokens) out[((ulong)t * v_heads + h) * n + j0 + c] = ds[e] * inv_sqrt_n;
+        }
+    }
+    BARRIER;
+    for (int idx = tid; idx < n * COLS; idx += tpg.x) {
+        const int c = idx / n, r = idx % n;
+        state[((ulong)h * n + j0 + c) * n + r] = Ss[r * COLS + c];
+    }
+}
+
+template [[host_name("delta_chunk_scan_sg_8")]] kernel void delta_chunk_scan_sg<8>(ARGS, KP, uint);
+
 // ---- Copies --------------------------------------------------------------------------
 
 // `bytes` from `src` to `dst`, in order with the other work: 16 bytes a thread when both

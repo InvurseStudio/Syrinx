@@ -135,7 +135,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "delta_scan" => &[7, 8],
         "delta_out" => &[0],
         "delta_chunk_prep" => &[7],
-        "delta_chunk_scan" => &[1, 2],
+        n if n.starts_with("delta_chunk_scan") => &[1, 2],
         "copy_bytes" => &[0],
         "to_half" => &[1],
         _ => return None,
@@ -647,6 +647,8 @@ struct Kernels {
     /// A prompt's DeltaNet in chunks of DELTA_CHUNK tokens.
     delta_chunk_prep: Pso,
     delta_chunk_scan: Pso,
+    /// delta_chunk_scan on SIMD-group matrices, 8 columns a threadgroup.
+    delta_chunk_scan_sg: [Pso; 1],
 }
 
 /// The weight types with kernels, in the order of `Kernels::matvec` and `matmul`.
@@ -876,6 +878,7 @@ impl Gpu {
             delta_out: pipeline("delta_out")?,
             delta_chunk_prep: pipeline("delta_chunk_prep")?,
             delta_chunk_scan: pipeline("delta_chunk_scan")?,
+            delta_chunk_scan_sg: [pipeline("delta_chunk_scan_sg_8")?],
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
@@ -1620,9 +1623,17 @@ impl Gpu {
                 Arg::I32(n as i32),
                 Arg::I32(tokens as i32),
             ];
-            // 16 columns of the state a threadgroup (DSC_COLS in vireo.metal).
-            let grid = (d.v_heads as u32, (n / 16) as u32);
-            self.run(&self.kernels.delta_chunk_scan, grid, 64, &scan)?;
+            if n.is_multiple_of(8) {
+                // On SIMD-group matrices, 8 columns of the state a threadgroup: on the M5
+                // Max, Qwen 3.5 read prompts 15% faster than with delta_chunk_scan (16
+                // columns a threadgroup was 1% faster than that, 32 slower).
+                let grid = (d.v_heads as u32, (n / 8) as u32);
+                self.run(&self.kernels.delta_chunk_scan_sg[0], grid, 128, &scan)?;
+            } else {
+                // 16 columns of the state a threadgroup (DSC_COLS in vireo.metal).
+                let grid = (d.v_heads as u32, (n / 16) as u32);
+                self.run(&self.kernels.delta_chunk_scan, grid, 64, &scan)?;
+            }
             let out = [
                 Arg::Ptr(d.out),
                 Arg::Ptr(d.z),
