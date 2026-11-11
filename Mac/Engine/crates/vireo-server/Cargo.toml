@@ -7,3 +7,9 @@ publish.workspace = true
 
 [dependencies]
 vireo-engine = { path = "../vireo-engine" }
+
+# The Mac's document readers (PDFKit, AppKit) for read_file, through objc2's thin
+# bindings as the engine reaches Metal.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
