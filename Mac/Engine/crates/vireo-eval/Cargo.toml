@@ -1,0 +1,8 @@
+[package]
+name = "vireo-eval"
+description = "How well each model uses Vireo's tools: chats through vireo-server with a stand-in PC, scored"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
