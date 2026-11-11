@@ -189,7 +189,9 @@ fn easy() -> Vec<Case> {
                 .file(&format!(r"{projects}\vireo\docs\secret.txt"), "Remember: the code word is HERON.")
                 .file(&format!(r"{projects}\garden\plan.md"), "Plant tomatoes in May."),
             check: |r| {
-                need(r.calls.iter().any(|c| c.tool == "read_file" && c.points_at("path", "secret.txt")), "never read secret.txt")?;
+                // Found however it likes: a search's matching line (as the app gives it)
+                // shows the word as well as reading the file does.
+                need(!r.calls.is_empty(), "didn't look")?;
                 need(r.says(&["HERON"]), "didn't give the code word")
             },
         },

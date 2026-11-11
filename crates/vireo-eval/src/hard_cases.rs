@@ -104,8 +104,9 @@ pub fn all() -> Vec<Case> {
                         .any(|c| c.tool == "read_file" && c.points_at("path", "app.log")),
                     "didn't read the log",
                 )?;
+                // In its own words is fine: "the disk on drive D: was full".
                 need(
-                    r.says(&["DISK_FULL", "disk full", "disk is full"]),
+                    r.says(&["DISK_FULL"]) || (r.says(&["disk", "drive"]) && r.says(&["full"])),
                     "didn't find the 14:32 error",
                 )
             },
@@ -318,7 +319,11 @@ mod tests {
     #[test]
     fn the_long_log_is_long_and_has_its_line() {
         let log = super::long_log();
-        assert!((5000..8000).contains(&log.len()), "{} characters", log.len());
+        assert!(
+            (5000..8000).contains(&log.len()),
+            "{} characters",
+            log.len()
+        );
         assert_eq!(log.matches("DISK_FULL").count(), 1);
         assert!(log.contains("14:32:17 ERROR backup job: DISK_FULL"));
     }

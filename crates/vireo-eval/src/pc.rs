@@ -10,6 +10,20 @@ use crate::json::Value;
 /// The home folder relative paths start from, as the app's do.
 pub const HOME: &str = r"C:\Users\me";
 
+/// "Invoice-Register-FY2026.xlsx": a file's name (the app's `FileNamePattern`,
+/// `^[^\s/\\]+\.[A-Za-z0-9]{1,6}$`), searched for by name only.
+fn is_file_name(s: &str) -> bool {
+    let Some((stem, ext)) = s.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !stem
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+        && (1..=6).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 #[derive(Default, Clone)]
 pub struct Pc {
     /// Files by full path (lowercased for lookup), with their path as written and text.
@@ -95,24 +109,69 @@ impl Pc {
                 entries.dedup();
                 Ok(entries.join("\n"))
             }
+            // As the app's SearchFiles: a file or folder name matches when it holds every
+            // word of the search ("*.pdf" finds a.pdf, "STEM camp" finds Stem-Camp.docx),
+            // with - _ . read as spaces; unless the search is itself a file name, lines
+            // inside files that hold the whole search match too.
             "search_files" => {
                 let folder = arg("directory")?;
-                let pattern = args.str("pattern").unwrap_or("").to_lowercase();
-                let prefix = format!("{}\\", key(&folder));
-                let hits: Vec<&str> = self
-                    .files
-                    .iter()
-                    .filter(|(k, (p, text))| {
-                        k.starts_with(&prefix)
-                            && (p.to_lowercase().contains(&pattern)
-                                || text.to_lowercase().contains(&pattern))
-                    })
-                    .map(|(_, (p, _))| p.as_str())
+                let raw = args.str("pattern").unwrap_or("").trim().to_string();
+                let pattern = raw.to_lowercase();
+                let words: Vec<String> = pattern
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
                     .collect();
-                Ok(if hits.is_empty() {
-                    format!("Nothing in {folder} matches {pattern:?}.")
+                let names_only = is_file_name(&raw);
+                let name_matches = |name: &str| {
+                    let plain: String = name
+                        .to_lowercase()
+                        .chars()
+                        .map(|c| if matches!(c, '-' | '_' | '.') { ' ' } else { c })
+                        .collect();
+                    !words.is_empty() && words.iter().all(|w| plain.contains(w.as_str()))
+                };
+                let prefix = format!("{}\\", key(&folder));
+                let mut results = Vec::new();
+                let mut folders_seen = std::collections::BTreeSet::new();
+                for (k, (p, text)) in &self.files {
+                    if !k.starts_with(&prefix) {
+                        continue;
+                    }
+                    // The folders between the search's folder and the file.
+                    let rel = &p[prefix.len()..];
+                    let mut so_far = p[..prefix.len() - 1].to_string();
+                    for part in rel
+                        .split('\\')
+                        .collect::<Vec<_>>()
+                        .split_last()
+                        .map_or(&[][..], |(_, dirs)| dirs)
+                    {
+                        so_far = format!("{so_far}\\{part}");
+                        if folders_seen.insert(so_far.to_lowercase()) && name_matches(part) {
+                            results.push(format!("{so_far}\\ (folder name matches)"));
+                        }
+                    }
+                    let name = p.rsplit('\\').next().unwrap_or(p);
+                    if name_matches(name) {
+                        results.push(format!("{p} (file name matches)"));
+                    } else if !names_only {
+                        for (n, line) in text.lines().enumerate() {
+                            if line.to_lowercase().contains(&pattern) {
+                                results.push(format!("{p}:{}: {}", n + 1, line.trim()));
+                            }
+                        }
+                    }
+                }
+                Ok(if results.is_empty() {
+                    format!("No matches found for \"{raw}\" in {folder}")
                 } else {
-                    hits.join("\n")
+                    let n = results.len();
+                    format!(
+                        "{n} match{} for \"{raw}\":\n\n{}",
+                        if n == 1 { "" } else { "es" },
+                        results.join("\n")
+                    )
                 })
             }
             "file_exists" => {
@@ -183,7 +242,41 @@ mod tests {
         );
         assert_eq!(
             run("search_files", &[("pattern", "a.pdf"), ("directory", ".")]),
-            Ok(r"C:\Users\me\Documents\Invoices\a.pdf".into())
+            Ok("1 match for \"a.pdf\":\n\nC:\\Users\\me\\Documents\\Invoices\\a.pdf (file name matches)".into())
+        );
+        // As the app: every word in the name ("*.pdf" is the word "pdf"), folders too,
+        // and lines inside files for a search that isn't a file name.
+        let found = run(
+            "search_files",
+            &[("pattern", "*.pdf"), ("directory", "Documents")],
+        )
+        .unwrap();
+        assert!(
+            found.contains(r"Invoices\a.pdf (file name matches)"),
+            "{found}"
+        );
+        let found = run(
+            "search_files",
+            &[("pattern", "invoices"), ("directory", ".")],
+        )
+        .unwrap();
+        assert!(
+            found.contains(r"C:\Users\me\Documents\Invoices\ (folder name matches)"),
+            "{found}"
+        );
+        let found = run("search_files", &[("pattern", "hello"), ("directory", ".")]).unwrap();
+        assert!(found.contains(r"notes.txt:1: hello"), "{found}");
+        assert!(
+            run(
+                "search_files",
+                &[("pattern", "nothing here"), ("directory", ".")]
+            )
+            .unwrap()
+            .starts_with("No matches")
+        );
+        assert!(
+            super::is_file_name("Invoice-Register-FY2026.xlsx")
+                && !super::is_file_name("README invoices")
         );
         assert!(
             run("file_exists", &[("path", r"C:\Users\me\nope.txt")])
