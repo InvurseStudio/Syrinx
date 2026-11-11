@@ -20,15 +20,21 @@
 //!   a copy kernel, as CUDA's asynchronous copies do.
 //! - **Graphs.** A recording is the list of dispatches with their arguments; replaying it
 //!   encodes them again, which costs a few microseconds per dispatch.
-//! - **8-bit activations.** Apple GPUs have no dp4a or CUDA tensor cores, so
-//!   [`Gpu::supports_8bit`] is false for every type and the models use the f32 kernels.
+//! - **The default mode's matrix products.** Apple GPUs have no dp4a, so there are no 8-bit
+//!   activations. On GPUs with neural accelerators (M5, A19 and later; Metal 4's tensor
+//!   operations, `kernels/vireo_tensor.metal`), the default mode's prompts go there
+//!   instead, with the weights rounded to f16: [`Gpu::supports_8bit`] says so, the
+//!   "8-bit" input is the f32 activations themselves, and exact mode keeps f32
+//!   throughout. Without them the default mode is exact mode's kernels.
 //!
 //! All GPU work goes, in order, through one queue. The types are Send and Sync, as the CUDA
 //! ones are, and like them meant to be used from one thread at a time.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use objc2::rc::Retained;
@@ -116,6 +122,9 @@ struct State {
     staging: Vec<MtlBuffer>,
     /// Buffers were added to or taken from the residency set since its last commit.
     residency_dirty: bool,
+    /// With VIREO_METAL_PROFILE set: each dispatch runs on its own, and its GPU time is
+    /// added up by kernel (seconds, dispatches), printed when the GPU is closed.
+    profile: Option<HashMap<String, (f64, usize)>>,
 }
 
 /// The device, its queue, the kernels and the in-order state all work goes through.
@@ -126,6 +135,8 @@ struct Context {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     copy: Pso,
     state: Mutex<State>,
+    /// Each pipeline's kernel name, by its address, for the profile.
+    names: HashMap<usize, String>,
 }
 
 // Metal's objects may be used from any thread; the engine uses each GPU from one at a time
@@ -221,6 +232,25 @@ impl Context {
         Ok(())
     }
 
+    /// With profiling on: runs what's queued (just `d`) and adds its GPU time to the profile.
+    fn profile_step(&self, state: &mut State, d: &Dispatch) -> Result<()> {
+        if state.profile.is_none() {
+            return Ok(());
+        }
+        let commands = state.open.as_ref().unwrap().commands.clone();
+        self.finish(state)?;
+        let seconds = commands.GPUEndTime() - commands.GPUStartTime();
+        let name = self
+            .names
+            .get(&(Retained::as_ptr(&d.pipeline) as *const c_void as usize))
+            .cloned()
+            .unwrap_or_else(|| "?".into());
+        let entry = state.profile.as_mut().unwrap().entry(name).or_default();
+        entry.0 += seconds;
+        entry.1 += 1;
+        Ok(())
+    }
+
     /// Runs `d` after the work already queued, or records it.
     fn dispatch(&self, d: Dispatch) -> Result<()> {
         if d.grid.0 == 0 || d.grid.1 == 0 || d.grid.2 == 0 {
@@ -237,7 +267,8 @@ impl Context {
             recording.push(d);
             return Ok(());
         }
-        self.encode(&mut state, &d)
+        self.encode(&mut state, &d)?;
+        self.profile_step(&mut state, &d)
     }
 
     /// Commits the queued work and waits for it.
@@ -443,6 +474,7 @@ impl Graph {
         assert!(state.recording.is_none(), "launching a graph while recording");
         for d in &self.dispatches {
             self.context.encode(&mut state, d)?;
+            self.context.profile_step(&mut state, d)?;
         }
         Ok(())
     }
@@ -450,7 +482,10 @@ impl Graph {
 
 struct Kernels {
     matvec: [Pso; 7],
-    matmul: [Pso; 7],
+    /// The matrix-matrix products on the SIMD-group matrix units, in f32.
+    matmul_sg: [Pso; 7],
+    /// On the neural accelerators (f16 weights), where the GPU has them.
+    matmul_tc: Option<[Pso; 7]>,
     rms_norm: Pso,
     residual_norm: Pso,
     qkv_prep: Pso,
@@ -458,8 +493,9 @@ struct Kernels {
     attention_h: Pso,
     attention_part: [Pso; 2],
     attention_combine: Pso,
-    /// For head sizes 64, 128, 256 and 512.
+    /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
+    attention_tiled_h: [Pso; 4],
     swiglu: Pso,
     geglu: Pso,
     add: Pso,
@@ -512,12 +548,20 @@ unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
 
 const SOURCE: &str = include_str!("../../kernels/vireo.metal");
+/// The kernels on the neural accelerators: compiled after SOURCE, where Metal has them.
+const TENSOR_SOURCE: &str = include_str!("../../kernels/vireo_tensor.metal");
+
+/// Whether the GPU opened has neural accelerators (the tensor kernels compiled).
+static TENSOR_OPS: AtomicBool = AtomicBool::new(false);
 
 /// The number of threads the matrix-vector kernels use per threadgroup: 4 SIMD groups.
 const ROWS_PER_BLOCK: u32 = 4;
-/// The matrix-matrix kernels' tile: rows of weights by tokens.
-const TILE_ROWS: u32 = 128;
-const TILE_TOKENS: u32 = 64;
+/// The matrix-matrix kernel's tile (matmul_sg): rows of weights by tokens.
+const TILE_ROWS: u32 = 64;
+const TILE_TOKENS: u32 = 32;
+/// The tensor kernel's tile (matmul_tc in vireo_tensor.metal).
+const TC_ROWS: u32 = 64;
+const TC_TOKENS: u32 = 128;
 /// The most parts one token's attention is split into.
 const MAX_PARTS: u32 = 16;
 
@@ -536,9 +580,20 @@ impl Gpu {
         // overflows to NaN for large inputs (GeGLU and Gemma's softcap).
         options.setMathMode(MTLMathMode::Safe);
         options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
-        let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), Some(&options))
-            .map_err(|e| driver_error("compiling the kernels", &e))?;
+        // With the tensor kernels where Metal compiles them (it can't before the M5 and A19).
+        let with_tensors = format!("{SOURCE}\n{TENSOR_SOURCE}");
+        let (library, tensor_ops) = match device
+            .newLibraryWithSource_options_error(&NSString::from_str(&with_tensors), Some(&options))
+        {
+            Ok(library) => (library, true),
+            Err(_) => (
+                device
+                    .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), Some(&options))
+                    .map_err(|e| driver_error("compiling the kernels", &e))?,
+                false,
+            ),
+        };
+        let names = std::cell::RefCell::new(HashMap::new());
         let pipeline = |name: &str| -> Result<Pso> {
             let function = library
                 .newFunctionWithName(&NSString::from_str(name))
@@ -547,9 +602,13 @@ impl Gpu {
                     code: 0,
                     name: format!("no kernel {name}"),
                 })?;
-            device
+            let pso = device
                 .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|e| driver_error("newComputePipelineState", &e))
+                .map_err(|e| driver_error("newComputePipelineState", &e))?;
+            names
+                .borrow_mut()
+                .insert(Retained::as_ptr(&pso) as *const c_void as usize, name.to_string());
+            Ok(pso)
         };
         let per_kind = |prefix: &str| -> Result<[Pso; 7]> {
             let v: Vec<Pso> = KINDS
@@ -560,7 +619,12 @@ impl Gpu {
         };
         let kernels = Kernels {
             matvec: per_kind("matvec")?,
-            matmul: per_kind("matmul")?,
+            matmul_sg: per_kind("matmul_sg")?,
+            matmul_tc: if tensor_ops {
+                Some(per_kind("matmul_tc")?)
+            } else {
+                None
+            },
             rms_norm: pipeline("rms_norm")?,
             residual_norm: pipeline("residual_norm")?,
             qkv_prep: pipeline("qkv_prep")?,
@@ -573,6 +637,12 @@ impl Gpu {
                 pipeline("attention_tiled_128")?,
                 pipeline("attention_tiled_256")?,
                 pipeline("attention_tiled_512")?,
+            ],
+            attention_tiled_h: [
+                pipeline("attention_tiled_h_64")?,
+                pipeline("attention_tiled_h_128")?,
+                pipeline("attention_tiled_h_256")?,
+                pipeline("attention_tiled_h_512")?,
             ],
             swiglu: pipeline("swiglu")?,
             geglu: pipeline("geglu")?,
@@ -589,6 +659,7 @@ impl Gpu {
             delta_out: pipeline("delta_out")?,
         };
         let copy = pipeline("copy_bytes")?;
+        TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
 
         let queue = device.newCommandQueue().ok_or(Error::Driver {
             call: "newCommandQueue",
@@ -613,7 +684,11 @@ impl Gpu {
             queue,
             residency,
             copy,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                profile: std::env::var_os("VIREO_METAL_PROFILE").map(|_| HashMap::new()),
+                ..State::default()
+            }),
+            names: names.into_inner(),
         });
         let parts_bytes = 64 * MAX_PARTS as usize * (2 + 512) * 4;
         let attention_parts = Self::alloc_in(&context, parts_bytes)?;
@@ -834,7 +909,7 @@ impl Gpu {
             }
             return Ok(());
         }
-        let kernel = &self.kernels.matmul[Self::kind_index(kind)?];
+        let kernel = &self.kernels.matmul_sg[Self::kind_index(kind)?];
         let grid = (
             (rows as u32).div_ceil(TILE_ROWS),
             (tokens as u32).div_ceil(TILE_TOKENS),
@@ -847,7 +922,7 @@ impl Gpu {
             Arg::I32(cols as i32),
             Arg::I32(tokens as i32),
         ];
-        self.run(kernel, grid, 256, &args)
+        self.run(kernel, grid, 128, &args)
     }
 
     /// RMSNorm of each of `rows` rows of `n` numbers; `weight` is the same for every row,
@@ -1004,14 +1079,6 @@ impl Gpu {
                 &combine,
             );
         }
-        if half_cache {
-            return self.run(
-                &self.kernels.attention_h,
-                (heads as u32, tokens as u32),
-                128,
-                &args,
-            );
-        }
         let tiled = match head_dim {
             64 => Some((0, 8)),
             128 => Some((1, 8)),
@@ -1020,18 +1087,24 @@ impl Gpu {
             _ => None,
         };
         if let (true, Some((kernel, lanes))) = (tokens > 1, tiled) {
+            // A prompt: a threadgroup of tokens shares each key and value it reads.
             let mut args = args.to_vec();
             args.push(Arg::I32(tokens as i32));
             let blocks = (tokens as u32).div_ceil(256 / lanes);
-            return self.run(
-                &self.kernels.attention_tiled[kernel],
-                (heads as u32, blocks),
-                256,
-                &args,
-            );
+            let kernels = if half_cache {
+                &self.kernels.attention_tiled_h
+            } else {
+                &self.kernels.attention_tiled
+            };
+            return self.run(&kernels[kernel], (heads as u32, blocks), 256, &args);
         }
+        let one = if half_cache {
+            &self.kernels.attention_h
+        } else {
+            &self.kernels.attention
+        };
         self.run(
-            &self.kernels.attention,
+            one,
             (heads as u32, tokens as u32),
             128,
             &args,
@@ -1246,41 +1319,90 @@ impl Gpu {
         )
     }
 
-    /// Whether a weight of this type has kernels for 8-bit activations: none on Metal.
-    pub fn supports_8bit(_kind: TensorType) -> bool {
-        false
+    /// Whether a weight of this type has the default mode's own kernels (on the neural
+    /// accelerators): only where the GPU has them.
+    pub fn supports_8bit(kind: TensorType) -> bool {
+        TENSOR_OPS.load(Ordering::Relaxed) && KINDS.contains(&kind)
     }
 
-    /// Room for `tokens` rows of up to `cols` numbers rounded to 8 bits. Never used on
-    /// Metal (no type has 8-bit kernels), so it takes no memory.
+    /// The default mode's input to the matrix products. On Metal it's the f32 activations
+    /// themselves (the kernels round the weights instead), so this takes no memory.
     pub fn alloc_q8(&self, _tokens: usize, _cols: usize) -> Result<Q8> {
-        Ok(Q8 { _private: () })
+        Ok(Q8 {
+            x: AtomicU64::new(0),
+        })
     }
 
-    /// Rounds activations to 8 bits: no kernel for it on Metal.
-    pub fn quantize(&self, _x: CuDevicePtr, _q8: &Q8, _tokens: usize, _cols: usize) -> Result<()> {
-        Err(Error::Unsupported(TensorType::Q8_0))
+    /// Readies `x` as the input of [`Gpu::matmul_8bit`]: it's read as it is (see
+    /// [`Q8`]), so this only notes where.
+    pub fn quantize(&self, x: CuDevicePtr, q8: &Q8, _tokens: usize, cols: usize) -> Result<()> {
+        assert!(
+            cols.is_multiple_of(32),
+            "rows of {cols} aren't whole blocks of 32"
+        );
+        q8.x.store(x, Ordering::Relaxed);
+        Ok(())
     }
 
-    /// `y = W x` with 8-bit activations: no kernels for it on Metal.
+    /// `y = W x` for each of `tokens` rows of the activations [`Gpu::quantize`] noted: a
+    /// prompt on the neural accelerators, one token as in exact mode.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_8bit(
         &self,
         kind: TensorType,
-        _w: CuDevicePtr,
-        _q8: &Q8,
-        _y: CuDevicePtr,
-        _rows: usize,
-        _cols: usize,
-        _tokens: usize,
+        w: CuDevicePtr,
+        q8: &Q8,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        tokens: usize,
     ) -> Result<()> {
-        Err(Error::Unsupported(kind))
+        let x = q8.x.load(Ordering::Relaxed);
+        let kernels = match &self.kernels.matmul_tc {
+            Some(k) if tokens > 1 && cols.is_multiple_of(32) => k,
+            _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
+        };
+        let grid = (
+            (rows as u32).div_ceil(TC_ROWS),
+            (tokens as u32).div_ceil(TC_TOKENS),
+        );
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::I32(tokens as i32),
+        ];
+        self.run(&kernels[Self::kind_index(kind)?], grid, 128, &args)
     }
 
     /// Fills a buffer with zeros.
     pub fn zero(&self, buffer: &Buffer) -> Result<()> {
         let zeros = vec![0u8; buffer.len_bytes()];
         buffer.write_bytes_at(0, &zeros)
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        let state = self.context.lock();
+        let Some(profile) = state.profile.as_ref() else {
+            return;
+        };
+        let total: f64 = profile.values().map(|v| v.0).sum();
+        let mut rows: Vec<_> = profile.iter().collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        eprintln!("GPU time by kernel ({:.1} ms in all, each dispatch on its own):", total * 1e3);
+        for (name, (seconds, count)) in rows {
+            eprintln!(
+                "  {:>8.2} ms {:>5.1}%  {:>7} × {:>7.1} µs  {name}",
+                seconds * 1e3,
+                100.0 * seconds / total,
+                count,
+                seconds * 1e6 / *count as f64
+            );
+        }
     }
 }
 
@@ -1335,9 +1457,12 @@ pub struct DeltaNet {
 /// Tokens per chunk of a prompt's DeltaNet on CUDA (DC in vireo.cu).
 const DELTA_CHUNK: usize = 64;
 
-/// Activations rounded to 8 bits: never made on Metal.
+/// The default mode's input to the matrix products ([`Gpu::quantize`]). The tensor
+/// kernels read the f32 activations as they are, so it holds only their address: noted
+/// when the products' input is ready, read when they're queued, as CUDA's rounded copy
+/// would be.
 pub struct Q8 {
-    _private: (),
+    x: AtomicU64,
 }
 
 /// A kernel argument, by type.

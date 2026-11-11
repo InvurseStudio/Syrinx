@@ -719,8 +719,12 @@ fn check_8bit(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
                 .fold(0f32, f32::max)
         };
         let (kernels, rounding) = (worst(&got, &by_row), worst(&got, &exact));
+        // On CUDA both kernels round x to the same 8 bits, so they agree but for the order
+        // of sums. On Metal a batch rounds the weights to f16 on the neural accelerators
+        // and one token is f32, so they're as far apart as f16 rounding takes them.
+        let agree = if cfg!(target_os = "macos") { 2e-3 } else { 2e-5 };
         assert!(
-            kernels <= scale * 2e-5,
+            kernels <= scale * agree,
             "{name}: tensor cores and dp4a differ by {kernels} (largest value {scale})"
         );
         assert!(

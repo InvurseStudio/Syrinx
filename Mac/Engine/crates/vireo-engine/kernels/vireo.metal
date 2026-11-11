@@ -511,6 +511,95 @@ kernel void matmul(ARGS, KP) {
     }
 }
 
+// The same product on the SIMD-group matrix units: tiles of SG_ROWS rows × SG_TOKENS
+// tokens, SG_K columns at a time. The 128 threads decode the tile's weights (as f32,
+// with decode8) and copy its activations into threadgroup memory; each of the 4 SIMD
+// groups then multiplies 8 × 8 blocks for 32 rows × 16 tokens of the tile, in f32 as the
+// CPU does. C = W Xᵀ (rows × tokens) is stored transposed, as y's rows of `rows`.
+#define SG_ROWS 64
+#define SG_TOKENS 32
+#define SG_K 32
+#define SG_PAD 4
+template <int KIND>
+kernel void matmul_sg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]]) {
+    device const u8* w = ARG_PTR(const u8, 0);
+    device const float* x = ARG_PTR(const float, 1);
+    device float* y = ARG_PTR(float, 2);
+    const int rows = ARG_INT(3), cols = ARG_INT(4), tokens = ARG_INT(5);
+    const ulong row_bytes = mm_row_bytes<KIND>(cols);
+    constexpr int SA = SG_K + SG_PAD, SB = SG_K + SG_PAD;
+    threadgroup float sa[SG_ROWS * SA];      // weights: [row][k]
+    threadgroup float sb[SG_TOKENS * SB];    // activations: [token][k]
+    threadgroup float cs[SG_TOKENS * SG_ROWS];  // the results of a partial tile: [token][row]
+    const int row0 = gid.x * SG_ROWS, tok0 = gid.y * SG_TOKENS;
+    // Loading: thread → row tid / 2, columns (tid % 2) × 16.. of the weights; token
+    // tid / 4, columns (tid % 4) × 8.. of the activations.
+    const int lr = tid >> 1, lk = (tid & 1) * 16;
+    const int lt = tid >> 2, lx = (tid & 3) * 8;
+    const bool row_live = row0 + lr < rows, tok_live = tok0 + lt < tokens;
+    device const u8* wrow = w + (ulong)(row0 + lr) * row_bytes;
+    device const float* xrow = x + (ulong)(tok0 + lt) * cols;
+    // This SIMD group's part of the tile: rows sr.., tokens st..
+    const int sr = (sg & 1) * 32, st = (sg >> 1) * 16;
+    simdgroup_float8x8 acc[4][2];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < cols; k0 += SG_K) {
+        float v[8];
+        for (int part = 0; part < 2; part++) {
+            if (row_live) {
+                decode8<KIND>(wrow, cols / 32, k0 + lk + part * 8, v);
+            } else {
+                for (int i = 0; i < 8; i++) v[i] = 0.0f;
+            }
+            for (int i = 0; i < 8; i++) sa[lr * SA + lk + part * 8 + i] = v[i];
+        }
+        if (tok_live) {
+            const float4 a = f4(xrow + k0 + lx), b = f4(xrow + k0 + lx + 4);
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx]) = a;
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx + 4]) = b;
+        } else {
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx]) = float4(0.0f);
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx + 4]) = float4(0.0f);
+        }
+        BARRIER;
+        for (int kk = 0; kk < SG_K; kk += 8) {
+            simdgroup_float8x8 a[4], b[2];
+            for (int i = 0; i < 4; i++) simdgroup_load(a[i], &sa[(sr + 8 * i) * SA + kk], SA);
+            // Xᵀ: the activations' [token][k] read transposed, as k × tokens.
+            for (int j = 0; j < 2; j++) simdgroup_load(b[j], &sb[(st + 8 * j) * SB + kk], SB, ulong2(0, 0), true);
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 2; j++) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        BARRIER;
+    }
+    if (row0 + SG_ROWS <= rows && tok0 + SG_TOKENS <= tokens) {
+        // A whole tile: straight to y, transposed (y holds a row of `rows` per token).
+        device float* out = y + (ulong)tok0 * rows + row0;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 2; j++)
+                simdgroup_store(acc[i][j], out + (ulong)(st + 8 * j) * rows + sr + 8 * i, (ulong)rows, ulong2(0, 0), true);
+        return;
+    }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++)
+            simdgroup_store(acc[i][j], &cs[(st + 8 * j) * SG_ROWS + sr + 8 * i], SG_ROWS, ulong2(0, 0), true);
+    BARRIER;
+    for (int e = tid; e < SG_ROWS * SG_TOKENS; e += tpg.x) {
+        const int t = e / SG_ROWS, r = e % SG_ROWS;
+        if (tok0 + t < tokens && row0 + r < rows) y[(ulong)(tok0 + t) * rows + row0 + r] = cs[e];
+    }
+}
+
+template [[host_name("matmul_sg_f32")]] kernel void matmul_sg<K_F32>(ARGS, KP, uint);
+template [[host_name("matmul_sg_f16")]] kernel void matmul_sg<K_F16>(ARGS, KP, uint);
+template [[host_name("matmul_sg_q4_0")]] kernel void matmul_sg<K_Q4_0>(ARGS, KP, uint);
+template [[host_name("matmul_sg_q8_0")]] kernel void matmul_sg<K_Q8_0>(ARGS, KP, uint);
+template [[host_name("matmul_sg_q4_k")]] kernel void matmul_sg<K_Q4_K>(ARGS, KP, uint);
+template [[host_name("matmul_sg_q5_k")]] kernel void matmul_sg<K_Q5_K>(ARGS, KP, uint);
+template [[host_name("matmul_sg_q6_k")]] kernel void matmul_sg<K_Q6_K>(ARGS, KP, uint);
+
 template [[host_name("matmul_f32")]] kernel void matmul<K_F32>(ARGS, KP);
 template [[host_name("matmul_f16")]] kernel void matmul<K_F16>(ARGS, KP);
 template [[host_name("matmul_q4_0")]] kernel void matmul<K_Q4_0>(ARGS, KP);
@@ -833,11 +922,11 @@ kernel void attention_combine(ARGS, KP) {
 }
 
 // A prompt's attention, tiled (see attention_tiled in vireo.cu).
-template <int LANES, int PER, int CHUNK>
+template <typename KV, int LANES, int PER, int CHUNK>
 kernel void attention_tiled(ARGS, KP) {
     device const float* q = ARG_PTR(const float, 0);
-    device const float* keys = ARG_PTR(const float, 1);
-    device const float* values = ARG_PTR(const float, 2);
+    device const KV* keys = ARG_PTR(const KV, 1);
+    device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
     const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
@@ -871,8 +960,8 @@ kernel void attention_tiled(ARGS, KP) {
             const int r = (i * 4) / HD, d = (i * 4) % HD;
             float4 kv4 = float4(0.0f), vv4 = float4(0.0f);
             if (r < count) {
-                kv4 = f4(keys + (ulong)(start + r) * kv_dim + kv + d);
-                vv4 = f4(values + (ulong)(start + r) * kv_dim + kv + d);
+                kv4 = load4(keys + (ulong)(start + r) * kv_dim + kv + d);
+                vv4 = load4(values + (ulong)(start + r) * kv_dim + kv + d);
             }
             *reinterpret_cast<threadgroup float4*>(&ks[r][d]) = kv4;
             *reinterpret_cast<threadgroup float4*>(&vs[r][d]) = vv4;
@@ -924,10 +1013,16 @@ kernel void attention_tiled(ARGS, KP) {
     for (int j = 0; j < PER; j++) o[sub * PER + j] = acc[j] / total;
 }
 
-template [[host_name("attention_tiled_64")]] kernel void attention_tiled<8, 8, 32>(ARGS, KP);
-template [[host_name("attention_tiled_128")]] kernel void attention_tiled<8, 16, 32>(ARGS, KP);
-template [[host_name("attention_tiled_256")]] kernel void attention_tiled<16, 16, 16>(ARGS, KP);
-template [[host_name("attention_tiled_512")]] kernel void attention_tiled<32, 16, 8>(ARGS, KP);
+template [[host_name("attention_tiled_64")]] kernel void attention_tiled<float, 8, 8, 32>(ARGS, KP);
+template [[host_name("attention_tiled_128")]] kernel void attention_tiled<float, 8, 16, 32>(ARGS, KP);
+template [[host_name("attention_tiled_256")]] kernel void attention_tiled<float, 16, 16, 16>(ARGS, KP);
+template [[host_name("attention_tiled_512")]] kernel void attention_tiled<float, 32, 16, 8>(ARGS, KP);
+// Over an f16 cache (8-bit mode): the keys and values read as f16, kept as f32 in
+// threadgroup memory.
+template [[host_name("attention_tiled_h_64")]] kernel void attention_tiled<half, 8, 8, 32>(ARGS, KP);
+template [[host_name("attention_tiled_h_128")]] kernel void attention_tiled<half, 8, 16, 32>(ARGS, KP);
+template [[host_name("attention_tiled_h_256")]] kernel void attention_tiled<half, 16, 16, 16>(ARGS, KP);
+template [[host_name("attention_tiled_h_512")]] kernel void attention_tiled<half, 32, 16, 8>(ARGS, KP);
 
 // ---- Element-wise steps --------------------------------------------------------------
 
