@@ -44,6 +44,10 @@ static inline u32 u32_at2(device const u8* p) {
 
 static inline float4 f4(device const float* p) { return *reinterpret_cast<device const float4*>(p); }
 
+// Four bytes from a 4-byte-aligned address: Q6_K's numbers, its blocks padded to 224 bytes
+// on the GPU (Q4_0's and Q8_0's blocks keep GGUF's odd sizes, so they use u32_at2).
+static inline u32 u32_at4(device const u8* p) { return *reinterpret_cast<device const u32*>(p); }
+
 // The sum of `v` over the threadgroup, returned to every thread. `scratch` holds 32 floats.
 static inline float block_sum(float v, threadgroup float* scratch, uint tid, uint threads) {
     const uint lane = tid & 31, warp = tid >> 5;
@@ -327,8 +331,8 @@ kernel void matvec_q6_k(ARGS, KP) {
             if (r >= nrows) break;
             device const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
             const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + hf * 64 + l), ql1 = u32_at2(block + hf * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + hf * 32 + l);
+            const u32 ql0 = u32_at4(block + hf * 64 + l), ql1 = u32_at4(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + hf * 32 + l);
             device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
             float bsum = 0.0f;
             for (int k = 0; k < 4; k++) {
@@ -486,8 +490,8 @@ kernel void matvec_split_q6_k(ARGS, KP) {
             if (r >= nrows) break;
             device const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
             const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + hf * 64 + l), ql1 = u32_at2(block + hf * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + hf * 32 + l);
+            const u32 ql0 = u32_at4(block + hf * 64 + l), ql1 = u32_at4(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + hf * 32 + l);
             device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
             float bsum = 0.0f;
             for (int k = 0; k < 4; k++) {
@@ -651,8 +655,8 @@ kernel void matvec_glu_q6_k(ARGS, KP) {
             if ((r & 1) >= nrows) continue;
             device const u8* block = ((r >> 1) ? wu : w) + (row0 + (r & 1)) * row_bytes + b * Q6K_BYTES;
             const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + hf * 64 + l), ql1 = u32_at2(block + hf * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + hf * 32 + l);
+            const u32 ql0 = u32_at4(block + hf * 64 + l), ql1 = u32_at4(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + hf * 32 + l);
             device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
             float bsum = 0.0f;
             for (int k = 0; k < 4; k++) {
@@ -2221,6 +2225,85 @@ kernel void delta_net(ARGS, KP) {
     for (int r = 0; r < 32; r++)
         if (r < per) column[part + 4 * r] = st[r];
 }
+
+// delta_net with PARTS threads to a column of the state (PARTS × n threads a head): 8
+// halves each thread's walk along its column, for one token's latency.
+template <int PARTS>
+kernel void delta_net_p(ARGS, KP) {
+    device const float* conv = ARG_PTR(const float, 0);
+    const int channels = ARG_INT(1), key_dim = ARG_INT(2);
+    device const float* beta_raw = ARG_PTR(const float, 3);
+    device const float* alpha_raw = ARG_PTR(const float, 4);
+    device const float* dt_bias = ARG_PTR(const float, 5);
+    device const float* a = ARG_PTR(const float, 6);
+    device float* state = ARG_PTR(float, 7);
+    device const float* z = ARG_PTR(const float, 8);
+    device const float* norm = ARG_PTR(const float, 9);
+    device float* out = ARG_PTR(float, 10);
+    const int n = ARG_INT(11), k_heads = ARG_INT(12);
+    const float eps = ARG_F32(13);
+    const int tokens = ARG_INT(14);
+    threadgroup float scratch[32];
+    threadgroup float ks[128];
+    threadgroup float qs[128];
+    const int h = gid.x, v_heads = ngrid.x, kh = h % k_heads;
+    const int j = tid / PARTS, part = tid % PARTS, per = n / PARTS;
+    device float* column = state + ((ulong)h * n + j) * n;
+    float st[128 / PARTS];
+    for (int r = 0; r < 128 / PARTS; r++)
+        if (r < per) st[r] = column[part + PARTS * r];
+    const float inv_sqrt_n = 1.0f / sqrt((float)n);
+    for (int t = 0; t < tokens; t++) {
+        device const float* c = conv + (ulong)t * channels;
+        float qj = 0.0f, kj = 0.0f;
+        if (part == 0) {
+            qj = c[kh * n + j];
+            kj = c[key_dim + kh * n + j];
+        }
+        const float q_len = sqrt(block_sum(qj * qj, scratch, tid, tpg.x));
+        const float k_len = sqrt(block_sum(kj * kj, scratch, tid, tpg.x));
+        if (part == 0) {
+            qs[j] = qj * (1.0f / max(q_len, eps));
+            ks[j] = kj * (1.0f / max(k_len, eps));
+        }
+        BARRIER;
+        const int head_at = t * v_heads + h;
+        const float beta = 1.0f / (1.0f + exp(-beta_raw[head_at]));
+        const float decay = exp(softplus_(alpha_raw[head_at] + dt_bias[h]) * a[h]);
+
+        float dot = 0.0f;
+        for (int r = 0; r < 128 / PARTS; r++) {
+            if (r < per) {
+                st[r] *= decay;
+                dot += st[r] * ks[part + PARTS * r];
+            }
+        }
+        for (ushort o = 1; o < PARTS; o <<= 1) dot += simd_shuffle_xor(dot, o);
+        const float delta = (c[2 * key_dim + h * n + j] - dot) * beta;
+        float o = 0.0f;
+        for (int r = 0; r < 128 / PARTS; r++) {
+            if (r < per) {
+                st[r] += ks[part + PARTS * r] * delta;
+                o += st[r] * qs[part + PARTS * r];
+            }
+        }
+        for (ushort o2 = 1; o2 < PARTS; o2 <<= 1) o += simd_shuffle_xor(o, o2);
+        o *= inv_sqrt_n;
+
+        const float sum = block_sum(part == 0 ? o * o : 0.0f, scratch, tid, tpg.x);
+        if (part == 0) {
+            const float normed = o / sqrt(sum / (float)n + eps) * norm[j];
+            const ulong at = (ulong)head_at * n + j;
+            const float zj = z[at];
+            out[at] = normed * (zj / (1.0f + exp(-zj)));
+        }
+    }
+    for (int r = 0; r < 128 / PARTS; r++)
+        if (r < per) column[part + PARTS * r] = st[r];
+}
+
+template [[host_name("delta_net_4")]] kernel void delta_net_p<4>(ARGS, KP);
+template [[host_name("delta_net_8")]] kernel void delta_net_p<8>(ARGS, KP);
 
 // Gated DeltaNet for state sizes over 128: a thread per row of the state.
 kernel void delta_net_wide(ARGS, KP) {
