@@ -35,7 +35,7 @@ use sample::Sampler;
 use vireo_engine::cuda::Gpu;
 use vireo_engine::models::gemma4_cuda::Gemma4Cuda;
 use vireo_engine::models::llama_cuda::LlamaCuda;
-use vireo_engine::models::qwen35_cuda::Qwen35Cuda;
+use vireo_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
 use vireo_engine::models::{Logits, Precision};
 use vireo_engine::{GgufFile, Tokenizer};
 
@@ -477,6 +477,16 @@ enum Session {
     Gemma4(vireo_engine::models::gemma4_cuda::Gemma4CudaSession),
 }
 
+/// The one session the server keeps between replies, so a chat's next turn reads only
+/// what's new: its keys and values (and Qwen's DeltaNet state) stay on the GPU.
+struct Kept {
+    session: Session,
+    /// The tokens in the session, in order: the last prompt, then its reply.
+    tokens: Vec<u32>,
+    /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
+    checkpoint: Option<Qwen35Checkpoint>,
+}
+
 impl Model {
     fn session(&self, capacity: usize) -> Result<Session, String> {
         let e = |e: vireo_engine::models::Error| e.to_string();
@@ -503,6 +513,67 @@ impl Model {
         };
         r.map_err(|e| e.to_string())?
             .ok_or_else(|| "no logits".into())
+    }
+
+    /// Reads `ids` (the history, then from `mark` on the reply's opened turn) into the
+    /// kept session, starting from the longest start it shares with the tokens already
+    /// there; the last token's logits, and how many tokens were reused. On an error the
+    /// session's contents are unknown: drop it.
+    fn continue_with(
+        &self,
+        kept: &mut Kept,
+        ids: &[u32],
+        mark: usize,
+    ) -> Result<(Vec<f32>, usize), String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        // At least the last token is read again, for its logits.
+        let shared = kept
+            .tokens
+            .iter()
+            .zip(ids)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(ids.len() - 1);
+        let from = match (self, &mut kept.session) {
+            (Model::Llama(_), Session::Llama(s)) => {
+                s.truncate(shared);
+                shared
+            }
+            (Model::Gemma4(_), Session::Gemma4(s)) => {
+                s.truncate(shared);
+                shared
+            }
+            // A DeltaNet state can't be cut back: go on from the end, if every token
+            // there is wanted, else from the last history's end, else from empty.
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                if shared == s.len() {
+                    shared
+                } else if let Some(cp) = kept.checkpoint.as_ref().filter(|c| c.len() <= shared) {
+                    m.restore(s, cp).map_err(e)?;
+                    cp.len()
+                } else {
+                    m.reset(s).map_err(e)?;
+                    kept.checkpoint = None;
+                    0
+                }
+            }
+            _ => unreachable!("a session belongs to its model"),
+        };
+        kept.tokens.truncate(from);
+        // Qwen: the history read on its own, and its DeltaNet saved where the next
+        // turn's prompt will part from this one.
+        let mut start = from;
+        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut kept.session)
+            && mark > from
+        {
+            m.forward_batch(s, &ids[from..mark], Logits::None)
+                .map_err(e)?;
+            m.save(s, &mut kept.checkpoint).map_err(e)?;
+            start = mark;
+        }
+        let logits = self.read(&mut kept.session, &ids[start..])?;
+        kept.tokens.extend_from_slice(&ids[from..]);
+        Ok((logits, from))
     }
 
     fn next(&self, s: &mut Session, id: u32, logits: &mut [f32]) -> Result<(), String> {
@@ -588,9 +659,35 @@ fn engine(
     }));
 
     let mut seed = random_u64();
+    let mut kept: Option<Kept> = None;
     for job in jobs {
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        if let Err(e) = reply(&model, &tokenizer, family, context, seed, &job) {
+        if kept.is_none() {
+            match model.session(context) {
+                Ok(session) => {
+                    kept = Some(Kept {
+                        session,
+                        tokens: Vec::new(),
+                        checkpoint: None,
+                    })
+                }
+                Err(e) => {
+                    let _ = job.out.send(Out::Error(e));
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = reply(
+            &model,
+            kept.as_mut().unwrap(),
+            &tokenizer,
+            family,
+            context,
+            seed,
+            &job,
+        ) {
+            // Whatever the session held is unknown now: the next reply starts afresh.
+            kept = None;
             let _ = job.out.send(Out::Error(e));
         }
     }
@@ -598,6 +695,7 @@ fn engine(
 
 fn reply(
     model: &Model,
+    kept: &mut Kept,
     tokenizer: &Tokenizer,
     family: Family,
     context: usize,
@@ -608,16 +706,19 @@ fn reply(
     let max_tokens = job.max_tokens.min(context / 2);
     // The chat's latest messages that fit with room for the reply.
     let mut first = 0;
-    let ids = loop {
-        let text = chat::prompt(
+    let opening = tokenizer.encode(chat::opening(family), false, true);
+    let (ids, mark) = loop {
+        let text = chat::history(
             family,
             job.system.as_deref(),
             &job.messages[first..],
             &today,
         );
-        let ids = tokenizer.encode(&text, false, true);
+        let mut ids = tokenizer.encode(&text, false, true);
+        let mark = ids.len();
+        ids.extend_from_slice(&opening);
         if ids.len() + max_tokens <= context || first + 1 >= job.messages.len() {
-            break ids;
+            break (ids, mark);
         }
         first += 1;
         while first < job.messages.len() && job.messages[first].role != "user" {
@@ -632,8 +733,7 @@ fn reply(
         ));
     }
     let started = Instant::now();
-    let mut session = model.session(ids.len() + max_tokens)?;
-    let mut logits = model.read(&mut session, &ids)?;
+    let (mut logits, reused) = model.continue_with(kept, &ids, mark)?;
     let prompt_seconds = started.elapsed().as_secs_f64();
 
     let settings = family.sampling().with(job.generation.as_ref());
@@ -673,7 +773,8 @@ fn reply(
                 }
             }
         }
-        model.next(&mut session, next, &mut logits)?;
+        model.next(&mut kept.session, next, &mut logits)?;
+        kept.tokens.push(next);
     }
     if !pending.is_empty() {
         let _ = job
@@ -682,9 +783,10 @@ fn reply(
     }
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens in {prompt_seconds:.2}s ({:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s){}.",
+        "Reply: {} prompt tokens ({reused} kept from the last reply, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s){}.",
         ids.len(),
-        ids.len() as f64 / prompt_seconds.max(1e-9),
+        ids.len() - reused,
+        (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),
         generated.len(),
         generated.len() as f64 / seconds.max(1e-9),
         if job.stop.load(Ordering::Relaxed) {

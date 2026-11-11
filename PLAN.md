@@ -93,6 +93,7 @@ git), for checking our output and speed.
 | 2026-11-11 | The tensor-core matrix kernels read the next step's bytes ahead into registers (one block per SM, all but Q6_K); Llama's and Qwen's last layer runs past its keys and values only for the token whose logits are wanted (see "Ninth round") | 8-bit perplexity unchanged to every digit on all three (the same integer sums; scoring runs every layer); the same generated tokens. 75 engine tests pass |
 | 2026-11-11 | The small kernels: Qwen's convolution in registers (it had gone to local memory), `qkv_prep` with a thread per number and 8 tokens a block, Gemma's F16 per-layer projection as Q8_0 in 8-bit mode (see "Tenth round") | Llama and Qwen: 8-bit perplexity and generated tokens unchanged to every digit. Gemma: the same tokens; perplexity per chunk within 0.3% of before and nearer exact on average (0.14% from it, 0.27% before); next-token probabilities nearer exact too (20.04% against exact 20.67%, before 22.12%). 75 engine tests pass |
 | 2026-11-11 | Qwen's DeltaNet for a prompt in chunks of 64 tokens, the WY form (`delta_chunk_prep`, `delta_chunk_scan`; see "Eleventh round") | Exact perplexity the same as token by token to every digit at 2,048 tokens (chunk 1: 16.2601 against 16.2602 on the first build, then identical); 8-bit within 0.25% per chunk, nearer exact on average. A new test case reads Qwen in batches of 200 (across chunks, ending in part of one) against one token at a time: logits within 1e-4 of 31 exact. 75 engine tests pass |
+| 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52 → 0.07 s, Qwen 1.33 → 0.10 s, Gemma 1.06 → 0.05 s at turn 5). 76 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -686,6 +687,9 @@ whole plan, and this phase finds out early.
 kernels while keeping everything above them ours).
 
 ### 2. Vireo-only engine features
+
+Started 2026-11-11 with the KV cache kept between turns (see Progress). One chat at a time:
+switching chats reads the other one's history again, until a saved cache per chat.
 
 The shared prompt start loaded at launch, a saved KV cache per chat, grammar-constrained
 tool calls, the scheduler.
