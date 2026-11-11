@@ -600,6 +600,8 @@ struct Kernels {
     /// The quantized ones with each row pair split over the threadgroup's 4 SIMD groups
     /// (none for F32 and F16).
     matvec_split: [Option<Pso>; 7],
+    /// One token's gate and up projections with the activation (Gpu::matvec_glu).
+    matvec_glu: [Option<Pso>; 7],
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
     matmul_sg: [Pso; 7],
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
@@ -616,6 +618,9 @@ struct Kernels {
     /// 64, 128, 256 and 512, by how many query heads they take at once (built for 1; the
     /// kernel takes more, see vireo.metal).
     attention_decode: [[[Option<Pso>; 4]; 4]; 2],
+    /// The same for heads of 128, 256 and 512 with a SIMD group a position (lanes across
+    /// the head), over f32 and f16 caches.
+    attention_decode_wide: [[Pso; 3]; 2],
     /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
     attention_tiled_h: [Pso; 4],
@@ -769,20 +774,20 @@ impl Gpu {
                 .collect::<Result<_>>()?;
             Ok(v.try_into().unwrap_or_else(|_| unreachable!()))
         };
+        // The quantized types' kernels of a family (none for F32 and F16).
+        let quantized = |prefix: &str| -> Result<[Option<Pso>; 7]> {
+            let mut v: [Option<Pso>; 7] = Default::default();
+            for (slot, kind) in v.iter_mut().zip(KINDS) {
+                if !matches!(kind, TensorType::F32 | TensorType::F16) {
+                    *slot = Some(pipeline(&format!("{prefix}_{}", kind.name().to_lowercase()))?);
+                }
+            }
+            Ok(v)
+        };
         let kernels = Kernels {
             matvec: per_kind("matvec")?,
-            matvec_split: {
-                let mut v: [Option<Pso>; 7] = Default::default();
-                for (slot, kind) in v.iter_mut().zip(KINDS) {
-                    if !matches!(kind, TensorType::F32 | TensorType::F16) {
-                        *slot = Some(pipeline(&format!(
-                            "matvec_split_{}",
-                            kind.name().to_lowercase()
-                        ))?);
-                    }
-                }
-                v
-            },
+            matvec_split: quantized("matvec_split")?,
+            matvec_glu: quantized("matvec_glu")?,
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
                 Some((per_kind("matmul_tc")?, pipeline("to_half")?))
@@ -796,6 +801,18 @@ impl Gpu {
             attention_h: pipeline("attention_h")?,
             attention_part: [pipeline("attention_part_f32")?, pipeline("attention_part_f16")?],
             attention_combine: pipeline("attention_combine")?,
+            attention_decode_wide: [
+                [
+                    pipeline("attention_decode_wide_f32_128")?,
+                    pipeline("attention_decode_wide_f32_256")?,
+                    pipeline("attention_decode_wide_f32_512")?,
+                ],
+                [
+                    pipeline("attention_decode_wide_f16_128")?,
+                    pipeline("attention_decode_wide_f16_256")?,
+                    pipeline("attention_decode_wide_f16_512")?,
+                ],
+            ],
             attention_decode: {
                 let mut v: [[[Option<Pso>; 4]; 4]; 2] = Default::default();
                 for (c, cache) in ["f32", "f16"].iter().enumerate() {
@@ -1112,6 +1129,39 @@ impl Gpu {
         self.run(kernel, (grid, 1), ROWS_PER_BLOCK * 32, &args)
     }
 
+    /// One token's gate and up projections and the activation in one dispatch: `y =
+    /// act(W_gate x) × (W_up x)`, act SiLU (`gelu` false) or tanh-GELU, both matrices
+    /// `rows` × `cols` of type `kind`. What two `matvec`s and `swiglu`/`geglu` do, with
+    /// one dependent step fewer. Ok(false), having done nothing, for a type without the
+    /// kernel (F32, F16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_glu(
+        &self,
+        kind: TensorType,
+        w_gate: CuDevicePtr,
+        w_up: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        gelu: bool,
+    ) -> Result<bool> {
+        let Some(kernel) = &self.kernels.matvec_glu[Self::kind_index(kind)?] else {
+            return Ok(false);
+        };
+        let args = [
+            Arg::Ptr(w_gate),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(w_up),
+            Arg::I32(i32::from(gelu)),
+        ];
+        self.run(kernel, ((rows as u32).div_ceil(2), 1), 128, &args)?;
+        Ok(true)
+    }
+
     /// `y = W x` for each of `tokens` rows of `x` (`cols` numbers each) into rows of `y`
     /// (`rows` each): one pass over the weights for all of them.
     #[allow(clippy::too_many_arguments)]
@@ -1196,7 +1246,9 @@ impl Gpu {
             Arg::I32(n as i32),
             Arg::F32(eps),
         ];
-        self.run(&self.kernels.residual_norm, (tokens as u32, 1), 256, &args)
+        // 512 threads: one token's norm is a step of its own on one threadgroup, and its
+        // latency halved from 256 (Gemma 4 generating ~4.5% faster on the M5 Max).
+        self.run(&self.kernels.residual_norm, (tokens as u32, 1), 512, &args)
     }
 
     /// Gets `tokens` tokens' queries, keys and values ready for attention: see
@@ -1298,9 +1350,15 @@ impl Gpu {
             let mut args = args.to_vec();
             args.push(Arg::Ptr(self.attention_parts.ptr()));
             args.push(Arg::Ptr(self.attention_counters.ptr()));
-            let kernel = self.kernels.attention_decode[usize::from(half_cache)][i][j]
-                .as_ref()
-                .expect("built for one query head at a time");
+            // Heads of 128 or more: a SIMD group a position (Gemma 4 generating 5–6% faster
+            // than with a lane a position on the M5 Max).
+            let kernel = if i >= 1 {
+                &self.kernels.attention_decode_wide[usize::from(half_cache)][i - 1]
+            } else {
+                self.kernels.attention_decode[usize::from(half_cache)][i][j]
+                    .as_ref()
+                    .expect("built for one query head at a time")
+            };
             return self.run(kernel, (threadgroups, parts), 256, &args);
         }
         if tokens == 1 && heads <= 64 {
