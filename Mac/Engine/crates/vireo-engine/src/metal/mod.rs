@@ -12,9 +12,13 @@
 //!   plus an offset, which the models do arithmetic on. Kernels take them as raw pointers,
 //!   so every buffer is kept resident through one residency set, and Metal's hazard
 //!   tracking is off (the work runs in order, as on one CUDA stream).
-//! - **The stream.** Work is encoded, in order, into one compute encoder that runs its
-//!   dispatches one after another; it's committed and waited for when results are read
-//!   ([`Gpu::synchronize`], [`Buffer::read_f32`] and the like).
+//! - **The stream.** Work is encoded, in order, into one compute encoder; it's committed
+//!   and waited for when results are read ([`Gpu::synchronize`], [`Buffer::read_f32`] and
+//!   the like). The encoder lets dispatches overlap, as a CUDA stream doesn't, so the
+//!   backend puts a memory barrier before each dispatch that touches a buffer an earlier
+//!   one since the last barrier wrote (or writes one it read): it knows which of each
+//!   kernel's arguments it writes ([`written_args`]) and which buffer each address falls
+//!   in. Independent steps (a layer's q, k and v, its gate and up) then run together.
 //! - **Copies.** Memory is shared with the CPU. A write when the GPU has nothing queued is
 //!   a plain copy; with work queued it goes in line behind it, through a staging buffer and
 //!   a copy kernel, as CUDA's asynchronous copies do.
@@ -41,7 +45,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary,
     MTLMathFloatingPointFunctions, MTLMathMode,
@@ -105,6 +109,36 @@ struct Dispatch {
     grid: (u32, u32, u32),
     threads: u32,
     shared: u32,
+    /// The buffers it reads or writes (by start address; true when it writes), or None
+    /// when that isn't known: then it's kept apart from everything around it.
+    access: Option<Vec<(u64, bool)>>,
+}
+
+/// Which of a kernel's arguments (by index) it writes; the other addresses it's given it
+/// only reads. None for a kernel without a list, which is kept apart from all others.
+fn written_args(name: &str) -> Option<&'static [usize]> {
+    Some(match name {
+        n if n.starts_with("matvec") || n.starts_with("matmul") => &[2],
+        "rms_norm" => &[2],
+        "residual_norm" => &[0, 5],
+        "qkv_prep" => &[4, 9, 10],
+        n if n.starts_with("attention_part") => &[3],
+        "attention_combine" => &[1],
+        n if n.starts_with("attention") => &[3],
+        "swiglu" | "geglu" | "add" | "softcap" | "apply_gate" => &[0],
+        "conv_silu" => &[1, 3],
+        "conv_silu_parallel" => &[3],
+        "conv_history" => &[1],
+        "delta_net" | "delta_net_wide" => &[7, 10],
+        "delta_l2" => &[0],
+        "delta_scan" => &[7, 8],
+        "delta_out" => &[0],
+        "delta_chunk_prep" => &[7],
+        "delta_chunk_scan" => &[1, 2],
+        "copy_bytes" => &[0],
+        "to_half" => &[1],
+        _ => return None,
+    })
 }
 
 /// The command buffer being filled, and its encoder.
@@ -116,6 +150,10 @@ struct Open {
 #[derive(Default)]
 struct State {
     open: Option<Open>,
+    /// What the dispatches since the encoder's last barrier read and wrote (see
+    /// [`Dispatch::access`]); `blocked` when one of them is unknown.
+    pending: Vec<(u64, bool)>,
+    blocked: bool,
     /// Dispatches being recorded instead of run.
     recording: Option<Vec<Dispatch>>,
     /// Staging buffers for writes queued behind other work, kept until it's done.
@@ -125,6 +163,9 @@ struct State {
     /// With VIREO_METAL_PROFILE set: each dispatch runs on its own, and its GPU time is
     /// added up by kernel (seconds, dispatches), printed when the GPU is closed.
     profile: Option<HashMap<String, (f64, usize)>>,
+    /// With VIREO_METAL_TIMING set: the command buffers' GPU time and wall time from
+    /// commit to done (seconds), and how many, printed when the GPU is closed.
+    timing: Option<(f64, f64, usize)>,
 }
 
 /// The device, its queue, the kernels and the in-order state all work goes through.
@@ -137,6 +178,10 @@ struct Context {
     state: Mutex<State>,
     /// Each pipeline's kernel name, by its address, for the profile.
     names: HashMap<usize, String>,
+    /// Each pipeline's written arguments ([`written_args`]), by its address.
+    writes: HashMap<usize, &'static [usize]>,
+    /// The live buffers: start address to end.
+    allocations: Mutex<std::collections::BTreeMap<u64, u64>>,
 }
 
 // Metal's objects may be used from any thread; the engine uses each GPU from one at a time
@@ -179,9 +224,40 @@ impl Context {
         Ok(buffer)
     }
 
-    fn track(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+    fn track(&self, buffer: &ProtocolObject<dyn MTLBuffer>, bytes: usize) {
         self.residency.addAllocation(ProtocolObject::from_ref(buffer));
         self.lock().residency_dirty = true;
+        let start = buffer.gpuAddress();
+        self.allocations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(start, start + bytes.max(1) as u64);
+    }
+
+    /// The buffers `d` reads and writes, from its kernel's [`written_args`] and the
+    /// live buffers its addresses fall in.
+    fn access_of(&self, d: &Dispatch) -> Option<Vec<(u64, bool)>> {
+        let key = Retained::as_ptr(&d.pipeline) as *const c_void as usize;
+        let writes = self.writes.get(&key)?;
+        let allocations = self.allocations.lock().unwrap_or_else(|e| e.into_inner());
+        let mut access: Vec<(u64, bool)> = Vec::with_capacity(d.count);
+        for (i, &a) in d.args[..d.count].iter().enumerate() {
+            if a == 0 {
+                continue;
+            }
+            let Some((&start, &end)) = allocations.range(..=a).next_back() else {
+                continue;
+            };
+            if a >= end {
+                continue;
+            }
+            let write = writes.contains(&i);
+            match access.iter_mut().find(|(b, _)| *b == start) {
+                Some(entry) => entry.1 |= write,
+                None => access.push((start, write)),
+            }
+        }
+        Some(access)
     }
 
     /// The encoder for the work being queued, starting a command buffer if needed.
@@ -193,19 +269,40 @@ impl Context {
                 name: "no command buffer".into(),
             })?;
             let encoder = commands
-                .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
                 .ok_or(Error::Driver {
                     call: "computeCommandEncoder",
                     code: 0,
                     name: "no encoder".into(),
                 })?;
             state.open = Some(Open { commands, encoder });
+            state.pending.clear();
+            state.blocked = false;
         }
         Ok(&state.open.as_ref().unwrap().encoder)
     }
 
     fn encode(&self, state: &mut State, d: &Dispatch) -> Result<()> {
-        let encoder = self.encoder(state)?;
+        self.encoder(state)?;
+        // A barrier first when it touches what the dispatches since the last one wrote, or
+        // writes what they read.
+        let hazard = state.blocked
+            || match &d.access {
+                None => !state.pending.is_empty(),
+                Some(access) => access.iter().any(|&(b, w)| {
+                    state.pending.iter().any(|&(pb, pw)| pb == b && (w || pw))
+                }),
+            };
+        let encoder = &state.open.as_ref().unwrap().encoder;
+        if hazard {
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            state.pending.clear();
+            state.blocked = false;
+        }
+        match &d.access {
+            Some(access) => state.pending.extend_from_slice(access),
+            None => state.blocked = true,
+        }
         encoder.setComputePipelineState(&d.pipeline);
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -252,7 +349,7 @@ impl Context {
     }
 
     /// Runs `d` after the work already queued, or records it.
-    fn dispatch(&self, d: Dispatch) -> Result<()> {
+    fn dispatch(&self, mut d: Dispatch) -> Result<()> {
         if d.grid.0 == 0 || d.grid.1 == 0 || d.grid.2 == 0 {
             return Ok(());
         }
@@ -262,6 +359,7 @@ impl Context {
             d.threads,
             d.pipeline.maxTotalThreadsPerThreadgroup()
         );
+        d.access = self.access_of(&d);
         let mut state = self.lock();
         if let Some(recording) = state.recording.as_mut() {
             recording.push(d);
@@ -281,8 +379,14 @@ impl Context {
             self.residency.commit();
             state.residency_dirty = false;
         }
+        let committed = std::time::Instant::now();
         open.commands.commit();
         open.commands.waitUntilCompleted();
+        if let Some(t) = state.timing.as_mut() {
+            t.0 += open.commands.GPUEndTime() - open.commands.GPUStartTime();
+            t.1 += committed.elapsed().as_secs_f64();
+            t.2 += 1;
+        }
         state.staging.clear();
         if open.commands.status() == MTLCommandBufferStatus::Error {
             return Err(match open.commands.error() {
@@ -326,7 +430,8 @@ impl Context {
         let staged = self.new_buffer(data.len(), Some(data))?;
         let encoder = self.encoder(&mut state)?;
         encoder.useResource_usage(ProtocolObject::from_ref(&*staged), MTLResourceUsage::Read);
-        let d = copy_dispatch(&self.copy, to.ptr + offset as u64, staged.gpuAddress(), data.len());
+        let mut d = copy_dispatch(&self.copy, to.ptr + offset as u64, staged.gpuAddress(), data.len());
+        d.access = self.access_of(&d);
         self.encode(&mut state, &d)?;
         state.staging.push(staged);
         Ok(())
@@ -365,6 +470,7 @@ fn copy_dispatch(copy: &Pso, to: CuDevicePtr, from: CuDevicePtr, bytes: usize) -
         grid: ((items as u32).div_ceil(256).max(1), 1, 1),
         threads: 256,
         shared: 0,
+        access: None,
     }
 }
 
@@ -450,6 +556,11 @@ impl Drop for Buffer {
             .residency
             .removeAllocation(ProtocolObject::from_ref(&*self.buffer));
         state.residency_dirty = true;
+        self.context
+            .allocations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.ptr);
     }
 }
 
@@ -677,6 +788,11 @@ impl Gpu {
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
+        let names = names.into_inner();
+        let writes = names
+            .iter()
+            .filter_map(|(&key, name)| written_args(name).map(|w| (key, w)))
+            .collect();
 
         let queue = device.newCommandQueue().ok_or(Error::Driver {
             call: "newCommandQueue",
@@ -703,9 +819,12 @@ impl Gpu {
             copy,
             state: Mutex::new(State {
                 profile: std::env::var_os("VIREO_METAL_PROFILE").map(|_| HashMap::new()),
+                timing: std::env::var_os("VIREO_METAL_TIMING").map(|_| (0.0, 0.0, 0)),
                 ..State::default()
             }),
-            names: names.into_inner(),
+            writes,
+            names,
+            allocations: Mutex::new(std::collections::BTreeMap::new()),
         });
         let parts_bytes = 64 * MAX_PARTS as usize * (2 + 512) * 4;
         let attention_parts = Self::alloc_in(&context, parts_bytes)?;
@@ -723,7 +842,7 @@ impl Gpu {
     }
 
     fn wrap(context: &Arc<Context>, buffer: MtlBuffer, bytes: usize) -> Result<Buffer> {
-        context.track(&buffer);
+        context.track(&buffer, bytes);
         let ptr = buffer.gpuAddress();
         Ok(Buffer {
             context: Arc::clone(context),
@@ -860,6 +979,7 @@ impl Gpu {
             grid,
             threads: block,
             shared,
+            access: None,
         })
     }
 
@@ -1474,6 +1594,13 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         let state = self.context.lock();
+        if let Some((gpu, wall, count)) = state.timing {
+            eprintln!(
+                "{count} command buffers: {:.1} ms on the GPU, {:.1} ms from commit to done",
+                gpu * 1e3,
+                wall * 1e3
+            );
+        }
         let Some(profile) = state.profile.as_ref() else {
             return;
         };
