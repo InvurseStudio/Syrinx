@@ -123,6 +123,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "residual_norm" => &[0, 5],
         "qkv_prep" => &[4, 9, 10],
         n if n.starts_with("attention_part") => &[3],
+        n if n.starts_with("attention_decode") => &[3, 10, 11],
         "attention_combine" => &[1],
         n if n.starts_with("attention") => &[3],
         "swiglu" | "geglu" | "add" | "softcap" | "apply_gate" => &[0],
@@ -205,7 +206,10 @@ impl Context {
     /// A new buffer of `bytes` (with `data` copied in, when given), resident from the next
     /// commit on.
     fn new_buffer(&self, bytes: usize, data: Option<&[u8]>) -> Result<MtlBuffer> {
-        let length = bytes.max(16);
+        // Slack past the end of the memory asked for (zeros, as Metal hands out new
+        // buffers): attention_tc reads whole chunks of positions, up to 63 past a cache's
+        // last, with weights of 0, and they mustn't fall off the buffer.
+        let length = bytes.max(16) + BUFFER_SLACK;
         let buffer = match data {
             Some(d) if !d.is_empty() => unsafe {
                 self.device.newBufferWithBytes_length_options(
@@ -593,6 +597,9 @@ impl Graph {
 
 struct Kernels {
     matvec: [Pso; 7],
+    /// The quantized ones with each row pair split over the threadgroup's 4 SIMD groups
+    /// (none for F32 and F16).
+    matvec_split: [Option<Pso>; 7],
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
     matmul_sg: [Pso; 7],
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
@@ -605,12 +612,20 @@ struct Kernels {
     attention_h: Pso,
     attention_part: [Pso; 2],
     attention_combine: Pso,
+    /// One token's attention in one dispatch, over f32 and f16 caches, for head sizes
+    /// 64, 128, 256 and 512, by how many query heads they take at once (built for 1; the
+    /// kernel takes more, see vireo.metal).
+    attention_decode: [[[Option<Pso>; 4]; 4]; 2],
     /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
     attention_tiled_h: [Pso; 4],
     /// A prompt over an f16 cache on the SIMD-group matrix units, for head sizes 64, 128,
     /// 256 and 512 (tokens per threadgroup in `FLASH_TOKENS`).
     attention_flash: [Pso; 4],
+    /// The same with bigger query tiles (FLASH2_TOKENS, FLASH2_THREADS).
+    attention_flash2: [Pso; 4],
+    /// On the neural accelerators, where the GPU has them (ATTENTION_TC_TOKENS).
+    attention_tc: Option<[Pso; 4]>,
     swiglu: Pso,
     geglu: Pso,
     add: Pso,
@@ -659,6 +674,8 @@ pub struct Gpu {
     /// attention_part's partial results: room for MAX_PARTS parts of 512-wide heads, 64
     /// heads. All work goes through one queue, so one is enough for every session.
     attention_parts: Buffer,
+    /// attention_decode's count of finished parts, one per head (left at 0).
+    attention_counters: Buffer,
     pub info: DeviceInfo,
 }
 
@@ -677,13 +694,25 @@ const ROWS_PER_BLOCK: u32 = 4;
 /// The matrix-matrix kernel's tile (matmul_sg): rows of weights by tokens.
 const TILE_ROWS: u32 = 64;
 const TILE_TOKENS: u32 = 32;
-/// The tensor kernel's tile (matmul_tc in vireo_tensor.metal).
-const TC_ROWS: u32 = 64;
-const TC_TOKENS: u32 = 128;
+/// The tensor kernel's tile (matmul_tc in vireo_tensor.metal): weight rows, tokens and
+/// SIMD groups. Of the shapes tried on the M5 Max (16–128 rows, 64–256 tokens, 2–8
+/// groups), 32 × 128 × 4 read prompts fastest on all three test models.
+fn tensor_tile() -> (u32, u32, u32) {
+    (32, 128, 4)
+}
 /// attention_flash's tokens per threadgroup, for head sizes 64, 128, 256 and 512.
 const FLASH_TOKENS: [u32; 4] = [32, 32, 16, 8];
+/// attention_flash2's tokens and threads per threadgroup, for the same head sizes.
+const FLASH2_TOKENS: [u32; 4] = [64, 64, 32, 16];
+const FLASH2_THREADS: [u32; 4] = [128, 256, 256, 256];
+/// attention_tc's tokens per threadgroup (256 threads), for the same head sizes.
+const ATTENTION_TC_TOKENS: [u32; 4] = [32, 32, 32, 16];
+/// Bytes past the end of every buffer [`Gpu::alloc`] makes (see `Context::new_buffer`).
+const BUFFER_SLACK: usize = 128 * 1024;
 /// The most parts one token's attention is split into.
 const MAX_PARTS: u32 = 16;
+/// The most parts attention_decode splits a context into.
+const MAX_DECODE_PARTS: u32 = 64;
 
 /// A parameter for the kernels, which take raw addresses: 0 stands for "none".
 fn or_null(buffer: Option<&Buffer>) -> CuDevicePtr {
@@ -701,7 +730,10 @@ impl Gpu {
         options.setMathMode(MTLMathMode::Safe);
         options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
         // With the tensor kernels where Metal compiles them (it can't before the M5 and A19).
-        let with_tensors = format!("{SOURCE}\n{TENSOR_SOURCE}");
+        let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
+        let with_tensors = format!(
+            "{SOURCE}\n#define TC_ROWS {tc_rows}\n#define TC_TOKENS {tc_tokens}\n#define TC_SG {tc_sg}\n{TENSOR_SOURCE}"
+        );
         let (library, tensor_ops) = match device
             .newLibraryWithSource_options_error(&NSString::from_str(&with_tensors), Some(&options))
         {
@@ -739,6 +771,18 @@ impl Gpu {
         };
         let kernels = Kernels {
             matvec: per_kind("matvec")?,
+            matvec_split: {
+                let mut v: [Option<Pso>; 7] = Default::default();
+                for (slot, kind) in v.iter_mut().zip(KINDS) {
+                    if !matches!(kind, TensorType::F32 | TensorType::F16) {
+                        *slot = Some(pipeline(&format!(
+                            "matvec_split_{}",
+                            kind.name().to_lowercase()
+                        ))?);
+                    }
+                }
+                v
+            },
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
                 Some((per_kind("matmul_tc")?, pipeline("to_half")?))
@@ -752,6 +796,20 @@ impl Gpu {
             attention_h: pipeline("attention_h")?,
             attention_part: [pipeline("attention_part_f32")?, pipeline("attention_part_f16")?],
             attention_combine: pipeline("attention_combine")?,
+            attention_decode: {
+                let mut v: [[[Option<Pso>; 4]; 4]; 2] = Default::default();
+                for (c, cache) in ["f32", "f16"].iter().enumerate() {
+                    for (i, d) in [64, 128, 256, 512].iter().enumerate() {
+                        for (j, hg) in [1].iter().enumerate() {
+                            if hg * d / 32 <= 32 {
+                                v[c][i][j] =
+                                    Some(pipeline(&format!("attention_decode_{cache}_{d}_{hg}"))?);
+                            }
+                        }
+                    }
+                }
+                v
+            },
             attention_tiled: [
                 pipeline("attention_tiled_64")?,
                 pipeline("attention_tiled_128")?,
@@ -764,6 +822,22 @@ impl Gpu {
                 pipeline("attention_flash_256")?,
                 pipeline("attention_flash_512")?,
             ],
+            attention_flash2: [
+                pipeline("attention_flash2_64")?,
+                pipeline("attention_flash2_128")?,
+                pipeline("attention_flash2_256")?,
+                pipeline("attention_flash2_512")?,
+            ],
+            attention_tc: if tensor_ops {
+                Some([
+                    pipeline("attention_tc_64")?,
+                    pipeline("attention_tc_128")?,
+                    pipeline("attention_tc_256")?,
+                    pipeline("attention_tc_512")?,
+                ])
+            } else {
+                None
+            },
             attention_tiled_h: [
                 pipeline("attention_tiled_h_64")?,
                 pipeline("attention_tiled_h_128")?,
@@ -826,12 +900,15 @@ impl Gpu {
             names,
             allocations: Mutex::new(std::collections::BTreeMap::new()),
         });
-        let parts_bytes = 64 * MAX_PARTS as usize * (2 + 512) * 4;
+        let parts_bytes = 64 * MAX_DECODE_PARTS as usize * (2 + 512) * 4;
         let attention_parts = Self::alloc_in(&context, parts_bytes)?;
+        let attention_counters = Self::alloc_in(&context, 64 * 4)?;
+        attention_counters.write_bytes_at(0, &[0u8; 64 * 4])?;
         Ok(Self {
             context,
             kernels,
             attention_parts,
+            attention_counters,
             info,
         })
     }
@@ -1005,14 +1082,7 @@ impl Gpu {
         rows: usize,
         cols: usize,
     ) -> Result<()> {
-        let kernel = &self.kernels.matvec[Self::kind_index(kind)?];
-        // The quantized kernels give each SIMD group 2 rows (MV_ROWS in vireo.metal).
-        let rows_per_warp = if matches!(kind, TensorType::F32 | TensorType::F16) {
-            1
-        } else {
-            2
-        };
-        let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK * rows_per_warp);
+        let index = Self::kind_index(kind)?;
         let args = [
             Arg::Ptr(w),
             Arg::Ptr(x),
@@ -1020,6 +1090,25 @@ impl Gpu {
             Arg::I32(rows as i32),
             Arg::I32(cols as i32),
         ];
+        if let Some(split) = &self.kernels.matvec_split[index] {
+            // A SIMD group of the plain kernel takes 512 columns a step (Q8_0 128), one
+            // after another. Long rows (4 steps or more) and small matrices are quicker
+            // with each row pair split over 4 SIMD groups; many short rows aren't (on the
+            // M5 Max: 2,048 × 8,192 Q6_K 21.8 → 19.2 µs, 512 × 2,048 Q4_K 5.7 → 4.2, but
+            // 6,144 × 1,024 Q5_K 11.1 → 11.9).
+            let per_step = if kind == TensorType::Q8_0 { 128 } else { 512 };
+            if cols / per_step >= 4 || rows <= 1024 {
+                return self.run(split, ((rows as u32).div_ceil(2), 1), 128, &args);
+            }
+        }
+        let kernel = &self.kernels.matvec[index];
+        // The quantized kernels give each SIMD group 2 rows (MV_ROWS in vireo.metal).
+        let rows_per_warp = if matches!(kind, TensorType::F32 | TensorType::F16) {
+            1
+        } else {
+            2
+        };
+        let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK * rows_per_warp);
         self.run(kernel, (grid, 1), ROWS_PER_BLOCK * 32, &args)
     }
 
@@ -1185,6 +1274,35 @@ impl Gpu {
             Arg::I32(group as i32),
             Arg::F32(scale),
         ];
+        let wide = match head_dim {
+            64 => Some(0),
+            128 => Some(1),
+            256 => Some(2),
+            512 => Some(3),
+            _ => None,
+        };
+        if let (1, true, Some(i)) = (tokens, heads <= 64, wide) {
+            // One token, in one dispatch: the query heads sharing a key/value head together
+            // (so each key and value is read once for them), the context in parts so
+            // every GPU core has work, the parts merged by the last to finish.
+            // One query head a threadgroup: taking a key/value head's whole group at once (2,
+            // 4 or 8 heads, each key and value read once for them) was slower on the M5 Max
+            // at every split tried, the repeated reads coming from the cache. Narrow heads
+            // want more parts (Llama's 64: 340 tokens/s generating at 2,500 tokens with
+            // twice as many, against 315); 256- and 512-wide heads fewer.
+            let (j, hg) = (0, 1);
+            let spread: u32 = if head_dim <= 128 { 4 } else { 2 };
+            let threadgroups = (heads / hg) as u32;
+            let cores = self.info.multiprocessors.max(1) as u32;
+            let parts = (spread * cores).div_ceil(threadgroups).clamp(1, MAX_DECODE_PARTS);
+            let mut args = args.to_vec();
+            args.push(Arg::Ptr(self.attention_parts.ptr()));
+            args.push(Arg::Ptr(self.attention_counters.ptr()));
+            let kernel = self.kernels.attention_decode[usize::from(half_cache)][i][j]
+                .as_ref()
+                .expect("built for one query head at a time");
+            return self.run(kernel, (threadgroups, parts), 256, &args);
+        }
         if tokens == 1 && heads <= 64 {
             // One token: split each head's context into parts so every GPU core has work.
             let cores = self.info.multiprocessors.max(1) as u32;
@@ -1226,11 +1344,26 @@ impl Gpu {
         if let (true, true, Some((kernel, _))) = (tokens > 1, half_cache, tiled) {
             let mut args = args.to_vec();
             args.push(Arg::I32(tokens as i32));
-            let blocks = (tokens as u32).div_ceil(FLASH_TOKENS[kernel]);
+            if let Some(tc) = &self.kernels.attention_tc {
+                let blocks = (tokens as u32).div_ceil(ATTENTION_TC_TOKENS[kernel]);
+                return self.run(&tc[kernel], (heads as u32, blocks), 256, &args);
+            }
+            // The bigger tiles pay off only for 512-wide heads (Gemma 4's global layers);
+            // for 64 and 256 the smaller ones were quicker on the M5 Max.
+            if head_dim != 512 {
+                let blocks = (tokens as u32).div_ceil(FLASH_TOKENS[kernel]);
+                return self.run(
+                    &self.kernels.attention_flash[kernel],
+                    (heads as u32, blocks),
+                    128,
+                    &args,
+                );
+            }
+            let blocks = (tokens as u32).div_ceil(FLASH2_TOKENS[kernel]);
             return self.run(
-                &self.kernels.attention_flash[kernel],
+                &self.kernels.attention_flash2[kernel],
                 (heads as u32, blocks),
-                128,
+                FLASH2_THREADS[kernel],
                 &args,
             );
         }
@@ -1569,9 +1702,10 @@ impl Gpu {
             (Some((k, _)), Some(half)) if tokens > 1 && cols.is_multiple_of(32) => (k, half),
             _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
         };
+        let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
         let grid = (
-            (rows as u32).div_ceil(TC_ROWS),
-            (tokens as u32).div_ceil(TC_TOKENS),
+            (rows as u32).div_ceil(tc_rows),
+            (tokens as u32).div_ceil(tc_tokens),
         );
         let args = [
             Arg::Ptr(w),
@@ -1581,7 +1715,7 @@ impl Gpu {
             Arg::I32(cols as i32),
             Arg::I32(tokens as i32),
         ];
-        self.run(&kernels[Self::kind_index(kind)?], grid, 128, &args)
+        self.run(&kernels[Self::kind_index(kind)?], grid, 32 * tc_sg, &args)
     }
 
     /// Fills a buffer with zeros.
