@@ -20,6 +20,7 @@
 //! Anything else answers 404, which the app takes as "not on this server".
 
 mod chat;
+mod files;
 mod http;
 mod json;
 mod sample;
@@ -513,6 +514,17 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
             _ => None,
         })
         .collect();
+    // The files the chat may reach on this Mac, for the PC tools the app doesn't run.
+    let folders = body
+        .array("folders")
+        .iter()
+        .filter_map(|f| match f {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let files =
+        files::Access::from_request(body.str("access"), folders).map(files::Files::for_user);
     let job = Job {
         system,
         messages,
@@ -521,6 +533,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         stop: stop.clone(),
         out,
         client_tools,
+        files,
         tool_results: shared.tool_results.clone(),
     };
     if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
@@ -582,6 +595,9 @@ struct Job {
     out: Sender<Out>,
     /// The tools the app runs on the PC (its `clientTools`).
     client_tools: Vec<String>,
+    /// What the chat may reach on this Mac (its `access`, and `folders`), for the PC tools
+    /// the server runs itself; `None` for none.
+    files: Option<files::Files>,
     tool_results: ToolWaits,
 }
 
@@ -1193,7 +1209,7 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
-    let mut offered = tools::offered(&job.client_tools);
+    let mut offered = tools::offered(&job.client_tools, job.files.is_some());
     if options().scored_groups
         && !offered.is_empty()
         && let Some(request) = job.messages.last()
@@ -1652,8 +1668,8 @@ fn write_call(
     String::from_utf8(text).map_err(|_| "A tool call wasn't text.".to_string())
 }
 
-/// Runs a call: the server's own tools here, the PC's by asking the app and waiting for
-/// its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
+/// Runs a call: the server's own tools here (with the Mac's files when the app doesn't
+/// run the PC's tools), the PC's by asking the app and waiting for its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
 /// model should read it. `None` if the reply was stopped meanwhile.
 fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<String> {
     let runs = offered
@@ -1661,7 +1677,7 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         .find(|t| t.name == call.tool)
         .map(|t| t.runs)?;
     let result = match runs {
-        tools::Runs::Server => tools::run_here(call),
+        tools::Runs::Server => tools::run_here(call, job.files.as_ref()),
         tools::Runs::App => {
             let id = format!("call-{:016x}", random_u64());
             let (tx, rx) = channel();
