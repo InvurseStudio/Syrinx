@@ -613,8 +613,9 @@ struct Kernels {
     attention_part: [Pso; 2],
     attention_combine: Pso,
     /// One token's attention in one dispatch, over f32 and f16 caches, for head sizes
-    /// 64, 128, 256 and 512.
-    attention_decode: [[Pso; 4]; 2],
+    /// 64, 128, 256 and 512, by how many query heads they take at once (built for 1; the
+    /// kernel takes more, see vireo.metal).
+    attention_decode: [[[Option<Pso>; 4]; 4]; 2],
     /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
     attention_tiled_h: [Pso; 4],
@@ -710,6 +711,8 @@ const ATTENTION_TC_TOKENS: [u32; 4] = [32, 32, 32, 16];
 const BUFFER_SLACK: usize = 128 * 1024;
 /// The most parts one token's attention is split into.
 const MAX_PARTS: u32 = 16;
+/// The most parts attention_decode splits a context into.
+const MAX_DECODE_PARTS: u32 = 64;
 
 /// A parameter for the kernels, which take raw addresses: 0 stands for "none".
 fn or_null(buffer: Option<&Buffer>) -> CuDevicePtr {
@@ -793,20 +796,20 @@ impl Gpu {
             attention_h: pipeline("attention_h")?,
             attention_part: [pipeline("attention_part_f32")?, pipeline("attention_part_f16")?],
             attention_combine: pipeline("attention_combine")?,
-            attention_decode: [
-                [
-                    pipeline("attention_decode_f32_64")?,
-                    pipeline("attention_decode_f32_128")?,
-                    pipeline("attention_decode_f32_256")?,
-                    pipeline("attention_decode_f32_512")?,
-                ],
-                [
-                    pipeline("attention_decode_f16_64")?,
-                    pipeline("attention_decode_f16_128")?,
-                    pipeline("attention_decode_f16_256")?,
-                    pipeline("attention_decode_f16_512")?,
-                ],
-            ],
+            attention_decode: {
+                let mut v: [[[Option<Pso>; 4]; 4]; 2] = Default::default();
+                for (c, cache) in ["f32", "f16"].iter().enumerate() {
+                    for (i, d) in [64, 128, 256, 512].iter().enumerate() {
+                        for (j, hg) in [1].iter().enumerate() {
+                            if hg * d / 32 <= 32 {
+                                v[c][i][j] =
+                                    Some(pipeline(&format!("attention_decode_{cache}_{d}_{hg}"))?);
+                            }
+                        }
+                    }
+                }
+                v
+            },
             attention_tiled: [
                 pipeline("attention_tiled_64")?,
                 pipeline("attention_tiled_128")?,
@@ -897,7 +900,7 @@ impl Gpu {
             names,
             allocations: Mutex::new(std::collections::BTreeMap::new()),
         });
-        let parts_bytes = 64 * MAX_PARTS as usize * (2 + 512) * 4;
+        let parts_bytes = 64 * MAX_DECODE_PARTS as usize * (2 + 512) * 4;
         let attention_parts = Self::alloc_in(&context, parts_bytes)?;
         let attention_counters = Self::alloc_in(&context, 64 * 4)?;
         attention_counters.write_bytes_at(0, &[0u8; 64 * 4])?;
@@ -1279,15 +1282,26 @@ impl Gpu {
             _ => None,
         };
         if let (1, true, Some(i)) = (tokens, heads <= 64, wide) {
-            // One token, in one dispatch: each head's context in parts so every GPU core
-            // has work, the parts merged by the last to finish.
+            // One token, in one dispatch: the query heads sharing a key/value head together
+            // (so each key and value is read once for them), the context in parts so
+            // every GPU core has work, the parts merged by the last to finish.
+            // One query head a threadgroup: taking a key/value head's whole group at once (2,
+            // 4 or 8 heads, each key and value read once for them) was slower on the M5 Max
+            // at every split tried, the repeated reads coming from the cache. Narrow heads
+            // want more parts (Llama's 64: 340 tokens/s generating at 2,500 tokens with
+            // twice as many, against 315); 256- and 512-wide heads fewer.
+            let (j, hg) = (0, 1);
+            let spread: u32 = if head_dim <= 128 { 4 } else { 2 };
+            let threadgroups = (heads / hg) as u32;
             let cores = self.info.multiprocessors.max(1) as u32;
-            let parts = (2 * cores).div_ceil(heads as u32).clamp(1, MAX_PARTS);
+            let parts = (spread * cores).div_ceil(threadgroups).clamp(1, MAX_DECODE_PARTS);
             let mut args = args.to_vec();
             args.push(Arg::Ptr(self.attention_parts.ptr()));
             args.push(Arg::Ptr(self.attention_counters.ptr()));
-            let kernel = &self.kernels.attention_decode[usize::from(half_cache)][i];
-            return self.run(kernel, (heads as u32, parts), 256, &args);
+            let kernel = self.kernels.attention_decode[usize::from(half_cache)][i][j]
+                .as_ref()
+                .expect("built for one query head at a time");
+            return self.run(kernel, (threadgroups, parts), 256, &args);
         }
         if tokens == 1 && heads <= 64 {
             // One token: split each head's context into parts so every GPU core has work.
