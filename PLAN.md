@@ -96,6 +96,7 @@ git), for checking our output and speed.
 | 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52 → 0.07 s, Qwen 1.33 → 0.10 s, Gemma 1.06 → 0.05 s at turn 5). 76 engine tests pass |
 | 2026-11-11 | A saved cache per chat: a session's keys and values (and Qwen's DeltaNet at its checkpoint) copied to system memory and back (`export`, `import`, `SavedState`); vireo-server saves the chat in use when a prompt would throw much of it away, or when the app closes, to `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\` (a file per chat, written on a thread of its own; 4 GB per model, the oldest go first), and loads the saved chat that shares the most of a new prompt. Llama and Gemma can load part of one (a shared start); Qwen's loads whole | A new GPU test: an imported session goes on to the bit as the one it came from, whole and in part, exact and 8-bit. Two chats about 3,500- and 4,400-token documents taking turns, then a restart: going back to a chat or reopening it loads its cache in 17-66 ms, the first word in 0.06-0.13 s, against 0.8-1.4 s reading it again, on all three models. 77 engine tests pass |
 | 2026-11-11 | Tools, step 1: our own grammar matcher (`grammar`: a schema to a byte-level matcher, the vocabulary's tokens in a byte trie for the tokens that may come next, forced text written ahead) | Unit tests, and on all three vocabularies the trie's tokens equal trying each of 128K-262K tokens at every byte of a call; 0.04-0.06 ms a step on average, 0.5 ms at most. On the GPU each model asked about a file writes the expected `read_file` call: 23-30 tokens in 10-12 passes (forced text saves over half). Llama 3.2 1B also filled the optional `max_lines` with 1: a valid call, a poor choice, which the grammar can't catch. 80 engine tests pass |
+| 2026-11-11 | Tools, step 2: vireo-server's tool loop. Each family's own form, from its template: declarations in the system turn, Qwen's `<tool_call><function=...><parameter=...>`, Llama's JSON (opened with `<|python_tag|>` or `{`), Gemma 4's `<|tool_call>call:name{key:<|"|>value<|"|>}`; the grammar gained raw text up to an end mark and other punctuation for objects. The model writes freely until a call starts, the grammar writes the call, the app runs the PC's tools (`client_tool_request`, `/api/agent/client-tool-result`) and the server its own (the date), and the result goes back in the family's form, all in the kept cache. A repeated call isn't run again; used-up calls leave the model only an answer. Read-only tools so far | Unit tests for each family's calls and declarations. A first baseline, five chats (read a file, list a folder, the date, 17 × 23 with no tool, find then read): Gemma 4 E2B 4/5, Qwen 3.5 0.8B 2/5, Llama 3.2 1B 1/5. Every call parses and reaches its tool; what's left is the small models choosing the tool (Qwen reaches for `git_*` when unsure, Llama calls one more than needed). In the installed app, Gemma reads a README through the app's own `read_file` and sums it up |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -622,8 +623,9 @@ The CPU backend (Rust SIMD) is the fallback and the reference for correctness ch
 ### Tools and skills for small models (design, 2026-11-11)
 
 All our own, from the grammar up: no llguidance, xgrammar, outlines or JSON library. The
-target is the smallest models (0.8–4B) working well, fast and right, not only the large
-ones. Small models fail in known ways, and each part of the design answers one of them:
+target is the smallest models (0.8–4B) working well, fast and right, and everything must
+work just as well on large ones (Qwen3.8-27B, Muse Glimmer 30B, the mixture-of-experts
+models). Small models fail in known ways, and each part of the design answers one of them:
 
 | A small model... | So Vireo... |
 |---|---|
@@ -637,6 +639,42 @@ ones. Small models fail in known ways, and each part of the design answers one o
 
 Read-only tools start as soon as their arguments close, while the model writes its
 closing tokens. Approvals stay as the Mac's server asks them.
+
+**Large models too.** None of this may cost a large model anything:
+
+- Constraints only rule out what's invalid, so a model that writes valid calls writes the
+  same calls; forced text and cached tool text make large models faster as well, and
+  they gain the most from it (each pass costs more).
+- How much guidance a model gets is a setting per model, not a guess from its size: a
+  skill one step at a time or whole, a group's tools or all of them, optional arguments
+  offered or held back. Each model's setting is what the eval measures best for it
+  (kept with the model's profile, `model_profiles.py`'s successor), with a default for
+  models never measured.
+- The eval runs large models as well as small ones, and a feature that helps small
+  models but costs large ones is made a setting, not left on for all.
+
+### Skills (design, 2026-11-11)
+
+Skills stay in the open SKILL.md format (`server/skill_library.py`: a name and description,
+then steps in Markdown; 10 built in, the user's own, and drafts from skill learning). The
+file is the source; Vireo compiles each one when it loads, without changing it:
+
+- **Picked by scoring.** The request scores each skill's name and "none" in one pass, in
+  place of the model choosing to call `use_skill`. (`tool_evals.py` has the cases:
+  plan my day, research, and leaving skills alone.)
+- **Instructions cached.** A skill's text is a branch of the KV prefix, read once.
+- **One step at a time, where it helps.** A skill's numbered steps become a checklist the
+  engine walks: the model sees the step it's on and that step's tools only (step 3 of
+  `analyze-data` offers `calculate`), and the engine moves on when the step is done. A
+  model that does better with the whole skill (the per-model setting above) gets it whole.
+- **The answer's shape kept.** Where a skill sets an answer's layout (`analyze-data`'s
+  **Answer:** / **Details:** / **Worth noting:**), the headings are written for the model
+  (forced text) and it writes what goes under each. Free text itself is never constrained.
+- **A fallback.** A skill without clear steps is used whole, as cached instructions.
+- **Learned skills alike.** A skill drafted from a run compiles the same way.
+
+The tool loop (step 2) is built for this from the start: the tools offered can change from
+one step to the next, and a step can end on a forced heading as well as on a call.
 
 **How we know:** our own eval, in Rust, against vireo-server: the 14 cases of
 `server/tool_evals.py` first (Gemma 4 E2B passes 13 on today's stack), then cases from the
@@ -652,10 +690,13 @@ counts arguments as well as tools.
 **Order:**
 1. ~~The grammar matcher and token masks, with forced text written ahead (vireo-engine).~~
    Done 2026-11-11 (see Progress).
-2. vireo-server's tool loop, with the app's own PC tools (the protocol is there:
-   `client_tool_request`, `/api/agent/client-tool-result`) and each family's call format.
+2. ~~vireo-server's tool loop, with the app's own PC tools (the protocol is there:
+   `client_tool_request`, `/api/agent/client-tool-result`) and each family's call format.~~
+   Done 2026-11-11, read-only tools (see Progress); the tools that change things, with
+   approvals, follow.
 3. The eval, and a baseline.
-4. Copying constraints, scored choices, compact tool text, then compiled skills.
+4. Copying constraints, scored choices, compact tool text.
+5. Compiled skills (above), then the per-model guidance settings from the eval.
 
 ### Compiled skills
 
