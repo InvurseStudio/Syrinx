@@ -70,6 +70,69 @@ impl Pc {
         self.files.keys().any(|k| k.starts_with(&prefix))
     }
 
+    /// A folder's files and folders (folders with a trailing `\`), sorted.
+    fn entries(&self, folder: &str) -> Vec<String> {
+        let prefix = format!("{}\\", key(folder));
+        let mut entries: Vec<String> = self
+            .files
+            .values()
+            .filter(|(p, _)| key(p).starts_with(&prefix))
+            .map(|(p, _)| {
+                let rest = &p[prefix.len()..];
+                match rest.split_once('\\') {
+                    Some((folder, _)) => format!("{folder}\\"),
+                    None => rest.to_string(),
+                }
+            })
+            .collect();
+        entries.dedup();
+        entries
+    }
+
+    /// A missing path's error, as the app's `NotFound` gives it: the nearest folder above
+    /// it that's there (in the home folder), what that holds, the names there nearest the
+    /// one asked for, and files of the same name further down.
+    fn not_found(&self, path: &str, first: String) -> String {
+        let home = key(HOME);
+        let mut folder = path.to_string();
+        let mut tail: Vec<String> = Vec::new();
+        loop {
+            let Some((parent, name)) = folder.rsplit_once('\\') else {
+                return first;
+            };
+            let parent_key = key(parent);
+            if !(parent_key == home || parent_key.starts_with(&format!("{home}\\"))) {
+                return first;
+            }
+            tail.insert(0, name.to_string());
+            folder = parent.to_string();
+            if self.is_folder(&folder) {
+                break;
+            }
+        }
+        // Folders first, then files, each by name ignoring case.
+        let mut entries = self.entries(&folder);
+        entries.sort_by_key(|e| (!e.ends_with('\\'), e.to_lowercase()));
+        let names: Vec<&str> = entries.iter().map(|e| e.trim_end_matches('\\')).collect();
+        let below = format!("{}\\", key(&folder));
+        let asked = key(tail.last().map_or("", String::as_str));
+        let found: Vec<&str> = self
+            .files
+            .iter()
+            .filter(|(k, _)| k.starts_with(&below) && k.rsplit('\\').next() == Some(asked.as_str()))
+            .map(|(_, (p, _))| p.as_str())
+            .take(3)
+            .collect();
+        not_found_text(
+            &first,
+            &folder,
+            &tail,
+            &entries,
+            &closest(&tail, &names),
+            &found,
+        )
+    }
+
     /// Runs one of the app's tools: its output, or why it failed.
     pub fn run(&self, tool: &str, args: &Value) -> Result<String, String> {
         let arg = |name: &str| {
@@ -85,29 +148,15 @@ impl Pc {
                     None if self.is_folder(&path) => {
                         Err(format!("{path} is a folder, not a file."))
                     }
-                    None => Err(format!("No such file: {path}")),
+                    None => Err(self.not_found(&path, format!("File not found: {path}"))),
                 }
             }
             "list_directory" => {
                 let path = arg("path")?;
                 if !self.is_folder(&path) {
-                    return Err(format!("No such folder: {path}"));
+                    return Err(self.not_found(&path, format!("Folder not found: {path}")));
                 }
-                let prefix = format!("{}\\", key(&path));
-                let mut entries: Vec<String> = self
-                    .files
-                    .values()
-                    .filter(|(p, _)| key(p).starts_with(&prefix))
-                    .map(|(p, _)| {
-                        let rest = &p[prefix.len()..];
-                        match rest.split_once('\\') {
-                            Some((folder, _)) => format!("{folder}\\"),
-                            None => rest.to_string(),
-                        }
-                    })
-                    .collect();
-                entries.dedup();
-                Ok(entries.join("\n"))
+                Ok(self.entries(&path).join("\n"))
             }
             // As the app's SearchFiles: a file or folder name matches when it holds every
             // word of the search ("*.pdf" finds a.pdf, "STEM camp" finds Stem-Camp.docx),
@@ -202,6 +251,97 @@ impl Pc {
     }
 }
 
+/// The words of a name, for comparing names: lowercase runs of letters or of digits, a
+/// file's extension left out ("Report_2026.pdf" is "report", "2026").
+fn words(name: &str, is_file: bool) -> Vec<String> {
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if is_file && !stem.is_empty() => stem,
+        _ => name,
+    };
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for c in stem.to_lowercase().chars() {
+        let breaks = word
+            .chars()
+            .last()
+            .is_some_and(|last| last.is_ascii_digit() != c.is_ascii_digit());
+        if (!c.is_alphanumeric() || breaks) && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        if c.is_alphanumeric() {
+            word.push(c);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Up to three of `names` sharing the most words with the missing part of the path
+/// (`tail`: its folders and its name), as the app's `Closest`.
+fn closest<'a>(tail: &[String], names: &[&'a str]) -> Vec<&'a str> {
+    let asked: Vec<String> = tail
+        .iter()
+        .enumerate()
+        .flat_map(|(i, part)| words(part, i + 1 == tail.len()))
+        .collect();
+    let mut scored: Vec<(usize, &str)> = names
+        .iter()
+        .map(|n| {
+            let have = words(n, true);
+            (asked.iter().filter(|w| have.contains(w)).count(), *n)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    scored.into_iter().take(3).map(|(_, n)| n).collect()
+}
+
+/// How many of a folder's items a missing path's error lists.
+const MAX_HINT_ENTRIES: usize = 30;
+
+/// The error's text, the same as the app's `NotFound`.
+fn not_found_text(
+    first: &str,
+    folder: &str,
+    tail: &[String],
+    entries: &[String],
+    closest: &[&str],
+    found: &[&str],
+) -> String {
+    let mut lines = vec![first.to_string()];
+    if tail.len() > 1 {
+        lines.push(format!("There's no folder {folder}\\{} either.", tail[0]));
+    }
+    lines.push(if entries.is_empty() {
+        format!("{folder} is empty.")
+    } else if entries.len() > MAX_HINT_ENTRIES {
+        format!(
+            "{folder} holds {} items, the first {MAX_HINT_ENTRIES}: {}",
+            entries.len(),
+            entries[..MAX_HINT_ENTRIES].join(", ")
+        )
+    } else {
+        format!("{folder} holds: {}", entries.join(", "))
+    });
+    if !closest.is_empty() {
+        let paths: Vec<String> = closest.iter().map(|n| format!("{folder}\\{n}")).collect();
+        lines.push(format!("Closest to what was asked: {}", paths.join(", ")));
+    }
+    if !found.is_empty() {
+        lines.push(format!(
+            "Also named {}: {}",
+            tail.last().map_or("", String::as_str),
+            found.join(", ")
+        ));
+    }
+    // Facts only, no advice: a last line telling the model to go on with one of these
+    // ("…use it and say so; if not, tell the user what's there", or "Go on with the one
+    // that fits the request, if one plainly does") scored lower, measured 2026-11-11.
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +428,55 @@ mod tests {
             Ok(" M main.rs".into())
         );
         assert!(run("git_status", &[("path", r"C:\Users\me")]).is_err());
+    }
+
+    #[test]
+    fn a_missing_path_says_what_is_there() {
+        let pc = Pc::default()
+            .file(r"C:\Users\me\Documents\meeting-notes.txt", "Tuesday")
+            .file(r"C:\Users\me\Documents\notes.txt", "eggs")
+            .file(r"C:\Users\me\Documents\report-2025.txt", "1.2")
+            .file(r"C:\Users\me\Documents\report-2026.txt", "1.5")
+            .file(r"C:\Users\me\Documents\Old\plan.md", "old plan");
+        let run = |tool: &str, path: &str| pc.run(tool, &args(&[("path", path)]));
+        assert_eq!(
+            run("read_file", r"Documents\Notes\meeting.txt").unwrap_err(),
+            [
+                r"File not found: C:\Users\me\Documents\Notes\meeting.txt",
+                r"There's no folder C:\Users\me\Documents\Notes either.",
+                r"C:\Users\me\Documents holds: Old\, meeting-notes.txt, notes.txt, report-2025.txt, report-2026.txt",
+                r"Closest to what was asked: C:\Users\me\Documents\meeting-notes.txt, C:\Users\me\Documents\notes.txt",
+            ]
+            .join("\n")
+        );
+        // Words apart from letters and digits, the extension left out.
+        let err = run("read_file", r"Documents\2026_report.pdf").unwrap_err();
+        assert!(
+            err.contains(r"asked: C:\Users\me\Documents\report-2026.txt, C:\Users\me\Documents\report-2025.txt"),
+            "{err}"
+        );
+        assert!(
+            run("read_file", r"Documents\report2026")
+                .unwrap_err()
+                .contains(r"asked: C:\Users\me\Documents\report-2026.txt,")
+        );
+        // The same name further down.
+        let err = run("read_file", r"Documents\plan.md").unwrap_err();
+        assert!(
+            err.contains(r"Also named plan.md: C:\Users\me\Documents\Old\plan.md"),
+            "{err}"
+        );
+        assert!(
+            run("list_directory", r"Documents\Reports")
+                .unwrap_err()
+                .contains("Closest to what was asked: report-2025.txt")
+                == false,
+            "a folder's name is one word: reports isn't report"
+        );
+        // Nothing past the home folder.
+        assert_eq!(
+            run("read_file", r"D:\nope\x.txt").unwrap_err(),
+            r"File not found: D:\nope\x.txt"
+        );
     }
 }
