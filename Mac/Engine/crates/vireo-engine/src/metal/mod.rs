@@ -496,6 +496,9 @@ struct Kernels {
     /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
     attention_tiled_h: [Pso; 4],
+    /// A prompt over an f16 cache on the SIMD-group matrix units, for head sizes 64, 128,
+    /// 256 and 512 (tokens per threadgroup in `FLASH_TOKENS`).
+    attention_flash: [Pso; 4],
     swiglu: Pso,
     geglu: Pso,
     add: Pso,
@@ -509,6 +512,9 @@ struct Kernels {
     delta_l2: Pso,
     delta_scan: Pso,
     delta_out: Pso,
+    /// A prompt's DeltaNet in chunks of DELTA_CHUNK tokens.
+    delta_chunk_prep: Pso,
+    delta_chunk_scan: Pso,
 }
 
 /// The weight types with kernels, in the order of `Kernels::matvec` and `matmul`.
@@ -562,6 +568,8 @@ const TILE_TOKENS: u32 = 32;
 /// The tensor kernel's tile (matmul_tc in vireo_tensor.metal).
 const TC_ROWS: u32 = 64;
 const TC_TOKENS: u32 = 128;
+/// attention_flash's tokens per threadgroup, for head sizes 64, 128, 256 and 512.
+const FLASH_TOKENS: [u32; 4] = [32, 32, 16, 8];
 /// The most parts one token's attention is split into.
 const MAX_PARTS: u32 = 16;
 
@@ -638,6 +646,12 @@ impl Gpu {
                 pipeline("attention_tiled_256")?,
                 pipeline("attention_tiled_512")?,
             ],
+            attention_flash: [
+                pipeline("attention_flash_64")?,
+                pipeline("attention_flash_128")?,
+                pipeline("attention_flash_256")?,
+                pipeline("attention_flash_512")?,
+            ],
             attention_tiled_h: [
                 pipeline("attention_tiled_h_64")?,
                 pipeline("attention_tiled_h_128")?,
@@ -657,6 +671,8 @@ impl Gpu {
             delta_l2: pipeline("delta_l2")?,
             delta_scan: pipeline("delta_scan")?,
             delta_out: pipeline("delta_out")?,
+            delta_chunk_prep: pipeline("delta_chunk_prep")?,
+            delta_chunk_scan: pipeline("delta_chunk_scan")?,
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
@@ -1086,6 +1102,17 @@ impl Gpu {
             512 => Some((3, 32)),
             _ => None,
         };
+        if let (true, true, Some((kernel, _))) = (tokens > 1, half_cache, tiled) {
+            let mut args = args.to_vec();
+            args.push(Arg::I32(tokens as i32));
+            let blocks = (tokens as u32).div_ceil(FLASH_TOKENS[kernel]);
+            return self.run(
+                &self.kernels.attention_flash[kernel],
+                (heads as u32, blocks),
+                128,
+                &args,
+            );
+        }
         if let (true, Some((kernel, lanes))) = (tokens > 1, tiled) {
             // A prompt: a threadgroup of tokens shares each key and value it reads.
             let mut args = args.to_vec();
@@ -1231,9 +1258,8 @@ impl Gpu {
         self.run_per_number(&self.kernels.conv_silu, channels, &conv)
     }
 
-    /// Scratch for a prompt's DeltaNet in chunks, in f32s. The Metal backend reads
-    /// prompts with `delta_scan` instead (the chunked kernels need more threadgroup memory
-    /// than Metal allows), so this only keeps the models' sizes as on CUDA.
+    /// Scratch for a prompt's DeltaNet in chunks ([`DeltaNet::scratch`]), in f32s, for up
+    /// to `tokens` tokens at a time.
     pub fn delta_scratch_floats(tokens: usize, v_heads: usize, n: usize) -> usize {
         tokens.div_ceil(DELTA_CHUNK)
             * v_heads
@@ -1248,6 +1274,53 @@ impl Gpu {
             n <= 256 && n.is_multiple_of(32),
             "state size {n}: the kernel takes multiples of 32 up to 256"
         );
+        if tokens > 1 && n <= 128 && d.scratch != 0 {
+            // A prompt in chunks of DELTA_CHUNK tokens (delta_chunk_prep and
+            // delta_chunk_scan in vireo.metal), between the norms for every token at once.
+            let rows = (tokens * 2 * d.k_heads) as u32;
+            let l2 = [
+                Arg::Ptr(d.conv),
+                Arg::I32(d.channels as i32),
+                Arg::I32(d.k_heads as i32),
+                Arg::I32(n as i32),
+                Arg::F32(d.eps),
+            ];
+            self.run(&self.kernels.delta_l2, (rows, 1), n as u32, &l2)?;
+            let prep = [
+                Arg::Ptr(d.conv),
+                Arg::I32(d.channels as i32),
+                Arg::I32(d.key_dim as i32),
+                Arg::Ptr(d.beta_raw),
+                Arg::Ptr(d.alpha_raw),
+                Arg::Ptr(d.dt_bias),
+                Arg::Ptr(d.a),
+                Arg::Ptr(d.scratch),
+                Arg::I32(n as i32),
+                Arg::I32(d.k_heads as i32),
+                Arg::I32(tokens as i32),
+            ];
+            let chunks = tokens.div_ceil(DELTA_CHUNK) as u32;
+            self.run(&self.kernels.delta_chunk_prep, (d.v_heads as u32, chunks), 256, &prep)?;
+            let scan = [
+                Arg::Ptr(d.scratch),
+                Arg::Ptr(d.state),
+                Arg::Ptr(d.out),
+                Arg::I32(n as i32),
+                Arg::I32(tokens as i32),
+            ];
+            // 16 columns of the state a threadgroup (DSC_COLS in vireo.metal).
+            let grid = (d.v_heads as u32, (n / 16) as u32);
+            self.run(&self.kernels.delta_chunk_scan, grid, 64, &scan)?;
+            let out = [
+                Arg::Ptr(d.out),
+                Arg::Ptr(d.z),
+                Arg::Ptr(d.norm),
+                Arg::I32(n as i32),
+                Arg::F32(d.eps),
+            ];
+            let rows = (tokens * d.v_heads) as u32;
+            return self.run(&self.kernels.delta_out, (rows, 1), n as u32, &out);
+        }
         if tokens > 1 && n <= 128 {
             // A prompt: the norms for every token at once, the state update split over
             // threadgroups of 16 columns, then the output norm for every token at once.
@@ -1450,12 +1523,14 @@ pub struct DeltaNet {
     pub n: usize,
     pub k_heads: usize,
     pub eps: f32,
-    /// Room for a prompt in chunks, or 0: unused on Metal (see delta_scratch_floats).
+    /// Room for a prompt in chunks ([`Gpu::delta_scratch_floats`]), or 0 to run it token
+    /// by token.
     pub scratch: CuDevicePtr,
 }
 
-/// Tokens per chunk of a prompt's DeltaNet on CUDA (DC in vireo.cu).
-const DELTA_CHUNK: usize = 64;
+/// Tokens per chunk of a prompt's DeltaNet (DC in vireo.metal: 32, where CUDA's is 64, so
+/// the prep's threadgroup memory fits Metal's 32 KB).
+const DELTA_CHUNK: usize = 32;
 
 /// The default mode's input to the matrix products ([`Gpu::quantize`]). The tensor
 /// kernels read the f32 activations as they are, so it holds only their address: noted
