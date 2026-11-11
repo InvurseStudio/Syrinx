@@ -1,0 +1,3 @@
+Vireo attachment test.
+The launch code is BLUE HERON 42.
+Café prices: €3.50 for a flat white.
