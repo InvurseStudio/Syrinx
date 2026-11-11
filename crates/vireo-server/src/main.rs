@@ -41,12 +41,13 @@ use vireo_engine::models::{Logits, Precision, SavedState};
 use vireo_engine::{GgufFile, Tokenizer};
 
 const USAGE: &str = "\
-Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>] [--exact]
+Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact]
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
-prints. --context is the most tokens a chat keeps (8192 by default); --exact runs f32
+prints. --context is the most tokens a chat keeps: auto (the default) is as many as the
+GPU's free memory holds once the model is loaded, up to the model's own limit; --exact runs f32
 arithmetic. Chats' caches are saved in %LOCALAPPDATA%\\VireoPrototype\\chat-cache (or
 --chat-cache's folder; off for none), so going back to a chat reads only what's new.
 
@@ -61,7 +62,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path = None;
     let mut port = 3000u16;
-    let mut context = 8192usize;
+    let mut context: Option<usize> = None;
     let mut precision = Precision::Int8;
     let mut app_token = None;
     let mut with_app = false;
@@ -74,8 +75,16 @@ fn main() -> ExitCode {
                 port = value.unwrap().parse().unwrap();
                 i += 1;
             }
-            "--context" if value.and_then(|v| v.parse::<usize>().ok()).is_some() => {
-                context = value.unwrap().parse().unwrap();
+            "--context" if value.is_some_and(|v| v == "auto") => {
+                context = None;
+                i += 1;
+            }
+            "--context"
+                if value
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .is_some_and(|n| n >= 256) =>
+            {
+                context = value.unwrap().parse().ok();
                 i += 1;
             }
             "--exact" => precision = Precision::Exact,
@@ -514,6 +523,15 @@ struct Kept {
     history_end: usize,
 }
 
+/// The context when the model's file doesn't say what it was trained for.
+const DEFAULT_CONTEXT: usize = 8192;
+/// The most `--context auto` picks, however much memory is free: further than the engine
+/// has been checked against llama.cpp.
+const AUTO_CONTEXT_MAX: usize = 32768;
+/// GPU memory `--context auto` leaves free: for the display and other programs on a PC
+/// whose GPU also drives the screen (and a tenth of what's free on top).
+const GPU_HEADROOM: usize = 1 << 30;
+
 /// How many tokens `ids` starts with that `tokens` does too, leaving at least the last of
 /// `ids` to read again (for its logits).
 fn shared_start(tokens: &[u32], ids: &[u32]) -> usize {
@@ -526,6 +544,36 @@ fn shared_start(tokens: &[u32], ids: &[u32]) -> usize {
 }
 
 impl Model {
+    /// As many tokens as the GPU's free memory holds in a session's caches, leaving
+    /// headroom, up to `trained` (and `AUTO_CONTEXT_MAX`), in whole thousands.
+    fn automatic_context(&self, trained: usize) -> Result<usize, String> {
+        let probe = self.session(1024)?;
+        let per = self.cache_bytes_per_position(&probe).max(1);
+        drop(probe);
+        let free = match self {
+            Model::Llama(m) => m.gpu().free_memory(),
+            Model::Qwen35(m) => m.gpu().free_memory(),
+            Model::Gemma4(m) => m.gpu().free_memory(),
+        };
+        let room = free.saturating_sub(GPU_HEADROOM + free / 10);
+        let n = (room / per).min(trained).min(AUTO_CONTEXT_MAX) / 1024 * 1024;
+        if n < 2048 {
+            return Err(format!(
+                "The GPU has {:.1} GB free once the model is loaded: not enough for chats. Close other programs using it, or choose a smaller model.",
+                free as f64 / 1e9
+            ));
+        }
+        Ok(n)
+    }
+
+    fn cache_bytes_per_position(&self, s: &Session) -> usize {
+        match s {
+            Session::Llama(s) => s.cache_bytes_per_position(),
+            Session::Qwen35(s) => s.cache_bytes_per_position(),
+            Session::Gemma4(s) => s.cache_bytes_per_position(),
+        }
+    }
+
     fn session(&self, capacity: usize) -> Result<Session, String> {
         let e = |e: vireo_engine::models::Error| e.to_string();
         Ok(match self {
@@ -720,7 +768,7 @@ impl Model {
 
 fn engine(
     path: &str,
-    context: usize,
+    context: Option<usize>,
     precision: Precision,
     chat_cache: Option<Option<PathBuf>>,
     ready: Sender<Result<ModelInfo, String>>,
@@ -777,6 +825,47 @@ fn engine(
         "8-bit"
     };
     eprintln!("Loaded {name} in {:.1?}.", started.elapsed());
+    let trained = file
+        .arch_u64("context_length")
+        .map_or(DEFAULT_CONTEXT, |n| n as usize);
+    let context = match context {
+        Some(n) => {
+            if n > trained {
+                eprintln!(
+                    "{name} was trained for {trained} tokens; {n} may read poorly past that."
+                );
+            }
+            n
+        }
+        None => match model.automatic_context(trained) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        },
+    };
+    // The session for the server's life, made now so a context too large fails here.
+    let mut kept: Option<Kept> = match model.session(context) {
+        Ok(session) => {
+            eprintln!(
+                "Chats keep up to {context} tokens ({:.1} GB of the GPU's memory for their cache).",
+                (model.cache_bytes_per_position(&session) * context) as f64 / 1e9
+            );
+            Some(Kept {
+                session,
+                tokens: Vec::new(),
+                checkpoint: None,
+                history_end: 0,
+            })
+        }
+        Err(e) => {
+            let _ = ready.send(Err(format!(
+                "Couldn't make room for {context}-token chats on the GPU ({e}). Try a smaller --context."
+            )));
+            return;
+        }
+    };
     let _ = ready.send(Ok(ModelInfo {
         model: name,
         runtime: format!("Vireo engine ({gpu_name}, {mode})"),
@@ -793,7 +882,6 @@ fn engine(
         s
     });
     let mut seed = random_u64();
-    let mut kept: Option<Kept> = None;
     for work in jobs {
         let job = match work {
             Work::Reply(job) => job,

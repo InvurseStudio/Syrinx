@@ -383,6 +383,30 @@ Reading a ~1,900–2,200-token prompt (the first 7,000 characters of this file) 
   ninth and tenth rounds; this round ~9%), ~10,000 tokens 2,731 → 3,162 (+16%).
   `llama-bench -p 2048` right after: 4,740, so ~79%.
 
+**Long chats (2026-11-11):** vireo-server's context is now automatic by default: as
+many tokens as the GPU's free memory holds once the model is loaded (leaving 1 GB and a
+tenth of what's free), up to the model's trained length and 32,768, the length checked
+below. On the RTX 5060 all three test models get 32,768 (cache 1.1 GB for Llama, 0.6 GB
+for Gemma, 0.4 GB for Qwen). The prototype app's Settings › Your Host has the choice
+(Automatic, or 4K to 32K).
+
+| Model | Perplexity, one 32K window: Vireo / llama.cpp | at 4K | Reading ~25K tokens: Vireo / llama.cpp (tokens/s) | Generating 25K deep: Vireo / llama.cpp |
+|---|---|---|---|---|
+| Llama 3.2 1B | 18.3595 / 18.3520 (+0.04%) | 24.2976 / 24.2865 (+0.05%) | 1,702 / 2,318 (73%) | ~31 / 49 (63%) |
+| Qwen 3.5 0.8B | 12.6015 / 12.6022 (-0.01%) | 17.8125 / 17.7922 (+0.11%) | 2,371 / 3,511 (68%) | ~62 / 85 (73%) |
+| Gemma 4 E2B | 23.7043 / 23.6904 (+0.06%) | 31.9485 / 31.9462 (+0.01%) | 2,596 / 3,635 (71%) | ~29 / 56 (52%) |
+
+(Perplexity: the repository's own docs and Python, `vireo-cli perplexity -c 32768 --chunks 1
+--gpu` against `llama-perplexity -c 32768 --chunks 1 -ngl 99`, both 8-bit. Speeds:
+vireo-server's own log for a ~25K-token chat against `llama-bench -p 25000 -n 64 -d 0,25000
+-fa 1`.) Accuracy holds at 32K: no further from llama.cpp than at 4K. Reading a long
+prompt keeps the same share of llama.cpp's speed as a short one; the first reply of a
+25K-token chat starts after 10-15 s, and the next ones in 0.1-0.2 s (the kept cache).
+Generating deep in a long chat falls behind, though: short chats are 19-25% ahead of
+llama.cpp, a 25K-token one 27-48% behind. That's one token's attention
+(`attention_part_*`), which reads the whole cache per token and needs tuning for long
+contexts before the automatic limit goes past 32K.
+
 **What limits speed now, and what's next:**
 
 - **Reading a prompt** is at about 70% (Llama), 79% (Qwen) and 89% (Gemma) of llama.cpp.
