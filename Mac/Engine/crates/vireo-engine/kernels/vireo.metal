@@ -1463,6 +1463,144 @@ template [[host_name("attention_flash_128")]] kernel void attention_flash<128, 3
 template [[host_name("attention_flash_256")]] kernel void attention_flash<256, 16, 8>(ARGS, KP, uint, uint);
 template [[host_name("attention_flash_512")]] kernel void attention_flash<512, 8, 8>(ARGS, KP, uint, uint);
 
+// attention_flash with bigger query tiles: the chunk's keys and then its values share one
+// buffer (the scores are worked out before the values come in), wide heads get 8 SIMD
+// groups, and O's results are staged over everything at the end, so twice the tokens fit
+// a threadgroup and each key and value is read half as often (O is written out in P passes
+// of D / P columns, to fit). Same arithmetic.
+template <int D, int QT, int C, int SG, int P>
+kernel void attention_flash2(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    device const float* q = ARG_PTR(const float, 0);
+    device const half* keys = ARG_PTR(const half, 1);
+    device const half* values = ARG_PTR(const half, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const int* pos = ARG_PTR(const int, 4);
+    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const float scale = ARG_F32(9);
+    const int tokens = ARG_INT(10);
+    constexpr int THREADS = 32 * SG, BLOCKS = QT / 8 * (D / 8) / SG;
+    constexpr int ROW_THREADS = THREADS / QT < C ? THREADS / QT : C, PER_THREAD = C / ROW_THREADS;
+    // [Q | keys or values | scores | probabilities], O's results over all of it at the end.
+    constexpr int BYTES_IN = QT * D * 2 + C * D * 2 + QT * C * 4 + QT * C * 2;
+    constexpr int DS = D / P, BYTES = BYTES_IN > QT * DS * 4 ? BYTES_IN : QT * DS * 4;
+    threadgroup float4 mem[BYTES / 16];
+    threadgroup half* sq = reinterpret_cast<threadgroup half*>(mem);
+    threadgroup half* skv = sq + QT * D;
+    threadgroup float* ss = reinterpret_cast<threadgroup float*>(skv + C * D);
+    threadgroup half* sp = reinterpret_cast<threadgroup half*>(ss + QT * C);
+    threadgroup float row_max[QT], row_sum[QT];
+    threadgroup float diag[QT / 8][64];
+    const int head = gid.x, heads = ngrid.x;
+    const int t0 = gid.y * QT, p0 = *pos;
+    const int kv = (head / group) * D;
+    const int last_row = p0 + min(t0 + QT, tokens) - 1;
+    const int lo = window > 0 ? max(0, p0 + t0 + 1 - window) : 0;
+
+    for (int i = tid; i < QT * D; i += THREADS) {
+        const int r = i / D, d = i % D;
+        sq[i] = t0 + r < tokens ? half(q[((ulong)(t0 + r) * heads + head) * D + d]) : half(0.0f);
+    }
+    for (int i = tid; i < QT / 8 * 64; i += THREADS) diag[i / 64][i % 64] = 0.0f;
+    if ((int)tid < QT) {
+        row_max[tid] = -INFINITY;
+        row_sum[tid] = 0.0f;
+    }
+    simdgroup_float8x8 o[BLOCKS];
+    for (int b = 0; b < BLOCKS; b++) o[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const int sr = tid / ROW_THREADS, sc0 = (tid % ROW_THREADS) * PER_THREAD;
+    const int s_at = p0 + t0 + sr;
+    const bool s_live = t0 + sr < tokens;
+    const int s_first = window > 0 ? max(0, s_at + 1 - window) : 0;
+
+    for (int start = lo; start <= last_row; start += C) {
+        const int count = min(C, last_row + 1 - start);
+        BARRIER;  // done with the last chunk's values and probabilities
+        for (int i = tid; i < C * D / 4; i += THREADS) {
+            const int r = (i * 4) / D, d = (i * 4) % D;
+            half4 k4 = half4(0.0h);
+            if (r < count) k4 = *reinterpret_cast<device const half4*>(keys + (ulong)(start + r) * kv_dim + kv + d);
+            *reinterpret_cast<threadgroup half4*>(skv + r * D + d) = k4;
+        }
+        BARRIER;
+        for (int tile = sg; tile < QT / 8 * (C / 8); tile += SG) {
+            const int rb = tile / (C / 8), kb = tile % (C / 8);
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int d = 0; d < D; d += 8) {
+                simdgroup_half8x8 a, b;
+                simdgroup_load(a, sq + rb * 8 * D + d, D);
+                simdgroup_load(b, skv + kb * 8 * D + d, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            simdgroup_store(acc, ss + rb * 8 * C + kb * 8, C);
+        }
+        BARRIER;  // done with the keys: the values go in their place
+        for (int i = tid; i < C * D / 4; i += THREADS) {
+            const int r = (i * 4) / D, d = (i * 4) % D;
+            half4 v4 = half4(0.0h);
+            if (r < count) v4 = *reinterpret_cast<device const half4*>(values + (ulong)(start + r) * kv_dim + kv + d);
+            *reinterpret_cast<threadgroup half4*>(skv + r * D + d) = v4;
+        }
+        if ((int)tid < QT * ROW_THREADS) {
+            float sv[PER_THREAD];
+            float mx = -INFINITY;
+            for (int j = 0; j < PER_THREAD; j++) {
+                const int c = sc0 + j, kpos = start + c;
+                const bool seen = s_live && c < count && kpos <= s_at && kpos >= s_first;
+                sv[j] = seen ? ss[sr * C + c] * scale : -INFINITY;
+                mx = max(mx, sv[j]);
+            }
+            for (int o2 = ROW_THREADS / 2; o2 > 0; o2 >>= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o2));
+            const float old_max = row_max[sr];
+            const float new_max = max(old_max, mx);
+            const float correction = new_max == -INFINITY ? 1.0f : exp(old_max - new_max);
+            float sum = 0.0f;
+            for (int j = 0; j < PER_THREAD; j++) {
+                const float pr = sv[j] == -INFINITY ? 0.0f : exp(sv[j] - new_max);
+                sp[sr * C + sc0 + j] = half(pr);
+                sum += pr;
+            }
+            for (int o2 = ROW_THREADS / 2; o2 > 0; o2 >>= 1) sum += simd_shuffle_xor(sum, (ushort)o2);
+            if (tid % ROW_THREADS == 0) {
+                row_max[sr] = new_max;
+                row_sum[sr] = row_sum[sr] * correction + sum;
+                diag[sr / 8][(sr % 8) * 9] = correction;
+            }
+        }
+        BARRIER;
+        for (int b = 0; b < BLOCKS; b++) {
+            const int block = sg * BLOCKS + b, rb = block / (D / 8), cb = block % (D / 8);
+            simdgroup_float8x8 dg;
+            simdgroup_load(dg, &diag[rb][0], 8);
+            simdgroup_multiply(o[b], dg, o[b]);
+            for (int kc = 0; kc < C; kc += 8) {
+                simdgroup_half8x8 pm, vm;
+                simdgroup_load(pm, sp + rb * 8 * C + kc, C);
+                simdgroup_load(vm, skv + kc * D + cb * 8, D);
+                simdgroup_multiply_accumulate(o[b], pm, vm, o[b]);
+            }
+        }
+    }
+    threadgroup float* so = reinterpret_cast<threadgroup float*>(mem);
+    for (int pass = 0; pass < P; pass++) {
+        BARRIER;  // done with the threadgroup memory (the last pass's results, or the loop's)
+        for (int b = 0; b < BLOCKS; b++) {
+            const int block = sg * BLOCKS + b, rb = block / (D / 8), cb = block % (D / 8);
+            if (cb * 8 / DS == pass) simdgroup_store(o[b], so + rb * 8 * DS + cb * 8 - pass * DS, DS);
+        }
+        BARRIER;
+        for (int i = tid; i < QT * DS; i += THREADS) {
+            const int r = i / DS, d = i % DS;
+            if (t0 + r < tokens) out[((ulong)(t0 + r) * heads + head) * D + pass * DS + d] = so[i] / row_sum[r];
+        }
+    }
+}
+
+template [[host_name("attention_flash2_64")]] kernel void attention_flash2<64, 64, 32, 4, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_flash2_128")]] kernel void attention_flash2<128, 64, 16, 8, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_flash2_256")]] kernel void attention_flash2<256, 32, 8, 8, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_flash2_512")]] kernel void attention_flash2<512, 16, 8, 8, 2>(ARGS, KP, uint, uint);
+
 // ---- Element-wise steps --------------------------------------------------------------
 
 #define PER_NUMBER const int i = gid.x * tpg.x + tid;
