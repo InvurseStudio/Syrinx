@@ -96,6 +96,11 @@ git), for checking our output and speed.
 | 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52 → 0.07 s, Qwen 1.33 → 0.10 s, Gemma 1.06 → 0.05 s at turn 5). 76 engine tests pass |
 | 2026-11-11 | A saved cache per chat: a session's keys and values (and Qwen's DeltaNet at its checkpoint) copied to system memory and back (`export`, `import`, `SavedState`); vireo-server saves the chat in use when a prompt would throw much of it away, or when the app closes, to `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\` (a file per chat, written on a thread of its own; 4 GB per model, the oldest go first), and loads the saved chat that shares the most of a new prompt. Llama and Gemma can load part of one (a shared start); Qwen's loads whole | A new GPU test: an imported session goes on to the bit as the one it came from, whole and in part, exact and 8-bit. Two chats about 3,500- and 4,400-token documents taking turns, then a restart: going back to a chat or reopening it loads its cache in 17-66 ms, the first word in 0.06-0.13 s, against 0.8-1.4 s reading it again, on all three models. 77 engine tests pass |
 | 2026-11-11 | Tools, step 1: our own grammar matcher (`grammar`: a schema to a byte-level matcher, the vocabulary's tokens in a byte trie for the tokens that may come next, forced text written ahead) | Unit tests, and on all three vocabularies the trie's tokens equal trying each of 128K-262K tokens at every byte of a call; 0.04-0.06 ms a step on average, 0.5 ms at most. On the GPU each model asked about a file writes the expected `read_file` call: 23-30 tokens in 10-12 passes (forced text saves over half). Llama 3.2 1B also filled the optional `max_lines` with 1: a valid call, a poor choice, which the grammar can't catch. 80 engine tests pass |
+| 2026-11-11 | Tools, step 2: vireo-server's tool loop. Each family's own form, from its template: declarations in the system turn, Qwen's `<tool_call><function=...><parameter=...>`, Llama's JSON (opened with `<|python_tag|>` or `{`), Gemma 4's `<|tool_call>call:name{key:<|"|>value<|"|>}`; the grammar gained raw text up to an end mark and other punctuation for objects. The model writes freely until a call starts, the grammar writes the call, the app runs the PC's tools (`client_tool_request`, `/api/agent/client-tool-result`) and the server its own (the date), and the result goes back in the family's form, all in the kept cache. A repeated call isn't run again; used-up calls leave the model only an answer. Read-only tools so far | Unit tests for each family's calls and declarations. A first baseline, five chats (read a file, list a folder, the date, 17 × 23 with no tool, find then read): Gemma 4 E2B 4/5, Qwen 3.5 0.8B 2/5, Llama 3.2 1B 1/5. Every call parses and reaches its tool; what's left is the small models choosing the tool (Qwen reaches for `git_*` when unsure, Llama calls one more than needed). In the installed app, Gemma reads a README through the app's own `read_file` and sums it up |
+| 2026-11-11 | Tools, step 3: `vireo-eval`, our own eval. It starts vireo-server with each model and stands in for the app: a PC of a few files, folders and a Git project in memory (`pc.rs`), answering the app's tools as `PcTools` does, so any sensible route gets real answers and every run the same ones. Twelve cases (`cases.rs`): the date, reading, listing, finding then reading, whether a file is there, Git status, two without tools, a missing file, adding up a file's numbers, two files, and an instruction planted in a file; each checks the tools, their arguments and the answer. `--server-arg` compares a server feature on and off. Baseline in `evals/baseline.json` | Gemma 4 E2B 12/12 (one call per step needed), Qwen 3.5 0.8B 8/12 (it reaches for `git_diff` when unsure: the date, listing, finding), Llama 3.2 1B 1/12 (24 calls for 12 cases: extra and wrong ones, and answers that drop what the tool said). 0.8 s a case on average. The fake PC's own tests pass |
+| 2026-11-11 | Tools, step 4, first round, both behind switches and measured: `--score-choices on` scores each tool's whole name (the grammar offers a branch's options; each is read and rolled back, Qwen through a scratch DeltaNet checkpoint) instead of a token at a time; `--tools-shown scored` asks the model, in a small session of its own, which groups a request needs (files, Git, the date, none: a multiple-choice question with eight worked examples, its letters scored in one pass) and declares only those (no tools only when "none" is 0.7 likely or more) | Eval (baseline / names scored / fewer tools): Gemma 4 E2B 12 / 12 / 12, Qwen 3.5 0.8B 8 / 8 / 8, Llama 3.2 1B 1 / 2 / 4. Scored names change nothing for Qwen: it really does rank `git_status` above `get_current_datetime` for the date (log-probability -0.44 against -2.26), so the tool's name isn't the problem; scoring costs 0.4-0.6 s a case. The picker is sharp on Gemma (0.99-1.00, all right, after the examples: without them it took "What does minutes.txt say?" as needing nothing) and near chance on Qwen 0.8B and Llama 1B, yet Llama gains from the shorter menu. Both stay off by default; fewer tools is the first per-model setting worth having (Llama 3.2 1B) |
+| 2026-11-11 | More test models, and token healing. Added Gemma 4 E4B (Google's Q4_0), Qwen 3.5 4B and 9B (Q4_K_M); Llama 3.2 1B left the eval's default set (2024, superseded; still the engine tests' reference). Qwen 3.5 9B scored 4/12, worse than the 0.8B, calling `git_diff` to read a file: forced text was written as its own tokens, so Qwen saw `\n<function=` end in a lone `=`, where its training merges `=` with the name (`=read`). Token healing (on by default, `--heal off`): forced text's last token is left to the model, under the grammar | Perplexity against llama.cpp, 2,048 tokens: E4B 22.81 / 22.85, 4B 11.274 / 11.272, 9B 9.948 / 9.947. The 9B's score for `read_file` went from -2.66 to -0.000 (`git_diff` -12). Eval (healing off / on / + names scored / + fewer tools): Gemma E2B 12/12/12/12, E4B 11/11/11/12, Qwen 0.8B 8/10/10/9, 4B 8/11/11/12, 9B 4/12/12/12 (and 11.7 to 5.0 s a case). Most of what looked like small models choosing badly was this. Scored names help nowhere and stay off; fewer tools is +1 on E4B and 4B, -1 on 0.8B, so a per-model setting, off for now |
+| 2026-11-11 | Twelve harder cases for `vireo-eval` (`hard_cases.rs`), counted apart from the easy twelve: three steps (find the project whose README mentions invoices, then its Git status), one line in a 6,000-character log, which of eight logs holds a code, "my 2026 report" beside 2025's, a path relative to home, counting PDFs among other files, two follow-ups on an earlier turn (one needs a file, one needs nothing), explaining `git status` without running it, recovering from a wrong path, a deadline against today's date, and what a diff changed. Cases can carry earlier turns now | Eval, all 24 (easy / hard): Gemma 4 E2B 20 (12 / 8), E4B 19 (11 / 8), Qwen 3.5 0.8B 16 (10 / 6), 4B 21 (11 / 10), 9B 23 (12 / 11). `recover` fails on every model: told a path that's wrong, each says the file is missing and stops, never looking around; `which-report` fails on three, which guess a path instead of listing the folder. Scored names (hard: 9 / 8 / 6 / 10 / 10) and fewer tools (8 / 7 / 6 / 9 / 9) help nowhere and stay off |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -486,6 +491,11 @@ small model tests the same code the 27B or 30B will run.
 | 2 | **Qwen 3.5 0.8B** (unsloth, Q4_K_M), then 2B | `qwen35` | Qwen 3.5, 3.6 and 3.8 (Qwen3.8-27B is the same `qwen3_5` architecture) | 0.53 GB | Qwen's tokenizer, `<think>` thinking, and whatever layers `qwen35` adds (check with `vireo-cli inspect`) |
 | 3 | **Gemma 4 E2B** (Google's own QAT Q4_0) | `gemma4` | Gemma 4 E4B, 12B, 26B-A4B, 31B | 3.35 GB (+ 0.99 GB vision) | SentencePiece-style tokenizer, Q4_0, sliding-window layers, Gemma's norms and its thinking channel |
 | 4 | **Muse Glimmer 30B** (Meta, Q4_K_M) | `muse-glimmer` | itself: there's no smaller one | 16.8 GB | Splitting a model between the GPU and system memory: it doesn't fit in 8 GB of VRAM |
+| 5 (2026-11-11) | **Gemma 4 E4B** (Google's own QAT Q4_0), **Qwen 3.5 4B and 9B** (unsloth, Q4_K_M) | `gemma4`, `qwen35` | the larger sizes of each, for the tools eval | 5.15, 2.74, 5.68 GB | Nothing new: the same code, larger shapes (perplexity matches llama.cpp, see Progress) |
+
+The tools eval (`vireo-eval`) runs Gemma 4 E2B and E4B and Qwen 3.5 0.8B, 4B and 9B:
+models people choose today. Llama 3.2 1B stays the engine tests' reference, but isn't in
+the eval's default set: it's from 2024, and no one picks it over these.
 
 There's no small Qwen 3.8: Qwen has released it at 27B, 2.4T-A95B and Flash-Next (180B)
 only, and Qwen 3.6 at 27B and 35B-A3B. Qwen 3.5's 0.8B–9B are the smallest of the
@@ -622,8 +632,9 @@ The CPU backend (Rust SIMD) is the fallback and the reference for correctness ch
 ### Tools and skills for small models (design, 2026-11-11)
 
 All our own, from the grammar up: no llguidance, xgrammar, outlines or JSON library. The
-target is the smallest models (0.8–4B) working well, fast and right, not only the large
-ones. Small models fail in known ways, and each part of the design answers one of them:
+target is the smallest models (0.8–4B) working well, fast and right, and everything must
+work just as well on large ones (Qwen3.8-27B, Muse Glimmer 30B, the mixture-of-experts
+models). Small models fail in known ways, and each part of the design answers one of them:
 
 | A small model... | So Vireo... |
 |---|---|
@@ -637,6 +648,42 @@ ones. Small models fail in known ways, and each part of the design answers one o
 
 Read-only tools start as soon as their arguments close, while the model writes its
 closing tokens. Approvals stay as the Mac's server asks them.
+
+**Large models too.** None of this may cost a large model anything:
+
+- Constraints only rule out what's invalid, so a model that writes valid calls writes the
+  same calls; forced text and cached tool text make large models faster as well, and
+  they gain the most from it (each pass costs more).
+- How much guidance a model gets is a setting per model, not a guess from its size: a
+  skill one step at a time or whole, a group's tools or all of them, optional arguments
+  offered or held back. Each model's setting is what the eval measures best for it
+  (kept with the model's profile, `model_profiles.py`'s successor), with a default for
+  models never measured.
+- The eval runs large models as well as small ones, and a feature that helps small
+  models but costs large ones is made a setting, not left on for all.
+
+### Skills (design, 2026-11-11)
+
+Skills stay in the open SKILL.md format (`server/skill_library.py`: a name and description,
+then steps in Markdown; 10 built in, the user's own, and drafts from skill learning). The
+file is the source; Vireo compiles each one when it loads, without changing it:
+
+- **Picked by scoring.** The request scores each skill's name and "none" in one pass, in
+  place of the model choosing to call `use_skill`. (`tool_evals.py` has the cases:
+  plan my day, research, and leaving skills alone.)
+- **Instructions cached.** A skill's text is a branch of the KV prefix, read once.
+- **One step at a time, where it helps.** A skill's numbered steps become a checklist the
+  engine walks: the model sees the step it's on and that step's tools only (step 3 of
+  `analyze-data` offers `calculate`), and the engine moves on when the step is done. A
+  model that does better with the whole skill (the per-model setting above) gets it whole.
+- **The answer's shape kept.** Where a skill sets an answer's layout (`analyze-data`'s
+  **Answer:** / **Details:** / **Worth noting:**), the headings are written for the model
+  (forced text) and it writes what goes under each. Free text itself is never constrained.
+- **A fallback.** A skill without clear steps is used whole, as cached instructions.
+- **Learned skills alike.** A skill drafted from a run compiles the same way.
+
+The tool loop (step 2) is built for this from the start: the tools offered can change from
+one step to the next, and a step can end on a forced heading as well as on a call.
 
 **How we know:** our own eval, in Rust, against vireo-server: the 14 cases of
 `server/tool_evals.py` first (Gemma 4 E2B passes 13 on today's stack), then cases from the
@@ -652,10 +699,24 @@ counts arguments as well as tools.
 **Order:**
 1. ~~The grammar matcher and token masks, with forced text written ahead (vireo-engine).~~
    Done 2026-11-11 (see Progress).
-2. vireo-server's tool loop, with the app's own PC tools (the protocol is there:
-   `client_tool_request`, `/api/agent/client-tool-result`) and each family's call format.
-3. The eval, and a baseline.
-4. Copying constraints, scored choices, compact tool text, then compiled skills.
+2. ~~vireo-server's tool loop, with the app's own PC tools (the protocol is there:
+   `client_tool_request`, `/api/agent/client-tool-result`) and each family's call format.~~
+   Done 2026-11-11, read-only tools (see Progress); the tools that change things, with
+   approvals, follow.
+3. ~~The eval, and a baseline.~~ Done 2026-11-11 (`vireo-eval`, see Progress). Gemma 4 E2B
+   passing all twelve means the cases are too easy for it: harder ones from the test
+   gauntlet (several steps, long results, near-miss tool names) come with the next
+   features, so there's room to measure them on capable models too.
+4. Copying constraints, scored choices, compact tool text. First round done 2026-11-11
+   (see Progress): token healing was the fix that mattered (Qwen 3.5 9B 4/12 to 12/12);
+   scored names and fewer tools are switches, measured, off by default. Harder cases
+   added 2026-11-11 (see Progress): every model gives up on a wrong path, and three guess
+   a path rather than look. So next, measured on them: results shaped to help the AI
+   agent on (a missing file's error lists what is in its folder, and the nearest names),
+   paths constrained to ones that exist (the copying constraint), then worked examples of
+   calls and the tools' text as the model sees them. The tools that change things, with
+   approvals, get their own cases when they come.
+5. Compiled skills (above), then the per-model guidance settings from the eval.
 
 ### Compiled skills
 
