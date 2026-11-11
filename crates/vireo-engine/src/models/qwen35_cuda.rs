@@ -5,8 +5,8 @@
 //! token (each needs the state the last one left), but inside one kernel launch.
 
 use super::gpu::{
-    GpuMatrix, Input, LogitsBuffer, Outputs, gpu_error, load_state, q8_room, record, row,
-    save_state,
+    GpuMatrix, Input, LogitsBuffer, Outputs, Positions, gpu_error, load_state, q8_room, record,
+    row, save_state,
 };
 use super::qwen35::Config;
 use super::{DEFAULT_BATCH, Logits, Precision, Result, SavedState, matrix, vector};
@@ -137,11 +137,11 @@ impl Qwen35CudaSession {
         Ok(())
     }
 
-    fn attention_buffers(&self) -> Vec<&Buffer> {
+    fn attention_buffers(&self) -> Vec<Positions<'_>> {
         self.memory
             .iter()
             .flat_map(|m| match m {
-                Memory::Attention { keys, values } => vec![keys, values],
+                Memory::Attention { keys, values } => vec![(keys, None), (values, None)],
                 Memory::DeltaNet { .. } => vec![],
             })
             .collect()

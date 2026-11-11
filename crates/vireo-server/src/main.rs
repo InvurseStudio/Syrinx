@@ -508,6 +508,10 @@ struct Kept {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
     checkpoint: Option<Qwen35Checkpoint>,
+    /// Where the last prompt's history ends (its tokens are still the session's first):
+    /// Gemma's chat is saved up to there, which the next turn and a retry both start with,
+    /// since its saved state can only be loaded whole.
+    history_end: usize,
 }
 
 /// How many tokens `ids` starts with that `tokens` does too, leaving at least the last of
@@ -568,6 +572,7 @@ impl Model {
             }
             (Model::Gemma4(_), Session::Gemma4(s)) => {
                 s.truncate(shared);
+                kept.history_end = kept.history_end.min(shared);
                 shared
             }
             // A DeltaNet state can't be cut back: go on from the end, if every token
@@ -600,6 +605,7 @@ impl Model {
         }
         let logits = self.read(&mut kept.session, &ids[start..])?;
         kept.tokens.extend_from_slice(&ids[from..]);
+        kept.history_end = mark;
         Ok((logits, from))
     }
 
@@ -621,28 +627,35 @@ impl Model {
     fn saveable(&self, kept: &Kept) -> usize {
         match &kept.session {
             Session::Qwen35(_) => kept.checkpoint.as_ref().map_or(0, |c| c.len()),
-            _ => kept.tokens.len(),
+            Session::Gemma4(_) => kept.history_end,
+            Session::Llama(_) => kept.tokens.len(),
         }
     }
 
     /// How many of `ids` a saved chat of `tokens` could give: as many as they share, but
-    /// Qwen's only whole (its DeltaNet state is for the end).
+    /// Qwen's only whole (its DeltaNet state is for the end), and Gemma's only whole once
+    /// it's longer than the sliding window (its older positions there weren't kept).
     fn usable(&self, tokens: &[u32], ids: &[u32], context: usize) -> usize {
         let shared = shared_start(tokens, ids);
         let n = match self {
             Model::Qwen35(_) if shared != tokens.len() => 0,
+            Model::Gemma4(m)
+                if shared != tokens.len() && tokens.len() > m.config.sliding_window =>
+            {
+                0
+            }
             _ => shared,
         };
         if n > context { 0 } else { n }
     }
 
-    /// The chat in `kept`, to save: every token (Qwen: up to its checkpoint), and the
-    /// state after them. `None` when there's nothing to save.
+    /// The chat in `kept`, to save: every token (Qwen: up to its checkpoint; Gemma: to its
+    /// last history's end), and the state after them. `None` when there's nothing to save.
     fn export(&self, kept: &Kept) -> Result<Option<(Vec<u32>, SavedState)>, String> {
         let e = |e: vireo_engine::models::Error| e.to_string();
         let state = match &kept.session {
             Session::Llama(s) => s.export().map_err(e)?,
-            Session::Gemma4(s) => s.export().map_err(e)?,
+            Session::Gemma4(s) => s.export(kept.history_end).map_err(e)?,
             Session::Qwen35(s) => match &kept.checkpoint {
                 Some(cp) => s.export(cp).map_err(e)?,
                 None => return Ok(None),
@@ -666,6 +679,7 @@ impl Model {
             }
             _ => unreachable!("a session belongs to its model"),
         }
+        kept.history_end = tokens.len();
         kept.tokens = tokens;
         Ok(())
     }
@@ -682,6 +696,7 @@ impl Model {
             _ => unreachable!("a session belongs to its model"),
         }
         kept.tokens.clear();
+        kept.history_end = 0;
         Ok(())
     }
 
@@ -799,6 +814,7 @@ fn engine(
                         session,
                         tokens: Vec::new(),
                         checkpoint: None,
+                        history_end: 0,
                     })
                 }
                 Err(e) => {
@@ -826,12 +842,20 @@ fn engine(
 
 /// Saves the chat in `kept` to `store`, if there's one worth saving.
 fn stash(model: &Model, kept: &Kept, store: &mut store::Store) {
+    if model.saveable(kept) < MIN_SAVED {
+        return;
+    }
     match model.export(kept) {
         Ok(Some((tokens, state))) => store.put(tokens, state),
         Ok(None) => {}
         Err(e) => eprintln!("Couldn't save the chat's cache: {e}"),
     }
 }
+
+/// The fewest tokens worth saving a chat's cache for: a shorter chat reads again in a
+/// few tenths of a second, about what loading it takes, and its file would still be
+/// megabytes (Qwen's DeltaNet state alone is 18 MB on the 0.8B).
+const MIN_SAVED: usize = 1024;
 
 /// How many more tokens a saved chat must spare reading, over the session in use, to be
 /// loaded instead: loading one costs about as much as reading a few dozen tokens.

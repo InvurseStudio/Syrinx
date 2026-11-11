@@ -195,25 +195,36 @@ pub(super) fn row(buffer: &Buffer, row: usize, width: usize) -> CuDevicePtr {
     buffer.f32_at(row * width)
 }
 
-/// Copies a session's first `len` positions of each of `positions` (buffers that hold
-/// `capacity` positions, each the same size) and the whole of each of `whole` into one
-/// [`SavedState`].
+/// A buffer of `capacity` positions (each the same size) to save, and how many of its
+/// last positions are worth keeping: `None` for all of them, `Some(w)` for a layer that
+/// only ever looks `w` positions back (a sliding window), so older ones are left out.
+pub(super) type Positions<'b> = (&'b Buffer, Option<usize>);
+
+/// Which of `len` positions a buffer that keeps `window` of them saves.
+fn kept(len: usize, window: Option<usize>) -> std::ops::Range<usize> {
+    len.saturating_sub(window.unwrap_or(len))..len
+}
+
+/// Copies a session's first `len` positions of each of `positions` (only the last ones a
+/// windowed buffer needs) and the whole of each of `whole` into one [`SavedState`].
 pub(super) fn save_state(
-    positions: &[&Buffer],
+    positions: &[Positions],
     capacity: usize,
     len: usize,
     whole: &[&Buffer],
 ) -> Result<SavedState> {
     let total = positions
         .iter()
-        .map(|b| b.len_bytes() / capacity * len)
+        .map(|(b, w)| b.len_bytes() / capacity * kept(len, *w).len())
         .chain(whole.iter().map(|b| b.len_bytes()))
         .sum();
     let mut bytes = vec![0u8; total];
     let mut at = 0;
-    for b in positions {
-        let n = b.len_bytes() / capacity * len;
-        b.read_bytes_at(0, &mut bytes[at..at + n])
+    for (b, w) in positions {
+        let per = b.len_bytes() / capacity;
+        let range = kept(len, *w);
+        let n = per * range.len();
+        b.read_bytes_at(per * range.start, &mut bytes[at..at + n])
             .map_err(gpu_error)?;
         at += n;
     }
@@ -228,38 +239,46 @@ pub(super) fn save_state(
 
 /// Puts the first `upto` positions of `saved` back into `positions` (and, when `whole`
 /// isn't empty, its whole buffers, which hold the state at `saved.len` and nothing
-/// before: then `upto` must be `saved.len`). An error if `saved` came from another
-/// model, precision or layout.
+/// before). Only all of it (`upto` = `saved.len`) when there's a `whole` buffer or a
+/// windowed one left out positions: what's missing would be needed before then. An
+/// error if `saved` came from another model, precision or layout.
 pub(super) fn load_state(
     saved: &SavedState,
     upto: usize,
-    positions: &[&Buffer],
+    positions: &[Positions],
     capacity: usize,
     whole: &[&Buffer],
 ) -> Result<()> {
     let expected: usize = positions
         .iter()
-        .map(|b| b.len_bytes() / capacity * saved.len)
+        .map(|(b, w)| b.len_bytes() / capacity * kept(saved.len, *w).len())
         .chain(whole.iter().map(|b| b.len_bytes()))
         .sum();
-    if saved.bytes.len() != expected || upto > saved.len || upto > capacity {
+    if saved.bytes.len() != expected || upto > saved.len || saved.len > capacity {
         return Err(Error::Invalid(format!(
             "a saved state of {} bytes for {} positions doesn't fit this session",
             saved.bytes.len(),
             saved.len
         )));
     }
-    if !whole.is_empty() && upto != saved.len {
+    let trimmed = positions.iter().any(|(_, w)| kept(saved.len, *w).start > 0);
+    if (trimmed || !whole.is_empty()) && upto != saved.len {
         return Err(Error::Invalid(
-            "a saved state with running layers can only be loaded whole".into(),
+            "this saved state can only be loaded whole".into(),
         ));
     }
     let mut at = 0;
-    for b in positions {
+    for (b, w) in positions {
         let per = b.len_bytes() / capacity;
-        b.write_bytes_at(0, &saved.bytes[at..at + per * upto])
+        let range = kept(saved.len, *w);
+        let n = per
+            * range
+                .start
+                .max(range.end.min(upto))
+                .saturating_sub(range.start);
+        b.write_bytes_at(per * range.start, &saved.bytes[at..at + n])
             .map_err(gpu_error)?;
-        at += per * saved.len;
+        at += per * range.len();
     }
     for b in whole {
         let n = b.len_bytes();

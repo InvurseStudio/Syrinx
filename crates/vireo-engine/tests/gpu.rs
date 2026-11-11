@@ -1116,13 +1116,25 @@ fn an_exported_session_goes_on_as_the_original() {
         if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
             let Some(gpu) = open_gpu() else { return };
             let tokenizer = Tokenizer::from_gguf(&file).unwrap();
-            let ids = long_text(&tokenizer, true);
-            let (part, most) = (ids.len() / 3, ids.len() * 3 / 4);
+            let ids = long_text(&tokenizer, true).repeat(2);
+            let most = ids.len() * 3 / 4;
             let mut m = Gemma4Cuda::load(&file, gpu).unwrap();
             m.set_precision(precision);
+            let window = m.config.sliding_window;
+            assert!(most > window, "the text should outrun the sliding window");
             let mut a = m.session(ids.len()).unwrap();
             m.forward_batch(&mut a, &ids[..most], Logits::None).unwrap();
-            let saved = a.export().unwrap();
+            // Past the window, its layers' older positions are left out.
+            let saved = a.export(most).unwrap();
+            let full_size = {
+                let early = a.export(window).unwrap();
+                early.bytes().len() / window * most
+            };
+            eprintln!(
+                "Gemma 4, {precision:?}: {most} positions saved in {} bytes, {full_size} with every position",
+                saved.bytes().len()
+            );
+            assert!(saved.bytes().len() < full_size);
             let mut b = m.session(ids.len() + 100).unwrap();
             b.import(&saved, most).unwrap();
             let la = m
@@ -1135,9 +1147,14 @@ fn an_exported_session_goes_on_as_the_original() {
                 .unwrap()
                 .unwrap()
                 .to_vec();
-            same(&label("Gemma 4", "whole"), &la, &lb);
+            same(&label("Gemma 4", "past its window"), &la, &lb);
+            // Only whole, then: what an earlier start needs wasn't kept.
+            assert!(b.import(&saved, most / 2).is_err());
+            // Within the window every position is there, so part of it loads.
+            let part = window / 2;
+            let early = a.export(window).unwrap();
             a.truncate(part);
-            b.import(&saved, part).unwrap();
+            b.import(&early, part).unwrap();
             let la = m
                 .forward_batch(&mut a, &ids[part..], Logits::Last)
                 .unwrap()
@@ -1148,7 +1165,7 @@ fn an_exported_session_goes_on_as_the_original() {
                 .unwrap()
                 .unwrap()
                 .to_vec();
-            same(&label("Gemma 4", "part"), &la, &lb);
+            same(&label("Gemma 4", "part, within its window"), &la, &lb);
         }
     }
 }
