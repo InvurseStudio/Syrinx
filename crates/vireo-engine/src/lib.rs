@@ -21,6 +21,7 @@ pub mod cpu;
 pub mod cuda;
 mod dylib;
 pub mod gguf;
+pub mod grammar;
 pub mod half;
 mod hash;
 mod mmap;
