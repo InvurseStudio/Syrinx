@@ -95,6 +95,7 @@ git), for checking our output and speed.
 | 2026-11-11 | Qwen's DeltaNet for a prompt in chunks of 64 tokens, the WY form (`delta_chunk_prep`, `delta_chunk_scan`; see "Eleventh round") | Exact perplexity the same as token by token to every digit at 2,048 tokens (chunk 1: 16.2601 against 16.2602 on the first build, then identical); 8-bit within 0.25% per chunk, nearer exact on average. A new test case reads Qwen in batches of 200 (across chunks, ending in part of one) against one token at a time: logits within 1e-4 of 31 exact. 75 engine tests pass |
 | 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52 → 0.07 s, Qwen 1.33 → 0.10 s, Gemma 1.06 → 0.05 s at turn 5). 76 engine tests pass |
 | 2026-11-11 | A saved cache per chat: a session's keys and values (and Qwen's DeltaNet at its checkpoint) copied to system memory and back (`export`, `import`, `SavedState`); vireo-server saves the chat in use when a prompt would throw much of it away, or when the app closes, to `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\` (a file per chat, written on a thread of its own; 4 GB per model, the oldest go first), and loads the saved chat that shares the most of a new prompt. Llama and Gemma can load part of one (a shared start); Qwen's loads whole | A new GPU test: an imported session goes on to the bit as the one it came from, whole and in part, exact and 8-bit. Two chats about 3,500- and 4,400-token documents taking turns, then a restart: going back to a chat or reopening it loads its cache in 17-66 ms, the first word in 0.06-0.13 s, against 0.8-1.4 s reading it again, on all three models. 77 engine tests pass |
+| 2026-11-11 | Tools, step 1: our own grammar matcher (`grammar`: a schema to a byte-level matcher, the vocabulary's tokens in a byte trie for the tokens that may come next, forced text written ahead) | Unit tests, and on all three vocabularies the trie's tokens equal trying each of 128K-262K tokens at every byte of a call; 0.04-0.06 ms a step on average, 0.5 ms at most. On the GPU each model asked about a file writes the expected `read_file` call: 23-30 tokens in 10-12 passes (forced text saves over half). Llama 3.2 1B also filled the optional `max_lines` with 1: a valid call, a poor choice, which the grammar can't catch. 80 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -617,6 +618,44 @@ The CPU backend (Rust SIMD) is the fallback and the reference for correctness ch
 - **Faster heavy tools.** Indexing watched folders, the vector store and chat search in
   parallel across cores, with less memory. Single everyday calls are already fast, so
   expect little gain there.
+
+### Tools and skills for small models (design, 2026-11-11)
+
+All our own, from the grammar up: no llguidance, xgrammar, outlines or JSON library. The
+target is the smallest models (0.8–4B) working well, fast and right, not only the large
+ones. Small models fail in known ways, and each part of the design answers one of them:
+
+| A small model... | So Vireo... |
+|---|---|
+| writes broken JSON, or a call in the wrong shape | **constrains the call.** Each tool's schema becomes a grammar the sampler enforces on bytes (our own matcher, token masks from the vocabulary's byte trie). The call's wrapper is each family's own (Qwen's `<tool_call>`, Gemma 4's and Llama 3's), so the model writes what it was trained on. |
+| spends many forward passes on braces, quotes and key names | **writes forced text itself.** Wherever the grammar allows one continuation (`{"name": "`, the rest of an unambiguous tool name, `", "arguments": {"path": "`), those tokens are added without sampling and read in one batch. |
+| retypes a path or link and drops a character (`_fix_retyped_links` in `tool_text.py`) | **copies instead of retyping.** Arguments of a path, link or id type are limited to values that exist: paths in the folders the chat may reach, links and ids that appeared in the chat or a tool's result. |
+| picks worse from a long tool list, and each schema costs context | **shows few tools, briefly.** A short fixed core; a group's tools only when a step needs them, chosen by scoring labels in one forward pass (not keywords, as `tool_groups.py` does); one compact line per tool, in the form measured to work best per family. Each group's text is a cached branch of the KV prefix, so showing it costs nothing after the first time. |
+| decides badly in free text (tool or answer, which skill, needs approval?) | **decides by scoring.** A few labels scored in one pass, constrained to the choices. |
+| loses track in long results | **shapes results.** Short, structured tool output (counts, the first lines, "N more"), with the values it may need to copy kept exact. |
+| follows long instructions poorly | **compiles skills** (below): a skill's instructions cached, its own few tools, a grammar for its output, its steps as branches. |
+
+Read-only tools start as soon as their arguments close, while the model writes its
+closing tokens. Approvals stay as the Mac's server asks them.
+
+**How we know:** our own eval, in Rust, against vireo-server: the 14 cases of
+`server/tool_evals.py` first (Gemma 4 E2B passes 13 on today's stack), then cases from the
+test gauntlet, each scored for the right tool, right arguments, using the result, steps
+and time. Run on every test model, with each feature on and off, against today's Python
+server on the same models. A feature stays only if the numbers say so.
+
+A lesson from step 1: optional arguments are where small models go wrong once the shape
+is guaranteed (Llama 3.2 1B asked for one line of a file). So each tool's optional
+arguments are offered only where a model needs them, or chosen by scoring, and the eval
+counts arguments as well as tools.
+
+**Order:**
+1. ~~The grammar matcher and token masks, with forced text written ahead (vireo-engine).~~
+   Done 2026-11-11 (see Progress).
+2. vireo-server's tool loop, with the app's own PC tools (the protocol is there:
+   `client_tool_request`, `/api/agent/client-tool-result`) and each family's call format.
+3. The eval, and a baseline.
+4. Copying constraints, scored choices, compact tool text, then compiled skills.
 
 ### Compiled skills
 
