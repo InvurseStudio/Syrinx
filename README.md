@@ -17,9 +17,24 @@ Nothing here is used by the shipping apps.
 | `tools/` | Scripts that generate engine source, such as the Unicode tables |
 | `models/` | Test models (not in git; see `crates/vireo-engine/tests/real_models.rs` for which) |
 | `crates/vireo-cli/` | Runs the engine from the command line, for testing and benchmarks |
+| `crates/vireo-server/` | A first server: one model on this PC over the part of the app's API that plain chats use (no tools, files or skills yet). The prototype app starts it itself; `start-server.cmd` runs it by hand |
 | `Windows/` | A copy of the native Windows app, the prototype's front end. It runs side by side with the Vireo app and keeps its own chats. See [Windows/README.md](Windows/README.md). |
 
-The server (`crates/vireo-server`) joins the workspace in phase 3.
+## Chatting with the engine in the prototype app
+
+1. Install the app with `Windows\install-test-build.cmd`. It builds `vireo-server` too
+   and installs it beside the app.
+2. Open **Vireo Prototype**, then Settings › Your Host › Run a model on this PC: choose a
+   Llama, Qwen 3.5 or Gemma 4 `.gguf` file and **Load Model**.
+
+The app starts `vireo-server` with that model (any free port on 127.0.0.1, a token it
+accepts without pairing), connects to it, and starts it again whenever the app opens,
+until **Stop**. The server ends with the app. The choice is kept in
+`%LOCALAPPDATA%\VireoPrototype\local-engine.json`.
+
+`start-server.cmd` runs the server by hand instead (port 3000, paired with the 6-digit
+code it prints). The full server (tools, files, skills, the scheduler) is the rest of
+phase 3.
 
 ## Setting up
 
