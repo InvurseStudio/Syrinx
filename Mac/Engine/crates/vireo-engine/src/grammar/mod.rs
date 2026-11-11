@@ -22,6 +22,17 @@ pub use trie::TokenTrie;
 pub enum Schema {
     /// An object with these keys, in this order; optional ones may be left out.
     Object(Vec<Property>),
+    /// The same in other punctuation: Qwen's `<parameter=key>` lines, Gemma's `{key:value}`.
+    Record {
+        fields: Vec<Property>,
+        style: RecordStyle,
+    },
+    /// Raw text, up to and including `until` (which must be ASCII and can't be in the
+    /// text): a value in a format that isn't JSON. At most `max_bytes` bytes before `until`.
+    Text {
+        until: String,
+        max_bytes: Option<usize>,
+    },
     /// Any string (as JSON: quoted, escaped), of at most `max_bytes` bytes inside the quotes.
     String {
         max_bytes: Option<usize>,
@@ -42,8 +53,36 @@ pub enum Schema {
     /// These one after another.
     Seq(Vec<Schema>),
     /// One of these texts, then what follows it: a tool's name, then that tool's
-    /// arguments. No text may be the start of another.
+    /// arguments. No text may be the start of another. A branch is a decision worth
+    /// making whole: [`Matcher::scored_options`] offers its texts to be scored.
     Branch(Vec<(String, Schema)>),
+}
+
+/// An object's punctuation: what opens and closes it, and what goes around each key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordStyle {
+    pub open: String,
+    pub key_open: String,
+    pub key_close: String,
+    /// Between one value and the next key.
+    pub separator: String,
+    pub close: String,
+    /// Keys written as JSON strings (in `key_open` and `key_close`'s place, quotes and all).
+    pub json_keys: bool,
+}
+
+impl RecordStyle {
+    /// `{"key": value, "key": value}`.
+    pub fn json() -> Self {
+        RecordStyle {
+            open: "{".into(),
+            key_open: String::new(),
+            key_close: ": ".into(),
+            separator: ", ".into(),
+            close: "}".into(),
+            json_keys: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +181,8 @@ struct Options {
     /// Per node: the option that ends there.
     ends: Vec<Option<u16>>,
     then: Vec<Then>,
+    /// A decision to score whole (a branch), not to take a token at a time.
+    scored: bool,
 }
 
 impl Options {
@@ -150,6 +191,7 @@ impl Options {
             edges: vec![Vec::new()],
             ends: vec![None],
             then: Vec::new(),
+            scored: false,
         };
         for (k, (bytes, then)) in options.into_iter().enumerate() {
             let mut at = 0usize;
@@ -196,6 +238,12 @@ impl Options {
 enum Node {
     Choice(Options),
     Str {
+        max: u32,
+    },
+    Text {
+        until: Vec<u8>,
+        /// KMP's failure function over `until`.
+        fail: Vec<u8>,
         max: u32,
     },
     Num {
@@ -270,7 +318,9 @@ impl Grammar {
                     .iter()
                     .map(|(text, rest)| (text.as_bytes().to_vec(), Then::Push(self.add(rest))))
                     .collect();
-                self.choice(compiled)
+                let mut options = Options::new(compiled);
+                options.scored = true;
+                self.push(Node::Choice(options))
             }
             Schema::Array { items, max_items } => {
                 let item = self.add(items);
@@ -286,7 +336,38 @@ impl Grammar {
                     last,
                 })
             }
-            Schema::Object(props) => {
+            Schema::Object(props) => self.record(props, &RecordStyle::json()),
+            Schema::Record { fields, style } => self.record(fields, style),
+            Schema::Text { until, max_bytes } => {
+                let until = until.as_bytes().to_vec();
+                assert!(
+                    !until.is_empty() && until.is_ascii() && until.len() < 255,
+                    "a text's end must be short ASCII"
+                );
+                let mut fail = vec![0u8; until.len()];
+                let mut k = 0usize;
+                for i in 1..until.len() {
+                    while k > 0 && until[i] != until[k] {
+                        k = fail[k - 1] as usize;
+                    }
+                    if until[i] == until[k] {
+                        k += 1;
+                    }
+                    fail[i] = k as u8;
+                }
+                self.push(Node::Text {
+                    until,
+                    fail,
+                    max: max_bytes.map_or(u32::MAX, |m| m.min(u32::MAX as usize) as u32),
+                })
+            }
+        }
+    }
+
+    /// An object (any punctuation): its opening text, then its keys and values.
+    fn record(&mut self, props: &[Property], style: &RecordStyle) -> u32 {
+        let body = {
+            {
                 let values: Vec<u32> = props.iter().map(|p| self.add(&p.schema)).collect();
                 let n = props.len();
                 let mut menus = Vec::with_capacity((n + 1) * 2);
@@ -297,23 +378,34 @@ impl Grammar {
                         for (j, p) in props.iter().enumerate().skip(next) {
                             let mut key = Vec::new();
                             if !first {
-                                key.extend_from_slice(b", ");
+                                key.extend_from_slice(style.separator.as_bytes());
                             }
-                            key.extend_from_slice(json_string(&p.name).as_bytes());
-                            key.extend_from_slice(b": ");
+                            key.extend_from_slice(style.key_open.as_bytes());
+                            if style.json_keys {
+                                key.extend_from_slice(json_string(&p.name).as_bytes());
+                            } else {
+                                key.extend_from_slice(p.name.as_bytes());
+                            }
+                            key.extend_from_slice(style.key_close.as_bytes());
                             options.push((key, Then::Property(j as u16)));
                             if p.required {
                                 break;
                             }
                         }
                         if props[next..].iter().all(|p| !p.required) {
-                            options.push((b"}".to_vec(), Then::CloseObject));
+                            options.push((style.close.as_bytes().to_vec(), Then::CloseObject));
                         }
                         menus.push(self.choice(options));
                     }
                 }
                 self.push(Node::Obj { values, menus })
             }
+        };
+        if style.open.is_empty() {
+            body
+        } else {
+            let open = self.choice(vec![(style.open.as_bytes().to_vec(), Then::Nothing)]);
+            self.push(Node::Seq(vec![open, body]))
         }
     }
 
@@ -346,6 +438,14 @@ enum Frame {
         open: bool,
         escape: u8,
         utf8: u8,
+    },
+    /// Raw text: how much of its end it has seen, its length, and the continuation
+    /// bytes a character still needs.
+    Text {
+        node: u32,
+        matched: u8,
+        utf8: u8,
+        len: u32,
     },
     /// A number, in the phase of JSON's number syntax it's at, and its length so far.
     Num {
@@ -382,6 +482,12 @@ impl Frame {
                 open: false,
                 escape: 0,
                 utf8: 0,
+            },
+            Node::Text { .. } => Frame::Text {
+                node,
+                matched: 0,
+                utf8: 0,
+                len: 0,
             },
             Node::Num { integer } => Frame::Num {
                 integer: *integer,
@@ -514,6 +620,53 @@ impl<'g> Matcher<'g> {
         out
     }
 
+    /// When the next part is a branch (a tool's name), the rest of each of its texts:
+    /// the options to score whole and choose between, rather than a token at a time.
+    pub fn scored_options(&self) -> Option<Vec<Vec<u8>>> {
+        // Parts not yet entered (a sequence's next) are entered here, as the next byte
+        // would enter them.
+        let mut m = *self;
+        while let Some(Frame::Seq { node, next }) = m.stack.top().copied() {
+            let Node::Seq(parts) = &self.grammar.nodes[node as usize] else {
+                unreachable!()
+            };
+            if next as usize >= parts.len() {
+                return None;
+            }
+            *m.stack.top().unwrap() = Frame::Seq {
+                node,
+                next: next + 1,
+            };
+            if !m.stack.push(Frame::new(self.grammar, parts[next as usize])) {
+                return None;
+            }
+        }
+        let top = m.stack.len.checked_sub(1).map(|i| m.stack.frames[i])?;
+        let Frame::Choice { node, at } = top else {
+            return None;
+        };
+        let Node::Choice(options) = &self.grammar.nodes[node as usize] else {
+            unreachable!()
+        };
+        if !options.scored {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![(at, Vec::new())];
+        while let Some((n, bytes)) = stack.pop() {
+            if options.ends[n as usize].is_some() {
+                out.push(bytes);
+                continue;
+            }
+            for &(b, child) in options.edges[n as usize].iter().rev() {
+                let mut next = bytes.clone();
+                next.push(b);
+                stack.push((child, next));
+            }
+        }
+        Some(out)
+    }
+
     /// Pops frames that are finished without more input (a number at the end, a sequence
     /// with nothing left).
     fn settle_end(&mut self) {
@@ -600,6 +753,56 @@ impl<'g> Matcher<'g> {
                     };
                     return true;
                 }
+                Frame::Text {
+                    node,
+                    matched,
+                    utf8,
+                    len,
+                } => {
+                    let Node::Text { until, fail, max } = &g.nodes[node as usize] else {
+                        unreachable!()
+                    };
+                    let (mut matched, mut utf8) = (matched as usize, utf8);
+                    if utf8 > 0 {
+                        if b & 0xC0 != 0x80 {
+                            return false;
+                        }
+                        utf8 -= 1;
+                        matched = 0;
+                    } else {
+                        match b {
+                            b'\n' | b'\t' | 0x20..=0x7E => {}
+                            0xC2..=0xDF => utf8 = 1,
+                            0xE0..=0xEF => utf8 = 2,
+                            0xF0..=0xF4 => utf8 = 3,
+                            _ => return false,
+                        }
+                        if utf8 > 0 {
+                            matched = 0;
+                        } else {
+                            while matched > 0 && until[matched] != b {
+                                matched = fail[matched - 1] as usize;
+                            }
+                            if until[matched] == b {
+                                matched += 1;
+                            }
+                            if matched == until.len() {
+                                self.stack.pop();
+                                return true;
+                            }
+                        }
+                    }
+                    if len >= *max && matched == 0 {
+                        return false;
+                    }
+                    *top = Frame::Text {
+                        node,
+                        matched: matched as u8,
+                        utf8,
+                        len: len + 1,
+                    };
+                    return true;
+                }
                 Frame::Num {
                     integer,
                     phase,
@@ -630,9 +833,6 @@ impl<'g> Matcher<'g> {
                         unreachable!()
                     };
                     if !open {
-                        if b != b'{' {
-                            return false;
-                        }
                         *top = Frame::Obj {
                             node,
                             next,
@@ -640,7 +840,10 @@ impl<'g> Matcher<'g> {
                             open: true,
                         };
                         let menu = menus[next as usize * 2 + usize::from(first)];
-                        return self.stack.push(Frame::new(g, menu));
+                        if !self.stack.push(Frame::new(g, menu)) {
+                            return false;
+                        }
+                        continue;
                     }
                     // Back from a value: what comes next.
                     let menu = menus[next as usize * 2 + usize::from(first)];
@@ -736,6 +939,26 @@ impl<'g> Matcher<'g> {
                 };
                 self.stack.push(Frame::new(g, item))
             }
+        }
+    }
+
+    /// When the matcher is in raw text, past any partial character and with none of its
+    /// end seen: the end's first byte, and the room left. Then any token of whole
+    /// characters without that byte fits.
+    fn in_plain_text(&self) -> Option<(u8, u32)> {
+        match self.stack.len.checked_sub(1).map(|i| self.stack.frames[i]) {
+            Some(Frame::Text {
+                node,
+                matched: 0,
+                utf8: 0,
+                len,
+            }) => {
+                let Node::Text { until, max, .. } = &self.grammar.nodes[node as usize] else {
+                    unreachable!()
+                };
+                Some((until[0], max - len))
+            }
+            _ => None,
         }
     }
 
