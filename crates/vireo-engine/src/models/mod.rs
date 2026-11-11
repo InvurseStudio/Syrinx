@@ -5,12 +5,40 @@
 
 pub mod gemma4;
 pub mod gemma4_cuda;
+mod gpu;
 pub mod llama;
 pub mod llama_cuda;
 pub mod qwen35;
 pub mod qwen35_cuda;
 
 use std::fmt;
+
+/// Which logits a GPU model's `forward_batch` hands back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Logits {
+    /// None: the tokens only go into the context.
+    None,
+    /// The last token's, to pick the next token from.
+    Last,
+    /// Every token's, one row of the vocabulary each (for scoring a text).
+    All,
+}
+
+/// How a GPU model does its matrix products.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Precision {
+    /// Activations rounded to 8 bits per block of 32, as llama.cpp does: the matrix
+    /// products run 4 at a time (dp4a) or on the tensor cores. Perplexity a little off
+    /// the exact one (llama.cpp: 38.42 against 38.32 on Llama 3.2 1B Q4_K_M).
+    #[default]
+    Int8,
+    /// Everything in f32 on the exact weights: the CPU reference's numbers, slower.
+    Exact,
+}
+
+/// How many tokens a GPU session reads at once, unless asked for another number:
+/// enough to keep the GPU busy, little enough memory to keep sessions cheap.
+pub const DEFAULT_BATCH: usize = 512;
 
 use crate::GgufFile;
 use crate::cpu::Matrix;
