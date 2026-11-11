@@ -362,30 +362,147 @@ impl Uploads {
         Ok(format!("/uploads/{file}"))
     }
 
-    /// The file name and text of the upload at `path` (`/uploads/<id>-<name>`).
+    /// The file name and text of the upload at `path` (`/uploads/<id>-<name>`), which
+    /// counts as a use of it (see [`Uploads::prune`]).
     pub fn by_path(&self, path: &str) -> Option<(String, String)> {
-        let file = path.strip_prefix("/uploads/")?;
-        let (id, name) = file.split_once('-')?;
-        if !valid_id(id) {
-            return None;
-        }
+        let id = id_in(path)?;
         let text = std::fs::read_to_string(self.dir.join(format!("{id}.txt"))).ok()?;
-        Some((name.to_string(), text))
+        let name = self.file_name(id)?;
+        self.touch(id, &name);
+        Some((name[id.len() + 1..].to_string(), text))
     }
 
     /// The same, by the upload's id (its `docId`).
     pub fn by_id(&self, id: &str) -> Option<(String, String)> {
-        if !valid_id(id) {
-            return None;
-        }
+        self.by_path(&format!("/uploads/{id}-"))
+    }
+
+    /// The upload's own file, for `GET /uploads/<id>-<name>`: its bytes and media type.
+    /// Only the id is used to find it, so no path can reach outside the folder.
+    pub fn file(&self, path: &str) -> Option<(Vec<u8>, &'static str)> {
+        let id = id_in(path)?;
+        let name = self.file_name(id)?;
+        let bytes = std::fs::read(self.dir.join(&name)).ok()?;
+        self.touch(id, &name);
+        Some((bytes, media_type(&name)))
+    }
+
+    /// `<id>-<name>`, the kept file of upload `id`.
+    fn file_name(&self, id: &str) -> Option<String> {
         let prefix = format!("{id}-");
-        let name = std::fs::read_dir(&self.dir).ok()?.flatten().find_map(|e| {
-            e.file_name()
-                .to_str()?
-                .strip_prefix(&prefix)
-                .map(str::to_string)
-        })?;
-        self.by_path(&format!("/uploads/{id}-{name}"))
+        std::fs::read_dir(&self.dir).ok()?.flatten().find_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            name.starts_with(&prefix).then_some(name)
+        })
+    }
+
+    /// Marks an upload used now, so pruning keeps it while its chat goes on.
+    fn touch(&self, id: &str, name: &str) {
+        let now = std::time::SystemTime::now();
+        for file in [format!("{id}.txt"), name.to_string()] {
+            if let Ok(f) = std::fs::File::options()
+                .append(true)
+                .open(self.dir.join(file))
+            {
+                let _ = f.set_modified(now);
+            }
+        }
+    }
+
+    /// Removes uploads not used for `max_age`, then the least recently used ones while
+    /// all of them together are over `max_bytes`. A chat that still names a removed
+    /// upload is told it's gone ([`gone`]). How many were removed.
+    pub fn prune(
+        &self,
+        now: std::time::SystemTime,
+        max_age: std::time::Duration,
+        max_bytes: u64,
+    ) -> usize {
+        // Each upload's files, its size and when it was last used.
+        let mut uploads: std::collections::HashMap<
+            String,
+            (Vec<PathBuf>, u64, std::time::SystemTime),
+        > = std::collections::HashMap::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let id = name.get(..16).unwrap_or("");
+            if !valid_id(id) || !(name[16..].starts_with('-') || &name[16..] == ".txt") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let used = meta.modified().unwrap_or(now);
+            let e = uploads
+                .entry(id.to_string())
+                .or_insert((Vec::new(), 0, std::time::UNIX_EPOCH));
+            e.0.push(entry.path());
+            e.1 += meta.len();
+            e.2 = e.2.max(used);
+        }
+        let mut by_age: Vec<_> = uploads.into_values().collect();
+        by_age.sort_by_key(|u| u.2);
+        let mut total: u64 = by_age.iter().map(|u| u.1).sum();
+        let mut removed = 0;
+        for (files, size, used) in by_age {
+            let old = now.duration_since(used).is_ok_and(|age| age > max_age);
+            if !old && total <= max_bytes {
+                break;
+            }
+            for f in files {
+                let _ = std::fs::remove_file(f);
+            }
+            total -= size;
+            removed += 1;
+        }
+        removed
+    }
+}
+
+/// How long an upload is kept after its chat last used it, and how much they may take.
+pub const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(90 * 86_400);
+pub const KEEP_BYTES: u64 = 2 << 30;
+
+/// The upload id in a path `/uploads/<id>-<name>`.
+fn id_in(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/uploads/")?
+        .get(..17)?
+        .strip_suffix('-')?;
+    valid_id(id).then_some(id)
+}
+
+/// The note a message gets in place of an attachment that's no longer kept.
+pub fn gone(question: &str, path: &str) -> String {
+    let name = path
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.get(17..))
+        .unwrap_or("a file");
+    format!(
+        "(The user attached {name} to this message, but it's no longer kept on this server, \
+         so its text isn't available. Ask them to attach it again if it's needed.)\n\n{question}"
+    )
+}
+
+fn media_type(name: &str) -> &'static str {
+    match extension(name).as_str() {
+        "pdf" => "application/pdf",
+        "docx" | "dotx" | "docm" => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        "csv" => "text/csv; charset=utf-8",
+        // Everything else kept was read as text (HTML too: shown, never run).
+        _ => "text/plain; charset=utf-8",
     }
 }
 
@@ -624,5 +741,79 @@ mod tests {
         assert!(cut.contains("of its 5000 characters fit here"), "{cut}");
         assert!(cut.ends_with("\n\nQ"));
         assert!(with_document("Q", "a.md", &long, 10).contains("doesn't fit"));
+    }
+
+    #[test]
+    fn serves_kept_files_by_id_only() {
+        let u = uploads("serve");
+        let path = u
+            .save("00000000000000cd", "Café notes.md", b"# Hi", "# Hi")
+            .unwrap();
+        assert_eq!(path, "/uploads/00000000000000cd-Café-notes.md");
+        let (bytes, media) = u.file(&path).unwrap();
+        assert_eq!(
+            (bytes.as_slice(), media),
+            (&b"# Hi"[..], "text/markdown; charset=utf-8")
+        );
+        // The name after the id doesn't matter (it may come percent-encoded).
+        assert!(
+            u.file("/uploads/00000000000000cd-Caf%C3%A9-notes.md")
+                .is_some()
+        );
+        for bad in [
+            "/uploads/../server-pairings.txt",
+            "/uploads/00000000000000cd",
+            "/uploads/00000000000000zz-x.md",
+            "/uploads/0000000000000000-x.md",
+            "/elsewhere/00000000000000cd-x.md",
+        ] {
+            assert!(u.file(bad).is_none(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&u.dir);
+    }
+
+    fn age(u: &Uploads, id: &str, days: u64) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        for e in std::fs::read_dir(&u.dir).unwrap().flatten() {
+            if e.file_name().to_string_lossy().starts_with(id) {
+                let f = std::fs::File::options()
+                    .append(true)
+                    .open(e.path())
+                    .unwrap();
+                f.set_modified(then).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn prunes_what_no_chat_has_used() {
+        let u = uploads("prune");
+        let (old, used, new) = ("000000000000000a", "000000000000000b", "000000000000000c");
+        for id in [old, used, new] {
+            u.save(id, "a.txt", &[b'x'; 100], "x").unwrap();
+        }
+        age(&u, old, 100);
+        age(&u, used, 100);
+        // Reading an upload for a chat counts as using it.
+        assert!(u.by_path(&format!("/uploads/{used}-a.txt")).is_some());
+        let now = std::time::SystemTime::now();
+        assert_eq!(u.prune(now, KEEP_FOR, KEEP_BYTES), 1);
+        assert!(u.by_id(old).is_none());
+        assert!(u.by_id(used).is_some() && u.by_id(new).is_some());
+        // Over the size budget, the least recently used go first.
+        age(&u, used, 10);
+        assert_eq!(u.prune(now, KEEP_FOR, 150), 1);
+        assert!(u.by_id(used).is_none() && u.by_id(new).is_some());
+        let _ = std::fs::remove_dir_all(&u.dir);
+    }
+
+    #[test]
+    fn says_when_an_attachment_is_gone() {
+        let note = gone("And the total?", "/uploads/00000000000000cd-budget.pdf");
+        assert!(
+            note.starts_with("(The user attached budget.pdf to this message"),
+            "{note}"
+        );
+        assert!(note.ends_with("\n\nAnd the total?"));
     }
 }
