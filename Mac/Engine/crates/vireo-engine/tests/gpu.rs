@@ -253,6 +253,8 @@ fn matvec_kernels_match_the_cpu_on_real_weights() {
                 "blk.0.ssm_out.weight",
                 "blk.0.ssm_alpha.weight",
                 "blk.3.attn_q.weight",
+                // Q6_K in short rows: the output projection, the largest matrix a token reads.
+                "token_embd.weight",
             ],
         );
     }

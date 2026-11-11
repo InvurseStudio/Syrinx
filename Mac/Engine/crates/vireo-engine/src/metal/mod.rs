@@ -131,7 +131,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "conv_silu" => &[1, 3],
         "conv_silu_parallel" => &[3],
         "conv_history" => &[1],
-        "delta_net" | "delta_net_wide" => &[7, 10],
+        "delta_net" | "delta_net_8" | "delta_net_wide" => &[7, 10],
         "delta_l2" => &[0],
         "delta_scan" => &[7, 8],
         "delta_out" => &[0],
@@ -678,6 +678,8 @@ struct Kernels {
     conv_silu_parallel: Pso,
     conv_history: Pso,
     delta_net: Pso,
+    /// delta_net with 8 threads to a column (delta_net_p<8>).
+    delta_net_8: Pso,
     delta_net_wide: Pso,
     delta_l2: Pso,
     delta_scan: Pso,
@@ -911,6 +913,7 @@ impl Gpu {
             conv_silu_parallel: pipeline("conv_silu_parallel")?,
             conv_history: pipeline("conv_history")?,
             delta_net: pipeline("delta_net")?,
+            delta_net_8: pipeline("delta_net_8")?,
             delta_net_wide: pipeline("delta_net_wide")?,
             delta_l2: pipeline("delta_l2")?,
             delta_scan: pipeline("delta_scan")?,
@@ -1749,6 +1752,16 @@ impl Gpu {
             Arg::F32(d.eps),
             Arg::I32(tokens as i32),
         ];
+        if n <= 128 && n.is_multiple_of(8) {
+            // 8 threads to a column of the state: Qwen 3.5 generating ~1.3% faster on the
+            // M5 Max than with 4 (delta_net).
+            return self.run(
+                &self.kernels.delta_net_8,
+                (d.v_heads as u32, 1),
+                8 * n as u32,
+                &args,
+            );
+        }
         if n <= 128 && n.is_multiple_of(8) {
             return self.run(
                 &self.kernels.delta_net,
