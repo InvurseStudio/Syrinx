@@ -22,7 +22,9 @@
 #ifndef TC_SG
 #define TC_SG 4
 #endif
-#define TC_K 64
+#ifndef TC_K
+#define TC_K 128
+#endif
 #define TC_THREADS (32 * TC_SG)
 
 template <int KIND>

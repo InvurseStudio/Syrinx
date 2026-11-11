@@ -703,7 +703,8 @@ const TILE_ROWS: u32 = 64;
 const TILE_TOKENS: u32 = 32;
 /// The tensor kernel's tile (matmul_tc in vireo_tensor.metal): weight rows, tokens and
 /// SIMD groups. Of the shapes tried on the M5 Max (16–128 rows, 64–256 tokens, 2–8
-/// groups), 32 × 128 × 4 read prompts fastest on all three test models.
+/// groups), 32 × 128 × 4 read prompts fastest on all three test models; with it, 128
+/// columns a step (TC_K) was ~3% faster for Gemma 4 than 64, and level for Qwen 3.5.
 fn tensor_tile() -> (u32, u32, u32) {
     (32, 128, 4)
 }
