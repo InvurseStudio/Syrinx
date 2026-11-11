@@ -56,7 +56,11 @@ pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map_or_else(
             || PathBuf::from("."),
-            |home| PathBuf::from(home).join("Library").join("Application Support"),
+            |home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+            },
         )
     } else {
         std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
