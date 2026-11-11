@@ -1,7 +1,8 @@
-//! A stand-in PC: a few folders and files in memory, and the app's read-only tools over
-//! them, answering as the app's `PcTools` does. A model may take any sensible route
-//! (listing a folder before reading, or searching): each step gets a real answer, and
-//! every run gets the same ones.
+//! A stand-in PC: a few folders and files in memory, and the app's tools over them,
+//! answering as the app's `PcTools` does. A model may take any sensible route (listing a
+//! folder before reading, or searching): each step gets a real answer, and every run gets
+//! the same ones. The tools that change files change it, so a case can check what the
+//! reply left; a folder is there while it holds a file.
 
 use std::collections::BTreeMap;
 
@@ -24,12 +25,14 @@ fn is_file_name(s: &str) -> bool {
         && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Pc {
     /// Files by full path (lowercased for lookup), with their path as written and text.
     files: BTreeMap<String, (String, String)>,
     /// `git status --short` per project folder (lowercased).
     git: BTreeMap<String, String>,
+    /// Tools whose approvals the stand-in user declines.
+    declines: Vec<String>,
 }
 
 fn key(path: &str) -> String {
@@ -63,6 +66,21 @@ impl Pc {
     pub fn git(mut self, folder: &str, status: &str) -> Self {
         self.git.insert(key(folder), status.to_string());
         self
+    }
+
+    /// The stand-in user declines this tool's approvals (they approve all others).
+    pub fn declining(mut self, tool: &str) -> Self {
+        self.declines.push(tool.to_string());
+        self
+    }
+
+    pub fn approves(&self, tool: &str) -> bool {
+        !self.declines.iter().any(|t| t == tool)
+    }
+
+    /// A file's text, by its full path (any case).
+    pub fn text(&self, path: &str) -> Option<&str> {
+        self.files.get(&key(path)).map(|(_, t)| t.as_str())
     }
 
     fn is_folder(&self, path: &str) -> bool {
@@ -133,8 +151,43 @@ impl Pc {
         )
     }
 
+    /// A file or folder moved, as the app's `Move`: refused onto something already there
+    /// (a change of case only is the same item) or into a folder that isn't.
+    fn move_item(&mut self, source: &str, destination: &str) -> Result<(), String> {
+        let is_file = self.files.contains_key(&key(source));
+        if !is_file && !self.is_folder(source) {
+            return Err(self.not_found(source, format!("File not found: {source}")));
+        }
+        let same = key(source) == key(destination);
+        if !same && (self.files.contains_key(&key(destination)) || self.is_folder(destination)) {
+            return Err(format!("Destination already exists: {destination}"));
+        }
+        if let Some((parent, _)) = destination.rsplit_once('\\')
+            && key(parent) != key(HOME)
+            && !self.is_folder(parent)
+        {
+            return Err(format!("Folder not found: {parent}"));
+        }
+        let moved: Vec<String> = if is_file {
+            vec![key(source)]
+        } else {
+            let prefix = format!("{}\\", key(source));
+            self.files
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+        for k in moved {
+            let (path, text) = self.files.remove(&k).unwrap();
+            let new_path = format!("{destination}{}", &path[source.len()..]);
+            self.files.insert(key(&new_path), (new_path, text));
+        }
+        Ok(())
+    }
+
     /// Runs one of the app's tools: its output, or why it failed.
-    pub fn run(&self, tool: &str, args: &Value) -> Result<String, String> {
+    pub fn run(&mut self, tool: &str, args: &Value) -> Result<String, String> {
         let arg = |name: &str| {
             args.str(name)
                 .map(full)
@@ -245,6 +298,68 @@ impl Pc {
                     ("git_status", Some(status)) => Ok(status),
                     (_, Some(_)) => Ok("diff --git a/src/main.rs b/src/main.rs\n-    let port = 3000;\n+    let port = 8080;".into()),
                 }
+            }
+            // The changes, as the app's WriteFileAsync, DeleteFile, RenameFile and MoveFile
+            // answer (the app's journal, which undoes them, has no part here).
+            "write_file" => {
+                let path = arg("path")?;
+                if self.is_folder(&path) {
+                    return Err(format!("{path} is a folder, not a file."));
+                }
+                let content = args.str("content").unwrap_or("").to_string();
+                self.files.insert(key(&path), (path.clone(), content));
+                Ok(format!("File written successfully: {path}"))
+            }
+            "delete_file" => {
+                let path = arg("path")?;
+                if self.is_folder(&path) {
+                    return Err(format!(
+                        "{path} is a folder. delete_file deletes files only."
+                    ));
+                }
+                if self.files.remove(&key(&path)).is_none() {
+                    return Err(self.not_found(&path, format!("File not found: {path}")));
+                }
+                Ok(format!("File moved to the Recycle Bin: {path}"))
+            }
+            "rename_file" => {
+                let source = arg("path")?;
+                let new_name = args.str("new_name").unwrap_or("").trim().to_string();
+                if new_name.is_empty()
+                    || new_name == "."
+                    || new_name == ".."
+                    || new_name.contains(['\\', '/'])
+                {
+                    return Err("New name must be a single file or folder name.".into());
+                }
+                let parent = source
+                    .rsplit_once('\\')
+                    .map_or(HOME, |(p, _)| p)
+                    .to_string();
+                let destination = format!("{parent}\\{new_name}");
+                self.move_item(&source, &destination)?;
+                let name = |p: &str| p.rsplit('\\').next().unwrap_or(p).to_string();
+                Ok(format!(
+                    "Renamed successfully: {} -> {}",
+                    name(&source),
+                    name(&destination)
+                ))
+            }
+            "move_file" => {
+                let source = arg("source")?;
+                let destination = arg("destination")?;
+                self.move_item(&source, &destination)?;
+                Ok(format!("Moved successfully: {source} -> {destination}"))
+            }
+            // As the app's CheckChange: the change made on a copy, so its errors are the
+            // change's own, and nothing here changes.
+            "check_change" => {
+                let tool = args.str("tool").unwrap_or("").to_string();
+                let change = args.get("args").cloned().unwrap_or(Value::Null);
+                if !crate::cases::CHANGE_TOOLS.contains(&tool.as_str()) {
+                    return Err(format!("{tool} can't be checked on this PC."));
+                }
+                self.clone().run(&tool, &change).map(|_| "ok".to_string())
             }
             other => Err(format!("This PC doesn't run {other}.")),
         }
@@ -357,11 +472,11 @@ mod tests {
 
     #[test]
     fn answers_like_the_apps_tools() {
-        let pc = Pc::default()
+        let mut pc = Pc::default()
             .file(r"C:\Users\me\Documents\notes.txt", "hello")
             .file(r"C:\Users\me\Documents\Invoices\a.pdf", "A")
             .git(r"C:\Users\me\Projects\x", " M main.rs");
-        let run = |tool: &str, a: &[(&str, &str)]| pc.run(tool, &args(a));
+        let mut run = |tool: &str, a: &[(&str, &str)]| pc.run(tool, &args(a));
         assert_eq!(
             run("read_file", &[("path", "Documents/notes.txt")]),
             Ok("hello".into()),
@@ -432,13 +547,13 @@ mod tests {
 
     #[test]
     fn a_missing_path_says_what_is_there() {
-        let pc = Pc::default()
+        let mut pc = Pc::default()
             .file(r"C:\Users\me\Documents\meeting-notes.txt", "Tuesday")
             .file(r"C:\Users\me\Documents\notes.txt", "eggs")
             .file(r"C:\Users\me\Documents\report-2025.txt", "1.2")
             .file(r"C:\Users\me\Documents\report-2026.txt", "1.5")
             .file(r"C:\Users\me\Documents\Old\plan.md", "old plan");
-        let run = |tool: &str, path: &str| pc.run(tool, &args(&[("path", path)]));
+        let mut run = |tool: &str, path: &str| pc.run(tool, &args(&[("path", path)]));
         assert_eq!(
             run("read_file", r"Documents\Notes\meeting.txt").unwrap_err(),
             [
@@ -478,5 +593,104 @@ mod tests {
             run("read_file", r"D:\nope\x.txt").unwrap_err(),
             r"File not found: D:\nope\x.txt"
         );
+    }
+
+    #[test]
+    fn changes_change_it_as_the_apps_do() {
+        let mut pc = Pc::default()
+            .file(r"C:\Users\me\Documents\draft.txt", "draft")
+            .file(r"C:\Users\me\Documents\Invoices\globex.pdf", "G")
+            .file(r"C:\Users\me\Downloads\acme.pdf", "A")
+            .declining("delete_file");
+        let mut run = |tool: &str, a: &[(&str, &str)]| pc.run(tool, &args(a));
+        assert_eq!(
+            run(
+                "write_file",
+                &[("path", "Documents/new.txt"), ("content", "hi")]
+            ),
+            Ok(r"File written successfully: C:\Users\me\Documents\new.txt".into())
+        );
+        assert_eq!(
+            run(
+                "rename_file",
+                &[("path", r"Documents\draft.txt"), ("new_name", "final.txt")]
+            ),
+            Ok("Renamed successfully: draft.txt -> final.txt".into())
+        );
+        assert!(
+            run(
+                "rename_file",
+                &[("path", r"Documents\final.txt"), ("new_name", r"..\x.txt")]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            run("move_file", &[("source", r"Downloads\acme.pdf"), ("destination", r"Documents\Invoices\acme.pdf")]),
+            Ok(r"Moved successfully: C:\Users\me\Downloads\acme.pdf -> C:\Users\me\Documents\Invoices\acme.pdf".into())
+        );
+        assert!(
+            run(
+                "move_file",
+                &[
+                    ("source", r"Documents\new.txt"),
+                    ("destination", r"Documents\final.txt")
+                ]
+            )
+            .unwrap_err()
+            .starts_with("Destination already exists")
+        );
+        assert!(
+            run(
+                "move_file",
+                &[
+                    ("source", r"Documents\new.txt"),
+                    ("destination", r"Documents\Nowhere\new.txt")
+                ]
+            )
+            .unwrap_err()
+            .starts_with("Folder not found")
+        );
+        // A folder moves with what it holds.
+        run(
+            "move_file",
+            &[
+                ("source", r"Documents\Invoices"),
+                ("destination", r"Documents\Bills"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            run("delete_file", &[("path", r"Documents\Bills")])
+                .unwrap_err()
+                .contains("deletes files only")
+        );
+        assert_eq!(
+            run("delete_file", &[("path", r"Documents\new.txt")]),
+            Ok(r"File moved to the Recycle Bin: C:\Users\me\Documents\new.txt".into())
+        );
+        // A check changes nothing, and fails as the change would.
+        let check = |change: &str| crate::json::parse(change).unwrap();
+        assert_eq!(
+            pc.run(
+                "check_change",
+                &check(r#"{"tool":"delete_file","args":{"path":"Documents\\final.txt"}}"#)
+            ),
+            Ok("ok".into())
+        );
+        let err = pc
+            .run(
+                "check_change",
+                &check(r#"{"tool":"move_file","args":{"source":"Downloads\\Acme invoice","destination":"Documents\\Bills\\a.pdf"}}"#),
+            )
+            .unwrap_err();
+        assert!(
+            err.starts_with(r"File not found: C:\Users\me\Downloads\Acme invoice"),
+            "{err}"
+        );
+        assert_eq!(pc.text(r"C:\Users\me\Documents\final.txt"), Some("draft"));
+        assert_eq!(pc.text(r"c:\users\me\documents\bills\acme.pdf"), Some("A"));
+        assert!(pc.text(r"C:\Users\me\Documents\draft.txt").is_none());
+        assert!(pc.text(r"C:\Users\me\Documents\new.txt").is_none());
+        assert!(!pc.approves("delete_file") && pc.approves("write_file"));
     }
 }

@@ -1,10 +1,10 @@
 //! `vireo-server`: serves one GGUF model on this PC over the part of the Vireo app's API
 //! that chats use, with Vireo's own engine on the GPU. The prototype app pairs with it as
 //! it would with the Mac (address `localhost`, the code this prints) and chats with it.
-//! Replies can call the tools that change nothing (reading and finding files, Git's
-//! status and diff, which the app runs on the PC, and the date and time), each call
-//! written under its grammar (`tools.rs`). Tools that change things, files and skills
-//! come next.
+//! Replies can call tools (reading, finding and changing files and Git's status and
+//! diff, which the app runs on the PC, and the date and time), each call written under its
+//! grammar (`tools.rs`). The ones that change files wait for the user's approval in the
+//! app first. Skills come next.
 //!
 //! The routes, as `server/api_server.py` answers them:
 //!   POST   /api/pairing/claim          {code, name} → {token}
@@ -13,6 +13,7 @@
 //!   GET    /api/metrics                {model, runtime, contextLimit}
 //!   GET    /api/capabilities           the tools
 //!   POST   /api/agent/client-tool-result a PC tool's result, from the app
+//!   POST   /api/agent/confirm          {id, approved, remember}: the user's answer to an approval
 //!   GET    /api/skill-library/commands no skills
 //!   GET    /api/assistant/approvals    and /activity: empty
 //!   POST   /api/chat/completions       the reply as server-sent events
@@ -50,6 +51,7 @@ const USAGE: &str = "\
 Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact]
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
+                    [--changes declared|scored|offered]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -57,6 +59,10 @@ prints. --context is the most tokens a chat keeps: auto (the default) is as many
 GPU's free memory holds once the model is loaded, up to the model's own limit; --exact runs f32
 arithmetic. Chats' caches are saved in %LOCALAPPDATA%\\VireoPrototype\\chat-cache (or
 --chat-cache's folder; off for none), so going back to a chat reads only what's new.
+
+The tools that change files are offered when one scored question says the request asks
+for a change (--changes), and each waits for the user's approval in the app. The kinds
+the user always allows are kept in %LOCALAPPDATA%\\VireoPrototype\\approvals.txt.
 
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
 and --with-app (stop when the app does: when its end of standard input closes), and
@@ -73,6 +79,21 @@ struct Options {
     /// Only the tool groups a request needs, picked by scoring (`--tools-shown scored`),
     /// in place of every tool (`all`).
     scored_groups: bool,
+    /// When the tools that change files are there (`--changes`): `declared` (the
+    /// default), declared and callable only when scoring says the request asks for a
+    /// change; `scored`, declared always but callable only then (the prompt stays the
+    /// same, but the longer tool list cost small models on other requests, and a model
+    /// kept from a change it wanted called another tool); `offered`, always. Measured
+    /// 2026-11-11 (PLAN.md).
+    changes: Changes,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum Changes {
+    Offered,
+    Scored,
+    #[default]
+    Declared,
 }
 
 static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
@@ -96,6 +117,7 @@ fn main() -> ExitCode {
     let mut score_choices = false;
     let mut scored_groups = false;
     let mut heal = true;
+    let mut changes = Changes::Declared;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -128,6 +150,19 @@ fn main() -> ExitCode {
             }
             "--tools-shown" if matches!(value.map(String::as_str), Some("all" | "scored")) => {
                 scored_groups = value.unwrap() == "scored";
+                i += 1;
+            }
+            "--changes"
+                if matches!(
+                    value.map(String::as_str),
+                    Some("offered" | "scored" | "declared")
+                ) =>
+            {
+                changes = match value.unwrap().as_str() {
+                    "offered" => Changes::Offered,
+                    "scored" => Changes::Scored,
+                    _ => Changes::Declared,
+                };
                 i += 1;
             }
             "--score-choices" if matches!(value.map(String::as_str), Some("on" | "off")) => {
@@ -164,6 +199,7 @@ fn main() -> ExitCode {
         score_choices,
         heal,
         scored_groups,
+        changes,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -218,6 +254,10 @@ fn main() -> ExitCode {
         runs: Mutex::new(HashMap::new()),
         next_run: AtomicU64::new(1),
         tool_results: Arc::default(),
+        approvals: Arc::new(Approvals {
+            waiting: Mutex::new(HashMap::new()),
+            always: Mutex::new(Approvals::load()),
+        }),
     });
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
@@ -240,10 +280,61 @@ struct Shared {
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_run: AtomicU64,
     tool_results: ToolWaits,
+    approvals: Arc<Approvals>,
 }
 
 /// Calls waiting for the app to run a tool, by request id: where its result goes.
 type ToolWaits = Arc<Mutex<HashMap<String, Sender<Result<String, String>>>>>;
+
+// ---- Approvals -------------------------------------------------------------------------
+
+/// Changes waiting for the user's answer, and the kinds they always allow.
+struct Approvals {
+    /// By approval id: where the answer (approved, remember) goes.
+    waiting: Mutex<HashMap<String, Sender<(bool, bool)>>>,
+    /// Tools the user said not to ask about again, kept in
+    /// %LOCALAPPDATA%\VireoPrototype\approvals.txt (a tool a line), as the Mac keeps
+    /// approvals.json.
+    always: Mutex<Vec<String>>,
+}
+
+/// How long an approval waits for the user, as on the Mac.
+const APPROVAL_SECONDS: u64 = 120;
+
+impl Approvals {
+    /// `VIREO_APPROVALS_FILE` puts it elsewhere (vireo-eval starts each run with none).
+    fn file() -> PathBuf {
+        if let Some(file) = std::env::var_os("VIREO_APPROVALS_FILE") {
+            return PathBuf::from(file);
+        }
+        let base =
+            std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
+        base.join("VireoPrototype").join("approvals.txt")
+    }
+
+    fn load() -> Vec<String> {
+        std::fs::read_to_string(Self::file())
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn always_allow(&self, tool: &str) {
+        let mut always = self.always.lock().unwrap();
+        if !always.iter().any(|t| t == tool) {
+            always.push(tool.to_string());
+            let file = Self::file();
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&file, always.join("\n") + "\n");
+            eprintln!("Always allowed from now on: {tool}");
+        }
+    }
+}
 
 // ---- Pairing ---------------------------------------------------------------------------
 
@@ -442,6 +533,25 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 ),
             }
         }
+        ("POST", "/api/agent/confirm") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            let Some(id) = body.str("id") else {
+                return http::respond(&mut stream, 400, &error("No id."));
+            };
+            let approved = matches!(body.get("approved"), Some(Value::Bool(true)));
+            let remember = matches!(body.get("remember"), Some(Value::Bool(true)));
+            match shared.approvals.waiting.lock().unwrap().remove(id) {
+                Some(waiting) => {
+                    let _ = waiting.send((approved, remember));
+                    http::respond(&mut stream, 200, "{\"success\":true}");
+                }
+                None => http::respond(
+                    &mut stream,
+                    404,
+                    &error("Confirmation request not found or already resolved."),
+                ),
+            }
+        }
         ("POST", p) if p.starts_with("/api/chat/runs/") && p.ends_with("/stop") => {
             let id = &p["/api/chat/runs/".len()..p.len() - "/stop".len()];
             if let Some(stop) = shared.runs.lock().unwrap().get(id) {
@@ -515,6 +625,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         out,
         client_tools,
         tool_results: shared.tool_results.clone(),
+        approvals: shared.approvals.clone(),
     };
     if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
         shared.runs.lock().unwrap().remove(&run_id);
@@ -576,6 +687,7 @@ struct Job {
     /// The tools the app runs on the PC (its `clientTools`).
     client_tools: Vec<String>,
     tool_results: ToolWaits,
+    approvals: Arc<Approvals>,
 }
 
 enum Out {
@@ -1191,6 +1303,19 @@ fn reply(
         let groups = pick_groups(model, kept, tokenizer, family, &request.content)?;
         offered.retain(|t| groups.contains(&t.group));
     }
+    // The tools a call may name: all those offered, less the ones that change files
+    // when the request doesn't ask for a change.
+    let mut callable = offered.clone();
+    if options().changes != Changes::Offered
+        && offered.iter().any(|t| t.asks.is_some())
+        && let Some(request) = job.messages.last()
+        && !asks_for_change(model, kept, tokenizer, family, &request.content)?
+    {
+        callable.retain(|t| t.asks.is_none());
+        if options().changes == Changes::Declared {
+            offered.retain(|t| t.asks.is_none());
+        }
+    }
     let declared = tools::declarations(family, &offered);
     // With tools, the system prompt opens with what they're for.
     let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
@@ -1249,7 +1374,7 @@ fn reply(
     let mut pending = Vec::new();
     let started = Instant::now();
     // Tool calls: the grammar they're written under, and how one starts.
-    let grammar = Grammar::new(&tools::call_grammar(family, &offered));
+    let grammar = Grammar::new(&tools::call_grammar(family, &callable));
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
@@ -1413,6 +1538,44 @@ fn reply(
 /// The tool groups a request needs, asked of the model in its picker session: one pass
 /// over a short multiple-choice question, its answer letters scored. Groups at least
 /// `GROUP_SHARE` likely are offered (the likeliest always, unless it's "none").
+/// Whether a request asks to change files, scored in one pass over a question with worked
+/// examples (`tools::change_question`), as `pick_groups` scores groups. "Yes" needs only
+/// `CHANGE_SHARE`: hiding a change the user asked for costs more than an approval they
+/// can decline.
+fn asks_for_change(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    family: Family,
+    request: &str,
+) -> Result<bool, String> {
+    const CHANGE_SHARE: f64 = 0.3;
+    let question = Message {
+        role: "user".into(),
+        content: tools::change_question(request),
+    };
+    let text = chat::history(family, None, "", &[question], &chat::today())
+        + chat::opening(family)
+        + "Changes:";
+    let ids = tokenizer.encode(&text, false, true);
+    if kept.picker.is_none() {
+        kept.picker = Some(model.session(1024)?);
+    }
+    let session = kept.picker.as_mut().unwrap();
+    model.empty(session)?;
+    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let score = |word: &str| {
+        let id = tokenizer.encode(&format!(" {word}"), false, false)[0];
+        f64::from(logits[id as usize])
+    };
+    let (yes, no) = (score("yes"), score("no"));
+    let share = 1.0 / (1.0 + (no - yes).exp());
+    if debug_calls() {
+        eprintln!("[calls] asks for a change: {share:.2}");
+    }
+    Ok(share >= CHANGE_SHARE)
+}
+
 fn pick_groups(
     model: &Model,
     kept: &mut Kept,
@@ -1646,41 +1809,148 @@ fn write_call(
 /// its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
 /// model should read it. `None` if the reply was stopped meanwhile.
 fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<String> {
-    let runs = offered
-        .iter()
-        .find(|t| t.name == call.tool)
-        .map(|t| t.runs)?;
-    let result = match runs {
-        tools::Runs::Server => tools::run_here(call),
-        tools::Runs::App => {
-            let id = format!("call-{:016x}", random_u64());
-            let (tx, rx) = channel();
-            job.tool_results.lock().unwrap().insert(id.clone(), tx);
-            let _ = job.out.send(Out::Event(format!(
-                "{{\"type\":\"client_tool_request\",\"id\":{},\"tool\":{},\"args\":{}}}",
-                json::string(&id),
+    let tool = offered.iter().find(|t| t.name == call.tool)?;
+    if let Some(ask) = tool.asks {
+        // The app checks first that the change can be made (the file is there, the name
+        // is free), so nobody is asked to approve a guess. An app that can't check says
+        // so, and the approval is asked as before.
+        if job.client_tools.iter().any(|t| t == CHECK_CHANGE) {
+            let args = format!(
+                "{{\"tool\":{},\"args\":{}}}",
                 json::string(&call.tool),
                 call.args_json()
-            )));
-            let asked = Instant::now();
-
-            loop {
-                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(r) => break r,
-                    Err(_) if job.stop.load(Ordering::Relaxed) => {
-                        job.tool_results.lock().unwrap().remove(&id);
-                        return None;
-                    }
-                    Err(_) if asked.elapsed().as_secs() > 120 => {
-                        job.tool_results.lock().unwrap().remove(&id);
-                        break Err("The PC didn't answer within two minutes.".into());
-                    }
-                    Err(_) => {}
-                }
+            );
+            if let Err(why) = ask_app(CHECK_CHANGE, &args, job)? {
+                return Some(format!("Error: {why}"));
             }
         }
+        match approve(call, ask, job) {
+            Some(Ok(())) => {}
+            Some(Err(why)) => return Some(format!("Error: {why}")),
+            None => return None,
+        }
+    }
+    let result = match tool.runs {
+        tools::Runs::Server => tools::run_here(call),
+        tools::Runs::App => ask_app(&call.tool, &call.args_json(), job)?,
     };
     Some(result.unwrap_or_else(|e| format!("Error: {e}")))
+}
+
+/// What the app runs, not a tool the model sees: whether a change could be made, without
+/// making it (`PcTools.CheckChange`). The app lists it in `clientTools` when it has it.
+const CHECK_CHANGE: &str = "check_change";
+
+/// Asks the app to run one of its tools and waits for the answer. `None` if the reply was
+/// stopped meanwhile.
+fn ask_app(tool: &str, args_json: &str, job: &Job) -> Option<Result<String, String>> {
+    let id = format!("call-{:016x}", random_u64());
+    let (tx, rx) = channel();
+    job.tool_results.lock().unwrap().insert(id.clone(), tx);
+    let _ = job.out.send(Out::Event(format!(
+        "{{\"type\":\"client_tool_request\",\"id\":{},\"tool\":{},\"args\":{}}}",
+        json::string(&id),
+        json::string(tool),
+        args_json
+    )));
+    let asked = Instant::now();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(r) => return Some(r),
+            Err(_) if job.stop.load(Ordering::Relaxed) => {
+                job.tool_results.lock().unwrap().remove(&id);
+                return None;
+            }
+            Err(_) if asked.elapsed().as_secs() > 120 => {
+                job.tool_results.lock().unwrap().remove(&id);
+                return Some(Err("The PC didn't answer within two minutes.".into()));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Asks the user to approve a change (`confirm_required`, as the Mac's server sends it)
+/// and waits for the answer at `/api/agent/confirm`, unless they always allow this kind.
+/// `Err` says, for the model, why it won't happen; `None` if the reply was stopped.
+fn approve(call: &tools::Call, ask: tools::Ask, job: &Job) -> Option<Result<(), String>> {
+    if ask.rememberable && job.approvals.always.lock().unwrap().contains(&call.tool) {
+        eprintln!("Approved without asking (always allowed): {}", call.tool);
+        return Some(Ok(()));
+    }
+    let id = format!("confirm-{:016x}", random_u64());
+    let (tx, rx) = channel();
+    job.approvals.waiting.lock().unwrap().insert(id.clone(), tx);
+    let preview = tools::approval_preview(call, |p| on_this_pc(p).exists());
+    let remember = if ask.rememberable {
+        format!(",\"rememberLabel\":{}", json::string(&ask.remember_label()))
+    } else {
+        String::new()
+    };
+    let _ = job.out.send(Out::Event(format!(
+        "{{\"type\":\"confirm_required\",\"id\":{},\"tool\":{},\"args\":{},\"category\":\"{}\",\"preview\":{}{remember}}}",
+        json::string(&id),
+        json::string(&call.tool),
+        call.args_json(),
+        if ask.rememberable { "automatic" } else { "restricted" },
+        json::string(&preview)
+    )));
+    let asked = Instant::now();
+    let answer = loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(answer) => break Some(answer),
+            Err(_) if job.stop.load(Ordering::Relaxed) => {
+                job.approvals.waiting.lock().unwrap().remove(&id);
+                return None;
+            }
+            Err(_) if asked.elapsed().as_secs() > APPROVAL_SECONDS => {
+                job.approvals.waiting.lock().unwrap().remove(&id);
+                break None;
+            }
+            Err(_) => {}
+        }
+    };
+    eprintln!(
+        "Approval for {}: {}",
+        call.tool,
+        match answer {
+            Some((true, _)) => "approved",
+            Some((false, _)) => "declined",
+            None => "no answer",
+        }
+    );
+    Some(match answer {
+        Some((true, remember)) => {
+            if remember && ask.rememberable {
+                job.approvals.always_allow(&call.tool);
+            }
+            Ok(())
+        }
+        Some((false, _)) => Err(
+            "The user declined this, so it wasn't done. Don't try it another way: tell them it wasn't done."
+                .into(),
+        ),
+        None => Err(format!(
+            "Nobody answered the approval within {} minutes, so it wasn't done. Tell the user.",
+            APPROVAL_SECONDS / 60
+        )),
+    })
+}
+
+/// A path as the app's tools take it (`PcTools.Resolve`): full, or relative to the home
+/// folder. For the approval's wording only: the app checks access when it runs the call.
+fn on_this_pc(path: &str) -> PathBuf {
+    let p = path.trim().trim_matches('"');
+    let p = p
+        .strip_prefix("~/")
+        .or_else(|| p.strip_prefix("~\\"))
+        .unwrap_or(p);
+    let path = PathBuf::from(p);
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::var_os("USERPROFILE").map_or(path.clone(), |home| PathBuf::from(home).join(&path))
+    }
 }
 
 /// A tool's result as the model reads it: at most `MAX_RESULT` characters, saying how much
