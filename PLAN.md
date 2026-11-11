@@ -83,6 +83,10 @@ git), for checking our output and speed.
 | 2026-11-10 | Qwen 3.5 on the CPU: the `qwen35` pre-tokenizer (combining marks in words; our own Unicode marks table), Q5_K and Q4_0 decoding, Gated DeltaNet layers (causal conv1d, L2-normalized q/k, the delta-rule state update, gated RMSNorm), gated attention with partial RoPE in halves | Tokenizer: identical ids to llama.cpp on all 4,310 runs. Qwen 3.5 0.8B: perplexity 25.1818 against llama.cpp's exact 25.1817 (llama.cpp runs a prompt's DeltaNet in chunks: the same arithmetic in another order); next-token probabilities within 0.0005 points |
 | 2026-11-10 | Gemma 4 on the CPU: its tokenizer (UTF-8 BPE with "▁" spaces, newline-only splits, `<0xXX>` byte fallback; end-of-turn tokens made control tokens as llama.cpp does), per-layer embeddings, keys and values shared from earlier layers, sliding-window and global layers with their own head sizes and RoPE bases, the extra norms, layer output scale and logit softcap | Tokenizer: identical ids to llama.cpp on all 4,312 runs (and Llama's and Qwen's re-checked after the end-of-turn change). Gemma 4 E2B: next-token probabilities within 0.0002 points; perplexity 30.8273 against llama.cpp's 30.8287 (0.005%) |
 | 2026-11-10 | Qwen 3.5 and Gemma 4 on the GPU: Q4_0 and Q5_K matrix-vector kernels, RMSNorm per head (with or without a weight), RoPE in halves and on part of a head, sliding-window attention, the DeltaNet convolution, L2 norm and a whole DeltaNet head step in one kernel, gated attention, GELU, softcap. Gemma's two embedding tables stay in system memory (looked up per token) | Every quantized kernel equals the CPU to f32 rounding on real Llama, Qwen and Gemma weights. Perplexity on the GPU: Qwen 25.1818 and Gemma 30.8273, the CPU's numbers to every digit; GPU tests check llama.cpp's probabilities and the answer for all three models |
+| 2026-11-10 | First round of GPU speed work: prompts in batches (matrix-matrix kernels, tiled attention, batched DeltaNet), one CUDA graph per generated token, fused residual/norm and query/key/value steps, faster matrix-vector kernels (see "Speed so far") | Perplexity identical to every digit before and after on all three models; the matrix-matrix kernels equal the CPU to f32 rounding; a prompt read in batches of 7 gives every token's logits within 2×10⁻⁵ of their range of reading it token by token, the same next token every time (Gemma across its sliding window); llama.cpp's probabilities still match with batched prompts. 72 engine tests pass |
+| 2026-11-10 | 8-bit activations on the GPU by default (`Precision::Int8`; `--exact` keeps f32): dp4a matrix-vector and tensor-core matrix-matrix kernels for Q4_0, Q8_0, Q4_K, Q5_K and Q6_K, a second PTX for compute 8.0, Q4_0 repacked on upload (see "Second round") | Perplexity within 0.1% of exact on all three models; tensor-core and dp4a kernels agree to ~1e-6 and stay within the rounding of x of the CPU; the France answers unchanged; exact-mode tests still match llama.cpp's exact numbers. 74 engine tests pass |
+| 2026-11-10 | An f16 key/value cache in 8-bit mode, prompt attention on the tensor cores, one token's attention split along the context (see "Third round") | Tensor-core and per-token attention over an f16 cache against f64 for head sizes 64–512 and a sliding window; perplexity within 0.13% of exact; exact mode unchanged (still llama.cpp's exact numbers); batches and token-by-token pick the same next token (Gemma: 553 of 554). 75 engine tests pass |
+| 2026-11-10 | Prompt speed: deeper tensor-core matrix steps with scales read once, Qwen's DeltaNet split into parallel norms and a column-split state update, the convolution over every token at once (see "Fourth round") | Exact perplexity unchanged to every digit (Qwen 25.0418); 8-bit perplexity within 0.13% of exact; the tensor-core and dp4a kernels still agree to ~1e-6. 75 engine tests pass |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -93,20 +97,112 @@ exactly. GELU is part of it but not all: exact GELU gives 30.8273, GELU through 
 table 30.8275, llama.cpp 30.8287. Worth tracking down with a per-layer comparison
 (llama.cpp's `llama-eval-callback`-style tensor dumps).
 
-**Speed so far** (RTX 5060 Laptop, tokens/s; llama.cpp b12262 CUDA by `llama-bench`):
+**Speed so far** (RTX 5060 Laptop on mains power, tokens/s; llama.cpp b12262 CUDA by
+`llama-bench`, run the same day; generating from a short prompt, reading a prompt of
+1,600–1,800 tokens; Vireo's default is 8-bit activations, `--exact` the f32 path):
 
-| Model | Generating: Vireo GPU / llama.cpp | Reading a prompt: Vireo GPU / llama.cpp | Vireo CPU |
-|---|---|---|---|
-| Llama 3.2 1B Q4_K_M | ~50 / 96 | ~55 / 4,224 | ~25 |
-| Qwen 3.5 0.8B Q4_K_M | ~62 / 118 | ~70 / 4,822 | ~28 |
-| Gemma 4 E2B Q4_0 | ~26 / 62 | ~28 / 5,109 | ~6.5 |
+| Model | Generating: Vireo 8-bit / exact / llama.cpp | Generating after 1,700 tokens: 8-bit / exact / llama.cpp | Reading a prompt: Vireo 8-bit / exact / llama.cpp | Vireo CPU |
+|---|---|---|---|---|
+| Llama 3.2 1B Q4_K_M | ~130 / ~99 / 101 | ~107 / ~80 / 95 | ~2,130 / ~604 / 4,241 | ~25 |
+| Qwen 3.5 0.8B Q4_K_M | ~150 / ~121 / 126 | ~135 / ~108 / 121 | ~2,690 / ~887 / 4,756 | ~28 |
+| Gemma 4 E2B Q4_0 | ~64 / ~53 / 64 | ~57 / ~48 / 63 | ~1,200 / ~331 / 5,346 | ~6.5 |
 
-Generation is at about half of llama.cpp's speed with the first, untuned kernels. The
-quantized matrix-vector kernels reach 30–60 GB/s of the GPU's roughly 380 GB/s, while the
-plain F16 one reaches ~200 GB/s, so decoding the blocks is the bottleneck. Next for speed,
-in order: read the prompt in batches (matrix-matrix kernels, so a prompt costs one pass
-over the weights, not one per token); wider loads and cheaper block decoding in the
-matrix-vector kernels; fewer launches (fused steps, CUDA graphs).
+Before the speed work below it was ~40 / 53 / 23 generating and ~40 / 53 / 17 reading a
+prompt. Exact perplexity on the GPU is unchanged to every digit.
+
+**First round of speed work (2026-11-10):**
+
+- **Prompts in batches** (`forward_batch`): matrix-matrix kernels (`matmul_*`, tiles of
+  128 rows × 64 tokens, weights decoded once per tile in f32), a tiled attention kernel
+  per head size (`attention_tiled_64` to `_512`: a block of queries shares each chunk of
+  keys and values, online softmax), Qwen's convolution and DeltaNet running a whole batch
+  per launch with each head's state in registers. `vireo-cli perplexity` and `generate`
+  use it. 4–12× faster prompts; scoring a text is 5–12× faster.
+- **One graph per token**: kernels read the position from GPU memory, so one token's
+  launches (300–600) are recorded once per session as a CUDA graph and replayed. Fused
+  steps: the residual add with the next RMSNorm (`residual_norm`, Gemma's extra norms and
+  layer scale included), and each head's norm, RoPE and cache write (`qkv_prep`).
+- **Matrix-vector kernels**: several bytes per lane per load instead of one, two rows per
+  warp, Q4_K's scales read as words, and small whole numbers made into floats without
+  I2F. 35–60 GB/s became 90–120 GB/s.
+
+**Second round: 8-bit activations (2026-11-10, decided: 8-bit by default, exact kept):**
+
+- `Precision::Int8` (the default; `--exact` or `Precision::Exact` for f32): before a matrix
+  product, the activations are rounded to 8 bits per block of 32 (`quantize_q8`: a scale
+  `max|x| / 127`, plus the scaled sum of each 16 for the K-quants' minimums), once per input
+  and shared by the products that read it (q/k/v, gate/up). Generating uses dp4a kernels
+  (`matvec8_*`, 4 multiply-adds per instruction); prompts the tensor cores
+  (`matmul8_*`: `mma.m16n8k16` on 8-bit numbers, 32-bit sums scaled into f32 per 32 or, for
+  Q6_K, per 16). The tensor-core kernels need compute capability 8.0 (RTX 30 series on), so
+  `build.rs` makes a second PTX for `compute_80`; older GPUs run the dp4a kernel per token.
+  F16 and F32 weights, attention, norms and DeltaNet stay f32.
+- Q4_0 is repacked when uploaded (`Gpu::upload_weights`): each row's 16-byte runs of 4-bit
+  numbers, then its scales, so the kernels read 8 and 16 bytes at a time instead of 2.
+- Accuracy: perplexity 48.45 against exact 48.42 (Llama), 25.07 against 25.04 (Qwen), 46.25
+  against 46.23 (Gemma), all within 0.1% (llama.cpp's own 8-bit gap on Llama is 0.26%); the
+  France prompt keeps its answer and likeliest first token on all three (Qwen's near-tie
+  moves 3 points). The tensor-core and dp4a kernels agree to ~1e-6. Reading a prompt in
+  batches or token by token picks the same next token every time; logits drift by up to 8%
+  of their range on Gemma, as small differences tip numbers across 8-bit steps.
+
+**Third round: attention (2026-11-10):**
+
+- In 8-bit mode the key/value cache is f16 (half the memory: a 32K-token context of
+  Llama 3.2 1B takes 1 GB, not 2; it matters most for the large models), written by
+  `qkv_prep`. Exact mode keeps f32.
+- A prompt's attention runs on the tensor cores (`attention_mma_64` to `_512`, compute 8.0
+  on; flash attention: S = Q Kᵀ and O += P V as f16 products with f32 sums, the online
+  softmax in f32 between them, P passed from one product to the next in registers;
+  Gemma's 512-wide heads in two halves of the output). Dynamic shared memory (up to ~87 KB)
+  through `cuFuncSetAttribute`. Attention went from 36% of Llama's prompt time to 6%.
+  Checked against f64 for every head size and a sliding window: within 0.06–0.08% of the
+  output's size (the queries and softmax weights rounded to f16, as llama.cpp's flash
+  attention does); perplexity 48.48 / 25.07 / 46.28 against exact 48.42 / 25.04 / 46.23.
+- One generated token's attention is split along the context (`attention_part_*`, then
+  `attention_combine`): about four blocks per SM instead of one per head, the split worked
+  out on the GPU from the position so the recorded graph fits every length. Generating
+  after a long prompt went from ~78 to ~107 tokens/s on Llama and ~33 to ~57 on Gemma.
+
+**Fourth round: prompts (2026-11-10):**
+
+- The tensor-core matrix kernels take 128 columns per step (64 tensor-core products per
+  warp between syncs, not 16) and read each group's scales once; two blocks per SM for
+  Q4_0, Q8_0 and Q6_K (Q4_K and Q5_K would spill registers). ~5.5 → ~6–6.7 TOPS on
+  Q4_K at 8192 × 2048 × 512 tokens. Measured by switching parts off in a standalone
+  benchmark: the per-32 scaling is about half the time (each result needs about as many
+  float operations to scale as multiply-adds on the tensor cores: inherent to a scale per
+  32 columns on both sides, which llama.cpp uses too), unpacking the weights most of the
+  rest. Neither I2F nor shared-memory loads were the limit.
+- Qwen's DeltaNet for a prompt in three steps (`delta_l2`, `delta_scan`, `delta_out`):
+  the q/k norms and the gated output norm, which don't depend on the state, run for every
+  token at once; the state update is split over blocks of 16 columns (the columns are
+  independent), with 16 tokens of q and k staged in shared memory at a time and no
+  block-wide sums left in the loop. 5 ms → 2 ms per layer for 512 tokens; the same
+  arithmetic (exact perplexity 25.0418, unchanged). The convolution runs over every
+  token at once too (`conv_silu_parallel`, then `conv_history`).
+- Prompts: Llama ~1,900 → ~2,130, Qwen ~2,000 → ~2,690, Gemma ~1,030 → ~1,200 tokens/s.
+
+**What limits speed now, and what's next:**
+
+- **Generating** is ahead of llama.cpp on Llama and Qwen, short or long context, and at
+  90–100% on Gemma, which reads ~1 GB of Q4_0 weights a token. The dp4a kernels reach
+  ~120–180 GB/s of ~400. The GPU runs at ~1.5 GHz under load (it reports a clock limit,
+  0x400; a pure f32 multiply-add loop reaches only ~4 TFLOPS), likely a laptop power mode;
+  llama.cpp ran under the same limit.
+- **Reading a prompt** is at 22–57% of llama.cpp. The tensor-core matrix products are
+  most of it; the remaining levers: the scaling (a cheaper epilogue, or a coarser x scale
+  per 128 or 256 so the group sums stay integers longer, which costs accuracy and needs
+  measuring), unpacking each weight tile once into a reusable layout at load time
+  (llama.cpp repacks for its MMQ kernels), and double buffering. For Qwen, the DeltaNet
+  scan (~21%) would need the chunked (WY) form to go much further.
+- **For larger models**: splitting a model between GPU and system memory (Muse Glimmer 30B), mixture-of-
+  experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), and more than one GPU are still to
+  do; the f16 cache is the first step.
+- Nsight Compute can't read the GPU's counters on this PC (`ERR_NVGPUCTRPERM`: allowing it
+  is an NVIDIA Control Panel setting, Desktop → Enable Developer Settings, then Developer →
+  Manage GPU Performance Counters). Nsight Systems works and gives per-kernel times,
+  including inside the graphs (`--cuda-graph-trace=node`).
 
 **NPU check (2026-11-10):** the AMD NPU's driver is installed and working
 (32.0.203.329), with AMD's XRT runtime (`xrt_coreutil.dll`), but not Ryzen AI Software.

@@ -9,6 +9,7 @@ use vireo_engine::cuda::Gpu;
 use vireo_engine::models::gemma4_cuda::Gemma4Cuda;
 use vireo_engine::models::llama_cuda::LlamaCuda;
 use vireo_engine::models::qwen35_cuda::Qwen35Cuda;
+use vireo_engine::models::{Logits, Precision};
 use vireo_engine::{GgufFile, Tokenizer};
 
 fn open_gpu() -> Option<Gpu> {
@@ -55,7 +56,7 @@ fn check_matvec(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
         let mut expected = vec![0.0; w.rows];
         cpu::matvec(&pool, &w, &x, &mut expected);
 
-        let weights = gpu.upload(w.data).unwrap();
+        let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
         let x_gpu = gpu.upload_f32(&x).unwrap();
         let y_gpu = gpu.alloc(w.rows * 4).unwrap();
         let run = || {
@@ -87,8 +88,12 @@ fn check_matvec(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
 
         // Speed: generation reads every weight once per token, so bytes per second is
         // what matters.
+        let warm = Instant::now();
+        while warm.elapsed().as_millis() < 200 {
+            run();
+            gpu.synchronize().unwrap();
+        }
         let runs = 200;
-        gpu.synchronize().unwrap();
         let started = Instant::now();
         for _ in 0..runs {
             run();
@@ -105,6 +110,109 @@ fn check_matvec(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
             gpu_time,
             w.data.len() as f64 / gpu_time.as_secs_f64() / 1e9,
         );
+    }
+}
+
+/// Each named weight times a batch of 100 vectors (not a whole number of the kernels'
+/// tiles) on the GPU, against the CPU one vector at a time. Prints the speed.
+fn check_matmul(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
+    let pool = Pool::with_all_cores();
+    let tokens = 100;
+    for &name in names {
+        let w = matrix(file, name);
+        let x: Vec<f32> = (0..w.cols * tokens)
+            .map(|c| ((c * 7919) % 1000) as f32 / 250.0 - 2.0)
+            .collect();
+        let mut expected = vec![0.0; w.rows * tokens];
+        for (xt, yt) in x.chunks(w.cols).zip(expected.chunks_mut(w.rows)) {
+            cpu::matvec(&pool, &w, xt, yt);
+        }
+        let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
+        let x_gpu = gpu.upload_f32(&x).unwrap();
+        let y_gpu = gpu.alloc(w.rows * tokens * 4).unwrap();
+        let run = || {
+            gpu.matmul(
+                w.kind,
+                weights.ptr(),
+                x_gpu.ptr(),
+                y_gpu.ptr(),
+                w.rows,
+                w.cols,
+                tokens,
+            )
+            .unwrap()
+        };
+        run();
+        let mut got = vec![0.0; w.rows * tokens];
+        y_gpu.read_f32(&mut got).unwrap();
+        let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = expected
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst <= scale * 1e-5,
+            "{name}: worst difference {worst}, largest value {scale}"
+        );
+        // Bring the GPU up to full clocks first: it idles at a fraction of them.
+        let warm = Instant::now();
+        while warm.elapsed().as_millis() < 300 {
+            run();
+            gpu.synchronize().unwrap();
+        }
+        let runs = 20;
+        let started = Instant::now();
+        for _ in 0..runs {
+            run();
+        }
+        gpu.synchronize().unwrap();
+        let time = started.elapsed() / runs;
+        let flops = 2.0 * (w.rows * w.cols * tokens) as f64;
+        eprintln!(
+            "{name:28} {:>5} {:>6}x{:<5} x{tokens} worst diff {:.1e} of {:>5.1}  GPU {:>7.1?} ({:>5.2} TFLOPS)",
+            w.kind.name(),
+            w.rows,
+            w.cols,
+            worst,
+            scale,
+            time,
+            flops / time.as_secs_f64() / 1e12,
+        );
+    }
+}
+
+#[test]
+fn matmul_kernels_match_the_cpu_on_real_weights() {
+    let Some(gpu) = open_gpu() else { return };
+    if let Some(file) = model("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+        check_matmul(
+            &gpu,
+            &file,
+            &[
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.attn_k.weight",
+            ],
+        );
+    }
+    if let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") {
+        check_matmul(
+            &gpu,
+            &file,
+            &["blk.0.attn_qkv.weight", "blk.0.ssm_alpha.weight"],
+        );
+    }
+    if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
+        check_matmul(
+            &gpu,
+            &file,
+            &["blk.0.ffn_gate.weight", "per_layer_model_proj.weight"],
+        );
+    }
+    // The same Llama weights decoded to f32 first: the arithmetic alone, without decoding.
+    if let Some(file) = model("Llama-3.2-1B-Instruct-from-Q4_K_M-F32.gguf") {
+        check_matmul(&gpu, &file, &["blk.0.ffn_gate.weight"]);
     }
 }
 
@@ -173,17 +281,17 @@ fn llama_forward_pass_on_the_gpu_matches_llama_cpp() {
         return;
     };
     let tokenizer = Tokenizer::from_gguf(&file).unwrap();
-    let model = LlamaCuda::load(&file, gpu).unwrap();
+    let mut model = LlamaCuda::load(&file, gpu).unwrap();
+    model.set_precision(Precision::Exact);
     let prompt = "<|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France? \
                   Answer in one sentence.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
     let ids = tokenizer.encode(prompt, true, true);
     let mut session = model.session(64).unwrap();
-    let mut logits = Vec::new();
-    for (i, &id) in ids.iter().enumerate() {
-        if let Some(l) = model.forward(&mut session, id, i + 1 == ids.len()).unwrap() {
-            logits = l.to_vec();
-        }
-    }
+    let mut logits = model
+        .forward_batch(&mut session, &ids, Logits::Last)
+        .unwrap()
+        .unwrap()
+        .to_vec();
     cpu::softmax(&mut logits);
     for (id, percent) in [
         (791, 95.7887),
@@ -213,20 +321,17 @@ fn llama_forward_pass_on_the_gpu_matches_llama_cpp() {
     );
 }
 
-/// Runs `prompt` through a GPU model and greedy-generates up to 20 tokens after `first`:
-/// returns the prompt's next-token probabilities and the answer.
+/// Reads the prompt `ids` into a GPU model in one batch (`read`) and greedy-generates up
+/// to 20 tokens after `first` one at a time (`forward`): returns the prompt's next-token
+/// probabilities and the answer.
 fn probabilities_and_answer(
+    read: &mut dyn FnMut(&[u32]) -> Vec<f32>,
     forward: &mut dyn FnMut(u32, bool) -> Option<Vec<f32>>,
     ids: &[u32],
     first: u32,
     tokenizer: &Tokenizer,
 ) -> (Vec<f32>, String) {
-    let mut logits = Vec::new();
-    for (i, &id) in ids.iter().enumerate() {
-        if let Some(l) = forward(id, i + 1 == ids.len()) {
-            logits = l;
-        }
-    }
+    let mut logits = read(ids);
     cpu::softmax(&mut logits);
     let mut next = first;
     let mut answer = vec![next];
@@ -247,18 +352,26 @@ fn qwen35_forward_pass_on_the_gpu_matches_llama_cpp() {
         return;
     };
     let tokenizer = Tokenizer::from_gguf(&file).unwrap();
-    let model = Qwen35Cuda::load(&file, gpu).unwrap();
+    let mut model = Qwen35Cuda::load(&file, gpu).unwrap();
+    model.set_precision(Precision::Exact);
     let prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sentence.<|im_end|>\n\
                   <|im_start|>assistant\n<think>\n\n</think>\n\n";
     let ids = tokenizer.encode(prompt, true, true);
-    let mut session = model.session(64).unwrap();
+    let session = std::cell::RefCell::new(model.session(64).unwrap());
+    let mut read = |ids: &[u32]| {
+        model
+            .forward_batch(&mut session.borrow_mut(), ids, Logits::Last)
+            .unwrap()
+            .unwrap()
+            .to_vec()
+    };
     let mut forward = |id, want| {
         model
-            .forward(&mut session, id, want)
+            .forward(&mut session.borrow_mut(), id, want)
             .unwrap()
             .map(<[f32]>::to_vec)
     };
-    let (probs, answer) = probabilities_and_answer(&mut forward, &ids, 760, &tokenizer);
+    let (probs, answer) = probabilities_and_answer(&mut read, &mut forward, &ids, 760, &tokenizer);
     for (id, percent) in [
         (760, 56.6133),
         (57590, 35.0073),
@@ -283,17 +396,25 @@ fn gemma4_forward_pass_on_the_gpu_matches_llama_cpp() {
         return;
     };
     let tokenizer = Tokenizer::from_gguf(&file).unwrap();
-    let model = Gemma4Cuda::load(&file, gpu).unwrap();
+    let mut model = Gemma4Cuda::load(&file, gpu).unwrap();
+    model.set_precision(Precision::Exact);
     let prompt = "<|turn>user\nWhat is the capital of France? Answer in one sentence.<turn|>\n<|turn>model\n";
     let ids = tokenizer.encode(prompt, true, true);
-    let mut session = model.session(64).unwrap();
+    let session = std::cell::RefCell::new(model.session(64).unwrap());
+    let mut read = |ids: &[u32]| {
+        model
+            .forward_batch(&mut session.borrow_mut(), ids, Logits::Last)
+            .unwrap()
+            .unwrap()
+            .to_vec()
+    };
     let mut forward = |id, want| {
         model
-            .forward(&mut session, id, want)
+            .forward(&mut session.borrow_mut(), id, want)
             .unwrap()
             .map(<[f32]>::to_vec)
     };
-    let (probs, answer) = probabilities_and_answer(&mut forward, &ids, 818, &tokenizer);
+    let (probs, answer) = probabilities_and_answer(&mut read, &mut forward, &ids, 818, &tokenizer);
     for (id, percent) in [
         (818, 99.7068),
         (50429, 0.2201),
@@ -307,4 +428,474 @@ fn gemma4_forward_pass_on_the_gpu_matches_llama_cpp() {
         );
     }
     assert_eq!(answer, "The capital of France is Paris.");
+}
+
+/// A text long enough to cross several of the attention kernels' chunks (over 128
+/// positions), and Gemma's sliding window when `long`.
+fn long_text(tokenizer: &Tokenizer, long: bool) -> Vec<u32> {
+    let paragraph = "The engine reads a prompt in batches: every weight is decoded once for many \
+                     tokens, and attention looks at a block of keys for a block of queries. When \
+                     it writes a reply, it replays one recorded graph per token. ";
+    let text = paragraph.repeat(if long { 12 } else { 6 });
+    tokenizer.encode(&text, true, false)
+}
+
+/// Every token's logits from reading `ids` in batches (of 7, so batches end mid-tile) and
+/// from running them one at a time nearly always pick the same next token, and differ by
+/// at most `worst` and on average `mean` of their range. Exact, they differ only by f32
+/// rounding (sums in another order). In 8-bit mode the two take different paths on
+/// purpose (a batch's attention runs on the tensor cores, rounding queries and softmax
+/// weights to f16; one token's doesn't), and small differences tip activations across
+/// 8-bit steps, so single logits drift much further: on Gemma, over 35 layers and a logit
+/// softcap, up to a quarter of the range on one token in 554 (0.6% on average), with
+/// perplexity within 0.1% of exact. That's the two paths' own roundings, not one path
+/// going wrong: measured against exact on the same Gemma text, batches were off by 0.14
+/// on average and token-by-token by 0.16, each picking the exact next token 552 and 551
+/// times in 554. So 8-bit mode is held to its average and its picks; how close it stays
+/// to exact is checked by `eight_bit_activations_stay_close_to_exact` and perplexity.
+fn check_batches_match_tokens(
+    name: &str,
+    worst_tolerance: f32,
+    mean_tolerance: f32,
+    ids: &[u32],
+    batched: &mut dyn FnMut(&[u32]) -> Vec<f32>,
+    one_by_one: &mut dyn FnMut(u32) -> Vec<f32>,
+) {
+    let all = batched(ids);
+    let vocab = all.len() / ids.len();
+    let (mut worst, mut largest, mut same_pick, mut total) = (0f32, 0f32, 0, 0f64);
+    for (i, &id) in ids.iter().enumerate() {
+        let single = one_by_one(id);
+        let row = &all[i * vocab..(i + 1) * vocab];
+        for (a, b) in row.iter().zip(&single) {
+            worst = worst.max((a - b).abs());
+            total += f64::from((a - b).abs());
+            largest = largest.max(b.abs());
+        }
+        let pick = |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap();
+        same_pick += usize::from(pick(row) == pick(&single));
+    }
+    let mean = (total / all.len() as f64) as f32;
+    eprintln!(
+        "{name}: {} tokens, logit difference worst {worst:.2e}, mean {mean:.1e} of {largest:.1}, same next token {same_pick}/{}",
+        ids.len(),
+        ids.len()
+    );
+    assert!(
+        worst <= largest * worst_tolerance,
+        "{name}: worst logit difference {worst} of {largest}"
+    );
+    assert!(
+        mean <= largest * mean_tolerance,
+        "{name}: mean logit difference {mean} of {largest}"
+    );
+    assert!(same_pick * 100 >= ids.len() * 99, "{name}: picks differ");
+}
+
+#[test]
+fn reading_in_batches_matches_one_token_at_a_time() {
+    for (precision, worst, mean) in [(Precision::Exact, 1e-3, 1e-4), (Precision::Int8, 1.0, 0.01)] {
+        let label = |model: &str| format!("{model}, {precision:?}");
+        if let Some(file) = model("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, false);
+            let mut m = LlamaCuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut a = m.session_with_batch(ids.len(), 7).unwrap();
+            let mut b = m.session(ids.len()).unwrap();
+            check_batches_match_tokens(
+                &label("Llama"),
+                worst,
+                mean,
+                &ids,
+                &mut |ids| {
+                    m.forward_batch(&mut a, ids, Logits::All)
+                        .unwrap()
+                        .unwrap()
+                        .to_vec()
+                },
+                &mut |id| m.forward(&mut b, id, true).unwrap().unwrap().to_vec(),
+            );
+        }
+        if let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, false);
+            let mut m = Qwen35Cuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            let mut a = m.session_with_batch(ids.len(), 7).unwrap();
+            let mut b = m.session(ids.len()).unwrap();
+            check_batches_match_tokens(
+                &label("Qwen 3.5"),
+                worst,
+                mean,
+                &ids,
+                &mut |ids| {
+                    m.forward_batch(&mut a, ids, Logits::All)
+                        .unwrap()
+                        .unwrap()
+                        .to_vec()
+                },
+                &mut |id| m.forward(&mut b, id, true).unwrap().unwrap().to_vec(),
+            );
+        }
+        if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
+            let Some(gpu) = open_gpu() else { return };
+            let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+            let ids = long_text(&tokenizer, true);
+            let mut m = Gemma4Cuda::load(&file, gpu).unwrap();
+            m.set_precision(precision);
+            assert!(
+                ids.len() > m.config.sliding_window,
+                "the text should cross the sliding window ({} tokens)",
+                ids.len()
+            );
+            let mut a = m.session_with_batch(ids.len(), 7).unwrap();
+            let mut b = m.session(ids.len()).unwrap();
+            check_batches_match_tokens(
+                &label("Gemma 4"),
+                worst,
+                mean,
+                &ids,
+                &mut |ids| {
+                    m.forward_batch(&mut a, ids, Logits::All)
+                        .unwrap()
+                        .unwrap()
+                        .to_vec()
+                },
+                &mut |id| m.forward(&mut b, id, true).unwrap().unwrap().to_vec(),
+            );
+        }
+    }
+}
+
+/// The France prompt's next-token probabilities (read in one batch) and greedy answer
+/// (generated a token at a time) with the given precision.
+fn france(file: &GgufFile, prompt: &str, precision: Precision) -> (Vec<f32>, String) {
+    let tokenizer = Tokenizer::from_gguf(file).unwrap();
+    let ids = tokenizer.encode(prompt, true, true);
+    let gpu = open_gpu().unwrap();
+    let pick = |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
+    let mut probs: Vec<f32>;
+    let mut answer = Vec::new();
+    macro_rules! run {
+        ($model:expr) => {{
+            let mut m = $model;
+            m.set_precision(precision);
+            let mut s = m.session(64).unwrap();
+            probs = m
+                .forward_batch(&mut s, &ids, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let mut next = pick(&probs);
+            answer.push(next);
+            while !tokenizer.is_end_of_generation(next) && answer.len() < 20 {
+                next = pick(m.forward(&mut s, next, true).unwrap().unwrap());
+                answer.push(next);
+            }
+        }};
+    }
+    match file.architecture() {
+        Some("qwen35") => run!(Qwen35Cuda::load(file, gpu).unwrap()),
+        Some("gemma4") => run!(Gemma4Cuda::load(file, gpu).unwrap()),
+        _ => run!(LlamaCuda::load(file, gpu).unwrap()),
+    }
+    cpu::softmax(&mut probs);
+    (probs, tokenizer.decode(&answer, false))
+}
+
+/// With 8-bit activations (the default), the France prompt still gets its answer and the
+/// same likeliest first token as exact arithmetic, with probabilities a few points apart
+/// at most, as llama.cpp's own are from exact ones.
+#[test]
+fn eight_bit_activations_stay_close_to_exact() {
+    let prompts = [
+        (
+            "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+            "<|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France? \
+             Answer in one sentence.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        ),
+        (
+            "Qwen3.5-0.8B-Q4_K_M.gguf",
+            "<|im_start|>user\nWhat is the capital of France? Answer in one sentence.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+        (
+            "gemma-4-E2B_q4_0-it.gguf",
+            "<|turn>user\nWhat is the capital of France? Answer in one sentence.<turn|>\n<|turn>model\n",
+        ),
+    ];
+    for (name, prompt) in prompts {
+        let Some(file) = model(name) else { continue };
+        let (exact, exact_answer) = france(&file, prompt, Precision::Exact);
+        let (fast, fast_answer) = france(&file, prompt, Precision::Int8);
+        let worst = exact
+            .iter()
+            .zip(&fast)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let top = |p: &[f32]| (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
+        eprintln!(
+            "{name}: likeliest first token {:.2}% exact, {:.2}% 8-bit; biggest probability change {:.2} points; answer {fast_answer:?}",
+            exact[top(&exact)] * 100.0,
+            fast[top(&exact)] * 100.0,
+            worst * 100.0
+        );
+        assert_eq!(
+            top(&exact),
+            top(&fast),
+            "{name}: a different likeliest token"
+        );
+        assert!(worst < 0.05, "{name}: probabilities {worst} apart");
+        assert_eq!(exact_answer, fast_answer, "{name}: a different answer");
+        assert_eq!(fast_answer, "The capital of France is Paris.");
+    }
+}
+
+/// With activations rounded to 8 bits, the tensor-core kernel (a batch) and the dp4a
+/// kernel (one row of x at a time) sum the same whole numbers, so they agree to f32
+/// rounding; both are within the rounding of x of the exact CPU result. Prints speeds.
+fn check_8bit(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
+    let pool = Pool::with_all_cores();
+    let tokens = 100;
+    for &name in names {
+        let w = matrix(file, name);
+        let x: Vec<f32> = (0..w.cols * tokens)
+            .map(|c| ((c * 7919) % 1000) as f32 / 250.0 - 2.0)
+            .collect();
+        let mut exact = vec![0.0; w.rows * tokens];
+        for (xt, yt) in x.chunks(w.cols).zip(exact.chunks_mut(w.rows)) {
+            cpu::matvec(&pool, &w, xt, yt);
+        }
+        let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
+        let x_gpu = gpu.upload_f32(&x).unwrap();
+        let q8 = gpu.alloc_q8(tokens, w.cols).unwrap();
+        let one = gpu.alloc_q8(1, w.cols).unwrap();
+        let y_batch = gpu.alloc(w.rows * tokens * 4).unwrap();
+        let y_one = gpu.alloc(w.rows * 4).unwrap();
+        gpu.quantize(x_gpu.ptr(), &q8, tokens, w.cols).unwrap();
+        let batch = || {
+            gpu.matmul_8bit(
+                w.kind,
+                weights.ptr(),
+                &q8,
+                y_batch.ptr(),
+                w.rows,
+                w.cols,
+                tokens,
+            )
+            .unwrap()
+        };
+        batch();
+        let mut got = vec![0.0; w.rows * tokens];
+        y_batch.read_f32(&mut got).unwrap();
+        let mut by_row = vec![0.0; w.rows * tokens];
+        for t in 0..tokens {
+            gpu.quantize(x_gpu.f32_at(t * w.cols), &one, 1, w.cols)
+                .unwrap();
+            gpu.matmul_8bit(w.kind, weights.ptr(), &one, y_one.ptr(), w.rows, w.cols, 1)
+                .unwrap();
+            y_one
+                .read_f32(&mut by_row[t * w.rows..(t + 1) * w.rows])
+                .unwrap();
+        }
+        let scale = exact.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        };
+        let (kernels, rounding) = (worst(&got, &by_row), worst(&got, &exact));
+        assert!(
+            kernels <= scale * 2e-5,
+            "{name}: tensor cores and dp4a differ by {kernels} (largest value {scale})"
+        );
+        assert!(
+            rounding <= scale * 0.02,
+            "{name}: 8-bit result off the exact one by {rounding} (largest value {scale})"
+        );
+
+        let warm = Instant::now();
+        while warm.elapsed().as_millis() < 300 {
+            batch();
+            gpu.synchronize().unwrap();
+        }
+        let runs = 20;
+        let started = Instant::now();
+        for _ in 0..runs {
+            batch();
+        }
+        gpu.synchronize().unwrap();
+        let batch_time = started.elapsed() / runs;
+        let single = || {
+            gpu.matmul_8bit(w.kind, weights.ptr(), &one, y_one.ptr(), w.rows, w.cols, 1)
+                .unwrap()
+        };
+        let runs = 200;
+        let started = Instant::now();
+        for _ in 0..runs {
+            single();
+        }
+        gpu.synchronize().unwrap();
+        let single_time = started.elapsed() / runs;
+        eprintln!(
+            "{name:28} {:>5} {:>6}x{:<5} kernels differ {:.1e}, off exact {:.1e} of {:>5.1}  x{tokens}: {:>7.1?} ({:>5.1} TOPS)  x1: {:>7.1?} ({:>4.0} GB/s)",
+            w.kind.name(),
+            w.rows,
+            w.cols,
+            kernels,
+            rounding,
+            scale,
+            batch_time,
+            2.0 * (w.rows * w.cols * tokens) as f64 / batch_time.as_secs_f64() / 1e12,
+            single_time,
+            w.data.len() as f64 / single_time.as_secs_f64() / 1e9,
+        );
+    }
+}
+
+#[test]
+fn eight_bit_kernels_agree_and_stay_close_to_exact() {
+    let Some(gpu) = open_gpu() else { return };
+    if let Some(file) = model("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+        check_8bit(
+            &gpu,
+            &file,
+            &[
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.attn_k.weight",
+                "token_embd.weight",
+            ],
+        );
+    }
+    if let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") {
+        check_8bit(
+            &gpu,
+            &file,
+            &["blk.0.attn_qkv.weight", "blk.0.ssm_alpha.weight"],
+        );
+    }
+    if let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") {
+        check_8bit(
+            &gpu,
+            &file,
+            &["blk.0.ffn_gate.weight", "blk.20.ffn_down.weight"],
+        );
+    }
+}
+
+/// Attention over an f16 cache (8-bit mode), for each head size: the tensor-core kernel
+/// (a batch of tokens) and the per-token kernel against f64 arithmetic on the same f16
+/// keys and values. The tensor cores also round the queries and the softmax weights to
+/// f16, so they're allowed a little more.
+#[test]
+fn attention_over_an_f16_cache_matches_f64() {
+    use vireo_engine::half::{f16_to_f32, f32_to_f16};
+    let Some(gpu) = open_gpu() else { return };
+    // (head size, query heads, key/value heads, sliding window, scale)
+    for (hd, heads, kv_heads, window, scale) in [
+        (64, 8, 2, 0, 0.125),
+        (128, 8, 2, 0, 0.088),
+        (256, 8, 2, 0, 0.0625),
+        (256, 8, 1, 40, 1.0),
+        (512, 8, 1, 0, 1.0),
+    ] {
+        let (p0, tokens) = (30, 100);
+        let len = p0 + tokens;
+        let kv_dim = kv_heads * hd;
+        let wave = |i: usize, k: usize| (((i * k) % 1009) as f32 / 504.5 - 1.0) * 0.6;
+        let q: Vec<f32> = (0..tokens * heads * hd).map(|i| wave(i, 7919)).collect();
+        let k16: Vec<u16> = (0..len * kv_dim)
+            .map(|i| f32_to_f16(wave(i, 6007)))
+            .collect();
+        let v16: Vec<u16> = (0..len * kv_dim)
+            .map(|i| f32_to_f16(wave(i, 3001)))
+            .collect();
+        let bytes = |h: &[u16]| h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let (keys, values) = (
+            gpu.upload(&bytes(&k16)).unwrap(),
+            gpu.upload(&bytes(&v16)).unwrap(),
+        );
+        let q_gpu = gpu.upload_f32(&q).unwrap();
+        let out = gpu.alloc(tokens * heads * hd * 4).unwrap();
+        let pos = gpu.alloc(4).unwrap();
+
+        // The exact answer, in f64.
+        let group = heads / kv_heads;
+        let mut expected = vec![0f64; tokens * heads * hd];
+        for t in 0..tokens {
+            let at = p0 + t;
+            let first = if window > 0 {
+                (at + 1).saturating_sub(window)
+            } else {
+                0
+            };
+            for h in 0..heads {
+                let kv = (h / group) * hd;
+                let qh = &q[(t * heads + h) * hd..][..hd];
+                let scores: Vec<f64> = (first..=at)
+                    .map(|j| {
+                        (0..hd)
+                            .map(|d| qh[d] as f64 * f16_to_f32(k16[j * kv_dim + kv + d]) as f64)
+                            .sum::<f64>()
+                            * scale as f64
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for d in 0..hd {
+                    expected[(t * heads + h) * hd + d] = (first..=at)
+                        .zip(&weights)
+                        .map(|(j, w)| w * f16_to_f32(v16[j * kv_dim + kv + d]) as f64)
+                        .sum::<f64>()
+                        / total;
+                }
+            }
+        }
+        let largest = expected.iter().fold(0f64, |m, v| m.max(v.abs()));
+        let worst = |got: &[f32]| {
+            got.iter()
+                .zip(&expected)
+                .map(|(g, e)| (*g as f64 - e).abs())
+                .fold(0f64, f64::max)
+        };
+        let run = |t0: usize, n: usize| {
+            pos.write_i32(&[(p0 + t0) as i32]).unwrap();
+            gpu.attention(
+                true,
+                q_gpu.f32_at(t0 * heads * hd),
+                keys.ptr(),
+                values.ptr(),
+                out.f32_at(t0 * heads * hd),
+                pos.ptr(),
+                window,
+                heads,
+                n,
+                hd,
+                kv_dim,
+                group,
+                scale,
+            )
+            .unwrap();
+        };
+        let mut got = vec![0f32; tokens * heads * hd];
+        run(0, tokens);
+        out.read_f32(&mut got).unwrap();
+        let batch = worst(&got);
+        for t in 0..tokens {
+            run(t, 1);
+        }
+        out.read_f32(&mut got).unwrap();
+        let single = worst(&got);
+        eprintln!(
+            "head size {hd}, window {window}: batch off by {batch:.1e}, one at a time {single:.1e} (largest {largest:.2})"
+        );
+        assert!(single <= largest * 1e-5, "one at a time: {single}");
+        assert!(batch <= largest * 2e-3, "batch: {batch}");
+    }
 }

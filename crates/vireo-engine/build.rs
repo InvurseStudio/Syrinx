@@ -3,7 +3,7 @@
 //! ships no CUDA libraries: the driver is all it needs.
 //!
 //! PTX for compute capability 7.5 runs on every NVIDIA GPU from the RTX 20 series on
-//! (CUDA 13's oldest target). Without the CUDA Toolkit, the engine builds without the
+//! (CUDA 13's oldest target); a second build for 8.0 adds the tensor-core kernels. Without the CUDA Toolkit, the engine builds without the
 //! kernels and reports the GPU as unavailable.
 //!
 //! nvcc is found from the NVCC or CUDA_PATH variables, or the newest toolkit in its
@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PTX_TARGET: &str = "compute_75";
+/// The tensor cores' 8-bit matrix multiply (mma.m16n8k16 on s8) needs 8.0.
+const PTX_TARGET_MMA: &str = "compute_80";
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(vireo_cuda)");
@@ -25,34 +27,42 @@ fn main() {
         println!("cargo::warning=CUDA Toolkit not found: building without GPU kernels");
         return;
     };
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vireo.ptx");
-    let mut command = Command::new(&nvcc);
-    command
-        .args(["-ptx", "-O3", "-std=c++17"])
-        .arg(format!("-arch={PTX_TARGET}"))
-        .arg("-o")
-        .arg(&out)
-        .arg("kernels/vireo.cu");
-    if cfg!(windows) {
-        match find_msvc() {
-            Some(cl) => {
-                command.arg("-ccbin").arg(cl);
-            }
-            None => {
-                println!(
-                    "cargo::warning=Visual Studio's C++ tools not found: building without GPU kernels"
-                );
-                return;
+    // Two builds of the same kernels: one every supported GPU runs, and one for compute
+    // capability 8.0 on (RTX 30 series and later) with the tensor-core kernels too.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    for (target, name) in [
+        (PTX_TARGET, "vireo.ptx"),
+        (PTX_TARGET_MMA, "vireo_sm80.ptx"),
+    ] {
+        let mut command = Command::new(&nvcc);
+        command
+            .args(["-ptx", "-O3", "-std=c++17"])
+            .arg(format!("-arch={target}"))
+            .arg("-o")
+            .arg(out_dir.join(name))
+            .arg("kernels/vireo.cu");
+        if cfg!(windows) {
+            match find_msvc() {
+                Some(cl) => {
+                    command.arg("-ccbin").arg(cl);
+                }
+                None => {
+                    println!(
+                        "cargo::warning=Visual Studio's C++ tools not found: building without GPU kernels"
+                    );
+                    return;
+                }
             }
         }
-    }
-    let output = command.output().expect("couldn't run nvcc");
-    if !output.status.success() {
-        panic!(
-            "nvcc failed to compile the kernels:\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output = command.output().expect("couldn't run nvcc");
+        if !output.status.success() {
+            panic!(
+                "nvcc failed to compile the kernels for {target}:
+{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
     println!("cargo::rustc-cfg=vireo_cuda");
 }
