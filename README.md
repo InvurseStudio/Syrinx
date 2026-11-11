@@ -19,6 +19,7 @@ Nothing here is used by the shipping apps.
 | `crates/vireo-cli/` | Runs the engine from the command line, for testing and benchmarks |
 | `crates/vireo-server/` | A first server: one model on this PC over the part of the app's API that plain chats use (no tools, files or skills yet). The prototype app starts it itself; `start-server.cmd` runs it by hand. It keeps each chat's cache (in `%LOCALAPPDATA%\VireoPrototype\chat-cache`), so going back to a chat reads only what's new |
 | `Windows/` | A copy of the native Windows app, the prototype's front end. It runs side by side with the Vireo app and keeps its own chats. See [Windows/README.md](Windows/README.md). |
+| `Mac/` | The Mac side, separate from the Windows side: its own copy of the Mac app (`Mac/App/`) and of the engine, CLI and server (`Mac/Engine/`). See [Mac/README.md](Mac/README.md). |
 
 ## Chatting with the engine in the prototype app
 
