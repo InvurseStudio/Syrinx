@@ -22,6 +22,10 @@ fn main() {
     println!("cargo::rerun-if-changed=kernels");
     println!("cargo::rerun-if-env-changed=NVCC");
     println!("cargo::rerun-if-env-changed=CUDA_PATH");
+    // On the Mac the GPU backend is Metal (src/metal), compiled when the GPU is opened.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        return;
+    }
 
     let Some(nvcc) = find_nvcc() else {
         println!("cargo::warning=CUDA Toolkit not found: building without GPU kernels");
