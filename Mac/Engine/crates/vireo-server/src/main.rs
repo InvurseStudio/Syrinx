@@ -244,7 +244,11 @@ struct Shared {
 }
 
 /// The platform reported to the app, as the Python server names it.
-const PLATFORM: &str = if cfg!(target_os = "macos") { "macOS" } else { "windows" };
+const PLATFORM: &str = if cfg!(target_os = "macos") {
+    "macOS"
+} else {
+    "windows"
+};
 
 /// Calls waiting for the app to run a tool, by request id: where its result goes.
 type ToolWaits = Arc<Mutex<HashMap<String, Sender<Result<String, String>>>>>;
