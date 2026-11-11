@@ -754,6 +754,102 @@ inline void decode8<K_Q6_K>(device const u8* row, int blocks, int k, thread floa
     }
 }
 
+// Thirty-two numbers of a row from column k (a multiple of 32), decoded as decode8 does
+// and stored to threadgroup memory as f16: one Q4_0 or Q8_0 block, or one sub-block of a
+// K-quant, so its scale is worked out once and its bits read 16 bytes at a time.
+template <int KIND>
+static inline void decode32(device const u8* row, int blocks, int k, threadgroup half* out) {
+    float v[8];
+    for (int i = 0; i < 4; i++) {
+        decode8<KIND>(row, blocks, k + 8 * i, v);
+        for (int j = 0; j < 8; j++) out[8 * i + j] = half(v[j]);
+    }
+}
+
+// Four f16 numbers from the low (shift 0) or high (shift 4) nibbles of 4 bytes, as
+// scale × nibble − offset.
+static inline half4 nibbles4(u32 b, int shift, float scale, float offset) {
+    const u32 q = (b >> shift) & 0x0F0F0F0Fu;
+    return half4(float4((float)(q & 0xFF), (float)((q >> 8) & 0xFF), (float)((q >> 16) & 0xFF), (float)(q >> 24)) *
+                     scale - offset);
+}
+
+template <>
+inline void decode32<K_Q4_0>(device const u8* row, int blocks, int k, threadgroup half* out) {
+    const int b = k / 32;
+    const float d = q4_0_scale(row, blocks, b);
+    const uint4 q = *reinterpret_cast<device const uint4*>(row + b * 16);
+    threadgroup half4* o = reinterpret_cast<threadgroup half4*>(out);
+    const u32 w[4] = {q.x, q.y, q.z, q.w};
+    for (int i = 0; i < 4; i++) {
+        o[i] = nibbles4(w[i], 0, d, 8.0f * d);      // numbers 4i.. (low nibbles)
+        o[4 + i] = nibbles4(w[i], 4, d, 8.0f * d);  // numbers 16 + 4i.. (high)
+    }
+}
+
+template <>
+inline void decode32<K_Q4_K>(device const u8* row, int blocks, int k, threadgroup half* out) {
+    device const u8* block = row + (k / 256) * 144;
+    const int j = (k % 256) / 32;
+    float sc, m;
+    q4_k_scale_min(j, block + 4, sc, m);
+    const float d1 = half_at(block) * sc, min1 = half_at(block + 2) * m;
+    device const uint4* q = reinterpret_cast<device const uint4*>(block + 16 + (j / 2) * 32);
+    const int shift = (j & 1) * 4;
+    threadgroup half4* o = reinterpret_cast<threadgroup half4*>(out);
+    for (int h = 0; h < 2; h++) {
+        const uint4 qq = q[h];
+        const u32 w[4] = {qq.x, qq.y, qq.z, qq.w};
+        for (int i = 0; i < 4; i++) o[4 * h + i] = nibbles4(w[i], shift, d1, min1);
+    }
+}
+
+template <>
+inline void decode32<K_Q5_K>(device const u8* row, int blocks, int k, threadgroup half* out) {
+    device const u8* block = row + (k / 256) * 176;
+    const int j = (k % 256) / 32;
+    float sc, m;
+    q4_k_scale_min(j, block + 4, sc, m);
+    const float d1 = half_at(block) * sc, min1 = half_at(block + 2) * m;
+    device const uint4* q = reinterpret_cast<device const uint4*>(block + 48 + (j / 2) * 32);
+    device const uint4* qh = reinterpret_cast<device const uint4*>(block + 16);
+    const int shift = (j & 1) * 4;
+    threadgroup half4* o = reinterpret_cast<threadgroup half4*>(out);
+    for (int h = 0; h < 2; h++) {
+        const uint4 qq = q[h], hh = qh[h];
+        const u32 w[4] = {qq.x, qq.y, qq.z, qq.w}, hw[4] = {hh.x, hh.y, hh.z, hh.w};
+        for (int i = 0; i < 4; i++) {
+            // the fifth bit of number l is bit j of qh[l]: 16 more
+            const u32 bits = (hw[i] >> j) & 0x01010101u;
+            const u32 qv = ((w[i] >> shift) & 0x0F0F0F0Fu) | (bits << 4);
+            o[4 * h + i] = half4(float4((float)(qv & 0xFF), (float)((qv >> 8) & 0xFF), (float)((qv >> 16) & 0xFF),
+                                        (float)(qv >> 24)) * d1 - min1);
+        }
+    }
+}
+
+template <>
+inline void decode32<K_Q6_K>(device const u8* row, int blocks, int k, threadgroup half* out) {
+    device const u8* block = row + (k / 256) * Q6K_BYTES;
+    const int n = k % 256, hf = n / 128, run = (n % 128) / 32;
+    const float d = half_at(block + 208);
+    device const uint4* ql = reinterpret_cast<device const uint4*>(block + hf * 64 + (run & 1) * 32);
+    device const uint4* qh = reinterpret_cast<device const uint4*>(block + 128 + hf * 32);
+    device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + 2 * run);
+    const int shift = run < 2 ? 0 : 4;
+    threadgroup half4* o = reinterpret_cast<threadgroup half4*>(out);
+    for (int h = 0; h < 2; h++) {  // numbers 16h.. take scale sc[h]
+        const float ds = d * (float)sc[h];
+        const uint4 lq = ql[h], hq = qh[h];
+        const u32 lw[4] = {lq.x, lq.y, lq.z, lq.w}, hw[4] = {hq.x, hq.y, hq.z, hq.w};
+        for (int i = 0; i < 4; i++) {
+            const u32 qv = ((lw[i] >> shift) & 0x0F0F0F0Fu) | (((hw[i] >> (2 * run)) & 0x03030303u) << 4);
+            o[4 * h + i] = half4((float4((float)(qv & 0xFF), (float)((qv >> 8) & 0xFF), (float)((qv >> 16) & 0xFF),
+                                         (float)(qv >> 24)) - 32.0f) * ds);
+        }
+    }
+}
+
 template <int KIND>
 static inline ulong mm_row_bytes(int cols) {
     switch (KIND) {
