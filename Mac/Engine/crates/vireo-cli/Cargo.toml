@@ -1,0 +1,9 @@
+[package]
+name = "vireo-cli"
+description = "Runs the Vireo engine from the command line: load a GGUF model, generate text"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vireo-engine = { path = "../vireo-engine" }
