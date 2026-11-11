@@ -102,7 +102,11 @@ impl Gemma4CudaSession {
 
     /// The GPU memory each position takes in this session's caches (keys and values).
     pub fn cache_bytes_per_position(&self) -> usize {
-        self.cache_buffers().iter().map(|(b, _)| b.len_bytes()).sum::<usize>() / self.capacity.max(1)
+        self.cache_buffers()
+            .iter()
+            .map(|(b, _)| b.len_bytes())
+            .sum::<usize>()
+            / self.capacity.max(1)
     }
 
     /// Forgets every position from `len` on (nothing, if the session is shorter), so the
