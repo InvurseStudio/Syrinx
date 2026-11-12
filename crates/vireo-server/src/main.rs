@@ -17,11 +17,15 @@
 //!   POST   /api/agent/confirm          {id, approved, remember}: the user's answer to an approval
 //!   GET    /api/skill-library/commands the skills this PC can follow, for slash commands
 //!   GET    /api/assistant/approvals    and /activity: empty
+//!   POST   /api/upload                 an attachment (multipart) → {path, docId, extractedText}
+//!   GET    /uploads/{id}-{name}        a kept attachment's file
 //!   POST   /api/chat/completions       the reply as server-sent events
 //!   POST   /api/chat/runs/{id}/stop    stops a reply
 //! Anything else answers 404, which the app takes as "not on this server".
 
+mod attach;
 mod chat;
+mod files;
 mod http;
 mod json;
 mod sample;
@@ -271,7 +275,14 @@ fn main() -> ExitCode {
             waiting: Mutex::new(HashMap::new()),
             always: Mutex::new(Approvals::load()),
         }),
+        uploads: attach::Uploads {
+            dir: store::data_dir().join("uploads"),
+        },
     });
+    {
+        let shared = shared.clone();
+        std::thread::spawn(move || prune_uploads(&shared));
+    }
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
         std::thread::spawn(move || serve(stream, &shared));
@@ -294,7 +305,16 @@ struct Shared {
     next_run: AtomicU64,
     tool_results: ToolWaits,
     approvals: Arc<Approvals>,
+    /// Attachments, and the text read from them.
+    uploads: attach::Uploads,
 }
+
+/// The platform reported to the app, as the Python server names it.
+const PLATFORM: &str = if cfg!(target_os = "macos") {
+    "macOS"
+} else {
+    "windows"
+};
 
 /// Calls waiting for the app to run a tool, by request id: where its result goes.
 type ToolWaits = Arc<Mutex<HashMap<String, Sender<Result<String, String>>>>>;
@@ -421,7 +441,7 @@ fn error(detail: &str) -> String {
 fn serve(mut stream: TcpStream, shared: &Shared) {
     let request = match http::read_request(&stream) {
         Ok(r) => r,
-        Err(e) => return http::respond(&mut stream, 400, &error(&e)),
+        Err((status, e)) => return http::respond(&mut stream, status, &error(&e)),
     };
     let method = request.method.as_str();
     let path = request.path.trim_end_matches('/');
@@ -497,15 +517,16 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 .query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("device="))
-                .unwrap_or("windows")
+                .unwrap_or(PLATFORM)
                 .to_string();
             http::respond(
                 &mut stream,
                 200,
                 &format!(
-                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":\"windows\",\"tools\":{}}}",
+                    "{{\"protocolVersion\":1,\"device\":{},\"serverPlatform\":{},\"tools\":{}}}",
                     json::string(&device),
-                    tools::capabilities_json()
+                    json::string(PLATFORM),
+                    tools::capabilities_json(PLATFORM)
                 ),
             );
         }
@@ -527,6 +548,23 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         ("GET", "/api/assistant/activity") => {
             http::respond(&mut stream, 200, "{\"latest\":0,\"entries\":[]}")
         }
+        ("POST", "/api/upload") => {
+            let id = format!("{:016x}", random_u64());
+            let (status, body) = attach::upload(
+                request.content_type.as_deref(),
+                &request.body,
+                &shared.uploads,
+                &id,
+            );
+            http::respond(&mut stream, status, &body);
+            if status == 200 {
+                prune_uploads(shared);
+            }
+        }
+        ("GET", p) if p.starts_with("/uploads/") => match shared.uploads.file(p) {
+            Some((bytes, media_type)) => http::respond_with(&mut stream, 200, media_type, &bytes),
+            None => http::respond(&mut stream, 404, &error("That attachment isn't kept here.")),
+        },
         ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
         ("POST", "/api/agent/client-tool-result") => {
             let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
@@ -588,16 +626,29 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     };
     let mut messages = Vec::new();
     let mut system = body.str("systemPrompt").map(str::to_string);
+    // The documents attached to user messages: the message's index, the file's name and text.
+    let mut documents: Vec<(usize, String, String)> = Vec::new();
+    // Attachments no longer kept: the message's index and the path.
+    let mut gone = Vec::new();
     for m in body.array("messages") {
         let (Some(role), Some(content)) = (m.str("role"), m.str("content")) else {
             continue;
         };
         match role {
             "system" => system = Some(content.to_string()),
-            "user" => messages.push(Message {
-                role: "user".into(),
-                content: content.to_string(),
-            }),
+            "user" => {
+                // The app sends each message's attachment path every turn.
+                if let Some(path) = m.str("image").filter(|p| p.starts_with("/uploads/")) {
+                    match shared.uploads.by_path(path) {
+                        Some((name, text)) => documents.push((messages.len(), name, text)),
+                        None => gone.push((messages.len(), path.to_string())),
+                    }
+                }
+                messages.push(Message {
+                    role: "user".into(),
+                    content: content.to_string(),
+                });
+            }
             "assistant" => messages.push(Message {
                 role: "assistant".into(),
                 content: chat::without_thinking(content),
@@ -616,6 +667,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     let max_tokens = generation
         .and_then(|g| g.num("max_tokens"))
         .map_or(DEFAULT_MAX_TOKENS, |v| v.max(1.0) as usize);
+    add_documents(shared, &body, &mut messages, documents, gone, max_tokens);
 
     let run_id = format!("run-{}", shared.next_run.fetch_add(1, Ordering::Relaxed));
     let stop = Arc::new(AtomicBool::new(false));
@@ -633,6 +685,17 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
             _ => None,
         })
         .collect();
+    // The files the chat may reach on this Mac, for the PC tools the app doesn't run.
+    let folders = body
+        .array("folders")
+        .iter()
+        .filter_map(|f| match f {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let files =
+        files::Access::from_request(body.str("access"), folders).map(files::Files::for_user);
     let job = Job {
         system,
         messages,
@@ -641,6 +704,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         stop: stop.clone(),
         out,
         client_tools,
+        files,
         tool_results: shared.tool_results.clone(),
         approvals: shared.approvals.clone(),
     };
@@ -650,6 +714,64 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
     }
     stream_reply(&mut stream, &run_id, &events, &stop);
     shared.runs.lock().unwrap().remove(&run_id);
+}
+
+/// Writes the attached documents into their messages. The last message's comes from
+/// what was kept of its upload, else the request's `extractedText` or `docId`. They share
+/// what the context has room for after the reply, the system prompt, tools and messages:
+/// the newest document first, and earlier ones are cut, or left out with a note.
+fn add_documents(
+    shared: &Shared,
+    body: &Value,
+    messages: &mut [Message],
+    mut documents: Vec<(usize, String, String)>,
+    gone: Vec<(usize, String)>,
+    max_tokens: usize,
+) {
+    let last = messages.len() - 1;
+    if documents.last().is_none_or(|d| d.0 != last) {
+        let name = body
+            .str("image")
+            .and_then(|p| p.rsplit('/').next())
+            .map(|f| f.split_once('-').map_or(f, |(_, n)| n).to_string())
+            .unwrap_or_default();
+        if let Some(text) = body.str("extractedText").filter(|t| !t.trim().is_empty()) {
+            documents.push((last, name, text.to_string()));
+        } else if let Some((name, text)) = body.str("docId").and_then(|id| shared.uploads.by_id(id))
+        {
+            documents.push((last, name, text));
+        }
+    }
+    for (i, path) in gone {
+        if !documents.iter().any(|d| d.0 == i) {
+            messages[i].content = attach::gone(&messages[i].content, &path);
+        }
+    }
+    if documents.is_empty() {
+        return;
+    }
+    // About three bytes of text a token, kept on the safe side.
+    let context = shared.info.context;
+    let room = context.saturating_sub(max_tokens.min(context / 2) + 2048) * 3;
+    let others: usize = messages.iter().map(|m| m.content.len()).sum();
+    let mut budget = room.saturating_sub(others);
+    for (i, name, text) in documents.iter().rev() {
+        let message = &mut messages[*i];
+        message.content = attach::with_document(&message.content, name, text, budget);
+        budget = budget.saturating_sub(text.len().min(budget));
+    }
+}
+
+/// Removes attachments no chat has used for a while (see [`attach::KEEP_FOR`]).
+fn prune_uploads(shared: &Shared) {
+    let removed = shared.uploads.prune(
+        std::time::SystemTime::now(),
+        attach::KEEP_FOR,
+        attach::KEEP_BYTES,
+    );
+    if removed > 0 {
+        eprintln!("Removed {removed} attachments no chat has used for a while.");
+    }
 }
 
 fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, stop: &AtomicBool) {
@@ -703,6 +825,9 @@ struct Job {
     out: Sender<Out>,
     /// The tools the app runs on the PC (its `clientTools`).
     client_tools: Vec<String>,
+    /// What the chat may reach on this Mac (its `access`, and `folders`), for the PC tools
+    /// the server runs itself; `None` for none.
+    files: Option<files::Files>,
     tool_results: ToolWaits,
     approvals: Arc<Approvals>,
 }
@@ -1112,8 +1237,11 @@ fn engine(
     let name = std::path::Path::new(path)
         .file_stem()
         .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned());
+    // The default mode: 8-bit activations on CUDA, f16 on the Mac's neural accelerators.
     let mode = if precision == Precision::Exact {
         "exact"
+    } else if cfg!(target_os = "macos") {
+        "f16"
     } else {
         "8-bit"
     };
@@ -1317,7 +1445,7 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
-    let mut offered = tools::offered(&job.client_tools);
+    let mut offered = tools::offered(&job.client_tools, job.files.is_some());
     if options().scored_groups
         && !offered.is_empty()
         && let Some(request) = job.messages.last()
@@ -1934,8 +2062,8 @@ fn write_call(
     String::from_utf8(text).map_err(|_| "A tool call wasn't text.".to_string())
 }
 
-/// Runs a call: the server's own tools here, the PC's by asking the app and waiting for
-/// its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
+/// Runs a call: the server's own tools here (with the Mac's files when the app doesn't
+/// run the PC's tools), the PC's by asking the app and waiting for its answer (`/api/agent/client-tool-result`). The result, or what went wrong as the
 /// model should read it. `None` if the reply was stopped meanwhile.
 fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<String> {
     let tool = offered.iter().find(|t| t.name == call.tool)?;
@@ -1960,7 +2088,7 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         }
     }
     let result = match tool.runs {
-        tools::Runs::Server => tools::run_here(call),
+        tools::Runs::Server => tools::run_here(call, job.files.as_ref()),
         tools::Runs::App => ask_app(&call.tool, &call.args_json(), job)?,
     };
     Some(result.unwrap_or_else(|e| format!("Error: {e}")))

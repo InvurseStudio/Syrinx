@@ -49,14 +49,9 @@ pub fn model_key(path: &Path, precision: &str) -> String {
     format!("{h:016x}")
 }
 
-/// The default folder for `key`'s saved chats.
-pub fn default_dir(key: &str) -> PathBuf {
-    data_dir().join("chat-cache").join(key)
-}
-
 /// The prototype's own folder: `~/Library/Application Support/VireoPrototype` on the Mac
 /// (where the Mac prototype app keeps its chats), `%LOCALAPPDATA%\VireoPrototype`
-/// elsewhere. The same as the Mac engine's copy (`VireoPrototype/Mac/Engine`).
+/// elsewhere.
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map_or_else(
@@ -71,6 +66,11 @@ pub fn data_dir() -> PathBuf {
         std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
     };
     base.join("VireoPrototype")
+}
+
+/// The default folder for `key`'s saved chats.
+pub fn default_dir(key: &str) -> PathBuf {
+    data_dir().join("chat-cache").join(key)
 }
 
 pub struct Entry {

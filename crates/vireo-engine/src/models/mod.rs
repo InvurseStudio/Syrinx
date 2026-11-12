@@ -37,7 +37,12 @@ pub enum Precision {
 }
 
 /// How many tokens a GPU session reads at once, unless asked for another number:
-/// enough to keep the GPU busy, little enough memory to keep sessions cheap.
+/// enough to keep the GPU busy, little enough memory to keep sessions cheap. Tuned per
+/// backend: 512 on CUDA; 1,024 on the Mac, where on the M5 Max it read Qwen's and Gemma's
+/// prompts 5–9% faster, the matrix kernels having more threadgroups to spread over the GPU.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_BATCH: usize = 1024;
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_BATCH: usize = 512;
 
 /// A GPU session's contents copied to system memory, to be loaded into a session of the

@@ -48,6 +48,113 @@ downloaded, Vireo offers the matching GGUF build. Whether mlx_vlm stays as a tem
 fallback on the Mac is still open (see Open questions). This doesn't affect the
 Windows-first work.
 
+## The Mac (Metal)
+
+The Mac's own record: the Metal backend (`crates/vireo-engine/src/metal`,
+`kernels/*.metal`), its tuning and its measurements. Since 2026-11-11 the Mac builds the
+same workspace as Windows (it had its own copy under `Mac/Engine/` for a day); only the
+backend and its tuning are the Mac's, everything else is shared.
+
+**Machine:** MacBook Pro, Apple M5 Max (40 GPU cores, neural accelerators in the GPU),
+128 GB, macOS 27. Rust 1.99.1 (Homebrew's `rustup`). Reference: llama.cpp b12228's macOS
+arm64 build (Metal, with Metal 4 tensor operations on the M5) in `reference/`.
+
+**How it's built.** `src/metal/` is a Metal backend with the CUDA backend's types and
+methods; on macOS `crate::cuda` is that module (see `lib.rs`), so the models' GPU passes,
+the CLI, the server and the tests are the same code as on Windows. The kernels are
+`kernels/vireo.metal` (a port of `vireo.cu`, plus SIMD-group-matrix kernels) and
+`kernels/vireo_tensor.metal` (matrix products on the neural accelerators, compiled only
+where Metal has them), compiled from source when the GPU opens (~0.4 s), with precise
+math. Kernels take raw GPU addresses as on CUDA (buffers resident through a residency
+set); dispatches run concurrently, with a barrier only where one touches what an earlier
+one wrote (each kernel's written arguments are listed). `VIREO_METAL_PROFILE=1` adds up
+GPU time by kernel; `VIREO_METAL_TIMING=1` reports command-buffer GPU time.
+
+**Modes.** Apple GPUs have no dp4a or CUDA tensor cores, so there are no 8-bit kernels.
+The default mode's counterpart is f16: a prompt's activations are rounded to f16 and its
+matrix products run on the neural accelerators with f16 weights (f32 sums), and prompt
+attention runs on SIMD-group matrices over the f16 cache. Exact mode is f32 throughout,
+the CPU's numbers. Generating is the same in both (matrix-vector products in f32 on the
+exact weights).
+
+**Checked (2026-11-11):** all 95 engine tests pass (each kernel against the CPU; Llama,
+Qwen 3.5 and Gemma 4 against llama.cpp; batches against token by token; saved sessions).
+Perplexity on 4 × 2,048 tokens (PLAN.md and gguf.rs as text), default / exact /
+llama.cpp: Llama 33.636 / 33.635 / 33.558, Qwen 18.297 / 18.297 / 18.316, Gemma 35.369 /
+35.378 / 35.385. `vireo-server` runs all three, streaming replies to the app's API.
+
+**Speed** (tokens/s, default mode, against `llama-bench -p 2048 -n 128 -ngl 99`, and
+`-d 2048` for generating with a context, run back to back with Vireo; Vireo generating
+128 tokens from a short prompt and after a prompt of 2,600–2,700 tokens, and reading
+that prompt; 2026-11-11, fourth tuning pass). Llama is no longer tuned or measured (the
+Windows side dropped it from its tests as an old model); its code and tests remain.
+
+| Model | Generating: Vireo / llama.cpp | … with ~2,600 tokens before it | Reading a prompt: Vireo / llama.cpp | Vireo CPU |
+|---|---|---|---|---|
+| Qwen 3.5 0.8B Q4_K_M | ~412 / 353 (117%) | ~383 / 341 (112%) | ~19,700 / 16,700 (118%) | ~40 |
+| Gemma 4 E2B Q4_0 | ~204 / 181 (113%) | ~194 / 174 (111%) | ~21,050 / 20,660 (102%) | ~22 |
+
+Runs move by ±3% (the laptop warms up: compare within a sitting). Exact mode generates at
+the same speed and reads prompts at ~7,400 / 6,800.
+
+How prompt reading got there (Qwen / Gemma): the straight port 3,750 / 3,850;
+SIMD-group matrices for the products and tiled attention over the f16 cache 5,100 /
+6,500; the matrix products on the neural accelerators 7,600 / 11,300; flash attention on
+SIMD-group matrices and the chunked DeltaNet (chunks of 32, so it fits Metal's 32 KB of
+threadgroup memory) 11,600 / 11,900; f16 activations 12,600 / 12,700; concurrent
+dispatch ~12,900 / 12,800; tiles of 32 rows × 128 tokens (searched 16–128 × 64–256,
+2–8 SIMD groups) and batches of 1,024 ~15,100 / 14,400; attention on the neural
+accelerators (`attention_tc`) ~16,700 / 19,600; the DeltaNet scan on SIMD-group matrices
+(`delta_chunk_scan_sg`) ~19,100 / –; 128 columns a step in the products ~19,100 / ~19,300;
+committing every 128 dispatches (the GPU starting while the CPU encodes the rest)
+~19,450 / ~20,300; decoding the weights 32 at a time (`decode32`: a Q4_0 block or a
+K-quant sub-block, its scale worked out once and its bits read 16 bytes at a time)
+~19,700 / ~21,050. Scoring a text (every token's logits, `vireo-cli perplexity`) also got
+faster with it: Qwen 4 × 2,048 tokens in 3.4 → 2.6 s.
+
+And generating (short prompt): the port 338 / 169; concurrent dispatch 351 / 166; one
+token's attention in one dispatch (`attention_decode`) 364 / 176; matrix-vector rows
+split over 4 SIMD groups (`matvec_split_*`) 380 / 180; gate, up and the activation in
+one dispatch (`matvec_glu_*`) ~+1% each; `residual_norm` on 512 threads ~+2% / +4.5%;
+wide heads with a SIMD group a position (`attention_decode_wide`) ~394 / ~197;
+committing every 128 dispatches ~407 / ~202; Qwen's one-token DeltaNet with 8 threads
+to a column (`delta_net_p<8>`) ~412 / ~204.
+
+Tried and left out (slower on the M5 Max): `residual_norm` with the row in registers;
+the o and down projections adding into the residual and finishing the norm in the same
+dispatch (the last threadgroup's norm plus every threadgroup's extra barriers cost more
+than the step saved); one token's attention for a key/value head's whole query group at
+once (2–8 heads; the repeated reads come from the cache); bigger query tiles for flash
+attention at 64- and 256-wide heads (kept for 512 where there are no neural
+accelerators); the DeltaNet scan with 16 or 32 state columns a threadgroup; the tensor
+products' weight tile double-buffered (1–3% faster reading prompts, but scoring a text
+~30% slower, probably fewer threadgroups a core with 16 KB each, and Gemma's perplexity
+not the same to the digit); 32-bit loads for Q6_K's words in the matrix-vector kernels
+(kept, no measurable change).
+
+A bug found on the way: the first version of `delta_chunk_scan_sg` zeroed its diagonal
+matrix and wrote γ on it without a barrier between, so some first chunks scaled rows of
+the state by 0; the model tests caught it (logits off by up to 1.5 in batches of 7), a
+new test (`delta_net_in_chunks_matches_token_by_token`) checks the chunked DeltaNet on
+its own.
+
+**What limits speed now, and what's next:**
+
+- **Generating** reads the big matrices at memory speed, but a token is still a chain of
+  ~8 dependent steps a layer at ~2–3 µs each (a dependent dispatch costs 2–3 µs, an
+  independent one 0.2–0.6), and the small matrices (a layer's q, k and o) are bound by
+  the latency of their few steps. Next: q, k and v in one dispatch, and the norms folded
+  into the projections' inputs.
+- **Reading prompts:** Gemma's Q4_0 matrix products are ~60% of its prompt time; its
+  small matrices (256 rows: k, v and the per-layer projections) leave the GPU part idle
+  and might want a smaller tile of their own. Qwen's DeltaNet is ~28% (the scan 18%, the
+  prep 10%, the prep's forward substitution a 32-step chain in each column).
+- **Measuring:** compare within a sitting, alternating A and B (`VIREO_*` switches
+  removed once settled), and time scoring a text too: it reads every token's logits, a
+  prompt-sized product over the whole vocabulary, which a prompt benchmark misses.
+- On Macs without neural accelerators (before the M5) the default mode uses the
+  SIMD-group kernels (`matmul_sg`, `attention_flash`, `attention_flash2`), untested here.
+
 ## Development machine
 
 The PC this starts on (checked 2026-11-10):
@@ -104,6 +211,8 @@ git), for checking our output and speed.
 | 2026-11-11 | A missing path's error says what is there (the app's `PcTools.NotFound`, and the eval's stand-in PC, which gives the same text): the nearest folder above it the chat can reach, what that holds (folders first, the first 30), up to three names there sharing the most words with the missing part (letters and digits apart, the extension left out: "2026_report.pdf" finds report-2026.txt before report-2025.txt), as full paths, and files of the same name a few folders down. Facts only: a last line telling the model to go on with one of them was tried two ways and scored lower | Eval, all 24, four versions against a fresh baseline (20 / 22 / 16 / 23 / 23, the same as before): names alone 21 / 22 / 17 / 23 / 23; full paths and "use it and say so; if not, tell the user what's there" 20 / 22 / 17 / 23 / 23; **full paths alone 21 / 22 / 18 / 23 / 23, kept**; full paths and "Go on with the one that fits the request" 21 / 22 / 17 / 23 / 23. `which-report` now passes on all five (3 before), and in two calls where 4B and 9B took three; `recover` on two (one before: Qwen 0.8B joins 4B). No other case moved, `missing` included. The three still failing `recover` (both Gemmas, Qwen 9B) now name meeting-notes.txt and ask the user whether to read it: a choice to stop, not a wrong path. Results: `evals/not-found-hints.json`. App tests 258 pass |
 | 2026-11-11 | Tools, step 2 finished: the tools that change files, with approvals. vireo-server offers `write_file`, `rename_file`, `move_file` and `delete_file` (the app's PcTools runs them, its undo journal recording each reply's changes), and before one runs it asks the user as the Mac's server does: `confirm_required` with a one-line preview ("Create …", "Move … to …"), answered at `/api/agent/confirm`; "Don't ask again" kept in `%LOCALAPPDATA%\VireoPrototype\approvals.txt` (deleting always asks); declined or unanswered in two minutes, the model is told it wasn't done and not to try another way. Before asking, the app checks the change could be made (`check_change`, not a tool the model sees: the file is there, the name free, the folder there), so nobody approves a guess; an app without it is asked as before. One scored question (worked examples, " yes"/" no") decides whether a request asks for a change; only then are the change tools declared and callable (`--changes declared`). `vireo-eval` gained six change cases (`change_cases.rs`: write a note, add a line keeping the rest, rename, find then move, a declined delete, advice without a change), a stand-in PC that changes and a stand-in user who approves or declines, and a rule for the other 24: a reply that changes a file fails | All 30 (older 24 / changes 6), against the older 24's last run (21 / 22 / 18 / 23 / 23): changes always offered (`offered`) Gemma 4 E2B 20 / 4, E4B 21 / 5, Qwen 3.5 0.8B 15 / 3, 4B 23 / 6, 9B 23 / 5; declared always but callable only when asked (`scored`) the same; **declared only when asked (`declared`, kept) 21 / 5, 22 / 5, 16 / 4, 23 / 6, 23 / 5**. The longer tool list was the cost on the older cases (Qwen 0.8B saved a poem to a file, and with `scored` was pushed into `git_status` instead); `declared` keeps those prompts as they were. The check works: on the guessed "Downloads\Acme invoice" no model was asked to approve anything. Still failing: `move-found` on four models (each guesses the name, is told the real one, then asks the user instead of moving it, as in `recover`), and Qwen 0.8B saying a declined file was deleted. Cost: a chat whose next request asks for a change reads its history again once (the declarations change). Results: `evals/changes.json` (`changes-offered.json`, `changes-scored.json` scored `advice-only` before its check took a name without ".docx"). App tests 259 pass |
 | 2026-11-11 | Skills, first round. vireo-server reads SKILL.md files as the Mac's `skill_library.py` does (`skills.rs`: the Mac's ten built-in skills from `server/builtin-skills`, the user's from %APPDATA%\InvurseChat\Skills, a user's replacing a built-in of the same name), and offers one when the first tool it names is one the PC has: `summarize-document`, `translate-document` and `code-review` (the calendar, web and spreadsheet skills wait for those tools). `/api/skill-library/commands` lists them, so the app's slash commands appear. A skill is picked by its slash command ("Use the X skill for this:") or by scoring: one short yes/no question per skill, with worked examples of made-up skills. The pick is written into the reply as the model's own `use_skill` call and its result (the skill's text, as the Mac's `use_skill` returns it), after the request: the model reads it just as on the Mac, and the chat's cached history is kept (a skill in the system prompt would change the whole prompt). Qwen 3.5 0.8B said yes to nearly every skill for every request (a skill on 25 of 30 other cases), so each skill is also scored once per model against a request that fits nothing ("What is 17 times 23?") and is picked only 0.4 above that: a model whose yes means nothing picks none, as before skills. `vireo-eval` gained five skill cases (`skill_cases.rs`: summarizing minutes, translating a file into a new one, reviewing a diff with a bug, a slash command, and a plain question about a file that takes no skill) and shows the scores behind each choice with `VIREO_DEBUG_CALLS` | All 35. Older 30, before and after: Gemma 4 E2B 26 / 26, E4B 27 / 27, Qwen 3.5 0.8B 20 / 20, 4B 29 / 29, 9B 28 / 29. Skill cases: 3, 5, 2, 5, 4 of 5. Skills taken on other cases: 2, 3, 0, 5, 4, all fitting ones (`summarize-document` for "sum up this email") and none failing. Misses: Gemma 4 E2B scores summarizing low (0.04 for "Can you summarize board-minutes.txt?", after an example that names a file and fits was added; it was lower before) and misses the review's bug; Qwen 0.8B picks no skill (its slash command still works); Qwen 9B takes `summarize-document` for "how long does the bread bake, going by bread.txt". Cost: 1.03 to 1.26 s a case on Gemma 4 E2B, 6.7 to 9.1 s on Qwen 9B, mostly the scoring passes (a change question and three skill questions of ~350 tokens each, read from scratch every time), with longer answers where a skill applies. Next: the questions' shared start kept in the picker's session, so each reads only its request. Results: `evals/skills.json` |
+| 2026-11-11 | The Mac gets the tools: vireo-server's tool loop (`tools.rs`, each family's own call format, token healing), the grammar's scored names, and `vireo-eval` with its 24 cases, ported from the Windows engine (PR #118). On the Mac the server reports `macOS` and answers `get_current_datetime` in local time (`localtime_r`), not UTC | 107 engine tests pass. Eval on the M-series GPU (f16), all five models' checksums as in `evals/MODELS.md` (easy / hard, against the Windows baseline): Gemma 4 E2B 19 (11 / 8; Windows 20), E4B 22 (11 / 11; 22), Qwen 3.5 0.8B 15 (9 / 6; 16), 4B 23 (11 / 12; 23), 9B 23 (12 / 11; 23); the same tool calls in 115 of 120 cases. The two lost points are both `find-then-read`, a close first choice (Windows E4B fails it too) that also fails here in `--exact`, so not the f16 rounding. 0.3-1.3 s a case, against 0.9-5.8 s on the RTX 5060 Laptop. Results in `evals/baseline.json` and `run-baseline.txt` |
+| 2026-11-11 | One workspace for both platforms: the Mac's copy of the engine (`Mac/Engine/`, a day apart) folded back in. The Metal backend comes in as the GPU backend on macOS (`src/metal`, standing in for `cuda` there; its kernels in `kernels/*.metal`), with the Mac's fused gate-up-activation for one token and its prompt batch of 1,024 (512 stays on CUDA) behind `cfg(target_os = "macos")`. vireo-server gains the Mac's server-run file and Git tools (`files.rs`, used when an app doesn't run them itself) and attachments (`attach/`), and keeps approvals, the change tools (app-run only until `files.rs` makes changes), the change check and skills. The Mac app builds and finds `vireo-server` here (`target/release`); `Mac/Engine/` is gone. See HANDOFF.md for where things stand | On Windows: every test passes (engine 70, GPU 11 on the RTX 5060, server 54, eval 9; `files.rs`'s three macOS-only tests run on the Mac), and all 35 eval cases pass or fail exactly as before on every model (Gemma 4 E2B 29, E4B 32, Qwen 3.5 4B 34, 9B 33; `evals/one-engine.json`). Qwen 3.5 0.8B leaves the eval's default models, too small to use the tools well (22 of 35; on request still). Not run here: the Metal build, the Mac's tests and the app's Swift tests |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.

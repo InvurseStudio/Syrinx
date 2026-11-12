@@ -4,14 +4,20 @@
 //! chat template (`tokenizer.chat_template` in its GGUF file) uses, so the model writes
 //! what it was trained on.
 //!
-//! The app runs the PC's tools (`PcTools` in the Windows app) when the server asks
-//! (`client_tool_request`); the server runs its own (the date and time). A tool that
-//! changes something (`asks`) waits for the user's approval first, as the Mac's server
-//! asks for it (`confirm_required`, answered at `/api/agent/confirm`).
+//! The PC's tools (files and Git) run on the server when the chat gives it access
+//! (`access`) and the app doesn't run them itself: the Mac app and this server share the
+//! Mac, so the server reads the files itself (`files.rs`). An app that says it runs them
+//! (`clientTools`, as the Windows app's `PcTools` and the eval's stand-in PC do) runs them
+//! instead, when the server asks (`client_tool_request`). The date and time are always the
+//! server's. A tool that changes something (`asks`) waits for the user's approval first, as
+//! the Mac's server asks for it (`confirm_required`, answered at `/api/agent/confirm`);
+//! those run only in an app that runs them for now, since `files.rs` doesn't make changes
+//! yet.
 
 use vireo_engine::grammar::{Property, RecordStyle, Schema, json_string};
 
 use crate::chat::Family;
+use crate::files::Files;
 use crate::json;
 
 /// What an argument holds.
@@ -33,7 +39,8 @@ pub struct Param {
 /// Who runs a tool.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Runs {
-    /// The app, on the PC (it says which it runs in `clientTools`).
+    /// The app, on the PC (it says which it runs in `clientTools`). In the catalog: a PC
+    /// tool, which this server runs itself when the app doesn't and the chat has access.
     App,
     /// This server.
     Server,
@@ -308,16 +315,27 @@ pub fn all_names() -> Vec<&'static str> {
     catalog().iter().map(|t| t.name).collect()
 }
 
-/// The tools a reply offers: the server's own, and those of the app's that it runs.
-pub fn offered(client_tools: &[String]) -> Vec<Tool> {
+/// The tools a reply offers: the server's own; the PC's that the app runs (its
+/// `clientTools`); and, when the chat reaches files here (`files_here`), the rest of the
+/// PC's, which this server then runs, but for the ones that change files: `files.rs`
+/// doesn't make changes yet, so those come only from an app that runs them.
+pub fn offered(client_tools: &[String], files_here: bool) -> Vec<Tool> {
     catalog()
         .into_iter()
-        .filter(|t| t.runs == Runs::Server || client_tools.iter().any(|c| c == t.name))
+        .filter_map(|mut t| {
+            if t.runs == Runs::App && !client_tools.iter().any(|c| c == t.name) {
+                if !files_here || t.asks.is_some() {
+                    return None;
+                }
+                t.runs = Runs::Server;
+            }
+            Some(t)
+        })
         .collect()
 }
 
 /// The capability list `/api/capabilities` answers with (the app's Settings count them).
-pub fn capabilities_json() -> String {
+pub fn capabilities_json(platform: &str) -> String {
     let items: Vec<String> = catalog()
         .iter()
         .map(|t| {
@@ -329,10 +347,11 @@ pub fn capabilities_json() -> String {
                 None => (t.name.replace('_', " "), "automatic"),
             };
             format!(
-                "{{\"name\":{},\"label\":{},\"description\":{},\"category\":\"{category}\",\"platforms\":[\"windows\"],\"available\":true}}",
+                "{{\"name\":{},\"label\":{},\"description\":{},\"category\":\"{category}\",\"platforms\":[{}],\"available\":true}}",
                 json::string(t.name),
                 json::string(&label),
-                json::string(t.description)
+                json::string(t.description),
+                json::string(platform)
             )
         })
         .collect();
@@ -875,11 +894,12 @@ pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, 
 
 // ---- The server's own tools -------------------------------------------------------------
 
-/// Runs one of the server's own tools.
-pub fn run_here(call: &Call) -> Result<String, String> {
-    match call.tool.as_str() {
-        "get_current_datetime" => Ok(now()),
-        other => Err(format!("{other} isn't one of this server's tools")),
+/// Runs one of the server's own tools, with the files the chat may reach, if any.
+pub fn run_here(call: &Call, files: Option<&Files>) -> Result<String, String> {
+    match (call.tool.as_str(), files) {
+        ("get_current_datetime", _) => Ok(now()),
+        (_, Some(files)) => files.run(call),
+        (other, None) => Err(format!("{other} isn't one of this server's tools")),
     }
 }
 
@@ -945,9 +965,55 @@ fn local_time() -> (u16, u16, u16, u16, u16, u16) {
     (t.year, t.month, t.day, t.day_of_week, t.hour, t.minute)
 }
 
-#[cfg(not(windows))]
+/// The Mac's local time, from `localtime_r` (the user's time zone, as the app shows it).
+#[cfg(target_os = "macos")]
 fn local_time() -> (u16, u16, u16, u16, u16, u16) {
-    // UTC, from the system clock (the Mac's server is the one that runs elsewhere).
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: *const u8,
+    }
+    unsafe extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    let mut tm = Tm {
+        sec: 0,
+        min: 0,
+        hour: 0,
+        mday: 1,
+        mon: 0,
+        year: 70,
+        wday: 4,
+        yday: 0,
+        isdst: 0,
+        gmtoff: 0,
+        zone: std::ptr::null(),
+    };
+    let now = unsafe { time(std::ptr::null_mut()) };
+    unsafe { localtime_r(&now, &mut tm) };
+    (
+        (tm.year + 1900) as u16,
+        (tm.mon + 1) as u16,
+        tm.mday as u16,
+        tm.wday as u16,
+        tm.hour as u16,
+        tm.min as u16,
+    )
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn local_time() -> (u16, u16, u16, u16, u16, u16) {
+    // UTC, from the system clock.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs()) as i64;
@@ -979,7 +1045,7 @@ mod tests {
     use vireo_engine::grammar::Grammar;
 
     fn written(family: Family, text: &str) -> Option<Call> {
-        let tools = offered(&["read_file".into(), "search_files".into()]);
+        let tools = offered(&["read_file".into(), "search_files".into()], false);
         let g = Grammar::new(&call_grammar(family, &tools));
         let mut m = g.matcher();
         assert!(
@@ -1033,7 +1099,7 @@ mod tests {
 
     #[test]
     fn declarations_follow_the_templates() {
-        let tools = offered(&["read_file".into()]);
+        let tools = offered(&["read_file".into()], false);
         let qwen = declarations(Family::Qwen35, &tools);
         assert!(qwen.contains(
             "\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file"
@@ -1094,7 +1160,7 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        let tools = offered(&all);
+        let tools = offered(&all, false);
         let ask = |name: &str| tools.iter().find(|t| t.name == name).unwrap().asks;
         assert_eq!(ask("read_file"), None);
         assert_eq!(
@@ -1107,7 +1173,7 @@ mod tests {
         );
         // Only what the app runs is offered.
         assert!(
-            offered(&["read_file".into()])
+            offered(&["read_file".into()], false)
                 .iter()
                 .all(|t| t.asks.is_none())
         );
@@ -1148,5 +1214,35 @@ mod tests {
                 declared.contains("new_name") && declared.contains("Asks the user for approval")
             );
         }
+    }
+
+    #[test]
+    fn the_pc_tools_run_where_the_app_says() {
+        let runs =
+            |tools: &[Tool], name: &str| tools.iter().find(|t| t.name == name).map(|t| t.runs);
+        // An app that runs them (the Windows app, the eval's stand-in PC) is asked to.
+        let app = offered(&["read_file".into()], false);
+        assert_eq!(runs(&app, "read_file"), Some(Runs::App));
+        assert_eq!(runs(&app, "list_directory"), None);
+        // With access and no client tools (the Mac app), the server runs them all, but for
+        // the ones that change files: files.rs doesn't make changes yet.
+        let here = offered(&[], true);
+        assert_eq!(
+            here.len(),
+            catalog().iter().filter(|t| t.asks.is_none()).count()
+        );
+        assert!(
+            here.iter()
+                .all(|t| t.runs == Runs::Server && t.asks.is_none())
+        );
+        // An app that runs a change tool is still asked to, with access or without.
+        let both = offered(&["write_file".into()], true);
+        assert_eq!(runs(&both, "write_file"), Some(Runs::App));
+        // Without access, only the server's own.
+        let none = offered(&[], false);
+        assert_eq!(
+            none.iter().map(|t| t.name).collect::<Vec<_>>(),
+            ["get_current_datetime"]
+        );
     }
 }
