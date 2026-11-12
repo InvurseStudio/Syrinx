@@ -23,6 +23,11 @@ written on one machine is written for both, and measured with `vireo-eval` on bo
 
 ## After pulling on the Mac
 
+Done on 2026-11-11 for the one-workspace merge (PR #129): every test passes on the Mac
+(engine 69, GPU 12 on the M5 Max, server 58, eval 9; swift test 132), the app builds
+`vireo-server` from the workspace, and the 35 cases on Metal (`evals/mac.json`) match
+Windows but for three that tip between the two GPUs. The steps, for the next time:
+
 1. Move the local, untracked folders that were in `Mac/Engine/` up to the workspace:
    `Mac/Engine/models/` to `VireoPrototype/models/` and `Mac/Engine/reference/` to
    `VireoPrototype/reference/` (git doesn't track them, so they stay behind in the old
