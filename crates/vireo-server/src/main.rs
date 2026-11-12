@@ -24,6 +24,7 @@
 //! Anything else answers 404, which the app takes as "not on this server".
 
 mod attach;
+mod calc;
 mod chat;
 mod files;
 mod http;
@@ -1563,6 +1564,12 @@ fn reply(
     // that start a call are taken away from it.
     let mut may_call = !offered.is_empty();
     let mut brace_tokens: Option<Vec<u32>> = None;
+    // After a tool's result (or the skill written in) the model must say something: its
+    // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
+    // longer list of tools, ended its turn on the result three times in 39 cases,
+    // answering nothing.
+    let mut answer_due = !skill_ids.is_empty();
+    let mut end_tokens: Option<Vec<u32>> = None;
     while generated.len() + call_tokens < max_tokens && !job.stop.load(Ordering::Relaxed) {
         if !may_call && !offered.is_empty() {
             if let Some(t) = start_token {
@@ -1584,10 +1591,21 @@ fn reply(
                 }
             }
         }
+        if answer_due {
+            let ends = end_tokens.get_or_insert_with(|| {
+                (0..tokenizer.vocab_size() as u32)
+                    .filter(|&id| tokenizer.is_end_of_generation(id))
+                    .collect()
+            });
+            for &t in ends.iter() {
+                logits[t as usize] = f32::NEG_INFINITY;
+            }
+        }
         let next = sampler.pick(&logits, &generated);
         if tokenizer.is_end_of_generation(next) {
             break;
         }
+        answer_due = false;
         if debug_calls() && turn_start {
             eprintln!(
                 "[calls] turn starts with {:?}",
@@ -1665,6 +1683,7 @@ fn reply(
             }
             logits = model.feed(kept, &ids)?;
             turn_start = true;
+            answer_due = true;
             continue;
         }
         turn_start = false;
@@ -1891,7 +1910,7 @@ fn pick_groups(
     if tools::GROUP_CHOICES[top].1.is_none() && shares[top] >= 0.7 {
         groups.clear();
     } else if groups.is_empty() {
-        let best = (0..3)
+        let best = (0..tools::GROUP_CHOICES.len() - 1)
             .max_by(|&a, &b| shares[a].total_cmp(&shares[b]))
             .unwrap();
         groups.extend(tools::GROUP_CHOICES[best].1);
@@ -2089,6 +2108,11 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
     }
     let result = match tool.runs {
         tools::Runs::Server => tools::run_here(call, job.files.as_ref()),
+        // The app answers create_docx with the file's path alone; the server words it.
+        tools::Runs::App if call.tool == "create_docx" => {
+            ask_app(&call.tool, &call.args_json(), job)?
+                .map(|path| format!("Word document saved: {}", path.trim()))
+        }
         tools::Runs::App => ask_app(&call.tool, &call.args_json(), job)?,
     };
     Some(result.unwrap_or_else(|e| format!("Error: {e}")))

@@ -50,17 +50,21 @@ pub enum Runs {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Group {
     Files,
+    /// A Git or code project: its status and diff, its tests, build and linter.
     Git,
     Time,
+    /// Arithmetic (`calculate`).
+    Numbers,
 }
 
 /// The question that picks a request's groups (`--tools-shown scored`), each answer's
 /// letter with the group it stands for; `None` is "no tools".
-pub const GROUP_CHOICES: [(&str, Option<Group>); 4] = [
+pub const GROUP_CHOICES: [(&str, Option<Group>); 5] = [
     ("A", Some(Group::Files)),
     ("B", Some(Group::Git)),
     ("C", Some(Group::Time)),
-    ("D", None),
+    ("D", Some(Group::Numbers)),
+    ("E", None),
 ];
 
 /// The question, with worked examples (small models sort far better from examples than
@@ -71,14 +75,15 @@ pub fn group_question(request: &str) -> String {
     format!(
         "Sort each request to an assistant on a PC by what answering it needs.\n\
          A = files or folders on the PC (reading, listing, finding, checking or changing one)\n\
-         B = a Git project (its status, changes or diff)\n\
+         B = a Git or code project (its status, changes, tests or build)\n\
          C = the date or the time now\n\
-         D = nothing: it can be answered directly\n\n\
+         D = arithmetic: totals, percentages, sums\n\
+         E = nothing: it can be answered directly\n\n\
          Request: What's in D:\\Work\\report-q3.docx?\nNeeds: A\n\n\
          Request: What's 15% of 80?\nNeeds: D\n\n\
          Request: Did I commit everything in my website repo?\nNeeds: B\n\n\
          Request: What's the date next Tuesday?\nNeeds: C\n\n\
-         Request: Write a haiku about autumn.\nNeeds: D\n\n\
+         Request: Write a haiku about autumn.\nNeeds: E\n\n\
          Request: Find my tax return somewhere in Documents.\nNeeds: A\n\n\
          Request: Do I have a file named plan.pdf on the Desktop?\nNeeds: A\n\n\
          Request: What time is it?\nNeeds: C\n\n\
@@ -224,6 +229,72 @@ fn catalog() -> Vec<Tool> {
             group: Group::Time,
             asks: None,
         },
+        Tool {
+            name: "calculate",
+            description: "Work out arithmetic exactly. Use it for every total, sum, difference, percentage or average instead of doing the maths yourself, e.g. \"412.50 + 129.30 + 400\" or \"sum([12.40, 8.99, 31.00]) * 1.13\". Dollar signs, thousands commas and % are fine.",
+            params: vec![text(
+                "expression",
+                "Numbers with + - * / % ** and brackets, or round, abs, min, max, sum. For several results, one expression a line.",
+            )],
+            runs: Runs::Server,
+            group: Group::Numbers,
+            asks: None,
+        },
+        // The Windows app's own tools for documents and projects (PcTools), offered when
+        // the app says it runs them. `files.rs` doesn't have them, so on the Mac they wait.
+        Tool {
+            name: "read_spreadsheet",
+            description: "Read an Excel workbook (.xlsx) on this PC: its sheet names, then the cells of its first sheet, row by row.",
+            params: vec![text(
+                "path",
+                "The workbook's path: a full path, or one relative to the home folder (Documents/budget.xlsx).",
+            )],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: None,
+        },
+        Tool {
+            name: "create_docx",
+            description: "Create a Word document (.docx) on this PC from a title and Markdown content (headings, lists, bold). Asks the user for approval.",
+            params: vec![
+                text(
+                    "path",
+                    "Where to save it, ending in .docx: a full path, or one relative to the home folder.",
+                ),
+                text("title", "The document's title."),
+                text("content", "The document's text in Markdown."),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Export a DOCX document",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "run_tests",
+            description: "Run a project's tests, with the test command its project files set up. Use it directly when asked to run tests. Changes nothing, and runs no other command.",
+            params: vec![text("path", "The project's folder.")],
+            runs: Runs::App,
+            group: Group::Git,
+            asks: None,
+        },
+        Tool {
+            name: "run_build",
+            description: "Build a project with the build command its project files set up. Runs no other command.",
+            params: vec![text("path", "The project's folder.")],
+            runs: Runs::App,
+            group: Group::Git,
+            asks: None,
+        },
+        Tool {
+            name: "run_linter",
+            description: "Run a project's linter or format check, as its project files set it up. Changes nothing, and runs no other command.",
+            params: vec![text("path", "The project's folder.")],
+            runs: Runs::App,
+            group: Group::Git,
+            asks: None,
+        },
         // The tools that change files, as the app's PcTools runs them (its undo journal
         // keeps what each reply changed). Their descriptions say they ask, as the Mac's do,
         // so a model calls them when asked instead of asking again in the chat.
@@ -306,9 +377,25 @@ pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
         "rename_file" => format!("Rename {} to {}", arg("path"), arg("new_name")),
         "move_file" => format!("Move {} to {}", arg("source"), arg("destination")),
         "delete_file" => format!("Move {} to the Recycle Bin", arg("path")),
+        "create_docx" => {
+            let path = arg("path");
+            let verb = if exists(&path) { "Replace" } else { "Create" };
+            format!("{verb} the Word document {path}")
+        }
         other => format!("Run {other}"),
     }
 }
+
+/// The app's tools that `files.rs` can run on the server instead, for an app that doesn't
+/// run them (the Mac app).
+const SERVER_FILE_TOOLS: [&str; 6] = [
+    "read_file",
+    "list_directory",
+    "search_files",
+    "file_exists",
+    "git_status",
+    "git_diff",
+];
 
 /// Every tool's name, offered or not.
 pub fn all_names() -> Vec<&'static str> {
@@ -324,7 +411,7 @@ pub fn offered(client_tools: &[String], files_here: bool) -> Vec<Tool> {
         .into_iter()
         .filter_map(|mut t| {
             if t.runs == Runs::App && !client_tools.iter().any(|c| c == t.name) {
-                if !files_here || t.asks.is_some() {
+                if !files_here || t.asks.is_some() || !SERVER_FILE_TOOLS.contains(&t.name) {
                     return None;
                 }
                 t.runs = Runs::Server;
@@ -898,6 +985,7 @@ pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, 
 pub fn run_here(call: &Call, files: Option<&Files>) -> Result<String, String> {
     match (call.tool.as_str(), files) {
         ("get_current_datetime", _) => Ok(now()),
+        ("calculate", _) => crate::calc::calculate_many(call.text("expression").unwrap_or("")),
         (_, Some(files)) => files.run(call),
         (other, None) => Err(format!("{other} isn't one of this server's tools")),
     }
@@ -1120,8 +1208,8 @@ mod tests {
         ));
         assert_eq!(
             tools.len(),
-            2,
-            "read_file, and the server's own date and time"
+            3,
+            "read_file, and the server's own date and time and calculate"
         );
     }
 
@@ -1224,12 +1312,21 @@ mod tests {
         let app = offered(&["read_file".into()], false);
         assert_eq!(runs(&app, "read_file"), Some(Runs::App));
         assert_eq!(runs(&app, "list_directory"), None);
-        // With access and no client tools (the Mac app), the server runs them all, but for
-        // the ones that change files: files.rs doesn't make changes yet.
+        // With access and no client tools (the Mac app), the server runs what files.rs
+        // has: not the changes, nor the app's document and project tools.
         let here = offered(&[], true);
         assert_eq!(
-            here.len(),
-            catalog().iter().filter(|t| t.asks.is_none()).count()
+            here.iter().map(|t| t.name).collect::<Vec<_>>(),
+            [
+                "read_file",
+                "list_directory",
+                "search_files",
+                "file_exists",
+                "git_status",
+                "git_diff",
+                "get_current_datetime",
+                "calculate"
+            ]
         );
         assert!(
             here.iter()
@@ -1242,7 +1339,7 @@ mod tests {
         let none = offered(&[], false);
         assert_eq!(
             none.iter().map(|t| t.name).collect::<Vec<_>>(),
-            ["get_current_datetime"]
+            ["get_current_datetime", "calculate"]
         );
     }
 }
