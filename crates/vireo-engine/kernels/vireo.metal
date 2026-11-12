@@ -1805,6 +1805,191 @@ template [[host_name("attention_decode_wide_f16_128")]] kernel void attention_de
 template [[host_name("attention_decode_wide_f16_256")]] kernel void attention_decode_wide<half, 256>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_wide_f16_512")]] kernel void attention_decode_wide<half, 512>(ARGS, KP, uint, uint);
 
+// One token's attention for all the query heads that share a key/value head (gid.x is
+// the key/value head, gid.y the part of the context): attention_decode_wide's layout (a
+// SIMD group a position, each lane D / 32 of the head), but each key and value row read
+// once for the whole group. Reading it once per query head, as attention_decode_wide does,
+// was the slow part deep in a context: Qwen 3.8 27B's 24 heads over 4 key/value heads at
+// 30K positions took 760 µs a layer, against 280 for the 4 heads alone. A SIMD group
+// holds H heads' outputs; with group / H slices of the heads, the 8 groups are that many
+// slices times 8 / slices streams of positions (every streams-th). The queries, scaled,
+// sit in threadgroup memory. Parts and merging as attention_decode's.
+constant constexpr int GROUP_SCRATCH = 7936;
+// The most parts attention_decode_group merges (the host keeps to it).
+constant constexpr int MAX_GROUP_PARTS = 64;
+template <typename KV, int D, int H>
+kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    device const float* q = ARG_PTR(const float, 0);
+    device const KV* keys = ARG_PTR(const KV, 1);
+    device const KV* values = ARG_PTR(const KV, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const int* pos = ARG_PTR(const int, 4);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const float scale = ARG_F32(9);
+    device float* partial = ARG_PTR(float, 10);
+    device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
+    {
+        const int z = (int)gid.z, nheads = (int)ngrid.x * group;
+        q += (ulong)z * nheads * D;
+        out += (ulong)z * nheads * D;
+        partial += (ulong)z * nheads * ngrid.y * (2 + D);
+        counters += (ulong)z * ngrid.x;
+    }
+    constexpr int SG = 8, DPL = D / 32;
+    // The group's queries, then the streams' outputs being merged: the host keeps
+    // (group + streams) × D within GROUP_SCRATCH.
+    threadgroup float scratch[GROUP_SCRATCH];
+    threadgroup float sm[SG], sl[SG];
+    threadgroup bool last;
+    // SIMD groups past slices × streams (when slices doesn't divide 8) only help merge.
+    const int slices = group / H, streams = SG / slices;
+    const int slice = (int)sg % slices, stream = (int)sg / slices;
+    const bool active = stream < streams;
+    const int len = *pos + 1 + (int)gid.z;
+    const int first = window > 0 ? max(0, len - window) : 0;
+    // A short context in fewer parts (at least min_share positions each): the rest of the
+    // grid has nothing to do, and the merge has less.
+    const int min_share = ARG_INT(12);
+    const int head0 = gid.x * group, part = gid.y;
+    const int parts = clamp((len - first + min_share - 1) / min_share, 1, (int)ngrid.y);
+    if (part >= parts) return;
+    const int share = (len - first + parts - 1) / parts;
+    const int lo = first + part * share, hi = min(len, lo + share);
+    const int kv = gid.x * D + lane * DPL;
+    threadgroup float* qs = scratch;
+    threadgroup float* so = scratch + group * D;
+    for (int i = tid; i < group * D; i += 256) qs[i] = q[head0 * D + i] * scale;
+    BARRIER;
+
+    float m[H], l[H], o[H][DPL];
+    for (int h = 0; h < H; h++) {
+        m[h] = -INFINITY;
+        l[h] = 0.0f;
+        for (int j = 0; j < DPL; j++) o[h][j] = 0.0f;
+    }
+    float qv[H][DPL];
+    for (int h = 0; h < H; h++)
+        for (int j = 0; j < DPL; j++) qv[h][j] = qs[(slice * H + h) * D + lane * DPL + j];
+    for (int at = active ? lo + stream : hi; at < hi; at += streams) {
+        device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
+        device const KV* v = values + ring_row(at, ring) * kv_dim + kv;
+        float kk[DPL], vv[DPL];
+        for (int j = 0; j < DPL; j += 4) {
+            const float4 k4 = load4(k + j);
+            kk[j] = k4.x; kk[j + 1] = k4.y; kk[j + 2] = k4.z; kk[j + 3] = k4.w;
+        }
+        for (int j = 0; j < DPL; j += 4) {
+            const float4 v4 = load4(v + j);
+            vv[j] = v4.x; vv[j + 1] = v4.y; vv[j + 2] = v4.z; vv[j + 3] = v4.w;
+        }
+        float s[H];
+        for (int h = 0; h < H; h++) {
+            float dot = 0.0f;
+            for (int j = 0; j < DPL; j++) dot += qv[h][j] * kk[j];
+            s[h] = dot;
+        }
+        for (int h = 0; h < H; h++) s[h] = simd_sum(s[h]);
+        for (int h = 0; h < H; h++) {
+            const float new_max = max(m[h], s[h]);
+            const float correction = exp(m[h] - new_max);
+            const float p = exp(s[h] - new_max);
+            l[h] = l[h] * correction + p;
+            for (int j = 0; j < DPL; j++) o[h][j] = o[h][j] * correction + p * vv[j];
+            m[h] = new_max;
+        }
+    }
+
+    // Each head in turn: merge its streams, then write it out (one part) or leave the
+    // part's maximum, sum and output in `partial`.
+    for (int h = 0; h < H; h++) {
+        for (int sl_i = 0; sl_i < slices; sl_i++) {
+            const int head = head0 + sl_i * H + h;
+            BARRIER;
+            if (active && slice == sl_i) {
+                if (lane == 0) {
+                    sm[stream] = m[h];
+                    sl[stream] = l[h];
+                }
+                for (int j = 0; j < DPL; j++) so[stream * D + lane * DPL + j] = o[h][j];
+            }
+            BARRIER;
+            float mx = -INFINITY;
+            for (int g = 0; g < streams; g++) mx = max(mx, sm[g]);
+            float total = 0.0f;
+            for (int g = 0; g < streams; g++)
+                if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
+            device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
+            if (parts > 1 && tid == 0) {
+                mine[0] = mx;
+                mine[1] = total;
+            }
+            for (int d = tid; d < D; d += 256) {
+                float acc = 0.0f;
+                for (int g = 0; g < streams; g++)
+                    if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g * D + d];
+                if (parts == 1)
+                    out[head * D + d] = acc / total;
+                else
+                    mine[2 + d] = acc;
+            }
+        }
+    }
+    if (parts == 1) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    BARRIER;
+    if (tid == 0) {
+        const uint done = atomic_fetch_add_explicit(&counters[gid.x], 1u, memory_order_relaxed);
+        last = done == (uint)parts - 1;
+        if (last) atomic_store_explicit(&counters[gid.x], 0u, memory_order_relaxed);
+    }
+    BARRIER;
+    if (!last) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    // Merge the parts: a SIMD group a head, its lanes taking the parts to find their
+    // weights (kept in the scratch), then the head's numbers.
+    for (int hh = (int)sg; hh < group; hh += SG) {
+        const int head = head0 + hh;
+        device const float* all = partial + (ulong)head * parts * (2 + D);
+        threadgroup float* w = scratch + sg * MAX_GROUP_PARTS;
+        float pm = -INFINITY;
+        for (int i = (int)lane; i < parts; i += 32) pm = max(pm, all[i * (2 + D)]);
+        pm = simd_max(pm);
+        float pt = 0.0f;
+        for (int i = (int)lane; i < parts; i += 32) {
+            const float mi = all[i * (2 + D)];
+            const float wi = mi != -INFINITY ? exp(mi - pm) : 0.0f;
+            w[i] = wi;
+            pt += wi * all[i * (2 + D) + 1];
+        }
+        pt = simd_sum(pt);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float acc[DPL];
+        for (int j = 0; j < DPL; j++) acc[j] = 0.0f;
+        for (int i = 0; i < parts; i++) {
+            const float wi = w[i];
+            device const float* row = all + i * (2 + D) + 2;
+            for (int j = 0; j < DPL; j++) acc[j] += wi * row[j * 32 + lane];
+        }
+        for (int j = 0; j < DPL; j++) out[head * D + j * 32 + lane] = acc[j] / pt;
+    }
+}
+
+
+
+template [[host_name("attention_decode_group_f32_256_1")]] kernel void attention_decode_group<float, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f32_256_2")]] kernel void attention_decode_group<float, 256, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f32_256_3")]] kernel void attention_decode_group<float, 256, 3>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f32_256_4")]] kernel void attention_decode_group<float, 256, 4>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f32_512_1")]] kernel void attention_decode_group<float, 512, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f32_512_2")]] kernel void attention_decode_group<float, 512, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f16_256_1")]] kernel void attention_decode_group<half, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f16_256_2")]] kernel void attention_decode_group<half, 256, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f16_256_3")]] kernel void attention_decode_group<half, 256, 3>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f16_256_4")]] kernel void attention_decode_group<half, 256, 4>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f16_512_1")]] kernel void attention_decode_group<half, 512, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_f16_512_2")]] kernel void attention_decode_group<half, 512, 2>(ARGS, KP, uint, uint);
+
 // A prompt's attention, tiled (see attention_tiled in vireo.cu).
 template <typename KV, int LANES, int PER, int CHUNK>
 kernel void attention_tiled(ARGS, KP) {
