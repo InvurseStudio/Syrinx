@@ -410,6 +410,22 @@ speed: 1.4-2.2x the tokens a reply (its answers restate the file or list more; r
 README), and a longer system turn (1,878 tokens against 1,292 and 1,655). Writing: Gemma
 19.5-22.2 tokens/s (lookup), Qwen 27.2-39.5 (its drafting layer, 80-100% taken), Muse
 26.5-35.2 (lookup). Results: `evals/large-models-five-cases.json`.
+The twelve hard cases on all three: Gemma 4 31B 12/12 (6.6 s a case), Qwen 3.8 27B 12/12
+(6.2 s), Muse 11/12 (10.2 s, 20 calls against the others' 15). Muse's miss, three runs of
+three: `follow-up-file` ("And what does plan.md in the same folder say?", after an earlier
+turn that answered from notes.txt with no call in the history) goes straight `to=user`
+without reasoning and makes the file's contents up. `Reasoning strength: medium` doesn't
+change that and slows every other case (it reasons 2-3x longer), so it stays `low`. Muse
+is thorough where the others are quick: `recover` 4 calls in 18.7 s (the others 2 in ~6),
+`three-steps` reads every README. Results: `evals/large-models-hard-cases.json`.
+
+Where a Muse call's ~1 s goes (`VIREO_TIME_LOG`, `read`): the call's scaffolding is fed in
+one ~100 ms read; the path is written a token at a time at 46 ms. Lookup guesses inside the
+call (tried, the calls the same in all 15 cases) saved nothing: a path in the request is
+tokenized after a space (" C") and in the call without, so the chat's runs rarely match.
+Left out. The same log shows ~3.6 s a case in the skill-picking questions before every
+reply, on every model (11 skills, ~330 ms each): the shared start of those questions kept
+in the picker's session is the larger win, for all three.
 
 **What limits speed now, and what's next:**
 
