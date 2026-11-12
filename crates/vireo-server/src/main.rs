@@ -62,6 +62,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
                     [--changes declared|scored|offered] [--skills on|off]
                     [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
+                    [--mtp on|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -85,7 +86,8 @@ reads the address from the \"Listening on\" line.
 pass: every token is still the model's own pick. Gemma 4 only. Without one, --lookup
 guesses up to <n> tokens a round from the chat itself (what followed the last few
 tokens where they appeared before; 3 by default, 0 for none), checked the same way.
-Gemma 4 only.";
+Gemma 4, and Qwen 3.5 on the Mac. A Qwen model with its own multi-token-prediction
+layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac).";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -114,6 +116,9 @@ struct Options {
     /// Guesses a round taken from the chat itself (`--lookup <n>`, 0 for none), for a
     /// model that can go back a few tokens (Gemma 4, Llama) and has no draft model.
     lookup: usize,
+    /// Qwen's multi-token-prediction layer as the draft, where the model has one
+    /// (`--mtp on`, the default; `off` for none).
+    mtp: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -150,6 +155,7 @@ fn main() -> ExitCode {
     let mut draft = None;
     let mut draft_tokens = draft::DEFAULT_GUESSES;
     let mut lookup = draft::DEFAULT_LOOKUP;
+    let mut mtp = true;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -234,6 +240,10 @@ fn main() -> ExitCode {
                 lookup = value.unwrap().parse().unwrap();
                 i += 1;
             }
+            "--mtp" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                mtp = value.map(String::as_str) == Some("on");
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -260,6 +270,7 @@ fn main() -> ExitCode {
         draft,
         draft_tokens,
         lookup,
+        mtp,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -739,6 +750,8 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         .collect();
     let files =
         files::Access::from_request(body.str("access"), folders).map(files::Files::for_user);
+    // `"tools": false`: a plain chat, no tools offered at all (the server's own too).
+    let no_tools = matches!(body.get("tools"), Some(Value::Bool(false)));
     let job = Job {
         system,
         messages,
@@ -748,6 +761,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         out,
         client_tools,
         files,
+        no_tools,
         tool_results: shared.tool_results.clone(),
         approvals: shared.approvals.clone(),
     };
@@ -871,6 +885,8 @@ struct Job {
     /// What the chat may reach on this Mac (its `access`, and `folders`), for the PC tools
     /// the server runs itself; `None` for none.
     files: Option<files::Files>,
+    /// No tools at all (the request's `"tools": false`).
+    no_tools: bool,
     tool_results: ToolWaits,
     approvals: Arc<Approvals>,
 }
@@ -893,6 +909,7 @@ enum Model {
     Gemma4(Gemma4Cuda<'static>),
 }
 
+#[allow(clippy::large_enum_variant)] // a few, for the life of the server
 enum Session {
     Llama(vireo_engine::models::llama_cuda::CudaSession),
     Qwen35(vireo_engine::models::qwen35_cuda::Qwen35CudaSession),
@@ -938,6 +955,12 @@ struct Picker {
     used: u64,
 }
 
+/// Guesses a round from Qwen's multi-token-prediction layer. On Qwen 3.8 27B the first is
+/// right 86% of the time and the first two 64% (`tests/mtp.rs`), but checking 4 tokens
+/// costs 1.8 times one (the few-token products get dear past 3), so 2 a round beat 3:
+/// nine eval cases, alternating, 8.6 / 8.9 s a case against 9.1 / 9.3.
+const MTP_GUESSES: usize = 2;
+
 /// The most picker sessions kept: the change question, the skill questions and the group
 /// question each start their own way.
 const PICKERS: usize = 3;
@@ -963,6 +986,46 @@ fn shared_start(tokens: &[u32], ids: &[u32]) -> usize {
         .take_while(|(a, b)| a == b)
         .count()
         .min(ids.len().saturating_sub(1))
+}
+
+/// With VIREO_TIME_LOG=<file>: each pass through the model (`read`, `read_all`, `next`),
+/// its tokens and milliseconds, a line each, appended. How a reply's time splits between
+/// writing, checking guesses and reading batches of each size (vireo-eval passes the
+/// variable on to the server it starts).
+struct TimeLog(&'static str, usize, std::time::Instant);
+impl TimeLog {
+    /// When logging, the GPU work already queued (a prompt read without logits, a
+    /// checkpoint's copies) finishes first, so its time isn't put down to this pass.
+    fn start(model: &Model, kind: &'static str, n: usize) -> Self {
+        if std::env::var_os("VIREO_TIME_LOG").is_some() {
+            let _ = match model {
+                Model::Llama(m) => m.gpu().synchronize(),
+                Model::Qwen35(m) => m.gpu().synchronize(),
+                Model::Gemma4(m) => m.gpu().synchronize(),
+            };
+        }
+        TimeLog(kind, n, std::time::Instant::now())
+    }
+}
+impl Drop for TimeLog {
+    fn drop(&mut self) {
+        if let Some(path) = std::env::var_os("VIREO_TIME_LOG") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(
+                    f,
+                    "{} {} {:.2}",
+                    self.0,
+                    self.1,
+                    self.2.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
 }
 
 impl Model {
@@ -1090,8 +1153,33 @@ impl Model {
         })
     }
 
+    /// The session chats run in: on a Qwen model with a multi-token-prediction layer
+    /// (and `--mtp on`), one that keeps the layer's cache up, to draft with.
+    fn chat_session(&self, capacity: usize) -> Result<Session, String> {
+        let mut session = self.session(capacity)?;
+        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut session)
+            && options().mtp
+            && m.has_mtp()
+        {
+            m.use_mtp(s).map_err(|e| e.to_string())?;
+        }
+        Ok(session)
+    }
+
+    /// Up to `k` guesses from Qwen's multi-token-prediction layer at the tokens after
+    /// `first` (picked, not read yet); none for a session that doesn't keep it.
+    fn mtp_draft(&self, kept: &mut Kept, first: u32, k: usize) -> Result<Vec<u32>, String> {
+        match (self, &mut kept.session) {
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                m.mtp_draft(s, first, k).map_err(|e| e.to_string())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// The prompt, in batches; the last token's logits.
     fn read(&self, s: &mut Session, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let _t = TimeLog::start(self, "read", ids.len());
         let r = match (self, s) {
             (Model::Llama(m), Session::Llama(s)) => m
                 .forward_batch(s, ids, Logits::Last)
@@ -1110,6 +1198,7 @@ impl Model {
 
     /// Reads `ids`; every one's logits, a row each.
     fn read_all(&self, s: &mut Session, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let _t = TimeLog::start(self, "read_all", ids.len());
         let r = match (self, s) {
             (Model::Llama(m), Session::Llama(s)) => m
                 .forward_batch(s, ids, Logits::All)
@@ -1254,6 +1343,10 @@ impl Model {
                 s.truncate(len);
                 true
             }
+            // Inside the last round read with its DeltaNet steps kept (`keep_steps`).
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                m.rewind(s, len).map_err(|e| e.to_string())?
+            }
             _ => false,
         };
         if ok {
@@ -1360,6 +1453,7 @@ impl Model {
     }
 
     fn next(&self, s: &mut Session, id: u32, logits: &mut [f32]) -> Result<(), String> {
+        let _t = TimeLog::start(self, "next", 1);
         let r = match (self, s) {
             (Model::Llama(m), Session::Llama(s)) => m
                 .forward(s, id, true)
@@ -1395,7 +1489,7 @@ fn engine(
     };
     let loaded = (|| -> Result<(Model, Tokenizer, Family, String), String> {
         let family = Family::of(file.architecture())
-            .ok_or_else(|| format!("{path} isn't a Llama, Qwen 3.5 or Gemma 4 model"))?;
+            .ok_or_else(|| format!("{path} isn't a Llama, Qwen 3.5, Gemma 4 or Muse Glimmer model"))?;
         let tokenizer = Tokenizer::from_gguf(file).map_err(|e| e.to_string())?;
         let gpu = Gpu::open().map_err(|e| format!("No GPU for the engine: {e}"))?;
         let gpu_name = gpu.info.name.clone();
@@ -1411,7 +1505,8 @@ fn engine(
                     m
                 })?)
             }
-            Family::Gemma4 => {
+            // Muse Glimmer runs on Gemma 4's model code (`Config::muse`).
+            Family::Gemma4 | Family::Muse => {
                 Model::Gemma4(Gemma4Cuda::load(file, gpu).map_err(e).map(|mut m| {
                     m.set_precision(precision);
                     m
@@ -1460,7 +1555,7 @@ fn engine(
         },
     };
     // The session for the server's life, made now so a context too large fails here.
-    let mut kept: Option<Kept> = match model.session(context) {
+    let mut kept: Option<Kept> = match model.chat_session(context) {
         Ok(session) => {
             eprintln!(
                 "Chats keep up to {context} tokens ({:.1} GB of the GPU's memory for their cache).",
@@ -1551,7 +1646,7 @@ fn engine(
         };
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         if kept.is_none() {
-            match model.session(context) {
+            match model.chat_session(context) {
                 Ok(session) => {
                     kept = Some(Kept {
                         session,
@@ -1673,7 +1768,11 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
-    let mut offered = tools::offered(&job.client_tools, job.files.is_some());
+    let mut offered = if job.no_tools {
+        Vec::new()
+    } else {
+        tools::offered(&job.client_tools, job.files.is_some())
+    };
     if options().scored_groups
         && !offered.is_empty()
         && let Some(request) = job.messages.last()
@@ -1790,6 +1889,17 @@ fn reply(
     let started = Instant::now();
     // Tool calls: the grammar they're written under, and how one starts.
     let grammar = Grammar::new(&tools::call_grammar(family, &callable));
+    // Muse's recipients without its reasoning (once it has used its budget), and without
+    // tools (once calls are used up, or none are offered).
+    let muse_grammars = (family == Family::Muse).then(|| {
+        (
+            Grammar::new(&tools::muse_call_grammar(&callable, false)),
+            Grammar::new(&tools::muse_call_grammar(&[], true)),
+        )
+    });
+    // Muse writing to itself, and the tokens it has so far this reply.
+    let mut thinking = false;
+    let mut thought = 0usize;
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
@@ -1808,11 +1918,29 @@ fn reply(
         d.start_reply();
     }
     // Without a draft model: guesses from the chat itself, for a model that can go back.
-    let mut lookup = (drafter.is_none()
-        && options().lookup > 0
-        && matches!(model, Model::Gemma4(_) | Model::Llama(_)))
-    .then(|| draft::Lookup::new(options().lookup));
-    let drafting = drafter.is_some() || lookup.is_some();
+    // Qwen goes back through the DeltaNet steps its chat session keeps for short batches:
+    // to draft with its multi-token-prediction layer, or from the chat on a large model.
+    // On a small one a check of a few tokens costs too much against one token for the
+    // chat's guesses to pay (Qwen 3.5 4B, eight eval cases: writing 5.5 → 5.9 s; 27B 58.4
+    // → 52.9 s).
+    let can_go_back = match (model, &mut kept.session) {
+        (Model::Gemma4(_) | Model::Llama(_), _) => true,
+        (Model::Qwen35(m), Session::Qwen35(s))
+            if m.can_rewind() && (s.keeps_mtp() || m.config.dim >= 5120) =>
+        {
+            m.keep_steps(s).map_err(|e| e.to_string())?;
+            true
+        }
+        _ => false,
+    };
+    // Qwen with its multi-token-prediction layer kept up: guesses from that, not the chat.
+    let mtp = drafter.is_none()
+        && can_go_back
+        && matches!(&kept.session, Session::Qwen35(s) if s.keeps_mtp());
+    let mut mtp_stats = (0usize, 0usize); // guessed, taken
+    let mut lookup = (drafter.is_none() && !mtp && options().lookup > 0 && can_go_back)
+        .then(|| draft::Lookup::new(options().lookup));
+    let drafting = drafter.is_some() || lookup.is_some() || mtp;
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
     // longer list of tools, ended its turn on the result three times in 39 cases,
@@ -1822,14 +1950,34 @@ fn reply(
     // `max_tokens` is the model's own writing; calls have their own limits (`MAX_CALLS`,
     // `MAX_CALL_TOKENS`), so a task of many calls still has room to answer.
     while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        // Muse names each message's recipient first. With no call to make, the user: the
+        // model writes to them from here. Otherwise the call's grammar has it choose (the
+        // user is one of its options), below.
+        let muse_turn = family == Family::Muse && turn_start;
+        let may_think = thought < MUSE_THOUGHT_TOKENS;
+        if muse_turn && !may_call && !may_think {
+            let ids = tokenizer.encode(tools::MUSE_TO_USER, false, true);
+            if kept.tokens.len() + ids.len() + 64 > context {
+                break;
+            }
+            logits = model.feed(kept, &ids)?;
+            turn_start = false;
+            continue;
+        }
         let room =
             (max_tokens - generated.len()).min(context.saturating_sub(kept.tokens.len() + 64));
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
-        if ahead.is_empty() {
-            let guesses = match (drafter.as_deref_mut(), lookup.as_mut()) {
-                (Some(d), _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
-                (None, Some(l)) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
+        if ahead.is_empty() && !muse_turn {
+            let guesses = match (drafter.as_deref_mut(), lookup.as_mut(), unread) {
+                (Some(d), _, _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
+                (None, Some(l), _) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
+                // The layer guesses what follows the token just picked.
+                (None, None, Some(first)) if mtp && room > 1 => {
+                    let g = model.mtp_draft(kept, first, MTP_GUESSES.min(room - 1))?;
+                    mtp_stats.0 += g.len();
+                    g
+                }
                 _ => Vec::new(),
             };
             match guesses {
@@ -1859,7 +2007,7 @@ fn reply(
                 }
             }
         }
-        if !may_call && !offered.is_empty() {
+        if !may_call && !offered.is_empty() && !thinking {
             if let Some(t) = start_token {
                 logits[t as usize] = f32::NEG_INFINITY;
             }
@@ -1889,24 +2037,42 @@ fn reply(
                 logits[t as usize] = f32::NEG_INFINITY;
             }
         }
-        let next = sampler.pick(&logits, &generated);
-        if tokenizer.is_end_of_generation(next) {
+        let mut next = sampler.pick(&logits, &generated);
+        // Muse's reasoning ends its message with <|eom|>, here even when it would end its
+        // turn, or runs out of room: its answer is still to come.
+        if thinking
+            && (tokenizer.is_end_of_generation(next) || thought >= MUSE_THOUGHT_TOKENS)
+            && let Some(eom) = start_token
+        {
+            next = eom;
+        }
+        if tokenizer.is_end_of_generation(next) && !muse_turn {
             break;
         }
-        answer_due = false;
+        if !muse_turn && !thinking {
+            answer_due = false;
+        }
         if debug_calls() && turn_start {
             eprintln!(
                 "[calls] turn starts with {:?}",
                 tokenizer.decode(&[next], true)
             );
         }
-        let by_token = Some(next) == start_token;
-        let by_brace = start.brace && turn_start && {
+        let by_token = !muse_turn && Some(next) == start_token;
+        // Muse's message start is the grammar's, as Llama's brace is (its pick is left).
+        let by_brace = muse_turn
+            || start.brace && turn_start && {
             let mut b = Vec::new();
             tokenizer.token_bytes(next, false, &mut b);
             b.first() == Some(&b'{')
         };
-        let opens_call = may_call && (by_token || by_brace);
+        // Muse's message start is always a choice, and its <|eom|> (taken away unless it
+        // may call or is thinking) always opens another message.
+        let opens_call = if family == Family::Muse {
+            muse_turn || by_token
+        } else {
+            may_call && (by_token || by_brace)
+        };
         // The guess is taken when it's the token picked, for plain text; otherwise the
         // model goes back to before the guesses.
         let guessed = !opens_call && ahead.front().is_some_and(|(g, _)| *g == next);
@@ -1921,18 +2087,40 @@ fn reply(
                 model.next(&mut kept.session, next, &mut logits)?;
                 kept.tokens.push(next);
                 call_tokens += 1;
+                if family == Family::Muse {
+                    // Muse's <|eom|>: another message follows, its recipient chosen at its start.
+                    let ids = tokenizer.encode(chat::opening(family), false, true);
+                    logits = model.feed(kept, &ids)?;
+                    call_tokens += ids.len();
+                    turn_start = true;
+                    thinking = false;
+                    continue;
+                }
             }
             let call_started = Instant::now();
+            let grammar = match &muse_grammars {
+                Some((_, answers)) if !may_call => answers,
+                Some((no_thinking, _)) if !may_think => no_thinking,
+                _ => &grammar,
+            };
             let text = write_call(
                 model,
                 kept,
                 tokenizer,
                 trie,
-                &grammar,
+                grammar,
                 &mut logits,
                 &mut call_tokens,
                 context,
             )?;
+            if family == Family::Muse
+                && (text == tools::MUSE_TO_USER || text == tools::MUSE_TO_SELF)
+            {
+                // To the user, or to itself (not shown): plain text from here.
+                turn_start = false;
+                thinking = text == tools::MUSE_TO_SELF;
+                continue;
+            }
             let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
             calls += 1;
@@ -1990,8 +2178,14 @@ fn reply(
             continue;
         }
         turn_start = false;
-        generated.push(next);
-        if Some(next) == channel.0 {
+        if thinking {
+            thought += 1;
+        } else {
+            generated.push(next);
+        }
+        if thinking {
+            // Muse's reasoning: the model's, not the reply's.
+        } else if Some(next) == channel.0 {
             in_channel = true;
         } else if Some(next) == channel.1 {
             in_channel = false;
@@ -2019,6 +2213,9 @@ fn reply(
             if let Some(l) = lookup.as_mut() {
                 l.taken += 1;
             }
+            if mtp {
+                mtp_stats.1 += 1;
+            }
         } else if drafting {
             unread = Some(next);
         } else {
@@ -2037,12 +2234,17 @@ fn reply(
     flush_text(job, &mut pending);
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}{}.",
+        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}{}{}.",
         ids.len(),
         ids.len() - reused,
         (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),
-        generated.len() + call_tokens,
-        (generated.len() + call_tokens) as f64 / seconds.max(1e-9),
+        generated.len() + call_tokens + thought,
+        (generated.len() + call_tokens + thought) as f64 / seconds.max(1e-9),
+        if thought > 0 {
+            format!(", {thought} of them reasoning")
+        } else {
+            String::new()
+        },
         if job.stop.load(Ordering::Relaxed) {
             ", stopped"
         } else {
@@ -2063,10 +2265,16 @@ fn reply(
                 l.guessed,
                 100.0 * l.taken as f64 / l.guessed.max(1) as f64
             )))
+            .or_else(|| mtp.then(|| format!(
+                ", {} of {} guesses from the multi-token-prediction layer taken ({:.0}%)",
+                mtp_stats.1,
+                mtp_stats.0,
+                100.0 * mtp_stats.1 as f64 / mtp_stats.0.max(1) as f64
+            )))
             .unwrap_or_default()
     );
     let _ = job.out.send(Out::Done {
-        tokens: generated.len() + call_tokens,
+        tokens: generated.len() + call_tokens + thought,
         seconds,
     });
     Ok(())
@@ -2154,7 +2362,9 @@ fn yes_share(
         content: question.to_string(),
     };
     let text =
-        chat::history(family, None, "", &[question], &chat::today()) + chat::opening(family) + lead;
+        chat::history(family, None, "", &[question], &chat::today())
+        + chat::answer_opening(family)
+        + lead;
     let ids = tokenizer.encode(&text, false, true);
     let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
     let score = |word: &str| {
@@ -2204,7 +2414,7 @@ fn pick_groups(
     };
     // The answer opens with the examples' "Needs:", so its next token is the letter.
     let text = chat::history(family, None, "", &[question], &chat::today())
-        + chat::opening(family)
+        + chat::answer_opening(family)
         + "Needs:";
     let ids = tokenizer.encode(&text, false, true);
     let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
@@ -2266,6 +2476,9 @@ fn debug_calls() -> bool {
 /// The most tool calls one reply makes: enough for a task over several files (read a
 /// guide, six invoices and a register, work out the sums, write the rows).
 const MAX_CALLS: usize = 20;
+/// The most tokens Muse may reason in, a reply (at "Reasoning strength: low"). Past it
+/// its reasoning message is ended for it and it answers or calls without more.
+const MUSE_THOUGHT_TOKENS: usize = 2048;
 /// The most tokens one call may take: a document's text or a spreadsheet's rows at most.
 const MAX_CALL_TOKENS: usize = 4096;
 /// The most of a tool's result the model reads, in characters (about 2,000 tokens).

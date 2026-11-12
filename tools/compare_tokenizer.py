@@ -28,8 +28,12 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REPO = ROOT.parent
-VIREO = ROOT / "target/release/vireo-cli.exe"
-LLAMA = next(ROOT.glob("reference/llama.cpp-*/llama-tokenize.exe"), None)
+# Windows (.exe, reference/llama.cpp-*) or the Mac (reference/llama-b*).
+VIREO = next((p for p in (ROOT / "target/release/vireo-cli.exe", ROOT / "target/release/vireo-cli")
+              if p.exists()), ROOT / "target/release/vireo-cli")
+LLAMA = next((p for pattern in ("reference/llama.cpp-*/llama-tokenize.exe",
+                                "reference/llama-*/llama-tokenize")
+              for p in ROOT.glob(pattern)), None)
 TEXT_SUFFIXES = {".md", ".txt", ".rs", ".swift", ".cs", ".py", ".js", ".jsx", ".ts", ".json",
                  ".yml", ".yaml", ".toml", ".xaml", ".sh", ".cmd", ".ps1", ".html", ".css", ".csv"}
 
@@ -108,7 +112,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     args = parser.parse_args()
     if LLAMA is None or not VIREO.exists():
-        sys.exit("Needs reference/llama.cpp-*/llama-tokenize.exe and a release vireo-cli.")
+        sys.exit("Needs llama.cpp's llama-tokenize in reference/ and a release vireo-cli.")
 
     texts = list(repo_texts()) + list(fuzz_texts(args.fuzz))
     work = [(name, text, raw) for name, text in texts for raw in (False, True)]
