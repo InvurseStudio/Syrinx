@@ -403,6 +403,13 @@ read all three READMEs, then the right project's Git). Reading the 1,878-token f
 849 tokens/s; writing 26.5-35.2 tokens/s with lookup drafting (53-72% of guesses taken),
 against 22-23 one at a time; each call takes ~0.9-1.4 s to write. Results:
 `evals/muse-glimmer-30B.json`.
+The other two large models on the same five cases and build, side by side: all three 5/5;
+a case Gemma 4 31B 5.9 s, Qwen 3.8 27B 6.8 s, Muse 10.6 s. Muse's extra time is length, not
+speed: 1.4-2.2x the tokens a reply (its answers restate the file or list more; reasoning is
+18-144 of them), six calls on three-steps where the others made three (it read every
+README), and a longer system turn (1,878 tokens against 1,292 and 1,655). Writing: Gemma
+19.5-22.2 tokens/s (lookup), Qwen 27.2-39.5 (its drafting layer, 80-100% taken), Muse
+26.5-35.2 (lookup). Results: `evals/large-models-five-cases.json`.
 
 **What limits speed now, and what's next:**
 
