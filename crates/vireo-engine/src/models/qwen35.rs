@@ -87,7 +87,13 @@ impl Config {
             .map(|a| a.len())
             .ok_or_else(|| Error::Missing("vocabulary".into()))?;
         let c = Self {
-            layers: required(file, "block_count")?,
+            // The larger models (Qwen 3.8 27B) count their multi-token-prediction layer
+            // (`blk.N.nextn.*`, for guessing ahead) in block_count; it isn't one of the
+            // model's own layers.
+            layers: required(file, "block_count")?
+                - file
+                    .arch_u64("nextn_predict_layers")
+                    .map_or(0, |v| v as usize),
             dim,
             ffn_dim: required(file, "feed_forward_length")?,
             vocab,

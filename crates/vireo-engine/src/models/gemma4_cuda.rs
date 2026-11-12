@@ -31,6 +31,8 @@ struct Layer {
     /// The per-layer input's gate, projection and norm (models with them).
     per_layer: Option<(GpuMatrix, GpuMatrix, Buffer)>,
     output_scale: f32,
+    /// Muse Glimmer: the gate on each head's output, sigmoid(attn_gate h).
+    attn_gate: Option<GpuMatrix>,
 }
 
 /// The per-layer inputs (E2B, E4B): their embedding, projection and the projection's norm.
@@ -190,6 +192,11 @@ impl Gemma4CudaSession {
 impl<'a> Gemma4Cuda<'a> {
     pub fn load(file: &'a GgufFile, gpu: Gpu) -> Result<Self> {
         let c = Config::from_gguf(file)?;
+        if c.muse && !cfg!(target_os = "macos") {
+            return Err(Error::Unsupported(
+                "Muse Glimmer on CUDA (its attention gate's kernel is Metal's only so far)".into(),
+            ));
+        }
         let (dim, pl) = (c.dim, c.per_layer_dim);
         let upload = |m: Matrix| GpuMatrix::upload(&gpu, m);
         let up = |v: Vec<f32>| gpu.upload_f32(&v).map_err(gpu_error);
@@ -235,17 +242,39 @@ impl<'a> Gemma4Cuda<'a> {
                     None
                 },
                 output_scale: vector(file, &name("layer_output_scale"), 1).map_or(1.0, |v| v[0]),
+                attn_gate: if c.muse {
+                    Some(upload(matrix(
+                        file,
+                        &name("attn_gate"),
+                        dim,
+                        c.heads * hd,
+                    )?)?)
+                } else {
+                    None
+                },
             });
             if own_kv && layers[i].k.is_none() {
                 return Err(Error::Missing(format!("tensor blk.{i}.attn_k.weight")));
             }
         }
-        if file.tensor("output.weight").is_some() {
+        let separate_output = file.tensor("output.weight").is_some();
+        if separate_output && !c.muse {
             return Err(Error::Unsupported(
                 "Gemma 4 with a separate output matrix".into(),
             ));
         }
         let embedding = matrix(file, "token_embd.weight", dim, c.vocab)?;
+        let output = if separate_output {
+            matrix(file, "output.weight", dim, c.vocab)?
+        } else {
+            embedding
+        };
+        // Muse's logits are scaled before the softcap: the same as scaling the final
+        // norm's weight, which they're a product with.
+        let output_norm: Vec<f32> = vector(file, "output_norm.weight", dim)?
+            .into_iter()
+            .map(|w| w * c.logit_scale)
+            .collect();
         let per_layer_inputs = if pl > 0 {
             let proj_norm: Vec<f32> = vector(file, "per_layer_proj_norm.weight", pl)?
                 .into_iter()
@@ -268,11 +297,11 @@ impl<'a> Gemma4Cuda<'a> {
         };
         Ok(Self {
             precision: Precision::default(),
-            output: upload(embedding)?,
+            output: upload(output)?,
             embedding,
             per_layer_inputs,
             rope_factors,
-            output_norm: up(vector(file, "output_norm.weight", dim)?)?,
+            output_norm: up(output_norm)?,
             layers,
             config: c,
             gpu,
@@ -398,7 +427,14 @@ impl<'a> Gemma4Cuda<'a> {
             );
             let e = &mut s.embedding[i * dim..(i + 1) * dim];
             self.embedding.decode_row(token as usize, e);
-            e.iter_mut().for_each(|v| *v *= embed_scale);
+            // Muse: RMS-normed, no weight; Gemma: times sqrt(dim).
+            let scale = if c.muse {
+                let mean_square = e.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+                1.0 / (mean_square + c.norm_eps).sqrt()
+            } else {
+                embed_scale
+            };
+            e.iter_mut().for_each(|v| *v *= scale);
             if let Some(inputs) = &self.per_layer_inputs {
                 let p = &mut s.per_layer_host[i * pl..(i + 1) * pl];
                 inputs.embedding.decode_row(token as usize, p);
@@ -469,15 +505,18 @@ impl<'a> Gemma4Cuda<'a> {
                     k: s.k_new.ptr(),
                     k_norm: layer.k_norm.as_ref().map(Buffer::ptr),
                     v: s.v_new.ptr(),
-                    v_norm: true,
+                    v_norm: !c.muse,
                     cache: own,
                     heads: c.heads,
                     kv_heads: c.kv_heads_of(l),
                     head_dim: hd,
-                    rope_dims: hd,
+                    // Muse's global layers have no RoPE.
+                    rope_dims: if c.muse && !c.is_swa[l] { 0 } else { hd },
                     rope_base: base,
                     rope_factors: factors,
-                    neox: true,
+                    // Muse's converter permutes its queries and keys for RoPE on pairs of
+                    // neighbours (llama.cpp's "normal"), as for Llama; Gemma's rotates halves.
+                    neox: !c.muse,
                     pos,
                     eps,
                     half_cache: s.half_cache,
@@ -508,9 +547,22 @@ impl<'a> Gemma4Cuda<'a> {
                 hd,
                 kv_dim,
                 c.heads / c.kv_heads_of(l),
-                1.0,
+                // Gemma's queries and keys are normed (scale 1); Muse's queries carry
+                // their scale in q_norm.
+                if c.muse {
+                    1.0 / (hd as f32).sqrt()
+                } else {
+                    1.0
+                },
             )
             .map_err(e)?;
+            if let Some(gate) = &layer.attn_gate {
+                // s.h still holds the layer's normed input; s.gate is free until the FFN.
+                gate.mul(&Input::new(g, s.h.ptr(), t, s.q8.as_ref()), s.gate.ptr())?;
+                #[cfg(target_os = "macos")]
+                g.sigmoid_mul(s.attention.ptr(), s.gate.ptr(), t * c.heads * hd)
+                    .map_err(e)?;
+            }
             layer.o.mul(
                 &Input::new(g, s.attention.ptr(), t, s.q8.as_ref()),
                 s.projected.ptr(),
@@ -534,14 +586,18 @@ impl<'a> Gemma4Cuda<'a> {
             let fused = t == 1
                 && layer
                     .gate
-                    .mul_glu(g, &layer.up, s.h.ptr(), s.gate.ptr(), true)?;
+                    .mul_glu(g, &layer.up, s.h.ptr(), s.gate.ptr(), !c.muse)?;
             #[cfg(not(target_os = "macos"))]
             let fused = false;
             if !fused {
                 let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
                 layer.gate.mul(&h, s.gate.ptr())?;
                 layer.up.mul(&h, s.up.ptr())?;
-                g.geglu(s.gate.ptr(), s.up.ptr(), f, f, t).map_err(e)?;
+                if c.muse {
+                    g.swiglu(s.gate.ptr(), s.up.ptr(), f, f, t).map_err(e)?;
+                } else {
+                    g.geglu(s.gate.ptr(), s.up.ptr(), f, f, t).map_err(e)?;
+                }
             }
             layer.down.mul(
                 &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),

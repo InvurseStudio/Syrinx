@@ -2234,6 +2234,17 @@ kernel void softcap(ARGS, KP) {
 
 // ---- Qwen 3.5 ------------------------------------------------------------------------
 
+// out[i] *= sigmoid(gate[i]): Muse Glimmer's gate on each head's attention output, from its
+// own projection (apply_gate below reads Qwen's, interleaved with the queries).
+kernel void sigmoid_mul(ARGS, KP) {
+    device float* out = ARG_PTR(float, 0);
+    device const float* gate = ARG_PTR(const float, 1);
+    const int n = ARG_INT(2);
+    PER_NUMBER
+    if (i >= n) return;
+    out[i] *= 1.0f / (1.0f + exp(-gate[i]));
+}
+
 kernel void apply_gate(ARGS, KP) {
     device float* out = ARG_PTR(float, 0);
     device const float* query_gate = ARG_PTR(const float, 1);
@@ -2431,6 +2442,10 @@ kernel void delta_net_p(ARGS, KP) {
     const int n = ARG_INT(11), k_heads = ARG_INT(12);
     const float eps = ARG_F32(13);
     const int tokens = ARG_INT(14);
+    // Optional (0 for none): the state before the batch and after each of its tokens but
+    // the last, a whole state a slot, so a draft's rejected guesses can be undone
+    // (Qwen35Cuda::rewind).
+    device float* steps = ARG_PTR(float, 15);
     threadgroup float scratch[32];
     threadgroup float ks[128];
     threadgroup float qs[128];
@@ -2441,6 +2456,10 @@ kernel void delta_net_p(ARGS, KP) {
     for (int r = 0; r < 128 / PARTS; r++)
         if (r < per) st[r] = column[part + PARTS * r];
     const float inv_sqrt_n = 1.0f / sqrt((float)n);
+    const ulong state_size = (ulong)v_heads * n * n, at_column = ((ulong)h * n + j) * n;
+    if (NONNULL(steps))
+        for (int r = 0; r < 128 / PARTS; r++)
+            if (r < per) steps[at_column + part + PARTS * r] = st[r];
     for (int t = 0; t < tokens; t++) {
         device const float* c = conv + (ulong)t * channels;
         float qj = 0.0f, kj = 0.0f;
@@ -2484,6 +2503,11 @@ kernel void delta_net_p(ARGS, KP) {
             const ulong at = (ulong)head_at * n + j;
             const float zj = z[at];
             out[at] = normed * (zj / (1.0f + exp(-zj)));
+        }
+        if (NONNULL(steps) && t + 1 < tokens) {
+            device float* slot = steps + (ulong)(t + 1) * state_size + at_column;
+            for (int r = 0; r < 128 / PARTS; r++)
+                if (r < per) slot[part + PARTS * r] = st[r];
         }
     }
     for (int r = 0; r < 128 / PARTS; r++)

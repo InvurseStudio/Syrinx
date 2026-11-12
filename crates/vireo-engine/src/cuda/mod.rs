@@ -1275,6 +1275,7 @@ impl Gpu {
     }
 
     pub fn delta_net(&self, d: &DeltaNet, tokens: usize) -> Result<()> {
+        assert!(d.steps == 0, "the CUDA DeltaNet keeps no per-token states");
         let n = d.n;
         assert!(
             n <= 256 && n.is_multiple_of(32),
@@ -1586,6 +1587,9 @@ pub struct DeltaNet {
     /// Room for a prompt in chunks ([`Gpu::delta_scratch_floats`]), or 0 to run it token
     /// by token.
     pub scratch: CuDevicePtr,
+    /// The Metal backend's per-token states for undoing a draft's guesses; not built for
+    /// CUDA yet, so always 0 here ([`crate::models::qwen35_cuda::Qwen35Cuda::can_rewind`]).
+    pub steps: CuDevicePtr,
 }
 
 /// Tokens per chunk of a prompt's DeltaNet (DC in vireo.cu).

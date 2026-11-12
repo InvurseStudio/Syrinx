@@ -674,11 +674,16 @@ struct Kernels {
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
     /// with the kernel that rounds the activations.
     matmul_tc: Option<([Pso; 7], Pso)>,
+    /// Adds up matmul_tc's splits (Gpu::matmul_8bit).
+    sum_parts: Option<Pso>,
     /// The same with the wide tile, for long batches (TC_WIDE).
     matmul_tc_wide: Option<[Pso; 7]>,
+    /// The same with 32- and 64-token tiles, for short batches (SMALL_TILES).
+    matmul_tc_small: Option<[[Pso; 7]; 4]>,
     rms_norm: Pso,
     residual_norm: Pso,
     qkv_prep: Pso,
+    sigmoid_mul: Pso,
     attention: Pso,
     attention_h: Pso,
     attention_part: [Pso; 2],
@@ -752,6 +757,8 @@ pub struct Gpu {
     /// attention_part's partial results: room for MAX_PARTS parts of 512-wide heads, 64
     /// heads. All work goes through one queue, so one is enough for every session.
     attention_parts: Buffer,
+    /// matmul_tc's splits' sums (MATMUL_PARTS_BYTES).
+    matmul_parts: Buffer,
     /// attention_decode's count of finished parts, one per head (left at 0).
     attention_counters: Buffer,
     pub info: DeviceInfo,
@@ -792,6 +799,34 @@ fn tensor_tile() -> (u32, u32, u32) {
 /// prompts and tool results, mostly under 1,024 tokens, read 10–20% slower with it.
 const TC_WIDE: u32 = 256;
 const WIDE_TOKENS: usize = 1024;
+/// The short batches' tiles (matmul_tc_t32, matmul_tc_t64): a batch of up to 32 or 64
+/// tokens (a tool result, a new turn, a scoring question) gets a tile of its size, not
+/// 128, so the accelerators don't multiply padding. On the M5 Max, Gemma 4 31B's Q6_K
+/// ffn_up at 16 / 42 / 64 tokens: 0.59 → 0.38-0.42 / 0.60 → 0.46 / 0.62 → 0.51 ms, the
+/// same sums to the bit (each tile's arithmetic is the 128-token one's). 9-64-token reads
+/// in the eval: 31B 15.5 → 10.5 s over nine cases, E2B, E4B and Qwen 3.5 4B 15-25% less.
+/// The product alone (no decoding) takes 0.22 of the 0.42 ms at 32 tokens, so a tile
+/// shape can't do much more: tried 16-128 rows, 4 and 8 SIMD groups, two weight tiles
+/// in turn and the next step's bytes loaded ahead, all level or slower. 96 for 65-96
+/// tokens (ffn_up at 70 / 80 / 96: 0.61 → 0.55, 0.64 → 0.56, 0.64 → 0.58 ms) and 192 for
+/// 129-192 (two tiles of 128 before; ffn_up at 150 / 180: 1.13 → 0.90, 1.13 → 0.93) too;
+/// 97-128 keep the 128-token one.
+const SMALL_TILES: [usize; 4] = [32, 64, 96, 192];
+/// A short batch's product split along the columns (matmul_tc's `splits`, added up by
+/// sum_parts) until there are about SPLIT_TARGET threadgroups: batches of up to
+/// SPLIT_TOKENS (256: ffn_down at 150 tokens 1.19 → 0.89 ms with the 192-token tile), at most MAX_SPLITS parts of at least SPLIT_COLS columns, their sums in a
+/// buffer of MATMUL_PARTS_BYTES. A matrix of few rows and long ones (Gemma 4 31B's
+/// ffn_down, 5,376 × 21,504, and attn_output) otherwise has 168 threadgroups for 40
+/// cores, each walking 168 steps: at 20 / 64 / 100 tokens ffn_down 0.77 → 0.33 / 0.91 →
+/// 0.45 / 1.02 → 0.63 ms, now level with ffn_up (Q6_K, M5 Max); targets of 320 and 640
+/// gave less, 2,560 no more. The sums are added in another order, so the numbers move by
+/// f32 rounding (31B, nine eval cases: one reply worded differently, the same passes);
+/// the same batch on the same build still gives the same bits.
+const SPLIT_TARGET: u32 = 1280;
+const SPLIT_TOKENS: usize = 256;
+const SPLIT_COLS: usize = 1024;
+const MAX_SPLITS: usize = 8;
+const MATMUL_PARTS_BYTES: usize = 32 << 20;
 /// attention_flash's tokens per threadgroup, for head sizes 64, 128, 256 and 512.
 const FLASH_TOKENS: [u32; 4] = [32, 32, 16, 8];
 /// attention_flash2's tokens and threads per threadgroup, for the same head sizes.
@@ -900,9 +935,25 @@ impl Gpu {
             } else {
                 None
             },
+            sum_parts: if tensor_ops {
+                Some(pipeline("sum_parts")?)
+            } else {
+                None
+            },
+            matmul_tc_small: if tensor_ops {
+                Some([
+                    per_kind("matmul_tc_t32")?,
+                    per_kind("matmul_tc_t64")?,
+                    per_kind("matmul_tc_t96")?,
+                    per_kind("matmul_tc_t192")?,
+                ])
+            } else {
+                None
+            },
             rms_norm: pipeline("rms_norm")?,
             residual_norm: pipeline("residual_norm")?,
             qkv_prep: pipeline("qkv_prep")?,
+            sigmoid_mul: pipeline("sigmoid_mul")?,
             attention: pipeline("attention")?,
             attention_h: pipeline("attention_h")?,
             attention_part: [
@@ -1044,10 +1095,12 @@ impl Gpu {
         // A counter a threadgroup column (up to 64 heads) and token (up to 8).
         let attention_counters = Self::alloc_in(&context, 64 * 8 * 4)?;
         attention_counters.write_bytes_at(0, &[0u8; 64 * 8 * 4])?;
+        let matmul_parts = Self::alloc_in(&context, MATMUL_PARTS_BYTES)?;
         Ok(Self {
             context,
             kernels,
             attention_parts,
+            matmul_parts,
             attention_counters,
             info,
         })
@@ -1250,6 +1303,18 @@ impl Gpu {
         };
         let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK * rows_per_warp);
         self.run(kernel, (grid, 1), ROWS_PER_BLOCK * 32, &args)
+    }
+
+    /// Whether `tokens` (2 to [`Gpu::MULTI_TOKENS`]) of a `rows` × `cols` matrix are
+    /// quicker through the short batches' tile ([`Gpu::matmul_8bit`]) than through
+    /// [`Gpu::matvec_multi`]: from 5 tokens, which matvec_few takes in two dispatches
+    /// (each reading the weights), on a large matrix. The tile costs about the same for 2
+    /// to 32 tokens. On the M5 Max at 5 / 8 tokens, Qwen 3.8 27B's Q6_K ffn_gate (89M
+    /// weights) 386 / 666 µs against 260, its Q8_0 ffn_down 390 / 585 against 340,
+    /// Gemma 4 31B's ffn_up (116M) 524 / 906 against 390; smaller matrices (Qwen's attn_qkv,
+    /// 52M, ssm_out, 31M; Gemma's attn_q, 44M) are level or quicker with matvec_few.
+    pub fn tile_beats_few(rows: usize, cols: usize, tokens: usize) -> bool {
+        tokens >= 5 && rows * cols >= 64 << 20
     }
 
     /// The most tokens [`Gpu::matvec_multi`] takes at once (MT in vireo.metal).
@@ -1786,6 +1851,12 @@ impl Gpu {
     }
 
     /// `out ×= sigmoid(gate)`, the gates being the second halves of `[query | gate]`.
+    /// `out[i] *= sigmoid(gate[i])` for `n` numbers (Muse Glimmer's attention gate).
+    pub fn sigmoid_mul(&self, out: CuDevicePtr, gate: CuDevicePtr, n: usize) -> Result<()> {
+        let args = [Arg::Ptr(out), Arg::Ptr(gate), Arg::I32(n as i32)];
+        self.run_per_number(&self.kernels.sigmoid_mul, n, &args)
+    }
+
     pub fn apply_gate(
         &self,
         out: CuDevicePtr,
@@ -1976,7 +2047,12 @@ impl Gpu {
             Arg::I32(d.k_heads as i32),
             Arg::F32(d.eps),
             Arg::I32(tokens as i32),
+            Arg::Ptr(d.steps),
         ];
+        assert!(
+            d.steps == 0 || (n <= 128 && n.is_multiple_of(8)),
+            "state steps are kept by delta_net_8 only"
+        );
         if n <= 128 && n.is_multiple_of(8) {
             // 8 threads to a column of the state: Qwen 3.5 generating ~1.3% faster on the
             // M5 Max than with 4 (delta_net).
@@ -2062,13 +2138,35 @@ impl Gpu {
             _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
         };
         let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
-        let (kernels, tc_tokens) = match &self.kernels.matmul_tc_wide {
-            Some(wide) if tokens >= WIDE_TOKENS => (wide, TC_WIDE),
-            _ => (kernels, tc_tokens),
+        let (kernels, tc_tokens) =
+            match (&self.kernels.matmul_tc_wide, &self.kernels.matmul_tc_small) {
+                (Some(wide), _) if tokens >= WIDE_TOKENS => (wide, TC_WIDE),
+                (_, Some([t32, ..])) if tokens <= SMALL_TILES[0] => (t32, SMALL_TILES[0] as u32),
+                (_, Some([_, t64, ..])) if tokens <= SMALL_TILES[1] => (t64, SMALL_TILES[1] as u32),
+                (_, Some([_, _, t96, _])) if tokens <= SMALL_TILES[2] => {
+                    (t96, SMALL_TILES[2] as u32)
+                }
+                // 129-192: one tile of 192, not two of 128.
+                (_, Some([.., t192])) if tokens > 128 && tokens <= SMALL_TILES[3] => {
+                    (t192, SMALL_TILES[3] as u32)
+                }
+                _ => (kernels, tc_tokens),
+            };
+        let tiles = (rows as u32).div_ceil(tc_rows) * (tokens as u32).div_ceil(tc_tokens);
+        let splits = if tokens <= SPLIT_TOKENS {
+            let by_room = MATMUL_PARTS_BYTES / (rows * tokens * 4);
+            (SPLIT_TARGET.div_ceil(tiles) as usize)
+                .min(cols / SPLIT_COLS)
+                .min(MAX_SPLITS)
+                .min(by_room)
+                .max(1)
+        } else {
+            1
         };
         let grid = (
             (rows as u32).div_ceil(tc_rows),
             (tokens as u32).div_ceil(tc_tokens),
+            splits as u32,
         );
         let args = [
             Arg::Ptr(w),
@@ -2077,8 +2175,32 @@ impl Gpu {
             Arg::I32(rows as i32),
             Arg::I32(cols as i32),
             Arg::I32(tokens as i32),
+            Arg::I32(splits as i32),
+            Arg::Ptr(self.matmul_parts.ptr()),
         ];
-        self.run(&kernels[Self::kind_index(kind)?], grid, 32 * tc_sg, &args)
+        self.run_3d(
+            &kernels[Self::kind_index(kind)?],
+            grid,
+            32 * tc_sg,
+            0,
+            &args,
+        )?;
+        if splits > 1 {
+            let n = rows * tokens;
+            let sum = self
+                .kernels
+                .sum_parts
+                .as_ref()
+                .expect("built with matmul_tc");
+            let args = [
+                Arg::Ptr(self.matmul_parts.ptr()),
+                Arg::Ptr(y),
+                Arg::I32(n as i32),
+                Arg::I32(splits as i32),
+            ];
+            self.run(sum, ((n as u32).div_ceil(256), 1), 256, &args)?;
+        }
+        Ok(())
     }
 
     /// Fills a buffer with zeros.
@@ -2170,6 +2292,9 @@ pub struct DeltaNet {
     /// Room for a prompt in chunks ([`Gpu::delta_scratch_floats`]), or 0 to run it token
     /// by token.
     pub scratch: CuDevicePtr,
+    /// For up to [`Gpu::MULTI_TOKENS`] tokens, room for `tokens` whole states (0 for
+    /// none): the state before the batch, then after each of its tokens but the last.
+    pub steps: CuDevicePtr,
 }
 
 /// Tokens per chunk of a prompt's DeltaNet (DC in vireo.metal: 32, where CUDA's is 64, so

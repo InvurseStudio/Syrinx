@@ -154,7 +154,7 @@ impl<'a> Engine<'a> {
         threads: Option<usize>,
         precision: Precision,
     ) -> Result<Self, String> {
-        if file.architecture() == Some("gemma4") {
+        if matches!(file.architecture(), Some("gemma4" | "muse-glimmer")) {
             if gpu {
                 let device = Gpu::open().map_err(|e| e.to_string())?;
                 return Gemma4Cuda::load(file, device)
@@ -531,7 +531,9 @@ fn perplexity(
         let tokens = &tokens[chunk * context..(chunk + 1) * context];
         let mut session = model.session(context);
         let mut input = tokens.to_vec();
-        if let Some(bos) = tokenizer.bos() {
+        // As llama-perplexity: a chunk starts with BOS only for a model that adds one
+        // (Qwen 3.8 27B names a BOS token but doesn't add it).
+        if let (true, Some(bos)) = (tokenizer.adds_bos(), tokenizer.bos()) {
             input[0] = bos;
         }
         // The first half only gives context; the second half's predictions are scored.
