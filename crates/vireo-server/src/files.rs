@@ -800,6 +800,7 @@ fn optional_arg(call: &Call, name: &str) -> Option<String> {
         .map(|(_, v)| match v {
             Arg::Text(s) => s.clone(),
             Arg::Integer(n) => n.to_string(),
+            Arg::Json(j) => j.clone(),
         })
 }
 

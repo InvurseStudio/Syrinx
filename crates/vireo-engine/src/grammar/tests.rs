@@ -106,6 +106,89 @@ fn arrays_and_nesting() {
     assert!(accepts(&nested, r#"{"rows": [{"x": 1}, {"x": 2}]}"#));
 }
 
+#[test]
+fn values_of_several_kinds_told_apart_by_their_first_byte() {
+    let cell = Schema::AnyOf(vec![
+        Schema::string(),
+        Schema::Number,
+        Schema::Boolean,
+        Schema::Null,
+    ]);
+    let rows = Schema::Array {
+        items: Box::new(Schema::Array {
+            items: Box::new(cell),
+            max_items: None,
+        }),
+        max_items: None,
+    };
+    assert!(accepts(
+        &rows,
+        r#"[["INV-1001", 1234.5, true, null], [], ["x", -3]]"#
+    ));
+    assert!(!accepts(&rows, r#"[[INV-1001]]"#), "a bare word is no value");
+    assert!(!accepts(&rows, r#"[["a" 1]]"#));
+    // Forced text runs up to the choice and no further.
+    let g = Grammar::new(&rows);
+    let mut m = g.matcher();
+    assert!(m.advance_all(b"[["));
+    assert!(m.forced().is_empty());
+    assert!(m.allows(b"12") && m.allows(b"\"") && m.allows(b"false") && !m.allows(b"x"));
+}
+
+#[test]
+fn lists_and_keyed_objects_in_other_punctuation() {
+    // Gemma 4's list: no space after the comma, strings between its quote marks.
+    let q = "<|\"|>";
+    let string = Schema::Seq(vec![
+        Schema::Literal(q.into()),
+        Schema::Text {
+            until: q.into(),
+            max_bytes: Some(100),
+        },
+    ]);
+    let list = Schema::List {
+        items: Box::new(string.clone()),
+        max_items: None,
+        open: b'[',
+        separator: ",".into(),
+        close: b']',
+    };
+    assert!(accepts(&list, &format!("[{q}a{q},{q}b, c{q}]")));
+    assert!(accepts(&list, "[]"));
+    assert!(!accepts(&list, &format!("[{q}a{q}, {q}b{q}]")), "one form of spacing");
+    // An object whose keys are the model's own: `{name:value,...}`.
+    let map = Schema::List {
+        items: Box::new(Schema::Seq(vec![
+            Schema::Text {
+                until: ":".into(),
+                max_bytes: Some(40),
+            },
+            string,
+        ])),
+        max_items: None,
+        open: b'{',
+        separator: ",".into(),
+        close: b'}',
+    };
+    assert!(accepts(&map, &format!("{{client:{q}Acme{q},date:{q}3 Nov{q}}}")));
+    assert!(accepts(&map, "{}"));
+    assert!(!accepts(&map, &format!("{{client:{q}Acme{q},}}")));
+    // JSON's: quoted keys.
+    let json_map = Schema::List {
+        items: Box::new(Schema::Seq(vec![
+            Schema::string(),
+            Schema::Literal(": ".into()),
+            Schema::string(),
+        ])),
+        max_items: None,
+        open: b'{',
+        separator: ", ".into(),
+        close: b'}',
+    };
+    assert!(accepts(&json_map, r#"{"client": "Acme", "amount": "12"}"#));
+    assert!(!accepts(&json_map, r#"{client: "Acme"}"#));
+}
+
 fn tools() -> Schema {
     Schema::tool_call(&[
         ("read_file".into(), read_file()),

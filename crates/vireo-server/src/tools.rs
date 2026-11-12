@@ -26,9 +26,18 @@ pub enum Kind {
     Text,
     #[allow(dead_code)] // for the integer arguments to come (lines, depth)
     Integer,
+    /// One plain value of any kind: text, a number, true or false, or null (to skip): a
+    /// spreadsheet's cell.
+    Cell,
+    /// A list of these.
+    List(&'static Kind),
+    /// An object with these fields.
+    Object(&'static [Param]),
+    /// An object whose keys the model names, each with text: a template's placeholders.
+    Map,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Param {
     pub name: &'static str,
     pub kind: Kind,
@@ -50,6 +59,8 @@ pub enum Runs {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Group {
     Files,
+    /// What Vireo remembers about the user, and their earlier chats.
+    Memory,
     /// A Git or code project: its status and diff, its tests, build and linter.
     Git,
     Time,
@@ -148,11 +159,37 @@ impl Ask {
 }
 
 const fn text(name: &'static str, description: &'static str) -> Param {
+    param(name, Kind::Text, description)
+}
+
+const fn param(name: &'static str, kind: Kind, description: &'static str) -> Param {
     Param {
         name,
-        kind: Kind::Text,
+        kind,
         description,
         required: true,
+    }
+}
+
+/// A spreadsheet's rows: lists of cells.
+const ROWS: Kind = Kind::List(&Kind::List(&Kind::Cell));
+/// A slide of a deck, as `create_pptx` takes it.
+const SLIDE: [Param; 2] = [
+    text("title", "The slide's title."),
+    param(
+        "bullets",
+        Kind::List(&Kind::Text),
+        "The slide's bullet points, each a short line.",
+    ),
+];
+const SLIDES: Kind = Kind::List(&Kind::Object(&SLIDE));
+
+impl Tool {
+    /// Whether it changes the user's files: offered only when a request asks for a change.
+    /// (Remembering asks for approval too, but a request that tells something about the
+    /// user is no request to change a file.)
+    pub fn changes_files(&self) -> bool {
+        self.asks.is_some() && self.group != Group::Memory
     }
 }
 
@@ -272,6 +309,71 @@ fn catalog() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "write_spreadsheet",
+            description: "Write rows of values into an Excel workbook (.xlsx) on this PC, creating the workbook if needed. To add rows to a sheet that already has some (a register, a tracker, a log), set start_cell to \"append\": they go after the last row, in the order of the header's columns. A text value starting with = is a formula, such as =SUM(B2:B9). Other cells are left as they are. Asks the user for approval.",
+            params: vec![
+                text(
+                    "path",
+                    "The workbook's path: a full path, or one relative to the home folder.",
+                ),
+                text(
+                    "start_cell",
+                    "The top-left cell to write from, such as A1, or \"append\" to add the rows after the last one.",
+                ),
+                param(
+                    "rows",
+                    ROWS,
+                    "The rows to write, each a list of cell values (text, numbers, true/false, or null to skip a cell).",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Write to spreadsheets",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "fill_docx_template",
+            description: "Fill a Word template on this PC: replace each {{placeholder}} in a .docx with a value, keeping its formatting, and save the result as a new document. Read the template first to see its placeholders. Asks the user for approval.",
+            params: vec![
+                text("template", "The template's path (.docx)."),
+                text(
+                    "path",
+                    "Where to save the filled document (.docx). A file name on its own saves it in the template's folder.",
+                ),
+                param(
+                    "values",
+                    Kind::Map,
+                    "Each placeholder's name, without the braces, and its text, e.g. {\"client\": \"Acme\", \"date\": \"3 November 2026\"}.",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Fill Word templates",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "create_pptx",
+            description: "Create a PowerPoint deck (.pptx) on this PC from slide titles and bullet points. Asks the user for approval.",
+            params: vec![
+                text(
+                    "path",
+                    "Where to save it, ending in .pptx: a full path, or one relative to the home folder.",
+                ),
+                text("title", "The deck's title, shown on its first slide."),
+                param("slides", SLIDES, "The slides after the title slide."),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Create slide decks",
+                rememberable: true,
+            }),
+        },
+        Tool {
             name: "run_tests",
             description: "Run a project's tests, with the test command its project files set up. Use it directly when asked to run tests. Changes nothing, and runs no other command.",
             params: vec![text("path", "The project's folder.")],
@@ -349,6 +451,47 @@ fn catalog() -> Vec<Tool> {
                 rememberable: true,
             }),
         },
+        // Memory: facts about the user kept by this server for later chats, and the app's
+        // own chats, which it searches.
+        Tool {
+            name: "remember",
+            description: "Save something about the user to remember in later chats: a preference, a fact about them, people or projects that matter to them, where their files are. Use it when they ask you to remember something, or tell you something they will clearly want remembered. One short fact per call. Asks the user for approval.",
+            params: vec![text(
+                "fact",
+                "The fact in one sentence, e.g. \"Prefers metric units.\"",
+            )],
+            runs: Runs::Server,
+            group: Group::Memory,
+            asks: Some(Ask {
+                label: "Remember",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "forget",
+            description: "Delete a remembered fact the user wants forgotten. Asks the user for approval.",
+            params: vec![text(
+                "fact",
+                "The fact to forget, in the words it was saved or close to them.",
+            )],
+            runs: Runs::Server,
+            group: Group::Memory,
+            asks: Some(Ask {
+                label: "Forget",
+                rememberable: false,
+            }),
+        },
+        Tool {
+            name: "search_chats",
+            description: "Search the user's earlier chats with you. Use it first when they refer to a past conversation or to something worked out in one (\"what did we decide about\", \"last time\", \"which did we\"), before searching files. Returns matching chats with dates and excerpts. Never guess what was said earlier.",
+            params: vec![text(
+                "query",
+                "Words that would appear in the earlier chat, e.g. \"Harbor Lane memo budget\".",
+            )],
+            runs: Runs::App,
+            group: Group::Memory,
+            asks: None,
+        },
         Tool {
             name: "delete_file",
             description: "Delete a file on this PC (it goes to the Recycle Bin). Asks the user for approval.",
@@ -382,6 +525,29 @@ pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
             let verb = if exists(&path) { "Replace" } else { "Create" };
             format!("{verb} the Word document {path}")
         }
+        "write_spreadsheet" => {
+            let rows = call
+                .json("rows")
+                .and_then(|r| json::parse(r).ok())
+                .map_or(0, |v| match v {
+                    json::Value::Array(rows) => rows.len(),
+                    _ => 0,
+                });
+            let s = if rows == 1 { "" } else { "s" };
+            if arg("start_cell").eq_ignore_ascii_case("append") {
+                format!("Add {rows} row{s} to {}", arg("path"))
+            } else {
+                format!("Write {rows} row{s} to {}", arg("path"))
+            }
+        }
+        "fill_docx_template" => format!("Fill {} and save it as {}", arg("template"), arg("path")),
+        "create_pptx" => {
+            let path = arg("path");
+            let verb = if exists(&path) { "Replace" } else { "Create" };
+            format!("{verb} the slide deck {path}")
+        }
+        "remember" => format!("Remember: {}", arg("fact")),
+        "forget" => format!("Forget: {}", arg("fact")),
         other => format!("Run {other}"),
     }
 }
@@ -516,31 +682,54 @@ impl J {
     }
 }
 
+/// An argument's JSON schema, as the Mac's server declares it: its type, description,
+/// then its items or properties. A cell (any plain value) is `{}`.
+fn kind_json(kind: Kind, description: Option<&str>) -> J {
+    let kind_name = match kind {
+        Kind::Text => "string",
+        Kind::Integer => "integer",
+        Kind::Cell => return J::Obj(vec![]),
+        Kind::List(_) => "array",
+        Kind::Object(_) | Kind::Map => "object",
+    };
+    let mut fields = vec![("type".to_string(), J::Str(kind_name.into()))];
+    if let Some(d) = description {
+        fields.push(("description".into(), J::Str(d.into())));
+    }
+    match kind {
+        Kind::List(item) => fields.push(("items".into(), kind_json(*item, None))),
+        Kind::Object(params) => {
+            fields.push(("properties".into(), properties_json(params)));
+            fields.push(("required".into(), required_json(params)));
+        }
+        _ => {}
+    }
+    J::Obj(fields)
+}
+
+fn properties_json(params: &[Param]) -> J {
+    J::Obj(
+        params
+            .iter()
+            .map(|p| (p.name.to_string(), kind_json(p.kind, Some(p.description))))
+            .collect(),
+    )
+}
+
+fn required_json(params: &[Param]) -> J {
+    J::Arr(
+        params
+            .iter()
+            .filter(|p| p.required)
+            .map(|p| J::Str(p.name.into()))
+            .collect(),
+    )
+}
+
 /// A tool as the OpenAI-style function declaration Qwen's and Llama's templates write.
 fn declaration(tool: &Tool) -> J {
-    let properties = tool
-        .params
-        .iter()
-        .map(|p| {
-            let kind = match p.kind {
-                Kind::Text => "string",
-                Kind::Integer => "integer",
-            };
-            (
-                p.name.to_string(),
-                J::Obj(vec![
-                    ("type".into(), J::Str(kind.into())),
-                    ("description".into(), J::Str(p.description.into())),
-                ]),
-            )
-        })
-        .collect();
-    let required = tool
-        .params
-        .iter()
-        .filter(|p| p.required)
-        .map(|p| J::Str(p.name.into()))
-        .collect();
+    let properties = properties_json(&tool.params);
+    let required = required_json(&tool.params);
     J::Obj(vec![
         ("type".into(), J::Str("function".into())),
         (
@@ -552,8 +741,8 @@ fn declaration(tool: &Tool) -> J {
                     "parameters".into(),
                     J::Obj(vec![
                         ("type".into(), J::Str("object".into())),
-                        ("properties".into(), J::Obj(properties)),
-                        ("required".into(), J::Arr(required)),
+                        ("properties".into(), properties),
+                        ("required".into(), required),
                     ]),
                 ),
             ]),
@@ -563,12 +752,120 @@ fn declaration(tool: &Tool) -> J {
 
 const QUOTE: &str = "<|\"|>";
 
+fn q(s: &str) -> String {
+    format!("{QUOTE}{s}{QUOTE}")
+}
+
+/// A kind's type as Gemma 4's declarations name it.
+fn gemma_type(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Text | Kind::Cell => "STRING",
+        Kind::Integer => "INTEGER",
+        Kind::List(_) => "ARRAY",
+        Kind::Object(_) | Kind::Map => "OBJECT",
+    }
+}
+
+/// Parameters as Gemma 4's template's `format_parameters` writes them: keys in alphabetical
+/// order, each `name:{description:...,[items or properties],type:...}`.
+fn gemma_properties(params: &[Param]) -> String {
+    let mut params = params.to_vec();
+    params.sort_by_key(|p| p.name);
+    params
+        .iter()
+        .map(|p| gemma_property(p.name, p.kind, p.description))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn gemma_required(params: &[Param]) -> Option<String> {
+    let required: Vec<String> = params
+        .iter()
+        .filter(|p| p.required)
+        .map(|p| q(p.name))
+        .collect();
+    (!required.is_empty()).then(|| format!("required:[{}]", required.join(",")))
+}
+
+fn gemma_property(name: &str, kind: Kind, description: &str) -> String {
+    let mut parts = Vec::new();
+    if !description.is_empty() {
+        parts.push(format!("description:{}", q(description)));
+    }
+    match kind {
+        Kind::List(item) => {
+            if let Some(items) = gemma_items(*item) {
+                parts.push(format!("items:{{{items}}}"));
+            }
+        }
+        Kind::Object(params) => {
+            parts.push(format!("properties:{{{}}}", gemma_properties(params)));
+            parts.extend(gemma_required(params));
+        }
+        // An object without properties: the template lists none.
+        Kind::Map => parts.push("properties:{}".into()),
+        _ => {}
+    }
+    parts.push(format!("type:{}", q(gemma_type(kind))));
+    format!("{name}:{{{}}}", parts.join(","))
+}
+
+/// A list's `items` schema, as the template writes it (its keys in alphabetical order:
+/// items, properties, required, type). None for a cell's empty schema, which it leaves out.
+fn gemma_items(item: Kind) -> Option<String> {
+    match item {
+        Kind::Cell => None,
+        Kind::List(inner) => {
+            // A nested `items` is written as an argument: keys quoted.
+            let mut inner_json = String::new();
+            gemma_argument(&kind_json(*inner, None), &mut inner_json);
+            Some(format!("items:{inner_json},type:{}", q("ARRAY")))
+        }
+        Kind::Object(params) => {
+            let mut parts = vec![format!("properties:{{{}}}", gemma_properties(params))];
+            parts.extend(gemma_required(params));
+            parts.push(format!("type:{}", q("OBJECT")));
+            Some(parts.join(","))
+        }
+        other => Some(format!("type:{}", q(gemma_type(other)))),
+    }
+}
+
+/// A value as the template's `format_argument` writes it (keys quoted, in order).
+fn gemma_argument(value: &J, out: &mut String) {
+    match value {
+        J::Str(s) => out.push_str(&q(s)),
+        J::Arr(items) => {
+            out.push('[');
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                gemma_argument(v, out);
+            }
+            out.push(']');
+        }
+        J::Obj(fields) => {
+            let mut fields: Vec<&(String, J)> = fields.iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push('{');
+            for (i, (k, v)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&q(k));
+                out.push(':');
+                gemma_argument(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 /// Gemma 4's declaration: `declaration:name{description:...,parameters:{...}}`, its own
 /// syntax, keys in alphabetical order.
 fn gemma_declaration(tool: &Tool) -> String {
-    let q = |s: &str| format!("{QUOTE}{s}{QUOTE}");
-    let mut params: Vec<&Param> = tool.params.iter().collect();
-    params.sort_by_key(|p| p.name);
+    let params = &tool.params;
     let mut out = format!(
         "declaration:{}{{description:{}",
         tool.name,
@@ -577,22 +874,7 @@ fn gemma_declaration(tool: &Tool) -> String {
     out.push_str(",parameters:{");
     if !params.is_empty() {
         out.push_str("properties:{");
-        let props: Vec<String> = params
-            .iter()
-            .map(|p| {
-                let kind = match p.kind {
-                    Kind::Text => "STRING",
-                    Kind::Integer => "INTEGER",
-                };
-                format!(
-                    "{}:{{description:{},type:{}}}",
-                    p.name,
-                    q(p.description),
-                    q(kind)
-                )
-            })
-            .collect();
-        out.push_str(&props.join(","));
+        out.push_str(&gemma_properties(params));
         out.push_str("},");
         let required: Vec<String> = tool
             .params
@@ -654,8 +936,120 @@ pub fn declarations(family: Family, tools: &[Tool]) -> String {
 
 // ---- Calling them -----------------------------------------------------------------------
 
-/// The longest text argument, in bytes: a path or a search, not an essay.
-const MAX_ARGUMENT: usize = 2048;
+/// The longest text argument, in bytes: room for a file's or a document's text.
+const MAX_ARGUMENT: usize = 12_000;
+/// The longest cell of a spreadsheet, a placeholder's name, and the most items in a list.
+const MAX_CELL: usize = 1000;
+const MAX_KEY: usize = 100;
+const MAX_ITEMS: usize = 200;
+
+/// A value in JSON, as Llama writes it and Qwen's template writes a structured argument
+/// (`tojson`: ", " and ": ", an object's keys in alphabetical order).
+fn json_value(kind: Kind) -> Schema {
+    match kind {
+        Kind::Text => Schema::String {
+            max_bytes: Some(MAX_ARGUMENT),
+        },
+        Kind::Integer => Schema::Integer,
+        Kind::Cell => Schema::AnyOf(vec![
+            Schema::String {
+                max_bytes: Some(MAX_CELL),
+            },
+            Schema::Number,
+            Schema::Boolean,
+            Schema::Null,
+        ]),
+        Kind::List(item) => Schema::Array {
+            items: Box::new(json_value(*item)),
+            max_items: Some(MAX_ITEMS),
+        },
+        Kind::Object(params) => {
+            let mut params = params.to_vec();
+            params.sort_by_key(|p| p.name);
+            Schema::Object(fields(&params, |p| json_value(p.kind)))
+        }
+        Kind::Map => Schema::List {
+            items: Box::new(Schema::Seq(vec![
+                Schema::String {
+                    max_bytes: Some(MAX_KEY),
+                },
+                Schema::Literal(": ".into()),
+                Schema::String {
+                    max_bytes: Some(MAX_ARGUMENT),
+                },
+            ])),
+            max_items: Some(MAX_ITEMS),
+            open: b'{',
+            separator: ", ".into(),
+            close: b'}',
+        },
+    }
+}
+
+/// Text between Gemma 4's quote marks.
+fn gemma_string(max: usize) -> Schema {
+    Schema::Seq(vec![
+        Schema::Literal(QUOTE.into()),
+        Schema::Text {
+            until: QUOTE.into(),
+            max_bytes: Some(max),
+        },
+    ])
+}
+
+fn gemma_style() -> RecordStyle {
+    RecordStyle {
+        open: "{".into(),
+        key_open: String::new(),
+        key_close: ":".into(),
+        separator: ",".into(),
+        close: "}".into(),
+        json_keys: false,
+    }
+}
+
+/// A value as Gemma 4's template writes a call's arguments (`format_argument`, keys bare):
+/// `<|"|>text<|"|>`, `[a,b]`, `{key:value,...}` in alphabetical order.
+fn gemma_value(kind: Kind) -> Schema {
+    match kind {
+        Kind::Text => gemma_string(MAX_ARGUMENT),
+        Kind::Integer => Schema::Integer,
+        Kind::Cell => Schema::AnyOf(vec![
+            gemma_string(MAX_CELL),
+            Schema::Number,
+            Schema::Boolean,
+            Schema::Null,
+        ]),
+        Kind::List(item) => Schema::List {
+            items: Box::new(gemma_value(*item)),
+            max_items: Some(MAX_ITEMS),
+            open: b'[',
+            separator: ",".into(),
+            close: b']',
+        },
+        Kind::Object(params) => {
+            let mut params = params.to_vec();
+            params.sort_by_key(|p| p.name);
+            Schema::Record {
+                fields: fields(&params, |p| gemma_value(p.kind)),
+                style: gemma_style(),
+            }
+        }
+        Kind::Map => Schema::List {
+            items: Box::new(Schema::Seq(vec![
+                Schema::Text {
+                    until: ":".into(),
+                    max_bytes: Some(MAX_KEY),
+                },
+                gemma_string(MAX_ARGUMENT),
+            ])),
+            max_items: Some(MAX_ITEMS),
+            open: b'{',
+            separator: ",".into(),
+            close: b'}',
+        },
+    }
+}
 
 /// How a call starts: with this special token (the model's), or, for Llama, with a turn
 /// that opens with `{` (the grammar's own first byte).
@@ -700,12 +1094,7 @@ pub fn call_tokens(family: Family) -> &'static [&'static str] {
 pub fn call_grammar(family: Family, tools: &[Tool]) -> Schema {
     match family {
         Family::Llama => {
-            let value = |p: &Param| match p.kind {
-                Kind::Text => Schema::String {
-                    max_bytes: Some(MAX_ARGUMENT),
-                },
-                Kind::Integer => Schema::Integer,
-            };
+            let value = |p: &Param| json_value(p.kind);
             Schema::Seq(vec![
                 Schema::Literal("{\"name\": ".into()),
                 Schema::Branch(
@@ -729,7 +1118,7 @@ pub fn call_grammar(family: Family, tools: &[Tool]) -> Schema {
                     until: END.into(),
                     max_bytes: Some(MAX_ARGUMENT),
                 },
-                Kind::Integer => Schema::Seq(vec![Schema::Integer, Schema::Literal(END.into())]),
+                other => Schema::Seq(vec![json_value(other), Schema::Literal(END.into())]),
             };
             let style = RecordStyle {
                 open: String::new(),
@@ -758,24 +1147,8 @@ pub fn call_grammar(family: Family, tools: &[Tool]) -> Schema {
             ])
         }
         Family::Gemma4 => {
-            let value = |p: &Param| match p.kind {
-                Kind::Text => Schema::Seq(vec![
-                    Schema::Literal(QUOTE.into()),
-                    Schema::Text {
-                        until: QUOTE.into(),
-                        max_bytes: Some(MAX_ARGUMENT),
-                    },
-                ]),
-                Kind::Integer => Schema::Integer,
-            };
-            let style = RecordStyle {
-                open: "{".into(),
-                key_open: String::new(),
-                key_close: ":".into(),
-                separator: ",".into(),
-                close: "}".into(),
-                json_keys: false,
-            };
+            let value = |p: &Param| gemma_value(p.kind);
+            let style = gemma_style();
             Schema::Seq(vec![
                 Schema::Literal("call:".into()),
                 Schema::Branch(
@@ -814,6 +1187,8 @@ fn fields(params: &[Param], value: impl Fn(&Param) -> Schema) -> Vec<Property> {
 pub enum Arg {
     Text(String),
     Integer(i64),
+    /// A list or object (or a number that isn't whole), as compact JSON.
+    Json(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -832,6 +1207,14 @@ impl Call {
         })
     }
 
+    /// A structured argument, as JSON, if the call has it.
+    pub fn json(&self, name: &str) -> Option<&str> {
+        self.args.iter().find_map(|(k, v)| match v {
+            Arg::Json(s) if k == name => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn args_json(&self) -> String {
         let parts: Vec<String> = self
             .args
@@ -840,6 +1223,7 @@ impl Call {
                 let v = match v {
                     Arg::Text(s) => json::string(s),
                     Arg::Integer(n) => n.to_string(),
+                    Arg::Json(j) => j.clone(),
                 };
                 format!("{}:{v}", json::string(k))
             })
@@ -848,8 +1232,54 @@ impl Call {
     }
 }
 
-/// A call written under `call_grammar`, read back. The grammar guarantees its shape.
-pub fn parse_call(family: Family, text: &str) -> Option<Call> {
+/// A JSON value as an argument: text and whole numbers as themselves, the rest as JSON.
+fn json_arg(v: &json::Value) -> Arg {
+    match v {
+        json::Value::String(s) => Arg::Text(s.clone()),
+        json::Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => Arg::Integer(*n as i64),
+        other => Arg::Json(other.to_json()),
+    }
+}
+
+/// A value Gemma 4 wrote (`format_argument`'s syntax), as JSON, and the text after it.
+fn gemma_json(s: &str) -> Option<(String, &str)> {
+    if let Some(rest) = s.strip_prefix(QUOTE) {
+        let (text, after) = rest.split_once(QUOTE)?;
+        return Some((json::string(text), after));
+    }
+    if let Some(mut rest) = s.strip_prefix('[') {
+        let mut items = Vec::new();
+        loop {
+            if let Some(after) = rest.strip_prefix(']') {
+                return Some((format!("[{}]", items.join(",")), after));
+            }
+            let (item, after) = gemma_json(rest)?;
+            items.push(item);
+            rest = after.strip_prefix(',').unwrap_or(after);
+        }
+    }
+    if let Some(mut rest) = s.strip_prefix('{') {
+        let mut fields = Vec::new();
+        loop {
+            if let Some(after) = rest.strip_prefix('}') {
+                return Some((format!("{{{}}}", fields.join(",")), after));
+            }
+            let (key, after) = rest.split_once(':')?;
+            let (value, after) = gemma_json(after)?;
+            fields.push(format!("{}:{value}", json::string(key)));
+            rest = after.strip_prefix(',').unwrap_or(after);
+        }
+    }
+    // A number, true, false or null: up to the next punctuation.
+    let end = s.find([',', '}', ']']).unwrap_or(s.len());
+    let word = s[..end].trim();
+    json::parse(word).ok()?;
+    Some((word.to_string(), &s[end..]))
+}
+
+/// A call written under `call_grammar` for `tools`, read back. The grammar guarantees its
+/// shape.
+pub fn parse_call(family: Family, text: &str, tools: &[Tool]) -> Option<Call> {
     match family {
         Family::Llama => {
             let v = json::parse(text).ok()?;
@@ -857,14 +1287,7 @@ pub fn parse_call(family: Family, text: &str) -> Option<Call> {
             let mut args = Vec::new();
             if let Some(json::Value::Object(params)) = v.get("parameters") {
                 for (k, v) in params {
-                    args.push((
-                        k.clone(),
-                        match v {
-                            json::Value::String(s) => Arg::Text(s.clone()),
-                            json::Value::Number(n) => Arg::Integer(*n as i64),
-                            _ => return None,
-                        },
-                    ));
+                    args.push((k.clone(), json_arg(v)));
                 }
             }
             Some(Call { tool, args })
@@ -872,16 +1295,28 @@ pub fn parse_call(family: Family, text: &str) -> Option<Call> {
         Family::Qwen35 => {
             let rest = text.strip_prefix("\n<function=")?;
             let (tool, mut rest) = rest.split_once(">\n")?;
+            let kind_of = |key: &str| {
+                tools
+                    .iter()
+                    .find(|t| t.name == tool)
+                    .and_then(|t| t.params.iter().find(|p| p.name == key))
+                    .map(|p| p.kind)
+            };
             let mut args = Vec::new();
             while let Some(after) = rest.strip_prefix("<parameter=") {
                 let (key, after) = after.split_once(">\n")?;
                 let (value, after) = after.split_once("\n</parameter>\n")?;
-                args.push((
-                    key.to_string(),
-                    value
+                let arg = match kind_of(key) {
+                    Some(Kind::Text) => Arg::Text(value.to_string()),
+                    // A list or object, in JSON.
+                    Some(Kind::List(_) | Kind::Object(_) | Kind::Map | Kind::Cell) => {
+                        Arg::Json(json::parse(value).ok()?.to_json())
+                    }
+                    _ => value
                         .parse::<i64>()
                         .map_or_else(|_| Arg::Text(value.to_string()), Arg::Integer),
-                ));
+                };
+                args.push((key.to_string(), arg));
                 rest = after;
             }
             Some(Call {
@@ -899,8 +1334,8 @@ pub fn parse_call(family: Family, text: &str) -> Option<Call> {
                     let (value, after) = quoted.split_once(QUOTE)?;
                     (Arg::Text(value.to_string()), after)
                 } else {
-                    let end = after.find([',', '}'])?;
-                    (Arg::Integer(after[..end].parse().ok()?), &after[end..])
+                    let (value, after) = gemma_json(after)?;
+                    (json_arg(&json::parse(&value).ok()?), after)
                 };
                 args.push((key.to_string(), value));
                 rest = after.strip_prefix(',').unwrap_or(after);
@@ -927,7 +1362,7 @@ pub fn call_text(family: Family, call: &Call) -> String {
         .iter()
         .filter_map(|(k, v)| match v {
             Arg::Text(s) => Some((k.as_str(), s.as_str())),
-            Arg::Integer(_) => None,
+            Arg::Integer(_) | Arg::Json(_) => None,
         })
         .collect();
     match family {
@@ -986,6 +1421,8 @@ pub fn run_here(call: &Call, files: Option<&Files>) -> Result<String, String> {
     match (call.tool.as_str(), files) {
         ("get_current_datetime", _) => Ok(now()),
         ("calculate", _) => crate::calc::calculate_many(call.text("expression").unwrap_or("")),
+        ("remember", _) => crate::memory::remember(call.text("fact").unwrap_or("")),
+        ("forget", _) => crate::memory::forget(call.text("fact").unwrap_or("")),
         (_, Some(files)) => files.run(call),
         (other, None) => Err(format!("{other} isn't one of this server's tools")),
     }
@@ -1140,7 +1577,7 @@ mod tests {
             m.advance_all(text.as_bytes()) && m.is_complete(),
             "{family:?}: {text:?}"
         );
-        parse_call(family, text)
+        parse_call(family, text, &tools)
     }
 
     #[test]
@@ -1185,6 +1622,121 @@ mod tests {
         );
     }
 
+    fn written_with(family: Family, names: &[&str], text: &str) -> Option<Call> {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let tools = offered(&names, false);
+        let g = Grammar::new(&call_grammar(family, &tools));
+        let mut m = g.matcher();
+        assert!(
+            m.advance_all(text.as_bytes()) && m.is_complete(),
+            "{family:?}: {text:?}"
+        );
+        parse_call(family, text, &tools)
+    }
+
+    #[test]
+    fn lists_and_objects_in_each_familys_form() {
+        let rows = r#"[["INV-1001",1234.5,null],["x",true]]"#;
+        let spreadsheet = |family, text: &str| {
+            let call = written_with(family, &["write_spreadsheet"], text).unwrap();
+            assert_eq!(call.tool, "write_spreadsheet");
+            assert_eq!(call.text("start_cell"), Some("append"), "{family:?}");
+            assert_eq!(call.json("rows"), Some(rows), "{family:?}");
+            assert_eq!(
+                approval_preview(&call, |_| true),
+                "Add 2 rows to Invoices/R.xlsx"
+            );
+        };
+        spreadsheet(
+            Family::Qwen35,
+            "\n<function=write_spreadsheet>\n<parameter=path>\nInvoices/R.xlsx\n</parameter>\n<parameter=start_cell>\nappend\n</parameter>\n<parameter=rows>\n[[\"INV-1001\", 1234.5, null], [\"x\", true]]\n</parameter>\n</function>\n",
+        );
+        spreadsheet(
+            Family::Gemma4,
+            "call:write_spreadsheet{path:<|\"|>Invoices/R.xlsx<|\"|>,rows:[[<|\"|>INV-1001<|\"|>,1234.5,null],[<|\"|>x<|\"|>,true]],start_cell:<|\"|>append<|\"|>}",
+        );
+        spreadsheet(
+            Family::Llama,
+            r#"{"name": "write_spreadsheet", "parameters": {"path": "Invoices/R.xlsx", "start_cell": "append", "rows": [["INV-1001", 1234.5, null], ["x", true]]}}"#,
+        );
+
+        // A template's values: keys the model names.
+        let values = r#"{"amount":"4,200.00","client name":"Riverside"}"#;
+        for (family, text) in [
+            (
+                Family::Gemma4,
+                "call:fill_docx_template{path:<|\"|>out.docx<|\"|>,template:<|\"|>T.docx<|\"|>,values:{amount:<|\"|>4,200.00<|\"|>,client name:<|\"|>Riverside<|\"|>}}",
+            ),
+            (
+                Family::Qwen35,
+                "\n<function=fill_docx_template>\n<parameter=template>\nT.docx\n</parameter>\n<parameter=path>\nout.docx\n</parameter>\n<parameter=values>\n{\"amount\": \"4,200.00\", \"client name\": \"Riverside\"}\n</parameter>\n</function>\n",
+            ),
+        ] {
+            let call = written_with(family, &["fill_docx_template"], text).unwrap();
+            assert_eq!(call.json("values"), Some(values), "{family:?}");
+            assert_eq!(call.text("template"), Some("T.docx"));
+        }
+
+        // Slides: objects in a list, their keys in alphabetical order.
+        let slides = r#"[{"bullets":["a","b"],"title":"One"}]"#;
+        for (family, text) in [
+            (
+                Family::Gemma4,
+                "call:create_pptx{path:<|\"|>d.pptx<|\"|>,slides:[{bullets:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],title:<|\"|>One<|\"|>}],title:<|\"|>Deck<|\"|>}",
+            ),
+            (
+                Family::Qwen35,
+                "\n<function=create_pptx>\n<parameter=path>\nd.pptx\n</parameter>\n<parameter=title>\nDeck\n</parameter>\n<parameter=slides>\n[{\"bullets\": [\"a\", \"b\"], \"title\": \"One\"}]\n</parameter>\n</function>\n",
+            ),
+        ] {
+            let call = written_with(family, &["create_pptx"], text).unwrap();
+            assert_eq!(call.json("slides"), Some(slides), "{family:?}");
+        }
+        // A slide without its title isn't a call the grammar lets through.
+        let tools = offered(&["create_pptx".into()], false);
+        let g = Grammar::new(&call_grammar(Family::Gemma4, &tools));
+        assert!(!g.matcher().advance_all(
+            "call:create_pptx{path:<|\"|>d.pptx<|\"|>,slides:[{bullets:[]}".as_bytes()
+        ));
+    }
+
+    #[test]
+    fn structured_arguments_are_declared_as_the_templates_do() {
+        let tools = offered(
+            &[
+                "write_spreadsheet".into(),
+                "fill_docx_template".into(),
+                "create_pptx".into(),
+            ],
+            false,
+        );
+        let gemma = declarations(Family::Gemma4, &tools);
+        assert!(gemma.contains(
+            ",items:{items:{},type:<|\"|>ARRAY<|\"|>},type:<|\"|>ARRAY<|\"|>},start_cell:"
+        ));
+        assert!(gemma.contains(
+            "items:{properties:{bullets:{description:<|\"|>The slide's bullet points, each a short line.<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},title:{description:<|\"|>The slide's title.<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>title<|\"|>,<|\"|>bullets<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>}"
+        ));
+        assert!(gemma.contains(",properties:{},type:<|\"|>OBJECT<|\"|>}},required:"));
+        let qwen = declarations(Family::Qwen35, &tools);
+        assert!(qwen.contains(
+            "\"rows\": {\"type\": \"array\", \"description\": \"The rows to write, each a list of cell values (text, numbers, true/false, or null to skip a cell).\", \"items\": {\"type\": \"array\", \"items\": {}}}"
+        ));
+        assert!(qwen.contains("\"values\": {\"type\": \"object\", \"description\":"));
+        assert!(qwen.contains("\"required\": [\"title\", \"bullets\"]}}"));
+    }
+
+    #[test]
+    fn memory_is_offered_without_asking_for_a_change() {
+        let tools = offered(&[], false);
+        let remember = tools.iter().find(|t| t.name == "remember").unwrap();
+        assert!(remember.asks.is_some() && !remember.changes_files());
+        assert_eq!(remember.runs, Runs::Server);
+        assert!(tools.iter().all(|t| t.name != "search_chats"), "the app runs it");
+        let app = offered(&["search_chats".into()], false);
+        assert!(app.iter().any(|t| t.name == "search_chats" && t.runs == Runs::App));
+    }
+
     #[test]
     fn declarations_follow_the_templates() {
         let tools = offered(&["read_file".into()], false);
@@ -1208,8 +1760,8 @@ mod tests {
         ));
         assert_eq!(
             tools.len(),
-            3,
-            "read_file, and the server's own date and time and calculate"
+            5,
+            "read_file, and the server's own date and time, calculate, remember and forget"
         );
     }
 
@@ -1230,7 +1782,7 @@ mod tests {
             let start = call_start(family).token;
             assert!(text.starts_with(start), "{text}");
             assert_eq!(
-                parse_call(family, &text[start.len()..]),
+                parse_call(family, &text[start.len()..], &[]),
                 Some(call.clone()),
                 "{text}"
             );
@@ -1263,7 +1815,7 @@ mod tests {
         assert!(
             offered(&["read_file".into()], false)
                 .iter()
-                .all(|t| t.asks.is_none())
+                .all(|t| !t.changes_files())
         );
 
         let call = |tool: &str, args: &[(&str, &str)]| Call {
@@ -1325,12 +1877,14 @@ mod tests {
                 "git_status",
                 "git_diff",
                 "get_current_datetime",
-                "calculate"
+                "calculate",
+                "remember",
+                "forget"
             ]
         );
         assert!(
             here.iter()
-                .all(|t| t.runs == Runs::Server && t.asks.is_none())
+                .all(|t| t.runs == Runs::Server && !t.changes_files())
         );
         // An app that runs a change tool is still asked to, with access or without.
         let both = offered(&["write_file".into()], true);
@@ -1339,7 +1893,7 @@ mod tests {
         let none = offered(&[], false);
         assert_eq!(
             none.iter().map(|t| t.name).collect::<Vec<_>>(),
-            ["get_current_datetime", "calculate"]
+            ["get_current_datetime", "calculate", "remember", "forget"]
         );
     }
 }

@@ -117,8 +117,10 @@ impl Pc {
         self
     }
 
+    /// Whether the stand-in user approves a call to this tool. Remembering is always
+    /// declined: a fact kept from one case would be in every later case's instructions.
     pub fn approves(&self, tool: &str) -> bool {
-        !self.declines.iter().any(|t| t == tool)
+        !matches!(tool, "remember" | "forget") && !self.declines.iter().any(|t| t == tool)
     }
 
     /// A file's text, by its full path (any case).
