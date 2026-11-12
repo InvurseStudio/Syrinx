@@ -1028,7 +1028,9 @@ kernel void matvec_few(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     template [[host_name("matvec_few" #MT "_q5_k")]] kernel void matvec_few<K_Q5_K, MT, FR>(ARGS, KP, uint, uint); \
     template [[host_name("matvec_few" #MT "_q6_k")]] kernel void matvec_few<K_Q6_K, MT, FR>(ARGS, KP, uint, uint);
 FEW_KINDS(2, 2)
+FEW_KINDS(3, 2)
 FEW_KINDS(4, 2)
+
 
 #define MM_ROWS 128
 #define MM_TOKENS 64
@@ -1539,13 +1541,22 @@ kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
+    // A few tokens at once (gid.z: a draft's guesses, a short batch): each its own query
+    // and output rows, its own length (causal), and its own share of the scratch.
+    {
+        const int z = (int)gid.z, nheads = (int)ngrid.x * HG;
+        q += (ulong)z * nheads * D;
+        out += (ulong)z * nheads * D;
+        partial += (ulong)z * nheads * ngrid.y * (2 + D);
+        counters += (ulong)z * ngrid.x;
+    }
     constexpr int SG = 8, DPL = D / 32;  // SIMD groups; output numbers per lane and head
     threadgroup float qs[HG][D];
     threadgroup float sm[SG], sl[SG];
     threadgroup float so[SG][D];
     threadgroup bool last;
     const int head0 = gid.x * HG, part = gid.y, parts = ngrid.y;
-    const int len = *pos + 1;
+    const int len = *pos + 1 + (int)gid.z;
     const int first = window > 0 ? max(0, len - window) : 0;
     const int share = (len - first + parts - 1) / parts;
     const int lo = first + part * share, hi = min(len, lo + share);
@@ -1687,12 +1698,21 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
+    // A few tokens at once (gid.z: a draft's guesses, a short batch): each its own query
+    // and output rows, its own length (causal), and its own share of the scratch.
+    {
+        const int z = (int)gid.z, nheads = (int)ngrid.x;
+        q += (ulong)z * nheads * D;
+        out += (ulong)z * nheads * D;
+        partial += (ulong)z * nheads * ngrid.y * (2 + D);
+        counters += (ulong)z * ngrid.x;
+    }
     constexpr int SG = 8, DPL = D / 32;
     threadgroup float sm[SG], sl[SG];
     threadgroup float so[SG][D];
     threadgroup bool last;
     const int head = gid.x, part = gid.y, parts = ngrid.y;
-    const int len = *pos + 1;
+    const int len = *pos + 1 + (int)gid.z;
     const int first = window > 0 ? max(0, len - window) : 0;
     const int share = (len - first + parts - 1) / parts;
     const int lo = first + part * share, hi = min(len, lo + share);

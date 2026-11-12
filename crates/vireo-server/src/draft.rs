@@ -150,3 +150,86 @@ fn argmax(logits: &[f32]) -> u32 {
         .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
         .unwrap_or(0) as u32
 }
+
+/// Guessing from the chat itself ("prompt lookup"), with no draft model: where the chat's
+/// last few tokens appeared before, the tokens that followed them there. Replies copy a
+/// lot from their chat (paths, names, a tool result's lines, the question's words), and
+/// checking a few guesses costs the model about what one token does, so each guess
+/// taken is a token nearly for free; one not taken costs little. As with a draft model,
+/// every token is still the model's own pick.
+pub struct Lookup {
+    /// The most tokens guessed a round.
+    pub max: usize,
+    /// This reply's guesses and those taken.
+    pub guessed: usize,
+    pub taken: usize,
+}
+
+/// Guesses a round from the chat when the command line doesn't say (`--lookup`). Gemma 4
+/// E2B on the M5 Max, 200-400-token replies: rewriting a document as a list 217 → 342-358
+/// tokens/s, returning an edited code file 217 → 445, a summary 217 → 212-216, a new story
+/// 219 → 216-217 (E4B: 125 → 165-196, 125 → 209-269, 125 → 128-131, 125 → 122-124).
+pub const DEFAULT_LOOKUP: usize = 3;
+
+/// The longest and shortest runs of the chat's last tokens looked for, longest first.
+const LONGEST_RUN: usize = 4;
+const SHORTEST_RUN: usize = 2;
+
+impl Lookup {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            guessed: 0,
+            taken: 0,
+        }
+    }
+
+    /// Up to `n` guesses at the tokens after `tokens`: what followed the latest earlier
+    /// place the last 4 tokens (or 3, or 2) appeared, at most 3 (2, 1) of them. None when
+    /// they haven't.
+    pub fn guess(&mut self, tokens: &[u32], n: usize) -> Vec<u32> {
+        let out = continuation(tokens, n);
+        self.guessed += out.len();
+        out
+    }
+}
+
+fn continuation(tokens: &[u32], n: usize) -> Vec<u32> {
+    let len = tokens.len();
+    for run in (SHORTEST_RUN..=LONGEST_RUN).rev() {
+        if len <= run {
+            continue;
+        }
+        let tail = &tokens[len - run..];
+        // The latest earlier run with at least one token after it.
+        if let Some(start) = (0..len - run).rev().find(|&s| &tokens[s..s + run] == tail) {
+            // Fewer guesses on a shorter match: a run of 2 is often chance (in new prose a
+            // guess was taken 2% of the time), and each guess checked costs a little.
+            let n = n.min(1 + run - SHORTEST_RUN);
+            let from = start + run;
+            return tokens[from..len.min(from + n)].to_vec();
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guesses_what_followed_the_latest_match() {
+        // ... 7 8 9 10 11 ... 7 8 9 → 10 11 (the run of 3 found, its latest place).
+        let tokens = [1, 7, 8, 9, 5, 6, 2, 7, 8, 9, 10, 11, 12, 3, 7, 8, 9];
+        assert_eq!(continuation(&tokens, 2), vec![10, 11]);
+        // A run of 4: up to 3 guesses, and no further than what's there.
+        let tokens = [1, 2, 3, 4, 5, 6, 1, 2, 3, 4];
+        assert_eq!(continuation(&tokens, 8), vec![5, 6, 1]);
+        // A run of 2: one guess.
+        let tokens = [4, 5, 6, 4, 5];
+        assert_eq!(continuation(&tokens, 5), vec![6]);
+        // A single token's match isn't enough.
+        assert!(continuation(&[1, 2, 3, 9, 3], 3).is_empty());
+        assert!(continuation(&[], 3).is_empty());
+    }
+}
