@@ -30,6 +30,7 @@ mod draft;
 mod files;
 mod http;
 mod json;
+mod memory;
 mod sample;
 mod skills;
 mod store;
@@ -1548,13 +1549,13 @@ fn reply(
     // when the request doesn't ask for a change.
     let mut callable = offered.clone();
     if options().changes != Changes::Offered
-        && offered.iter().any(|t| t.asks.is_some())
+        && offered.iter().any(|t| t.changes_files())
         && let Some(request) = job.messages.last()
         && !asks_for_change(model, kept, tokenizer, family, &request.content)?
     {
-        callable.retain(|t| t.asks.is_none());
+        callable.retain(|t| !t.changes_files());
         if options().changes == Changes::Declared {
-            offered.retain(|t| t.asks.is_none());
+            offered.retain(|t| !t.changes_files());
         }
     }
     // The skill the request asks for, if one fits: its instructions come in as the result
@@ -1588,9 +1589,14 @@ fn reply(
     let declared = tools::declarations(family, &offered);
     // With tools, the system prompt opens with what they're for.
     let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
-        (true, s) => s.map(str::to_string),
+        (true, s) => s.filter(|s| !s.is_empty()).map(str::to_string),
         (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
         (false, _) => Some(tools::PREAMBLE.to_string()),
+    };
+    // What the user asked to be remembered, after the rest (the Mac's order).
+    let system = match (system, memory::instructions()) {
+        (Some(s), Some(m)) => Some(format!("{s}\n\n{m}")),
+        (s, m) => s.or(m),
     };
     // The chat's latest messages that fit with room for the reply.
     let mut first = 0;
@@ -1671,8 +1677,10 @@ fn reply(
     // answering nothing.
     let mut answer_due = !skill_ids.is_empty();
     let mut end_tokens: Option<Vec<u32>> = None;
-    while generated.len() + call_tokens < max_tokens && !job.stop.load(Ordering::Relaxed) {
-        let room = (max_tokens - generated.len() - call_tokens)
+    // `max_tokens` is the model's own writing; calls have their own limits (`MAX_CALLS`,
+    // `MAX_CALL_TOKENS`), so a task of many calls still has room to answer.
+    while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        let room = (max_tokens - generated.len())
             .min(context.saturating_sub(kept.tokens.len() + 64));
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
@@ -1779,7 +1787,7 @@ fn reply(
                 &mut call_tokens,
                 context,
             )?;
-            let call = tools::parse_call(family, &text)
+            let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
             calls += 1;
             let args = call.args_json();
@@ -2095,10 +2103,11 @@ fn debug_calls() -> bool {
     std::env::var_os("VIREO_DEBUG_CALLS").is_some()
 }
 
-/// The most tool calls one reply makes.
-const MAX_CALLS: usize = 6;
-/// The most tokens one call may take: a path or a search, not an essay.
-const MAX_CALL_TOKENS: usize = 1024;
+/// The most tool calls one reply makes: enough for a task over several files (read a
+/// guide, six invoices and a register, work out the sums, write the rows).
+const MAX_CALLS: usize = 20;
+/// The most tokens one call may take: a document's text or a spreadsheet's rows at most.
+const MAX_CALL_TOKENS: usize = 4096;
 /// The most of a tool's result the model reads, in characters (about 2,000 tokens).
 const MAX_RESULT: usize = 8000;
 
@@ -2255,7 +2264,7 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         // The app checks first that the change can be made (the file is there, the name
         // is free), so nobody is asked to approve a guess. An app that can't check says
         // so, and the approval is asked as before.
-        if job.client_tools.iter().any(|t| t == CHECK_CHANGE) {
+        if tool.runs == tools::Runs::App && job.client_tools.iter().any(|t| t == CHECK_CHANGE) {
             let args = format!(
                 "{{\"tool\":{},\"args\":{}}}",
                 json::string(&call.tool),
