@@ -29,6 +29,7 @@ mod hard_cases;
 #[allow(dead_code)]
 mod json;
 mod more_cases;
+mod office_cases;
 mod pc;
 mod skill_cases;
 
@@ -76,7 +77,7 @@ fn category(case: &Case) -> &'static str {
     }
 }
 /// The PC tools the stand-in app runs (its `clientTools`).
-const CLIENT_TOOLS: [&str; 16] = [
+const CLIENT_TOOLS: [&str; 18] = [
     "read_file",
     "list_directory",
     "search_files",
@@ -88,6 +89,8 @@ const CLIENT_TOOLS: [&str; 16] = [
     "move_file",
     "delete_file",
     "read_spreadsheet",
+    "write_spreadsheet",
+    "fill_docx_template",
     "create_docx",
     "run_tests",
     "run_build",
@@ -350,6 +353,12 @@ impl Server {
                 std::env::temp_dir()
                     .join(format!("vireo-eval-approvals-{}.txt", std::process::id())),
             )
+            // Its own memory, which stays empty (the stand-in user declines remembering).
+            .env(
+                "VIREO_MEMORY_FILE",
+                std::env::temp_dir()
+                    .join(format!("vireo-eval-memory-{}.txt", std::process::id())),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -431,8 +440,11 @@ fn ask(port: u16, case: &Case) -> Run {
             )
         })
         .collect();
+    // Office tasks get the app's own budget (the server's default): their answers are
+    // tables over several files, which 400 tokens cut off before the last step.
+    let max_tokens = if case.id.starts_with("office-") { 2048 } else { 400 };
     let body = format!(
-        "{{\"messages\":[{}],\"clientTools\":[{}],\"generation\":{{\"max_tokens\":400,\"temperature\":0}}}}",
+        "{{\"messages\":[{}],\"clientTools\":[{}],\"generation\":{{\"max_tokens\":{max_tokens},\"temperature\":0}}}}",
         messages.join(","),
         tools.join(",")
     );

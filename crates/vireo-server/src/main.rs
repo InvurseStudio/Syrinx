@@ -30,6 +30,7 @@ mod draft;
 mod files;
 mod http;
 mod json;
+mod memory;
 mod sample;
 mod skills;
 mod store;
@@ -60,7 +61,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
                     [--changes declared|scored|offered] [--skills on|off]
-                    [--draft <small-model.gguf>] [--draft-tokens <n>]
+                    [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -81,7 +82,10 @@ reads the address from the \"Listening on\" line.
 
 --draft has a small model of the same family and vocabulary guess the next tokens (Gemma
 4 E2B for 31B), --draft-tokens at a time (2 by default), for the model to check in one
-pass: every token is still the model's own pick. Gemma 4 only.";
+pass: every token is still the model's own pick. Gemma 4 only. Without one, --lookup
+guesses up to <n> tokens a round from the chat itself (what followed the last few
+tokens where they appeared before; 3 by default, 0 for none), checked the same way.
+Gemma 4 only.";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -107,6 +111,9 @@ struct Options {
     /// A draft model to guess tokens with (`--draft`), and how many a round.
     draft: Option<String>,
     draft_tokens: usize,
+    /// Guesses a round taken from the chat itself (`--lookup <n>`, 0 for none), for a
+    /// model that can go back a few tokens (Gemma 4, Llama) and has no draft model.
+    lookup: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -142,6 +149,7 @@ fn main() -> ExitCode {
     let mut use_skills = true;
     let mut draft = None;
     let mut draft_tokens = draft::DEFAULT_GUESSES;
+    let mut lookup = draft::DEFAULT_LOOKUP;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -218,6 +226,14 @@ fn main() -> ExitCode {
                 draft_tokens = value.unwrap().parse().unwrap();
                 i += 1;
             }
+            "--lookup"
+                if value
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .is_some_and(|n| n <= 8) =>
+            {
+                lookup = value.unwrap().parse().unwrap();
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -243,6 +259,7 @@ fn main() -> ExitCode {
         skills: use_skills,
         draft,
         draft_tokens,
+        lookup,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -890,11 +907,17 @@ struct Kept {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
     checkpoint: Option<Qwen35Checkpoint>,
+    /// Qwen: its DeltaNet layers where a prompt parted from the one before (for a new
+    /// chat, the end of the system prompt and tools it shares with the last), so the
+    /// next new chat doesn't read them again.
+    base: Option<Qwen35Checkpoint>,
     /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
     scratch: Option<Qwen35Checkpoint>,
-    /// A small session apart, for questions the server asks the model itself (which tools a
-    /// request needs), so the chat's own cache is left as it is.
-    picker: Option<Session>,
+    /// Small sessions apart, for questions the server asks the model itself (which tools a
+    /// request needs, whether a skill fits), so the chat's own cache is left as it is.
+    /// One a kind of question (up to [`PICKERS`]), each going on from the start its last
+    /// question shares with the next ([`Model::ask`]).
+    pickers: Vec<Picker>,
     /// Each skill's share of yes for a request that fits no skill, by its question: this
     /// model's bias, scored once (`pick_skill`).
     skill_controls: HashMap<String, f64>,
@@ -903,6 +926,24 @@ struct Kept {
     /// since its saved state can only be loaded whole.
     history_end: usize,
 }
+
+/// A session for the server's own questions, and what's in it.
+struct Picker {
+    session: Session,
+    /// The tokens in the session: the last question read.
+    tokens: Vec<u32>,
+    /// Qwen: its DeltaNet layers where the last two questions part (their shared start).
+    checkpoint: Option<Qwen35Checkpoint>,
+    /// When it was last used (a count of questions), to reuse the oldest.
+    used: u64,
+}
+
+/// The most picker sessions kept: the change question, the skill questions and the group
+/// question each start their own way.
+const PICKERS: usize = 3;
+/// A question goes to a new or the oldest picker unless one shares at least this many
+/// tokens with it (more than the chat template's opening).
+const PICKER_MIN_SHARED: usize = 48;
 
 /// The context when the model's file doesn't say what it was trained for.
 const DEFAULT_CONTEXT: usize = 8192;
@@ -947,7 +988,79 @@ impl Model {
         Ok(n)
     }
 
-    /// Empties a session (the picker's, before each question).
+    /// Reads a question of the server's own (`ids`, from its start) in a picker session,
+    /// reading only what it doesn't share with the last question there; the last token's
+    /// logits. Gemma and Llama go back to the shared start; Qwen, whose DeltaNet state
+    /// can't be cut back, to a checkpoint saved where the last two questions parted (the
+    /// skill questions share their worked examples, ~230 tokens, and differ after).
+    fn ask(&self, kept: &mut Kept, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let count = kept.pickers.iter().map(|p| p.used).max().unwrap_or(0) + 1;
+        let best = (0..kept.pickers.len())
+            .max_by_key(|&i| shared_start(&kept.pickers[i].tokens, ids))
+            .filter(|&i| shared_start(&kept.pickers[i].tokens, ids) >= PICKER_MIN_SHARED);
+        let at = match best {
+            Some(i) => i,
+            None if kept.pickers.len() < PICKERS => {
+                kept.pickers.push(Picker {
+                    session: self.session(1024)?,
+                    tokens: Vec::new(),
+                    checkpoint: None,
+                    used: 0,
+                });
+                kept.pickers.len() - 1
+            }
+            None => (0..kept.pickers.len())
+                .min_by_key(|&i| kept.pickers[i].used)
+                .unwrap(),
+        };
+        let p = &mut kept.pickers[at];
+        p.used = count;
+        let shared = shared_start(&p.tokens, ids);
+        let mut from = match (self, &mut p.session) {
+            (Model::Llama(_), Session::Llama(s)) => {
+                s.truncate(shared);
+                shared
+            }
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(shared),
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                if shared == s.len() {
+                    shared
+                } else if let Some(cp) = p.checkpoint.as_ref().filter(|c| c.len() <= shared) {
+                    m.restore(s, cp).map_err(e)?;
+                    cp.len()
+                } else {
+                    m.reset(s).map_err(e)?;
+                    p.checkpoint = None;
+                    0
+                }
+            }
+            _ => unreachable!("a session belongs to its model"),
+        };
+        // Qwen: a checkpoint where this question parts from the last, a few tokens early
+        // (the next may part a token sooner), if it's well past where reading starts.
+        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut p.session) {
+            let mark = shared.saturating_sub(8);
+            if mark >= from + 32 {
+                m.forward_batch(s, &ids[from..mark], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut p.checkpoint).map_err(e)?;
+                from = mark;
+            }
+        }
+        p.tokens.clear();
+        let logits = self.read(&mut p.session, &ids[from..]);
+        if logits.is_ok() {
+            p.tokens.extend_from_slice(ids);
+        } else {
+            // Unknown contents: start over next time.
+            p.checkpoint = None;
+            self.empty(&mut p.session)?;
+        }
+        logits
+    }
+
+    /// Empties a session.
     fn empty(&self, s: &mut Session) -> Result<(), String> {
         match (self, s) {
             (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
@@ -1079,15 +1192,34 @@ impl Model {
                 } else if let Some(cp) = kept.checkpoint.as_ref().filter(|c| c.len() <= shared) {
                     m.restore(s, cp).map_err(e)?;
                     cp.len()
+                } else if let Some(cp) = kept.base.as_ref().filter(|c| c.len() <= shared) {
+                    m.restore(s, cp).map_err(e)?;
+                    cp.len()
                 } else {
                     m.reset(s).map_err(e)?;
                     kept.checkpoint = None;
+                    kept.base = None;
                     0
                 }
             }
             _ => unreachable!("a session belongs to its model"),
         };
         kept.tokens.truncate(from);
+        let reused = from;
+        // Qwen, read from the start again: a checkpoint where this prompt parts from the
+        // last (a few tokens early, as the next may part a token sooner), when that's before
+        // the history's end: the system prompt and tools a new chat shares.
+        let mut from = from;
+        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut kept.session) {
+            let base_at = shared.saturating_sub(8);
+            if kept.base.is_none() && base_at >= from + 64 && base_at < mark {
+                m.forward_batch(s, &ids[from..base_at], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut kept.base).map_err(e)?;
+                kept.tokens.extend_from_slice(&ids[from..base_at]);
+                from = base_at;
+            }
+        }
         // Qwen: the history read on its own, and its DeltaNet saved where the next
         // turn's prompt will part from this one.
         let mut start = from;
@@ -1102,7 +1234,7 @@ impl Model {
         let logits = self.read(&mut kept.session, &ids[start..])?;
         kept.tokens.extend_from_slice(&ids[from..]);
         kept.history_end = mark;
-        Ok((logits, from))
+        Ok((logits, reused))
     }
 
     /// Reads `ids` after what the session holds; the last one's logits.
@@ -1135,11 +1267,12 @@ impl Model {
     fn reusable(&self, kept: &Kept, ids: &[u32]) -> usize {
         let shared = shared_start(&kept.tokens, ids);
         match &kept.session {
-            Session::Qwen35(s) if shared != s.len() => kept
-                .checkpoint
-                .as_ref()
+            Session::Qwen35(s) if shared != s.len() => [&kept.checkpoint, &kept.base]
+                .into_iter()
+                .flatten()
                 .map(|c| c.len())
                 .filter(|&n| n <= shared)
+                .max()
                 .unwrap_or(0),
             _ => shared,
         }
@@ -1198,6 +1331,7 @@ impl Model {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 s.import(state).map_err(e)?;
                 m.save(s, &mut kept.checkpoint).map_err(e)?;
+                kept.base = None;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1216,6 +1350,7 @@ impl Model {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 m.reset(s).map_err(|e| e.to_string())?;
                 kept.checkpoint = None;
+                kept.base = None;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1335,8 +1470,9 @@ fn engine(
                 session,
                 tokens: Vec::new(),
                 checkpoint: None,
+                base: None,
                 scratch: None,
-                picker: None,
+                pickers: Vec::new(),
                 skill_controls: HashMap::new(),
                 history_end: 0,
             })
@@ -1421,8 +1557,9 @@ fn engine(
                         session,
                         tokens: Vec::new(),
                         checkpoint: None,
+                        base: None,
                         scratch: None,
-                        picker: None,
+                        pickers: Vec::new(),
                         skill_controls: HashMap::new(),
                         history_end: 0,
                     })
@@ -1548,13 +1685,13 @@ fn reply(
     // when the request doesn't ask for a change.
     let mut callable = offered.clone();
     if options().changes != Changes::Offered
-        && offered.iter().any(|t| t.asks.is_some())
+        && offered.iter().any(|t| t.changes_files())
         && let Some(request) = job.messages.last()
         && !asks_for_change(model, kept, tokenizer, family, &request.content)?
     {
-        callable.retain(|t| t.asks.is_none());
+        callable.retain(|t| !t.changes_files());
         if options().changes == Changes::Declared {
-            offered.retain(|t| t.asks.is_none());
+            offered.retain(|t| !t.changes_files());
         }
     }
     // The skill the request asks for, if one fits: its instructions come in as the result
@@ -1588,9 +1725,14 @@ fn reply(
     let declared = tools::declarations(family, &offered);
     // With tools, the system prompt opens with what they're for.
     let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
-        (true, s) => s.map(str::to_string),
+        (true, s) => s.filter(|s| !s.is_empty()).map(str::to_string),
         (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
         (false, _) => Some(tools::PREAMBLE.to_string()),
+    };
+    // What the user asked to be remembered, after the rest (the Mac's order).
+    let system = match (system, memory::instructions()) {
+        (Some(s), Some(m)) => Some(format!("{s}\n\n{m}")),
+        (s, m) => s.or(m),
     };
     // The chat's latest messages that fit with room for the reply.
     let mut first = 0;
@@ -1651,7 +1793,7 @@ fn reply(
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
-    let (mut calls, mut call_tokens) = (0usize, 0usize);
+    let (mut calls, mut call_tokens, mut repeats) = (0usize, 0usize, 0usize);
     let mut turn_start = true;
     // Once calls are used up (or the model repeats one), it may only answer: the tokens
     // that start a call are taken away from it.
@@ -1665,21 +1807,33 @@ fn reply(
     if let Some(d) = drafter.as_deref_mut() {
         d.start_reply();
     }
+    // Without a draft model: guesses from the chat itself, for a model that can go back.
+    let mut lookup = (drafter.is_none()
+        && options().lookup > 0
+        && matches!(model, Model::Gemma4(_) | Model::Llama(_)))
+    .then(|| draft::Lookup::new(options().lookup));
+    let drafting = drafter.is_some() || lookup.is_some();
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
     // longer list of tools, ended its turn on the result three times in 39 cases,
     // answering nothing.
     let mut answer_due = !skill_ids.is_empty();
     let mut end_tokens: Option<Vec<u32>> = None;
-    while generated.len() + call_tokens < max_tokens && !job.stop.load(Ordering::Relaxed) {
-        let room = (max_tokens - generated.len() - call_tokens)
-            .min(context.saturating_sub(kept.tokens.len() + 64));
+    // `max_tokens` is the model's own writing; calls have their own limits (`MAX_CALLS`,
+    // `MAX_CALL_TOKENS`), so a task of many calls still has room to answer.
+    while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        let room =
+            (max_tokens - generated.len()).min(context.saturating_sub(kept.tokens.len() + 64));
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
         if ahead.is_empty() {
-            match drafter.as_deref_mut() {
-                Some(d) if room > 1 => {
-                    let guesses = d.guess(&kept.tokens, d.guesses.min(room - 1))?;
+            let guesses = match (drafter.as_deref_mut(), lookup.as_mut()) {
+                (Some(d), _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
+                (None, Some(l)) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
+                _ => Vec::new(),
+            };
+            match guesses {
+                guesses if !guesses.is_empty() => {
                     let first = usize::from(unread.is_some());
                     let batch: Vec<u32> = unread
                         .take()
@@ -1779,7 +1933,7 @@ fn reply(
                 &mut call_tokens,
                 context,
             )?;
-            let call = tools::parse_call(family, &text)
+            let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
             calls += 1;
             let args = call.args_json();
@@ -1789,10 +1943,18 @@ fn reply(
                 json::string(&call.tool)
             )));
             // The same call again, with the same arguments, would get the same answer: a
-            // small model can loop on one. It isn't run again, and the model must answer.
+            // small model can loop on one. It isn't run again. The first time, the model may
+            // still call another tool (Qwen 3.5 4B repeated a sum in the test gauntlet, then had
+            // no way left to fill the template it was asked to); the second, it must answer.
             let repeated = last_call.as_ref() == Some(&call);
-            let result = if repeated {
+            if repeated {
+                repeats += 1;
+            }
+            let result = if repeated && repeats >= 2 {
                 "This is the same call as the last one, and its result is above. Answer the user from it now."
+                    .to_string()
+            } else if repeated {
+                "This is the same call as the last one, and its result is above. Go on from it: call the next tool the task needs, or answer."
                     .to_string()
             } else {
                 match run_tool(&call, &offered, job) {
@@ -1800,7 +1962,7 @@ fn reply(
                     None => break, // stopped while the app ran it
                 }
             };
-            if repeated || calls == MAX_CALLS {
+            if repeats >= 2 || calls == MAX_CALLS {
                 may_call = false;
             }
             last_call = Some(call.clone());
@@ -1854,7 +2016,10 @@ fn reply(
             if let Some(d) = drafter.as_deref_mut() {
                 d.taken += 1;
             }
-        } else if drafter.is_some() {
+            if let Some(l) = lookup.as_mut() {
+                l.taken += 1;
+            }
+        } else if drafting {
             unread = Some(next);
         } else {
             model.next(&mut kept.session, next, &mut logits)?;
@@ -1883,13 +2048,22 @@ fn reply(
         } else {
             ""
         },
-        drafter.as_deref().map_or(String::new(), |d| format!(
-            ", {} of {} guesses taken ({:.0}%, {:.2}s guessing)",
-            d.taken,
-            d.guessed,
-            100.0 * d.taken as f64 / d.guessed.max(1) as f64,
-            d.seconds
-        ))
+        drafter
+            .as_deref()
+            .map(|d| format!(
+                ", {} of {} guesses taken ({:.0}%, {:.2}s guessing)",
+                d.taken,
+                d.guessed,
+                100.0 * d.taken as f64 / d.guessed.max(1) as f64,
+                d.seconds
+            ))
+            .or_else(|| lookup.as_ref().map(|l| format!(
+                ", {} of {} guesses from the chat taken ({:.0}%)",
+                l.taken,
+                l.guessed,
+                100.0 * l.taken as f64 / l.guessed.max(1) as f64
+            )))
+            .unwrap_or_default()
     );
     let _ = job.out.send(Out::Done {
         tokens: generated.len() + call_tokens,
@@ -1913,9 +2087,9 @@ fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
 
 /// The skill a request asks for: the one it names (an app's slash command), or the one
 /// that fits best by scoring (`skills::fit_question`, a pass each), if its share of " yes"
-/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the share it gets for a
-/// request that fits no skill (`skills::CONTROL`, scored once per skill while this model
-/// runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
+/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the highest share it gets
+/// for requests that fit no skill (`skills::CONTROLS`, scored once per skill while this
+/// model runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
 /// for every request) so picks none, as before skills, instead of a wrong one.
 fn pick_skill(
     model: &Model,
@@ -1936,15 +2110,19 @@ fn pick_skill(
     for (i, skill) in skills.iter().enumerate() {
         let question = skills::fit_question(skill, request);
         let share = yes_share(model, kept, tokenizer, family, &question, "Fits:")?;
-        let control_question = skills::fit_question(skill, skills::CONTROL);
-        let control = match kept.skill_controls.get(&control_question) {
-            Some(c) => *c,
-            None => {
-                let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
-                kept.skill_controls.insert(control_question, c);
-                c
-            }
-        };
+        let mut control: f64 = 0.0;
+        for request in skills::CONTROLS {
+            let control_question = skills::fit_question(skill, request);
+            let c = match kept.skill_controls.get(&control_question) {
+                Some(c) => *c,
+                None => {
+                    let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
+                    kept.skill_controls.insert(control_question, c);
+                    c
+                }
+            };
+            control = control.max(c);
+        }
         if debug_calls() {
             eprintln!(
                 "[calls] skill {}: {share:.2} (control {control:.2})",
@@ -1978,12 +2156,7 @@ fn yes_share(
     let text =
         chat::history(family, None, "", &[question], &chat::today()) + chat::opening(family) + lead;
     let ids = tokenizer.encode(&text, false, true);
-    if kept.picker.is_none() {
-        kept.picker = Some(model.session(1024)?);
-    }
-    let session = kept.picker.as_mut().unwrap();
-    model.empty(session)?;
-    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
     let score = |word: &str| {
         let id = tokenizer.encode(&format!(" {word}"), false, false)[0];
         f64::from(logits[id as usize])
@@ -2034,12 +2207,7 @@ fn pick_groups(
         + chat::opening(family)
         + "Needs:";
     let ids = tokenizer.encode(&text, false, true);
-    if kept.picker.is_none() {
-        kept.picker = Some(model.session(1024)?);
-    }
-    let session = kept.picker.as_mut().unwrap();
-    model.empty(session)?;
-    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
     let scores: Vec<f64> = tools::GROUP_CHOICES
         .iter()
         .map(|(letter, _)| {
@@ -2095,10 +2263,11 @@ fn debug_calls() -> bool {
     std::env::var_os("VIREO_DEBUG_CALLS").is_some()
 }
 
-/// The most tool calls one reply makes.
-const MAX_CALLS: usize = 6;
-/// The most tokens one call may take: a path or a search, not an essay.
-const MAX_CALL_TOKENS: usize = 1024;
+/// The most tool calls one reply makes: enough for a task over several files (read a
+/// guide, six invoices and a register, work out the sums, write the rows).
+const MAX_CALLS: usize = 20;
+/// The most tokens one call may take: a document's text or a spreadsheet's rows at most.
+const MAX_CALL_TOKENS: usize = 4096;
 /// The most of a tool's result the model reads, in characters (about 2,000 tokens).
 const MAX_RESULT: usize = 8000;
 
@@ -2255,7 +2424,7 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         // The app checks first that the change can be made (the file is there, the name
         // is free), so nobody is asked to approve a guess. An app that can't check says
         // so, and the approval is asked as before.
-        if job.client_tools.iter().any(|t| t == CHECK_CHANGE) {
+        if tool.runs == tools::Runs::App && job.client_tools.iter().any(|t| t == CHECK_CHANGE) {
             let args = format!(
                 "{{\"tool\":{},\"args\":{}}}",
                 json::string(&call.tool),

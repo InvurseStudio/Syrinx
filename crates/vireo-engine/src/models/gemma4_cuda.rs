@@ -580,15 +580,32 @@ impl<'a> Gemma4Cuda<'a> {
             )
             .map_err(e)?;
 
-            inp_gate.mul(&Input::new(g, s.x.ptr(), t, s.q8.as_ref()), s.small.ptr())?;
-            g.geglu(
-                s.small.ptr(),
-                s.per_layer.f32_at(l * pl),
-                pl,
-                c.layers * pl,
-                t,
-            )
-            .map_err(e)?;
+            // One token on the Mac: the product and the GELU gate in one dispatch.
+            #[cfg(target_os = "macos")]
+            let fused = t == 1
+                && g.matvec_gelu(
+                    inp_gate.kind,
+                    inp_gate.data.ptr(),
+                    s.x.ptr(),
+                    s.small.ptr(),
+                    inp_gate.rows,
+                    inp_gate.cols,
+                    s.per_layer.f32_at(l * pl),
+                )
+                .map_err(e)?;
+            #[cfg(not(target_os = "macos"))]
+            let fused = false;
+            if !fused {
+                inp_gate.mul(&Input::new(g, s.x.ptr(), t, s.q8.as_ref()), s.small.ptr())?;
+                g.geglu(
+                    s.small.ptr(),
+                    s.per_layer.f32_at(l * pl),
+                    pl,
+                    c.layers * pl,
+                    t,
+                )
+                .map_err(e)?;
+            }
             proj.mul(
                 &Input::new(g, s.small.ptr(), t, s.q8.as_ref()),
                 s.projected.ptr(),
