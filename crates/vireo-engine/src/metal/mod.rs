@@ -124,9 +124,11 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         n if n.starts_with("matvec") || n.starts_with("matmul") => &[2],
         "rms_norm" => &[2],
         "residual_norm" => &[0, 5],
-        "qkv_prep" => &[4, 9, 10],
+        "qkv_prep" => &[4, 9, 10, 23],
         n if n.starts_with("attention_part") => &[3],
         n if n.starts_with("attention_decode") => &[3, 10, 11],
+        "attention_tcg_merge" => &[1],
+        n if n.starts_with("attention_tcg") => &[3, 11],
         "attention_combine" => &[1],
         n if n.starts_with("attention") => &[3],
         "swiglu" | "geglu" | "add" | "softcap" | "apply_gate" => &[0],
@@ -140,7 +142,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "delta_chunk_prep" => &[7],
         n if n.starts_with("delta_chunk_scan") => &[1, 2],
         "copy_bytes" => &[0],
-        "to_half" => &[1],
+        "to_half" | "q_group_half" => &[1],
         _ => return None,
     })
 }
@@ -251,6 +253,15 @@ impl Context {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(start, start + bytes.max(1) as u64);
+    }
+
+    /// The bytes from `address` to the end of the live buffer it falls in (0 if in none).
+    fn bytes_from(&self, address: u64) -> u64 {
+        let allocations = self.allocations.lock().unwrap_or_else(|e| e.into_inner());
+        match allocations.range(..=address).next_back() {
+            Some((_, &end)) if address < end => end - address,
+            _ => 0,
+        }
     }
 
     /// The buffers `d` reads and writes, from its kernel's [`written_args`] and the
@@ -678,8 +689,8 @@ struct Kernels {
     sum_parts: Option<Pso>,
     /// The same with the wide tile, for long batches (TC_WIDE).
     matmul_tc_wide: Option<[Pso; 7]>,
-    /// The same with 32- and 64-token tiles, for short batches (SMALL_TILES).
-    matmul_tc_small: Option<[[Pso; 7]; 4]>,
+    /// The same with 8- to 192-token tiles, for short batches (SMALL_TILES).
+    matmul_tc_small: Option<[[Pso; 7]; 6]>,
     rms_norm: Pso,
     residual_norm: Pso,
     qkv_prep: Pso,
@@ -709,6 +720,9 @@ struct Kernels {
     attention_flash2: [Pso; 4],
     /// On the neural accelerators, where the GPU has them (ATTENTION_TC_TOKENS).
     attention_tc: Option<[Pso; 4]>,
+    /// The same for query heads sharing a key/value head (attention_tcg), by head size
+    /// (128, 256, 512) and tile (TCG_TILES), and q_group_half for their queries.
+    attention_tcg: Option<([Pso; 3], Pso, Pso)>,
     swiglu: Pso,
     geglu: Pso,
     add: Pso,
@@ -765,6 +779,15 @@ pub struct Gpu {
     matmul_parts: Buffer,
     /// attention_decode's count of finished parts, one per head (left at 0).
     attention_counters: Buffer,
+    /// attention_tcg's queries in f16 (q_group_half), grown to the largest batch seen.
+    attention_qh: Mutex<Option<Buffer>>,
+    /// attention_tcg's parts for attention_tcg_merge, grown the same way.
+    attention_tcg_parts: Mutex<Option<Buffer>>,
+    /// Buffers those two outgrew: kept, as a recorded graph may still name them.
+    retired: Mutex<Vec<Buffer>>,
+    /// The queries the last [`Gpu::qkv_prep`] also wrote there, until an attention call
+    /// takes them: (q, tokens, heads, head size, group).
+    qh_ready: Mutex<Option<ReadyQueries>>,
     pub info: DeviceInfo,
 }
 
@@ -814,8 +837,13 @@ const WIDE_TOKENS: usize = 1024;
 /// in turn and the next step's bytes loaded ahead, all level or slower. 96 for 65-96
 /// tokens (ffn_up at 70 / 80 / 96: 0.61 → 0.55, 0.64 → 0.56, 0.64 → 0.58 ms) and 192 for
 /// 129-192 (two tiles of 128 before; ffn_up at 150 / 180: 1.13 → 0.90, 1.13 → 0.93) too;
-/// 97-128 keep the 128-token one.
-const SMALL_TILES: [usize; 4] = [32, 64, 96, 192];
+/// 97-128 keep the 128-token one. 8 and 16 for up to 8 and 16 tokens, taking 256 columns
+/// a step (the 128 of the others: half as many products, each the accelerators' smallest
+/// in tokens): ffn_up at 4 / 8 / 16 tokens 0.33 → 0.25, 0.33 → 0.25, 0.35 → 0.27 ms,
+/// ffn_down 0.32 → 0.26, 0.32 → 0.26, 0.33 → 0.27 (one token: 0.19). 256 columns a step
+/// did nothing for whole batches (ffn_up at 1,024 tokens 4.69 → 4.63 ms, ffn_down 5.43 →
+/// 5.50) and little at 32 (0.35 → 0.32).
+const SMALL_TILES: [usize; 6] = [8, 16, 32, 64, 96, 192];
 /// A short batch's product split along the columns (matmul_tc's `splits`, added up by
 /// sum_parts) until there are about SPLIT_TARGET threadgroups: batches of up to
 /// SPLIT_TOKENS (256: ffn_down at 150 tokens 1.19 → 0.89 ms with the 192-token tile), at most MAX_SPLITS parts of at least SPLIT_COLS columns, their sums in a
@@ -840,6 +868,27 @@ const FLASH2_THREADS: [u32; 4] = [128, 256, 256, 256];
 const ATTENTION_TC_TOKENS: [u32; 4] = [32, 32, 32, 16];
 /// Bytes past the end of every buffer [`Gpu::alloc`] makes (see `Context::new_buffer`).
 const BUFFER_SLACK: usize = 128 * 1024;
+/// Queries [`Gpu::qkv_prep`] left in f16 for attention_tcg: (q, tokens, heads, head size,
+/// group).
+type ReadyQueries = (CuDevicePtr, usize, usize, usize, usize);
+/// attention_tcg's tiles for heads of 128, 256 and 512: query rows, positions a step and
+/// threads (see vireo_tensor.metal).
+const TCG_TILES: [(usize, usize, u32); 3] = [(32, 128, 128), (32, 128, 256), (16, 256, 256)];
+/// The most parts attention_tcg splits a short batch's context into (attention_tcg_merge's
+/// weights).
+const TCG_MAX_PARTS: u32 = 64;
+/// Set to keep attention_tc for full attention too (VIREO_TCG=off, or
+/// [`Gpu::group_prompt_attention`]), to compare the two.
+static TCG_OFF: AtomicBool = AtomicBool::new(false);
+fn tcg_off() -> bool {
+    TCG_OFF.load(Ordering::Relaxed)
+}
+/// Whether 1 to 8 tokens' attention may go to attention_tcg too ([`Gpu::grouped_few`]):
+/// on unless VIREO_TCG_FEW=off.
+static TCG_FEW: AtomicBool = AtomicBool::new(true);
+fn tcg_few() -> bool {
+    TCG_FEW.load(Ordering::Relaxed)
+}
 /// The most parts one token's attention is split into.
 const MAX_PARTS: u32 = 16;
 /// attention_decode_group's builds: for heads of 256 and 512, how many heads a SIMD group
@@ -874,12 +923,25 @@ impl Gpu {
             .newLibraryWithSource_options_error(&NSString::from_str(&with_tensors), Some(&options))
         {
             Ok(library) => (library, true),
-            Err(_) => (
-                device
-                    .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), Some(&options))
-                    .map_err(|e| driver_error("compiling the kernels", &e))?,
-                false,
-            ),
+            Err(e) => {
+                // Expected before the M5 and A19; on a Mac that has the accelerators it
+                // means the tensor kernels no longer compile (VIREO_METAL_ERRORS shows why).
+                if std::env::var_os("VIREO_METAL_ERRORS").is_some() {
+                    eprintln!(
+                        "The tensor kernels didn't compile: {}",
+                        e.localizedDescription()
+                    );
+                }
+                (
+                    device
+                        .newLibraryWithSource_options_error(
+                            &NSString::from_str(SOURCE),
+                            Some(&options),
+                        )
+                        .map_err(|e| driver_error("compiling the kernels", &e))?,
+                    false,
+                )
+            }
         };
         let names = std::cell::RefCell::new(HashMap::new());
         let pipeline = |name: &str| -> Result<Pso> {
@@ -951,6 +1013,8 @@ impl Gpu {
             },
             matmul_tc_small: if tensor_ops {
                 Some([
+                    per_kind("matmul_tc_t8")?,
+                    per_kind("matmul_tc_t16")?,
                     per_kind("matmul_tc_t32")?,
                     per_kind("matmul_tc_t64")?,
                     per_kind("matmul_tc_t96")?,
@@ -1037,6 +1101,19 @@ impl Gpu {
             } else {
                 None
             },
+            attention_tcg: if tensor_ops {
+                Some((
+                    [
+                        pipeline("attention_tcg_128")?,
+                        pipeline("attention_tcg_256")?,
+                        pipeline("attention_tcg_512")?,
+                    ],
+                    pipeline("q_group_half")?,
+                    pipeline("attention_tcg_merge")?,
+                ))
+            } else {
+                None
+            },
             attention_tiled_h: [
                 pipeline("attention_tiled_h_64")?,
                 pipeline("attention_tiled_h_128")?,
@@ -1063,6 +1140,12 @@ impl Gpu {
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
+        if std::env::var("VIREO_TCG").is_ok_and(|v| v == "off") {
+            TCG_OFF.store(true, Ordering::Relaxed);
+        }
+        if std::env::var("VIREO_TCG_FEW").is_ok_and(|v| v == "off") {
+            TCG_FEW.store(false, Ordering::Relaxed);
+        }
         let fence = device.newFence().ok_or(Error::Driver {
             call: "newFence",
             code: 0,
@@ -1124,6 +1207,10 @@ impl Gpu {
             attention_parts,
             matmul_parts,
             attention_counters,
+            attention_qh: Mutex::new(None),
+            attention_tcg_parts: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            qh_ready: Mutex::new(None),
             info,
         })
     }
@@ -1327,16 +1414,25 @@ impl Gpu {
         self.run(kernel, (grid, 1), ROWS_PER_BLOCK * 32, &args)
     }
 
-    /// Whether `tokens` (2 to [`Gpu::MULTI_TOKENS`]) of a `rows` × `cols` matrix are
-    /// quicker through the short batches' tile ([`Gpu::matmul_8bit`]) than through
-    /// [`Gpu::matvec_multi`]: from 5 tokens, which matvec_few takes in two dispatches
-    /// (each reading the weights), on a large matrix. The tile costs about the same for 2
-    /// to 32 tokens. On the M5 Max at 5 / 8 tokens, Qwen 3.8 27B's Q6_K ffn_gate (89M
-    /// weights) 386 / 666 µs against 260, its Q8_0 ffn_down 390 / 585 against 340,
-    /// Gemma 4 31B's ffn_up (116M) 524 / 906 against 390; smaller matrices (Qwen's attn_qkv,
-    /// 52M, ssm_out, 31M; Gemma's attn_q, 44M) are level or quicker with matvec_few.
-    pub fn tile_beats_few(rows: usize, cols: usize, tokens: usize) -> bool {
-        tokens >= 5 && rows * cols >= 64 << 20
+    /// Whether `tokens` (2 to [`Gpu::MULTI_TOKENS`]) of a `rows` × `cols` matrix of `kind`
+    /// are quicker through the short batches' 8-token tile ([`Gpu::matmul_8bit`]) than
+    /// through [`Gpu::matvec_multi`]. The tile costs the same for 2 to 8 tokens, about 1.3
+    /// times one token's product on a large matrix; matvec_multi costs more with each
+    /// token, and reads the weights twice from 5. On the M5 Max, µs at 3 / 4 / 5 / 8
+    /// tokens, matvec_multi against the tile: Gemma 4 31B's Q6_K ffn_up (116M weights)
+    /// 221 / 296 / 437 / 583 against 250-260, its attn_k (22M) 62 / 71 / 102 / 124 against
+    /// 61; Qwen 3.8 27B's Q8_0 ffn_up (89M) 184 / 180 / 355 / 366 against 255; Qwen 3.5
+    /// 4B's Q4_K ffn_gate (24M) 59 / 63 / 92 / 114 against 60, its Q5_K ssm_out (10M)
+    /// 39 / 58 / 74 / 82 against 43; Gemma 4 E4B's Q4_0 ffn_gate (26M) 50 / 56 / 79 / 117
+    /// against 57. So from 4 tokens for the K-quants and 5 for the others (their kernels
+    /// take 4 as cheaply as 2), but for small matrices (1-3M: level or slower).
+    /// `tests/big_matmul.rs` (`big_few_or_tile`) measures it.
+    pub fn tile_beats_few(kind: TensorType, rows: usize, cols: usize, tokens: usize) -> bool {
+        let from = match kind {
+            TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K => 4,
+            _ => 5,
+        };
+        tokens >= from && rows * cols >= 4 << 20
     }
 
     /// The most tokens [`Gpu::matvec_multi`] takes at once (MT in vireo.metal).
@@ -1577,6 +1673,16 @@ impl Gpu {
         assert!(p.head_dim <= 512, "head size {} is over 512", p.head_dim);
         let kv = p.cache.is_some();
         let (k_cache, v_cache) = p.cache.unwrap_or((0, 0));
+        // A prompt batch whose attention may run on attention_tcg: its queries in f16 too,
+        // regrouped, saving q_group_half's pass.
+        let group = p.heads / p.kv_heads.max(1);
+        let ready = self.tcg_shape(p.half_cache, tokens, p.heads, p.head_dim, group);
+        let q_half = match ready {
+            Some(_) => self.qh_buffer(tokens * p.heads * p.head_dim * 2)?,
+            None => 0,
+        };
+        *self.qh_ready.lock().unwrap_or_else(|e| e.into_inner()) =
+            ready.map(|_| (p.q_out, tokens, p.heads, p.head_dim, group));
         let args = [
             Arg::Ptr(p.q),
             Arg::I32(p.q_stride as i32),
@@ -1601,6 +1707,7 @@ impl Gpu {
             Arg::I32(p.half_cache as i32),
             Arg::I32(tokens as i32),
             Arg::I32(p.ring as i32),
+            Arg::Ptr(q_half),
         ];
         let slots = p.heads + if kv { 2 * p.kv_heads } else { 0 };
         let threads = (p.head_dim.div_ceil(32) * 32).min(256) as u32;
@@ -1610,6 +1717,63 @@ impl Gpu {
             threads,
             &args,
         )
+    }
+
+    /// attention_tcg's kernel and tile (rows, positions a step, threads) for a batch of
+    /// this shape, if it's one the kernel takes: more than 8 tokens over an f16 cache,
+    /// heads of 128, 256 or 512, and a group that fits the tile's rows.
+    fn tcg_shape(
+        &self,
+        half_cache: bool,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        group: usize,
+    ) -> Option<(&Pso, (usize, usize, u32))> {
+        let (tcg, _, _) = self.kernels.attention_tcg.as_ref()?;
+        let i = [128, 256, 512].iter().position(|&d| d == head_dim)?;
+        let tile = TCG_TILES[i];
+        let fits = half_cache
+            && !tcg_off()
+            && (tokens > 8 || tcg_few())
+            && heads <= 64
+            && group >= 1
+            && heads.is_multiple_of(group)
+            && group <= tile.0;
+        fits.then_some((&tcg[i], tile))
+    }
+
+    /// One of attention_tcg's scratch buffers, grown to hold `bytes`. One it outgrows is
+    /// kept (a recorded graph may name it; they double, so they add up to less than the
+    /// last).
+    fn grown(&self, slot: &Mutex<Option<Buffer>>, bytes: usize) -> Result<CuDevicePtr> {
+        let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_ref().is_none_or(|b| b.len_bytes() < bytes) {
+            let new = self.alloc(bytes.next_power_of_two())?;
+            if let Some(old) = held.replace(new) {
+                self.retired
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(old);
+            }
+        }
+        Ok(held.as_ref().unwrap().ptr())
+    }
+
+    /// attention_tcg's f16 queries (q_group_half, or qkv_prep itself).
+    fn qh_buffer(&self, bytes: usize) -> Result<CuDevicePtr> {
+        self.grown(&self.attention_qh, bytes)
+    }
+
+    /// Whether a prompt's attention takes a key/value head's query heads together
+    /// (attention_tcg; on unless VIREO_TCG=off). For tests and timing.
+    pub fn group_prompt_attention(&self, on: bool) {
+        TCG_OFF.store(!on, Ordering::Relaxed);
+    }
+
+    /// The same for 1 to 8 tokens (on unless VIREO_TCG_FEW=off). For tests and timing.
+    pub fn group_few_attention(&self, on: bool) {
+        TCG_FEW.store(on, Ordering::Relaxed);
     }
 
     /// Causal attention for `tokens` tokens of `heads` query heads (see the CUDA backend's
@@ -1640,7 +1804,8 @@ impl Gpu {
     /// [`Gpu::attention`] over a cache that keeps a sliding-window layer's last `ring`
     /// positions only, position p at row p mod `ring` (0: every position, at its own row).
     /// The ring holds the window and a batch's new positions, and is a multiple of 64 (the
-    /// tensor kernel's chunk), so no chunk runs over its end.
+    /// tensor kernel's chunk), so no chunk runs over its end; attention_tcg, with longer
+    /// chunks, takes a ring that is a multiple of its own (the sessions round to 256).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_ring(
         &self,
@@ -1695,6 +1860,16 @@ impl Gpu {
         // layer: the prompt kernels' tiles cost several times as much for a few (Gemma 4
         // E2B, 2 tokens at 500: ~71 µs a layer against ~13 for one).
         if let (1..=8, true, Some(i)) = (tokens, heads <= 64, wide) {
+            if tcg_few() && Self::grouped_few(tokens, heads, head_dim, group, window) {
+                let mut tc_args = args.to_vec();
+                tc_args.push(Arg::I32(tokens as i32));
+                if self.attention_grouped(
+                    half_cache, q, keys, values, out, ring, heads, tokens, head_dim, kv_dim, group,
+                    &tc_args,
+                )? {
+                    return Ok(());
+                }
+            }
             // One token, in one dispatch: the query heads sharing a key/value head together
             // (so each key and value is read once for them), the context in parts so
             // every GPU core has work, the parts merged by the last to finish.
@@ -1785,6 +1960,12 @@ impl Gpu {
         if let (true, true, Some((kernel, _))) = (tokens > 1, half_cache, tiled) {
             let mut args = args.to_vec();
             args.push(Arg::I32(tokens as i32));
+            if self.attention_grouped(
+                half_cache, q, keys, values, out, ring, heads, tokens, head_dim, kv_dim, group,
+                &args,
+            )? {
+                return Ok(());
+            }
             if let Some(tc) = &self.kernels.attention_tc {
                 let blocks = (tokens as u32).div_ceil(ATTENTION_TC_TOKENS[kernel]);
                 return self.run(&tc[kernel], (heads as u32, blocks), 256, &args);
@@ -1826,6 +2007,133 @@ impl Gpu {
             &self.kernels.attention
         };
         self.run(one, (heads as u32, tokens as u32), 128, &args)
+    }
+
+    /// Whether 1 to 8 tokens' attention is quicker on attention_tcg than on the one-token
+    /// kernels, which walk the context once a token and query head: attention_tcg and its
+    /// merge cost 30-50 µs a layer whatever the count, and read the cache once. Measured
+    /// on the M5 Max (µs a layer, one-token kernels → attention_tcg). Full attention from
+    /// 2 tokens: Gemma 4 31B's global layers at 30K positions, 2 / 4 / 8 tokens 1,090 →
+    /// 580, 2,290 → 620, 4,980 → 800; Qwen 3.8 27B 460 → 300, 1,080 → 310, 2,200 → 430
+    /// (level at 2,300 positions, 10-20 slower at 200). One token only for narrow heads
+    /// in a large group (Muse 30B's global layers: 260 → 80 at 30K, 90 → 50 at 8K, level
+    /// at 2,300, 10 → 30 at 200); Gemma's and Qwen's read their cache at memory speed
+    /// already (480 → 590, 240 → 290). A sliding window bounds the old kernels' work, so
+    /// there only when tokens × heads × window × head size is large: Gemma 31B from 3
+    /// tokens (80 → 50), Muse from 4 (90 → 30), not E4B's (10-20 → 40).
+    fn grouped_few(
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        group: usize,
+        window: usize,
+    ) -> bool {
+        if window > 0 {
+            return tokens * heads * window * head_dim >= 20 << 20;
+        }
+        tokens >= 2 || (head_dim == 128 && group >= 8)
+    }
+
+    /// A batch's attention with a key/value head's query heads together, in longer chunks
+    /// (attention_tcg), where the shape is one it takes ([`Gpu::tcg_shape`]) and the cache
+    /// holds a chunk of positions (a ring whole chunks). `args` are the attention kernels'
+    /// first eleven. False, having done nothing, otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_grouped(
+        &self,
+        half_cache: bool,
+        q: CuDevicePtr,
+        keys: CuDevicePtr,
+        values: CuDevicePtr,
+        out: CuDevicePtr,
+        ring: usize,
+        heads: usize,
+        tokens: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        group: usize,
+        args: &[Arg],
+    ) -> Result<bool> {
+        let ready = self
+            .qh_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((tcg, (rows, chunk, threads))) =
+            self.tcg_shape(half_cache, tokens, heads, head_dim, group)
+        {
+            let chunk_bytes = (chunk * kv_dim * 2) as u64;
+            if ring.is_multiple_of(chunk)
+                && self.context.bytes_from(keys) >= chunk_bytes
+                && self.context.bytes_from(values) >= chunk_bytes
+            {
+                let qh = self.qh_buffer(tokens * heads * head_dim * 2)?;
+                if ready != Some((q, tokens, heads, head_dim, group)) {
+                    let (_, prep, _) = self.kernels.attention_tcg.as_ref().unwrap();
+                    let n4 = (tokens * heads * head_dim / 4) as u32;
+                    self.run(
+                        prep,
+                        (n4.div_ceil(256), 1),
+                        256,
+                        &[
+                            Arg::Ptr(q),
+                            Arg::Ptr(qh),
+                            Arg::I32(heads as i32),
+                            Arg::I32(group as i32),
+                            Arg::I32(head_dim as i32),
+                            Arg::I32(tokens as i32),
+                        ],
+                    )?;
+                }
+                let mut args = args.to_vec();
+                args[0] = Arg::Ptr(qh);
+                let kv_heads = (heads / group) as u32;
+                let blocks = (tokens as u32).div_ceil((rows / group) as u32);
+                // Few threadgroups (a short batch, few key/value heads): the context
+                // in parts, about three threadgroups a GPU core in all.
+                let cores = self.info.multiprocessors.max(1) as u32;
+                let parts = if kv_heads * blocks >= 2 * cores {
+                    1
+                } else {
+                    (3 * cores).div_ceil(kv_heads * blocks).min(TCG_MAX_PARTS)
+                };
+                if parts == 1 {
+                    args.push(Arg::Ptr(0));
+                    self.run(tcg, (kv_heads, blocks), threads, &args)?;
+                    return Ok(true);
+                }
+                let floats = (kv_heads * blocks * parts) as usize * rows * (2 + head_dim);
+                let partial = self.grown(&self.attention_tcg_parts, floats * 4)?;
+                args.push(Arg::Ptr(partial));
+                self.run_3d(tcg, (kv_heads, blocks, parts), threads, 0, &args)?;
+                let (_, _, merge) = self.kernels.attention_tcg.as_ref().unwrap();
+                self.run(
+                    merge,
+                    // One block: only the rows its tokens fill.
+                    (
+                        kv_heads * blocks,
+                        if blocks == 1 {
+                            (tokens * group).min(rows) as u32
+                        } else {
+                            rows as u32
+                        },
+                    ),
+                    (head_dim as u32).min(128),
+                    &[
+                        Arg::Ptr(partial),
+                        Arg::Ptr(out),
+                        Arg::I32(tokens as i32),
+                        Arg::I32(heads as i32),
+                        Arg::I32(group as i32),
+                        Arg::I32(head_dim as i32),
+                        Arg::I32(rows as i32),
+                        Arg::I32(parts as i32),
+                    ],
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// attention_decode_group for this layer, if it's one the kernel is quicker for: full
@@ -2211,14 +2519,12 @@ impl Gpu {
         let (kernels, tc_tokens) =
             match (&self.kernels.matmul_tc_wide, &self.kernels.matmul_tc_small) {
                 (Some(wide), _) if tokens >= WIDE_TOKENS => (wide, TC_WIDE),
-                (_, Some([t32, ..])) if tokens <= SMALL_TILES[0] => (t32, SMALL_TILES[0] as u32),
-                (_, Some([_, t64, ..])) if tokens <= SMALL_TILES[1] => (t64, SMALL_TILES[1] as u32),
-                (_, Some([_, _, t96, _])) if tokens <= SMALL_TILES[2] => {
-                    (t96, SMALL_TILES[2] as u32)
-                }
-                // 129-192: one tile of 192, not two of 128.
-                (_, Some([.., t192])) if tokens > 128 && tokens <= SMALL_TILES[3] => {
-                    (t192, SMALL_TILES[3] as u32)
+                // 129-192: one tile of 192, not two of 128; 97-128 keep the 128-token one.
+                (_, Some(small))
+                    if tokens <= SMALL_TILES[4] || (tokens > 128 && tokens <= SMALL_TILES[5]) =>
+                {
+                    let i = SMALL_TILES.iter().position(|&t| tokens <= t).unwrap();
+                    (&small[i], SMALL_TILES[i] as u32)
                 }
                 _ => (kernels, tc_tokens),
             };

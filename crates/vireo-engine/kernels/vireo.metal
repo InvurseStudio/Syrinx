@@ -1277,6 +1277,9 @@ kernel void qkv_prep(ARGS, KP) {
     device const int* pos = ARG_PTR(const int, 18);
     const float eps = ARG_F32(19);
     const int half_cache = ARG_INT(20), tokens = ARG_INT(21), ring = ARG_INT(22);
+    // The queries once more in f16, a key/value head's together across tokens, for
+    // attention_tcg (see q_group_half in vireo_tensor.metal), when given.
+    device half* q_half = ARG_PTR(half, 23);
 
     threadgroup float scratch[32];
     threadgroup float buf[512];
@@ -1300,9 +1303,12 @@ kernel void qkv_prep(ARGS, KP) {
         device const float* src;
         device float* dst = nullptr;
         device half* half_dst = nullptr;
+        device half* q2 = nullptr;
         if (kind == 0) {
             src = q_src + (ulong)t * q_stride + (ulong)h * q_head_stride;
             dst = q_dst + ((ulong)t * heads + h) * hd;
+            const int group = heads / kv_heads;
+            if (NONNULL(q_half)) q2 = q_half + (((ulong)(h / group) * tokens + t) * group + h % group) * hd;
         } else {
             src = (kind == 1 ? k_src : v_src) + (ulong)t * kv_dim + h * hd;
             const ulong at_cache = ring_row(at, ring) * kv_dim + h * hd;
@@ -1329,6 +1335,7 @@ kernel void qkv_prep(ARGS, KP) {
             if (j >= pairs) {
                 const int i = rotated + (j - pairs);
                 if (to_half) half_dst[i] = half(buf[i]); else dst[i] = buf[i];
+                if (NONNULL(q2)) q2[i] = half(buf[i]);
                 continue;
             }
             const int p = j;
@@ -1345,6 +1352,10 @@ kernel void qkv_prep(ARGS, KP) {
             } else {
                 dst[i0] = r0;
                 dst[i1] = r1;
+            }
+            if (NONNULL(q2)) {
+                q2[i0] = half(r0);
+                q2[i1] = half(r1);
             }
         }
     }

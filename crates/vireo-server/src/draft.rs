@@ -169,10 +169,14 @@ pub struct Lookup {
 /// E2B on the M5 Max, 200-400-token replies: rewriting a document as a list 217 → 342-358
 /// tokens/s, returning an edited code file 217 → 445, a summary 217 → 212-216, a new story
 /// 219 → 216-217 (E4B: 125 → 165-196, 125 → 209-269, 125 → 128-131, 125 → 122-124).
-pub const DEFAULT_LOOKUP: usize = 3;
+///
+/// On the Mac a batch of up to 8 tokens costs a large model about 1.4 times one token
+/// (Gemma 4 31B: one 52 ms, four 72, eight 74), so a long match guesses further: up to 7
+/// after a run of 8. Elsewhere 3 after a run of 4, as measured there.
+pub const DEFAULT_LOOKUP: usize = if cfg!(target_os = "macos") { 7 } else { 3 };
 
 /// The longest and shortest runs of the chat's last tokens looked for, longest first.
-const LONGEST_RUN: usize = 4;
+const LONGEST_RUN: usize = if cfg!(target_os = "macos") { 8 } else { 4 };
 const SHORTEST_RUN: usize = 2;
 
 impl Lookup {
@@ -185,8 +189,8 @@ impl Lookup {
     }
 
     /// Up to `n` guesses at the tokens after `tokens`: what followed the latest earlier
-    /// place the last 4 tokens (or 3, or 2) appeared, at most 3 (2, 1) of them. None when
-    /// they haven't.
+    /// place the last LONGEST_RUN tokens (or fewer, down to 2) appeared, at most one fewer
+    /// than the run's length (a run of 4: 3; of 2: 1). None when they haven't.
     pub fn guess(&mut self, tokens: &[u32], n: usize) -> Vec<u32> {
         let out = continuation(tokens, n);
         self.guessed += out.len();
@@ -228,6 +232,16 @@ mod tests {
         // A run of 2: one guess.
         let tokens = [4, 5, 6, 4, 5];
         assert_eq!(continuation(&tokens, 5), vec![6]);
+        // A longer run guesses further, where the platform looks for one.
+        let tokens = [
+            9, 1, 2, 3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        let want: &[u32] = if LONGEST_RUN >= 8 {
+            &[21, 22, 23, 24, 25, 26, 27]
+        } else {
+            &[21, 22, 23]
+        };
+        assert_eq!(continuation(&tokens, 8), want);
         // A single token's match isn't enough.
         assert!(continuation(&[1, 2, 3, 9, 3], 3).is_empty());
         assert!(continuation(&[], 3).is_empty());
