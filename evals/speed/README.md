@@ -9,6 +9,7 @@ server (fonts come from Google Fonts and fall back to system fonts offline).
 | Report | Machine | Against |
 |---|---|---|
 | `windows-rtx5060-2026-11-12.html` | ASUS TUF A14, RTX 5060 Laptop (8 GB), Windows 11 | llama.cpp b12262, CUDA build |
+| `mac-m5max-2026-11-12.html` | MacBook Pro, M5 Max (40-core GPU, 128 GB), macOS 27.2 | llama.cpp b12228 (Metal) and the shipped Vireo 0.9.0 (MLX) |
 
 ## Making one for another machine (the Mac, say)
 
@@ -24,6 +25,11 @@ server (fonts come from Google Fonts and fall back to system fonts offline).
      model. `before` (Vireo before a tuning round) is optional: leave it out of every
      panel and the markers, legend entry and table columns disappear. Keep or rewrite
      each panel's `note` for that platform.
+   - `labels.beforeShort` (optional) names the `before` series in tooltips and the table
+     (default "Vireo before"); `labels.beforeVerdict: true` gives each panel a second
+     verdict against it. The Mac report uses both, with `before` holding the shipped
+     Vireo 0.9, and draws `before` as a third (grey) bar instead of a marker, with a
+     light/dark switch; copy the Mac report to get these.
    - `method`: how it was measured (may use `<code>`).
 3. Add a row to the table above.
 
@@ -46,3 +52,19 @@ laptop a slower power state made both engines ~3× slower and shifted the compar
 (PLAN.md, "Thirteenth round"). Don't poll `nvidia-smi` (or `powermetrics`) during a
 measured run; it moves the clocks. Run old and new builds alternately, and compare
 within a row.
+
+The Mac numbers (`mac-m5max-2026-11-12.html`, and a dark image of it without the table,
+`mac-m5max-2026-11-12-dark.png`) came from `prompts-mac/bench_mac.py`, whose raw output is
+`prompts-mac/results-2026-11-12.jsonl`. They used fresh prompts, kept in `prompts-mac/`: `short.txt` (34 tokens), `medium.txt` (Vireo 0.9's release notes, ~2,300)
+and `long.txt` (~126 KB of the Mac app's Swift source, 27-31K tokens), the long ones
+ending with the short one. Every engine ran them with no drafting, one engine and
+model loaded at a time (three ~25 GB models loaded together slowed llama.cpp's reading
+by half), two rounds with the order reversed:
+
+- Vireo: `vireo-cli generate <model> <prompt> --file --gpu -n <128 short, 64 otherwise>`.
+- llama.cpp: `llama-server -ngl 99 -fa on -c 34000`, the prompt to `/completion` with
+  `cache_prompt: false`; speeds from the response's `timings`.
+- Vireo 0.9: the 0.9.0 DMG's own Python running its `server/mlx_server.py`, with the
+  app's environment (`APC_ENABLED=1`, snapshots every 256 tokens, 8 kept), the prompt
+  as a user message to `/v1/chat/completions` behind a unique first line (its prompt
+  cache survives `/v1/cache/reset`); speeds from the response's `timings`.
