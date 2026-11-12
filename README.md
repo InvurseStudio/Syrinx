@@ -29,13 +29,14 @@ Nothing here is used by the shipping apps.
 
 1. Install the app with `Windows\install-test-build.cmd`. It builds `vireo-server` too
    and installs it beside the app.
-2. Open **Vireo Prototype**, then Settings › Your Host › Run a model on this PC: choose a
-   Llama, Qwen 3.5 or Gemma 4 `.gguf` file and **Load Model**.
+2. Open **Vireo Prototype**, then Settings › Models: download one of the suggested models
+   or add a folder of `.gguf` files (Llama, Qwen 3.5 or Gemma 4), make it the active model,
+   and **Start**.
 
 The app starts `vireo-server` with that model (any free port on 127.0.0.1, a token it
-accepts without pairing), connects to it, and starts it again whenever the app opens,
-until **Stop**. The server ends with the app. The choice is kept in
-`%LOCALAPPDATA%\VireoPrototype\local-engine.json`.
+accepts without pairing) and sends chats to it while it runs, keeping any Mac's pairing.
+With *Start the model when Vireo opens* it starts with the app; it ends with the app. The
+choice is kept in `%LOCALAPPDATA%\VireoPrototype\engine.json`.
 
 `start-server.cmd` runs the server by hand instead (port 3000, paired with the 6-digit
 code it prints). The full server (tools, files, skills, the scheduler) is the rest of
