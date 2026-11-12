@@ -666,8 +666,9 @@ struct Kernels {
     matvec_glu: [Option<Pso>; 7],
     /// The split kernels with tanh-GELU times another vector after (Gpu::matvec_gelu).
     matvec_gelu: [Option<Pso>; 7],
-    /// A few tokens' products (Gpu::matvec_few), for up to 2 and 4 tokens.
-    matvec_few: [[Pso; 7]; 2],
+    /// A few tokens' products (Gpu::matvec_few), for up to 2, 3 and 4 tokens.
+    matvec_few: [[Pso; 7]; 3],
+
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
     matmul_sg: [Pso; 7],
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
@@ -882,7 +883,12 @@ impl Gpu {
                 .collect::<Result<_>>()?,
             matvec_glu: quantized("matvec_glu")?,
             matvec_gelu: quantized("matvec_split_gelu")?,
-            matvec_few: [per_kind("matvec_few2")?, per_kind("matvec_few4")?],
+            matvec_few: [
+                per_kind("matvec_few2")?,
+                per_kind("matvec_few3")?,
+                per_kind("matvec_few4")?,
+            ],
+
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
                 Some((per_kind("matmul_tc")?, pipeline("to_half")?))
@@ -1035,8 +1041,9 @@ impl Gpu {
         });
         let parts_bytes = 64 * MAX_DECODE_PARTS as usize * (2 + 512) * 4;
         let attention_parts = Self::alloc_in(&context, parts_bytes)?;
-        let attention_counters = Self::alloc_in(&context, 64 * 4)?;
-        attention_counters.write_bytes_at(0, &[0u8; 64 * 4])?;
+        // A counter a threadgroup column (up to 64 heads) and token (up to 8).
+        let attention_counters = Self::alloc_in(&context, 64 * 8 * 4)?;
+        attention_counters.write_bytes_at(0, &[0u8; 64 * 8 * 4])?;
         Ok(Self {
             context,
             kernels,
@@ -1354,7 +1361,7 @@ impl Gpu {
             Arg::I32(cols as i32),
             Arg::I32(tokens as i32),
         ];
-        let kernel = &self.kernels.matvec_few[usize::from(tokens > 2)][Self::kind_index(kind)?];
+        let kernel = &self.kernels.matvec_few[tokens.max(2) - 2][Self::kind_index(kind)?];
         // FEW_ROWS (2) rows a threadgroup.
         self.run(kernel, ((rows as u32).div_ceil(2), 1), 128, &args)
     }
@@ -1597,7 +1604,10 @@ impl Gpu {
             512 => Some(3),
             _ => None,
         };
-        if let (1, true, Some(i)) = (tokens, heads <= 64, wide) {
+        // Up to 8 tokens (a draft's guesses, a short batch) the same way, a token a grid
+        // layer: the prompt kernels' tiles cost several times as much for a few (Gemma 4
+        // E2B, 2 tokens at 500: ~71 µs a layer against ~13 for one).
+        if let (1..=8, true, Some(i)) = (tokens, heads <= 64, wide) {
             // One token, in one dispatch: the query heads sharing a key/value head together
             // (so each key and value is read once for them), the context in parts so
             // every GPU core has work, the parts merged by the last to finish.
@@ -1611,7 +1621,7 @@ impl Gpu {
             let threadgroups = (heads / hg) as u32;
             let cores = self.info.multiprocessors.max(1) as u32;
             let parts = (spread * cores)
-                .div_ceil(threadgroups)
+                .div_ceil(threadgroups * tokens as u32)
                 .clamp(1, MAX_DECODE_PARTS);
             let mut args = args.to_vec();
             args.push(Arg::Ptr(self.attention_parts.ptr()));
@@ -1625,7 +1635,9 @@ impl Gpu {
                     .as_ref()
                     .expect("built for one query head at a time")
             };
-            return self.run(kernel, (threadgroups, parts), 256, &args);
+            // The scratch: a part's maximum, sum and output for every head and token.
+            assert!(threadgroups * parts * tokens as u32 <= 64 * MAX_DECODE_PARTS);
+            return self.run_3d(kernel, (threadgroups, parts, tokens as u32), 256, 0, &args);
         }
         if tokens == 1 && heads <= 64 {
             // One token: split each head's context into parts so every GPU core has work.
@@ -1847,7 +1859,10 @@ impl Gpu {
             n <= 256 && n.is_multiple_of(32),
             "state size {n}: the kernel takes multiples of 32 up to 256"
         );
-        if tokens > 1 && n <= 128 && d.scratch != 0 {
+        // Up to 8 tokens (a short batch, a draft's guesses): the one-token kernel, which
+        // steps through them, beats the chunked prompt kernels (Qwen 3.5 4B, 2 tokens:
+        // ~13 µs a layer against ~77).
+        if tokens > Self::MULTI_TOKENS && n <= 128 && d.scratch != 0 {
             // A prompt in chunks of DELTA_CHUNK tokens (delta_chunk_prep and
             // delta_chunk_scan in vireo.metal), between the norms for every token at once.
             let rows = (tokens * 2 * d.k_heads) as u32;
@@ -1907,7 +1922,7 @@ impl Gpu {
             let rows = (tokens * d.v_heads) as u32;
             return self.run(&self.kernels.delta_out, (rows, 1), n as u32, &out);
         }
-        if tokens > 1 && n <= 128 {
+        if tokens > Self::MULTI_TOKENS && n <= 128 {
             // A prompt: the norms for every token at once, the state update split over
             // threadgroups of 16 columns, then the output norm for every token at once.
             let rows = (tokens * 2 * d.k_heads) as u32;
