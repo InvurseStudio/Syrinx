@@ -61,7 +61,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
                     [--changes declared|scored|offered] [--skills on|off]
-                    [--draft <small-model.gguf>] [--draft-tokens <n>]
+                    [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -82,7 +82,10 @@ reads the address from the \"Listening on\" line.
 
 --draft has a small model of the same family and vocabulary guess the next tokens (Gemma
 4 E2B for 31B), --draft-tokens at a time (2 by default), for the model to check in one
-pass: every token is still the model's own pick. Gemma 4 only.";
+pass: every token is still the model's own pick. Gemma 4 only. Without one, --lookup
+guesses up to <n> tokens a round from the chat itself (what followed the last few
+tokens where they appeared before; 3 by default, 0 for none), checked the same way.
+Gemma 4 only.";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -108,6 +111,9 @@ struct Options {
     /// A draft model to guess tokens with (`--draft`), and how many a round.
     draft: Option<String>,
     draft_tokens: usize,
+    /// Guesses a round taken from the chat itself (`--lookup <n>`, 0 for none), for a
+    /// model that can go back a few tokens (Gemma 4, Llama) and has no draft model.
+    lookup: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -143,6 +149,7 @@ fn main() -> ExitCode {
     let mut use_skills = true;
     let mut draft = None;
     let mut draft_tokens = draft::DEFAULT_GUESSES;
+    let mut lookup = draft::DEFAULT_LOOKUP;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -219,6 +226,14 @@ fn main() -> ExitCode {
                 draft_tokens = value.unwrap().parse().unwrap();
                 i += 1;
             }
+            "--lookup"
+                if value
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .is_some_and(|n| n <= 8) =>
+            {
+                lookup = value.unwrap().parse().unwrap();
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -244,6 +259,7 @@ fn main() -> ExitCode {
         skills: use_skills,
         draft,
         draft_tokens,
+        lookup,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -1791,6 +1807,12 @@ fn reply(
     if let Some(d) = drafter.as_deref_mut() {
         d.start_reply();
     }
+    // Without a draft model: guesses from the chat itself, for a model that can go back.
+    let mut lookup = (drafter.is_none()
+        && options().lookup > 0
+        && matches!(model, Model::Gemma4(_) | Model::Llama(_)))
+    .then(|| draft::Lookup::new(options().lookup));
+    let drafting = drafter.is_some() || lookup.is_some();
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
     // longer list of tools, ended its turn on the result three times in 39 cases,
@@ -1805,9 +1827,13 @@ fn reply(
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
         if ahead.is_empty() {
-            match drafter.as_deref_mut() {
-                Some(d) if room > 1 => {
-                    let guesses = d.guess(&kept.tokens, d.guesses.min(room - 1))?;
+            let guesses = match (drafter.as_deref_mut(), lookup.as_mut()) {
+                (Some(d), _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
+                (None, Some(l)) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
+                _ => Vec::new(),
+            };
+            match guesses {
+                guesses if !guesses.is_empty() => {
                     let first = usize::from(unread.is_some());
                     let batch: Vec<u32> = unread
                         .take()
@@ -1982,7 +2008,10 @@ fn reply(
             if let Some(d) = drafter.as_deref_mut() {
                 d.taken += 1;
             }
-        } else if drafter.is_some() {
+            if let Some(l) = lookup.as_mut() {
+                l.taken += 1;
+            }
+        } else if drafting {
             unread = Some(next);
         } else {
             model.next(&mut kept.session, next, &mut logits)?;
@@ -2011,13 +2040,22 @@ fn reply(
         } else {
             ""
         },
-        drafter.as_deref().map_or(String::new(), |d| format!(
-            ", {} of {} guesses taken ({:.0}%, {:.2}s guessing)",
-            d.taken,
-            d.guessed,
-            100.0 * d.taken as f64 / d.guessed.max(1) as f64,
-            d.seconds
-        ))
+        drafter
+            .as_deref()
+            .map(|d| format!(
+                ", {} of {} guesses taken ({:.0}%, {:.2}s guessing)",
+                d.taken,
+                d.guessed,
+                100.0 * d.taken as f64 / d.guessed.max(1) as f64,
+                d.seconds
+            ))
+            .or_else(|| lookup.as_ref().map(|l| format!(
+                ", {} of {} guesses from the chat taken ({:.0}%)",
+                l.taken,
+                l.guessed,
+                100.0 * l.taken as f64 / l.guessed.max(1) as f64
+            )))
+            .unwrap_or_default()
     );
     let _ = job.out.send(Out::Done {
         tokens: generated.len() + call_tokens,

@@ -181,6 +181,46 @@ contexts (+0.5% there, much slower at 7K tokens); 4 or 8 rows a threadgroup in t
 one-token kernels (2 is fastest). Not measured yet: Gemma 4 31B, and anything on CUDA
 (the server changes are shared; the kernel changes are Metal's).
 
+**Sixth pass: generating (2026-11-12).** Where a token's time goes: E2B reads 1.41 GB a
+token (a floor of ~391 tokens/s at ~550 GB/s), E4B 2.82 GB (~195), Qwen 3.5 4B 2.73 GB
+(~201), 9B 5.67 GB (~97): they ran at 57%, 66%, 72% and 92% of that. With every barrier
+dropped (wrong numbers, real timing) E2B ran at 354 tokens/s, E4B 183, Qwen 4B 175: the
+dependent steps cost 37%, 30% and 17%. A dependent dispatch costs ~2.2 µs against ~0.4
+for an independent one; the rest of a step is the GPU draining one kernel and filling
+the next. Skipping one kind of barrier at a time bounds what fusing it could give (E2B):
+the three norms of a layer +7%, qkv_prep → attention +4.5%, the products → qkv_prep
++3.5%, the GELU gate +2.3%; on Qwen, none. Tried and left out: a serial encoder (E2B +1%,
+Qwen -3%); grid-stride matrix-vector kernels (no change, Qwen slower with fewer
+threadgroups); the plain layout for E2B's short rows (+10% on one matrix, -5% on
+others).
+
+So, rather than shave steps, make tokens cheaper to check and guess more of them:
+
+- `--lookup <n>` (server, on by default, 3): with no draft model, guesses from the chat
+  itself, what followed the latest earlier place its last 4 (3, 2) tokens appeared, 3 (2,
+  1) of them, checked as a draft model's are, so every token is still the model's own
+  pick. Gemma 4 and Llama (Qwen's DeltaNet can't go back). Through the server, 200-400-
+  token replies, tokens/s off → on (guesses taken): E2B rewriting a document as a list 217
+  → 342-358 (78-80%), returning an edited code file 217 → 445 (94%), a summary 217 → 212-216,
+  a new story 219 → 216-217 (6-11%); E4B 125 → 165-196, 125 → 209-269, 125 → 128-131,
+  125 → 122-124.
+- One token's attention kernels take up to 8 tokens (a grid layer each, its own causal
+  length and scratch), not the prompt kernels: a 2-token check on E2B at 500 tokens 6.6
+  → 4.9 ms (one token 4.5), E4B 10.2 → 8.2 (7.9); Gemma 4 31B 61 → 53 ms (one 51).
+- Qwen's DeltaNet steps through up to 8 tokens with the one-token kernel rather than the
+  chunked prompt kernels (~13 µs a layer against ~77): Qwen 4B's 2-token batch 12.2 →
+  10.8 ms. Its numbers are now exactly token by token's for short batches.
+- `matvec_few` for 3 tokens (they were padded to 4): E2B's 3-token check 6.1 → 5.6 ms.
+  Tried and removed: gate, up and the activation in one few-token kernel (level on Q4_0,
+  slower on Q4_K, and on Q6_K 31B's 2-token check 53 → 71 ms).
+
+Eight eval cases (the six, three-steps, skill-summarize, skill-review), main → now,
+seconds for all eight, the same pass or fail and the same tokens in every case: E2B 6.00
+→ 5.34, E4B 12.76 → 11.10, Qwen 4B 18.31 → 16.29, 9B 30.12 → 26.92 (11-13% less; Qwen
+from the short batches alone). Next: the K-quants' few-token products (Qwen's are
+slower than Q4_0's: decode8 reads a byte at a time), a way back for Qwen so it can
+draft (a checkpoint a round), and the per-layer fusions above for Gemma.
+
 **What limits speed now, and what's next:**
 
 - **Generating** reads the big matrices at memory speed, but a token is still a chain of
