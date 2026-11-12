@@ -1657,7 +1657,7 @@ fn reply(
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
-    let (mut calls, mut call_tokens) = (0usize, 0usize);
+    let (mut calls, mut call_tokens, mut repeats) = (0usize, 0usize, 0usize);
     let mut turn_start = true;
     // Once calls are used up (or the model repeats one), it may only answer: the tokens
     // that start a call are taken away from it.
@@ -1797,10 +1797,18 @@ fn reply(
                 json::string(&call.tool)
             )));
             // The same call again, with the same arguments, would get the same answer: a
-            // small model can loop on one. It isn't run again, and the model must answer.
+            // small model can loop on one. It isn't run again. The first time, the model may
+            // still call another tool (Qwen 3.5 4B repeated a sum in the test gauntlet, then had
+            // no way left to fill the template it was asked to); the second, it must answer.
             let repeated = last_call.as_ref() == Some(&call);
-            let result = if repeated {
+            if repeated {
+                repeats += 1;
+            }
+            let result = if repeated && repeats >= 2 {
                 "This is the same call as the last one, and its result is above. Answer the user from it now."
+                    .to_string()
+            } else if repeated {
+                "This is the same call as the last one, and its result is above. Go on from it: call the next tool the task needs, or answer."
                     .to_string()
             } else {
                 match run_tool(&call, &offered, job) {
@@ -1808,7 +1816,7 @@ fn reply(
                     None => break, // stopped while the app ran it
                 }
             };
-            if repeated || calls == MAX_CALLS {
+            if repeats >= 2 || calls == MAX_CALLS {
                 may_call = false;
             }
             last_call = Some(call.clone());
