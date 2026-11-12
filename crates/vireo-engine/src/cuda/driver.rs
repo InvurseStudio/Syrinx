@@ -69,6 +69,7 @@ driver_functions! {
     cuModuleUnload(module: CuModule);
     cuModuleGetFunction(function: *mut CuFunction, module: CuModule, name: *const c_char);
     cuFuncSetAttribute(function: CuFunction, attribute: i32, value: i32);
+    cuOccupancyMaxActiveBlocksPerMultiprocessor(blocks: *mut i32, function: CuFunction, block_size: i32, shared_bytes: usize);
     cuMemAlloc_v2(pointer: *mut CuDevicePtr, bytes: usize);
     cuMemFree_v2(pointer: CuDevicePtr);
     cuMemGetInfo_v2(free: *mut usize, total: *mut usize);

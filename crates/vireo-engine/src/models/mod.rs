@@ -37,13 +37,12 @@ pub enum Precision {
 }
 
 /// How many tokens a GPU session reads at once, unless asked for another number:
-/// enough to keep the GPU busy, little enough memory to keep sessions cheap. Tuned per
-/// backend: 512 on CUDA; 1,024 on the Mac, where on the M5 Max it read Qwen's and Gemma's
-/// prompts 5–9% faster, the matrix kernels having more threadgroups to spread over the GPU.
-#[cfg(target_os = "macos")]
+/// enough to keep the GPU busy, little enough memory to keep sessions cheap. 1,024 on both
+/// backends: the matrix kernels get more blocks to spread over the GPU. On the M5 Max it
+/// read Qwen's and Gemma's prompts 5–9% faster than 512; on the RTX 5060 Laptop (26 SMs)
+/// ~2.5% faster on Qwen 3.5 4B and Gemma 4 E4B, whose 2,560-row matrices left the last
+/// wave of 160 tiles mostly idle at 512 (Qwen 3.5 9B unchanged).
 pub const DEFAULT_BATCH: usize = 1024;
-#[cfg(not(target_os = "macos"))]
-pub const DEFAULT_BATCH: usize = 512;
 
 /// A GPU session's contents copied to system memory, to be loaded into a session of the
 /// same model and precision later (`export` and `import` on each model): its keys and

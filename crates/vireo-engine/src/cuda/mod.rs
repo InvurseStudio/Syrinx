@@ -269,6 +269,10 @@ struct Kernels {
     attention_h: CuFunction,
     /// One token's attention split along the context, f32 and f16 caches, and the merge.
     attention_part: [CuFunction; 2],
+    /// One token's attention over an f16 cache, a block per key/value head (and set of up
+    /// to 4 of its query heads), for head sizes 64, 128, 256 and 512; with how many of its
+    /// blocks an SM holds at once.
+    attention_part_kv: [(CuFunction, u32); 4],
     attention_combine: CuFunction,
     /// On the tensor cores over an f16 cache, for head sizes 64, 128, 256 and 512:
     /// only on compute capability 8.0 and later.
@@ -349,8 +353,11 @@ const PTX_SM80: &str = include_str!(concat!(env!("OUT_DIR"), "/vireo_sm80.ptx"))
 const ROWS_PER_BLOCK: u32 = 4;
 /// The matrix-matrix kernels' tile: rows of weights by tokens.
 const TILE_ROWS: u32 = 128;
-/// The most parts one token's attention is split into.
+/// The most parts one token's attention is split into (`attention_part`, f32 cache).
 const MAX_PARTS: u32 = 16;
+/// The same for `attention_part_kv` (f16 cache), whose blocks each take a key/value head:
+/// fewer blocks a part, so more parts.
+const MAX_PARTS_KV: u32 = 64;
 const TILE_TOKENS: u32 = 64;
 
 /// A parameter for the kernels, which take raw addresses: 0 stands for "none".
@@ -488,6 +495,22 @@ impl Gpu {
                     function("attention_part_f32")?,
                     function("attention_part_f16")?,
                 ],
+                attention_part_kv: {
+                    let mut out = [(std::ptr::null_mut(), 1); 4];
+                    for (slot, hd) in out.iter_mut().zip([64, 128, 256, 512]) {
+                        let f = function(&format!("attention_part_kv_{hd}"))?;
+                        let mut blocks = 0;
+                        let r = (context.driver.cuOccupancyMaxActiveBlocksPerMultiprocessor)(
+                            &mut blocks,
+                            f,
+                            128,
+                            0,
+                        );
+                        context.check("cuOccupancyMaxActiveBlocksPerMultiprocessor", r)?;
+                        *slot = (f, blocks.max(1) as u32);
+                    }
+                    out
+                },
                 attention_combine: function("attention_combine")?,
                 attention_mma: if tensor_cores {
                     let mut out = [AttentionMma::default(); 4];
@@ -560,7 +583,7 @@ impl Gpu {
                     None
                 },
             };
-            let parts_bytes = 64 * MAX_PARTS as usize * (2 + 512) * 4;
+            let parts_bytes = 64 * MAX_PARTS.max(MAX_PARTS_KV) as usize * (2 + 512) * 4;
             let mut ptr = 0;
             let r = (context.driver.cuMemAlloc_v2)(&mut ptr, parts_bytes);
             context.check("cuMemAlloc", r)?;
@@ -989,6 +1012,49 @@ impl Gpu {
             // One token: split each head's context into parts so every SM has work (about
             // four blocks per SM), then merge them.
             let sms = self.info.multiprocessors.max(1) as u32;
+            let kv_kernel = match head_dim {
+                64 => Some(0),
+                128 => Some(1),
+                256 => Some(2),
+                512 => Some(3),
+                _ => None,
+            };
+            if let (true, Some(i)) = (half_cache, kv_kernel) {
+                // A block per key/value head and set of up to 4 of its query heads, so each
+                // key and value is read once a set. As many parts as fill the GPU in one
+                // wave (the blocks hold many registers: 2 an SM at head size 512), and no
+                // more than a sliding window fills 32 positions of each.
+                let (kernel, per_sm) = self.kernels.attention_part_kv[i];
+                let blocks = (heads / group * group.div_ceil(4)) as u32;
+                let mut parts = (per_sm * sms / blocks).clamp(1, MAX_PARTS_KV);
+                if window > 0 {
+                    parts = parts.min((window as u32).div_ceil(32)).max(1);
+                }
+                let part_args = [
+                    Arg::Ptr(q),
+                    Arg::Ptr(keys),
+                    Arg::Ptr(values),
+                    Arg::Ptr(self.attention_parts.ptr()),
+                    Arg::Ptr(pos),
+                    Arg::I32(window as i32),
+                    Arg::I32(kv_dim as i32),
+                    Arg::I32(group as i32),
+                    Arg::F32(scale),
+                ];
+                self.run(kernel, (blocks, parts), 128, &part_args)?;
+                let combine = [
+                    Arg::Ptr(self.attention_parts.ptr()),
+                    Arg::Ptr(out),
+                    Arg::I32(parts as i32),
+                    Arg::I32(head_dim as i32),
+                ];
+                return self.run(
+                    self.kernels.attention_combine,
+                    (heads as u32, 1),
+                    128,
+                    &combine,
+                );
+            }
             let parts = (4 * sms).div_ceil(heads as u32).clamp(1, MAX_PARTS);
             let part_args = [
                 Arg::Ptr(q),
