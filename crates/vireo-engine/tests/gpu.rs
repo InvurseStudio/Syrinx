@@ -1430,7 +1430,19 @@ fn the_tensor_kernels_compile_where_the_gpu_has_them() {
 #[ignore]
 fn time_matvec_kernels() {
     let Some(gpu) = open_gpu() else { return };
-    let sets: [(&str, &[&str]); 2] = [
+    let sets: [(&str, &[&str]); 3] = [
+        (
+            "gemma-4-E2B_q4_0-it.gguf",
+            &[
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.attn_output.weight",
+                "blk.0.attn_k.weight",
+                "blk.0.proj.weight",
+                "blk.0.inp_gate.weight",
+            ],
+        ),
         (
             "Qwen3.5-4B-Q4_K_M.gguf",
             &[
@@ -1519,11 +1531,23 @@ fn time_short_prompts() {
     if name.starts_with("gemma") {
         let m = Gemma4Cuda::load(&file, gpu).unwrap();
         let mut s = m.session(8192).unwrap();
+        let all = std::env::var_os("VIREO_ALL").is_some();
+        let base: Vec<u32> = (0..500u32).map(|i| 1000 + i % 5000).collect();
+        m.forward_batch(&mut s, &base, Logits::Last).unwrap();
+        time("1 token, generating", &mut || {
+            s.truncate(500);
+            m.forward(&mut s, 1234, true).unwrap();
+        });
         for &n in &counts {
             let prompt: Vec<u32> = (0..n as u32).map(|i| 1000 + i % 5000).collect();
             time(&format!("{n} tokens"), &mut || {
-                s.truncate(0);
-                m.forward_batch(&mut s, &prompt, Logits::Last).unwrap();
+                s.truncate(if all { 500 } else { 0 });
+                m.forward_batch(
+                    &mut s,
+                    &prompt,
+                    if all { Logits::All } else { Logits::Last },
+                )
+                .unwrap();
             });
         }
     } else {
@@ -1685,4 +1709,40 @@ fn few_token_products_match_one_token_at_a_time() {
             eprintln!("{line}");
         }
     }
+}
+
+/// What a dispatch costs on its own: a chain of tiny dependent ones (each adds into the
+/// same buffer) against independent ones (each into its own). Prints; --ignored.
+#[test]
+#[ignore]
+fn time_dispatch_chain() {
+    let Some(gpu) = open_gpu() else { return };
+    let n = 2048;
+    let bufs: Vec<_> = (0..512)
+        .map(|_| gpu.upload_f32(&vec![1.0; n]).unwrap())
+        .collect();
+    let src = gpu.upload_f32(&vec![1.0; n]).unwrap();
+    let time = |label: &str, f: &dyn Fn()| {
+        f();
+        gpu.synchronize().unwrap();
+        let started = Instant::now();
+        for _ in 0..10 {
+            f();
+        }
+        gpu.synchronize().unwrap();
+        eprintln!(
+            "{label}: {:.2} µs a dispatch",
+            started.elapsed().as_secs_f64() * 1e6 / 5120.0
+        );
+    };
+    time("dependent", &|| {
+        for _ in 0..512 {
+            gpu.add(bufs[0].ptr(), src.ptr(), n).unwrap();
+        }
+    });
+    time("independent", &|| {
+        for b in &bufs {
+            gpu.add(b.ptr(), src.ptr(), n).unwrap();
+        }
+    });
 }
