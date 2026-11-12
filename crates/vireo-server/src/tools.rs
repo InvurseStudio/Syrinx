@@ -1079,7 +1079,7 @@ pub fn call_start(family: Family) -> Start {
 
 /// What the system prompt says first when there are tools: what they're for, in a line,
 /// so a small model doesn't answer that it can't reach the user's files.
-pub const PREAMBLE: &str = "You are Vireo, running on the user's PC. With the tools below you can read and find      their files, check Git projects and get the date and time. When a question needs one of them, call it,      then answer from what it returns.";
+pub const PREAMBLE: &str = "You are Vireo, running on the user's PC. With the tools below you can read and find      their files, check Git projects and get the date and time. When a question needs one of them, call it,      then answer from what it returns. When the user tells you about themselves (their name and role, the people they work with, where their files are), save each fact with remember.";
 
 /// Special tokens a call is written with, inside it.
 pub fn call_tokens(family: Family) -> &'static [&'static str] {
