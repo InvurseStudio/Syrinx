@@ -352,7 +352,15 @@ impl Context {
         );
         let open = state.open.as_mut().unwrap();
         open.count += 1;
-        if self.commit_every > 0 && open.count >= self.commit_every {
+        // With nothing in flight the GPU is idle: hand it the first few dispatches at once
+        // (a token generated ~0.5-1% faster on the M5 Max, Gemma 4 E2B and Qwen 3.5 4B,
+        // with 8 to 32 than with 128).
+        let every = if state.inflight.is_empty() {
+            FIRST_COMMIT
+        } else {
+            self.commit_every
+        };
+        if self.commit_every > 0 && open.count >= every {
             self.commit_open(state);
         }
         Ok(())
@@ -652,10 +660,14 @@ struct Kernels {
     /// The quantized ones with each row pair split over the threadgroup's 4 SIMD groups
     /// (none for F32 and F16).
     matvec_split: [Option<Pso>; 7],
-    /// A few tokens at once (see [`Gpu::matvec_multi`]): Q6_K so far.
+    /// Q6_K's own kernels for 2 and 3 tokens at once (see [`Gpu::matvec_multi`]).
     matvec_q6_k_multi: Vec<Pso>,
     /// One token's gate and up projections with the activation (Gpu::matvec_glu).
     matvec_glu: [Option<Pso>; 7],
+    /// The split kernels with tanh-GELU times another vector after (Gpu::matvec_gelu).
+    matvec_gelu: [Option<Pso>; 7],
+    /// A few tokens' products (Gpu::matvec_few), for up to 2 and 4 tokens.
+    matvec_few: [[Pso; 7]; 2],
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
     matmul_sg: [Pso; 7],
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
@@ -753,6 +765,9 @@ const TENSOR_SOURCE: &str = include_str!("../../kernels/vireo_tensor.metal");
 
 /// Whether the GPU opened has neural accelerators (the tensor kernels compiled).
 static TENSOR_OPS: AtomicBool = AtomicBool::new(false);
+
+/// Dispatches in the first command buffer committed while the GPU is idle.
+const FIRST_COMMIT: usize = 16;
 
 /// The number of threads the matrix-vector kernels use per threadgroup: 4 SIMD groups.
 const ROWS_PER_BLOCK: u32 = 4;
@@ -862,10 +877,12 @@ impl Gpu {
         let kernels = Kernels {
             matvec: per_kind("matvec")?,
             matvec_split: quantized("matvec_split")?,
-            matvec_q6_k_multi: (2..=Self::MULTI_TOKENS)
+            matvec_q6_k_multi: (2..=3)
                 .map(|n| pipeline(&format!("matvec_multi_q6_k_{n}")))
                 .collect::<Result<_>>()?,
             matvec_glu: quantized("matvec_glu")?,
+            matvec_gelu: quantized("matvec_split_gelu")?,
+            matvec_few: [per_kind("matvec_few2")?, per_kind("matvec_few4")?],
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
                 Some((per_kind("matmul_tc")?, pipeline("to_half")?))
@@ -1232,8 +1249,9 @@ impl Gpu {
     pub const MULTI_TOKENS: usize = 8;
 
     /// `y[t] = W x[t]` for 2 to [`Gpu::MULTI_TOKENS`] tokens, `x` and `y` a row of f32 a
-    /// token, reading W once as for one token: a draft's guesses checked in one pass.
-    /// False, having done nothing, for a type without such a kernel (Q6_K has one).
+    /// token, reading W once (or twice, above 4) as for one token: a draft's guesses
+    /// checked in one pass, forced text, a short tool result. False, having done
+    /// nothing, for another count or columns not a multiple of 8.
     #[allow(clippy::too_many_arguments)]
     pub fn matvec_multi(
         &self,
@@ -1245,8 +1263,14 @@ impl Gpu {
         cols: usize,
         tokens: usize,
     ) -> Result<bool> {
-        if kind != TensorType::Q6_K || !(2..=Self::MULTI_TOKENS).contains(&tokens) {
+        if !(2..=Self::MULTI_TOKENS).contains(&tokens) || !cols.is_multiple_of(8) {
             return Ok(false);
+        }
+        // Q6_K's own kernel is faster for 2 and 3 tokens (2,560 × 9,216: 35 µs against
+        // 53 for 2), slower from 4 on (73 against 61; 570 against ~130 for 8).
+        if kind != TensorType::Q6_K || tokens > 3 {
+            self.matvec_few(kind, w, x, y, rows, cols, tokens)?;
+            return Ok(true);
         }
         let args = [
             Arg::Ptr(w),
@@ -1255,22 +1279,10 @@ impl Gpu {
             Arg::I32(rows as i32),
             Arg::I32(cols as i32),
         ];
+        // 4 rows a threadgroup: MULTI_ROWS in vireo.metal for 2 and 3 tokens.
         self.run(
             &self.kernels.matvec_q6_k_multi[tokens - 2],
-            // Rows a threadgroup: MULTI_ROWS in vireo.metal.
-            (
-                (rows as u32).div_ceil(match tokens {
-                    2 => 4,
-                    3 => 4,
-                    4 => 2,
-                    5 => 2,
-                    6 => 2,
-                    7 => 2,
-                    8 => 2,
-                    _ => 2,
-                }),
-                1,
-            ),
+            ((rows as u32).div_ceil(4), 1),
             128,
             &args,
         )?;
@@ -1305,6 +1317,72 @@ impl Gpu {
             Arg::I32(cols as i32),
             Arg::Ptr(w_up),
             Arg::I32(i32::from(gelu)),
+        ];
+        self.run(kernel, ((rows as u32).div_ceil(2), 1), 128, &args)?;
+        Ok(true)
+    }
+
+    /// `y[t] = W x[t]` for 1 to [`Gpu::MULTI_TOKENS`] tokens (`x` and `y` a row of f32 a
+    /// token), each weight decoded once for up to 4 of them: for a handful of tokens the
+    /// prompt kernels' 128-token tiles do far more work than needed. Any type. 5 to 8
+    /// tokens take two dispatches of up to 4, which run side by side (on the M5 Max
+    /// faster than the prompt kernels for every matrix of the test models, and than one
+    /// dispatch of 8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_few(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        assert!((1..=Self::MULTI_TOKENS).contains(&tokens) && cols.is_multiple_of(8));
+        if tokens > 4 {
+            let first = tokens / 2;
+            self.matvec_few(kind, w, x, y, rows, cols, first)?;
+            let (x, y) = (x + (first * cols * 4) as u64, y + (first * rows * 4) as u64);
+            return self.matvec_few(kind, w, x, y, rows, cols, tokens - first);
+        }
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::I32(tokens as i32),
+        ];
+        let kernel = &self.kernels.matvec_few[usize::from(tokens > 2)][Self::kind_index(kind)?];
+        // FEW_ROWS (2) rows a threadgroup.
+        self.run(kernel, ((rows as u32).div_ceil(2), 1), 128, &args)
+    }
+
+    /// One token's `y = gelu(W x) × u` in one dispatch (tanh-GELU, as [`Gpu::geglu`]):
+    /// what `matvec` and `geglu` do, with one dependent step fewer. Ok(false), having
+    /// done nothing, for a type without the kernel (F32, F16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_gelu(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        u: CuDevicePtr,
+    ) -> Result<bool> {
+        let Some(kernel) = &self.kernels.matvec_gelu[Self::kind_index(kind)?] else {
+            return Ok(false);
+        };
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(u),
         ];
         self.run(kernel, ((rows as u32).div_ceil(2), 1), 128, &args)?;
         Ok(true)

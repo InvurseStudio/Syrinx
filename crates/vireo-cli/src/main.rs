@@ -561,13 +561,9 @@ fn perplexity(
 }
 
 fn argmax(values: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, v) in values.iter().enumerate() {
-        if *v > values[best] {
-            best = i;
-        }
-    }
-    best as u32
+    // The largest value first (a branch-free pass), then the first place it's at.
+    let top = values.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+    values.iter().position(|&v| v == top).unwrap_or(0) as u32
 }
 
 fn tokenize(path: &str, text: &str, options: &[&str]) -> ExitCode {

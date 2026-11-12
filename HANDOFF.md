@@ -101,9 +101,12 @@ Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer 
 3. **Tool wording by who runs the tool:** the tools say "on this PC" and "Recycle Bin"
    everywhere. It should name the machine that runs each tool, and be measured on both,
    since it changes what every reply reads.
-4. **Skills, faster:** the scoring questions are read from scratch each time (0.2 s a case
-   on Gemma 4 E2B, up to 2.4 s on Qwen 3.5 9B). Keep their shared start in the picker's
-   session. Then: a skill one step at a time, its answer's headings forced.
+4. **Skills, faster:** done on 2026-11-12 (the Mac): the scoring questions now go on from
+   the start they share with the last one, in up to 3 picker sessions, and Qwen keeps a
+   checkpoint at the end of a system prompt new chats share (PLAN.md, "Fifth pass"). Six
+   eval cases ran 20-49% faster on the Mac with the same scores and results. **On
+   Windows:** run the eval to check the same there (the server code is shared). Next: a
+   skill one step at a time, its answer's headings forced.
 5. **Skills in the packaged Mac app:** the server finds the built-in skills by walking up
    to the repository's `server/builtin-skills`. A packaged app has to copy them in and set
    `VIREO_BUILTIN_SKILLS`. The slash-command list should also follow the asking device's
