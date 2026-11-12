@@ -104,6 +104,7 @@ fn main() -> ExitCode {
 }
 
 /// The model on the CPU or the GPU, behind one interface for the commands.
+#[allow(clippy::large_enum_variant)] // one, for the life of the command
 enum Engine<'a> {
     Cpu(Llama<'a>),
     Gpu(LlamaCuda<'a>),

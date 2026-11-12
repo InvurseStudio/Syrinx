@@ -28,10 +28,19 @@ struct Layer {
     up: GpuMatrix,
     down: GpuMatrix,
     post_ffw_norm: Buffer,
-    inp_gate: GpuMatrix,
-    proj: GpuMatrix,
-    post_norm: Buffer,
+    /// The per-layer input's gate, projection and norm (models with them).
+    per_layer: Option<(GpuMatrix, GpuMatrix, Buffer)>,
     output_scale: f32,
+}
+
+/// The per-layer inputs (E2B, E4B): their embedding, projection and the projection's norm.
+struct PerLayerInputs<'a> {
+    embedding: Matrix<'a>,
+    model_proj: GpuMatrix,
+    /// The same rounded to Q8_0, for 8-bit mode (it's F16 in Gemma's files).
+    model_proj_q8: Option<GpuMatrix>,
+    /// per_layer_proj_norm / sqrt(2), as llama.cpp folds it.
+    proj_norm: Buffer,
 }
 
 pub struct Gemma4Cuda<'a> {
@@ -39,13 +48,8 @@ pub struct Gemma4Cuda<'a> {
     gpu: Gpu,
     precision: Precision,
     embedding: Matrix<'a>,
-    per_layer_embedding: Matrix<'a>,
     output: GpuMatrix,
-    per_layer_model_proj: GpuMatrix,
-    /// The same rounded to Q8_0, for 8-bit mode (it's F16 in Gemma's files).
-    per_layer_model_proj_q8: Option<GpuMatrix>,
-    /// per_layer_proj_norm / sqrt(2), as llama.cpp folds it.
-    per_layer_proj_norm: Buffer,
+    per_layer_inputs: Option<PerLayerInputs<'a>>,
     rope_factors: Option<Buffer>,
     output_norm: Buffer,
     layers: Vec<Layer>,
@@ -57,6 +61,14 @@ pub struct Gemma4CudaSession {
     values: Vec<Option<Buffer>>,
     /// Each layer's sliding window (`None` for a global layer).
     windows: Vec<Option<usize>>,
+    /// Each layer's ring: on the Mac a sliding-window layer keeps only its window and a
+    /// batch's new positions, position p at row p mod ring (0: every position, in order).
+    rings: Vec<usize>,
+    /// The furthest position written since the session was last emptied: a ring's rows
+    /// before it may hold later positions than a rewind wants.
+    high: usize,
+    /// Rewinds can't go below this (but to 0): an imported state brought only the window.
+    floor: usize,
     len: usize,
     capacity: usize,
     batch: usize,
@@ -100,20 +112,42 @@ impl Gemma4CudaSession {
         self.capacity
     }
 
-    /// The GPU memory each position takes in this session's caches (keys and values).
+    /// The GPU memory each position takes in this session's caches (keys and values): a
+    /// ring's rows spread over the session's positions.
     pub fn cache_bytes_per_position(&self) -> usize {
         self.cache_buffers()
             .iter()
-            .map(|(b, _)| b.len_bytes())
+            .map(|(b, _, _)| b.len_bytes())
             .sum::<usize>()
             / self.capacity.max(1)
     }
 
     /// Forgets every position from `len` on (nothing, if the session is shorter), so the
     /// next tokens run from there: the keys and values before it stay as they are. For
-    /// continuing a chat whose new prompt starts with the tokens already read.
-    pub fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
+    /// continuing a chat whose new prompt starts with the tokens already read. The length
+    /// kept: `len`, or 0 where the sliding-window layers no longer hold the window before
+    /// `len` (a ring wrote over it, or an imported state didn't bring it).
+    pub fn truncate(&mut self, len: usize) -> usize {
+        let len = self.len.min(len);
+        self.high = self.high.max(self.len);
+        // A ring's window before `len` is intact while no position written since lies a
+        // whole ring past it.
+        let ring_floor = self
+            .rings
+            .iter()
+            .zip(&self.windows)
+            .filter(|(r, _)| **r > 0)
+            .map(|(r, w)| self.high.saturating_sub(r - w.unwrap_or(0)))
+            .max()
+            .unwrap_or(0);
+        if len < self.len && len < self.floor.max(ring_floor) {
+            self.len = 0;
+            self.high = 0;
+            self.floor = 0;
+        } else {
+            self.len = len;
+        }
+        self.len
     }
 
     /// The keys and values of the first `len` positions (no more than the session has),
@@ -135,16 +169,20 @@ impl Gemma4CudaSession {
     pub fn import(&mut self, saved: &SavedState, upto: usize) -> Result<()> {
         load_state(saved, upto, &self.cache_buffers(), self.capacity, &[])?;
         self.len = upto;
+        self.high = upto;
+        // A windowed layer brought only its window: nothing before `upto` can be rewound to.
+        let trimmed = self.windows.iter().flatten().any(|w| upto > *w);
+        self.floor = if trimmed { upto } else { 0 };
         Ok(())
     }
 
     /// Each layer's keys, then values, that has its own, with the sliding window it reads
     /// (a saved state keeps only that many of its last positions).
     fn cache_buffers(&self) -> Vec<Positions<'_>> {
-        let keys = self.keys.iter().zip(&self.windows);
-        let values = self.values.iter().zip(&self.windows);
+        let keys = self.keys.iter().zip(&self.windows).zip(&self.rings);
+        let values = self.values.iter().zip(&self.windows).zip(&self.rings);
         keys.chain(values)
-            .filter_map(|(b, w)| b.as_ref().map(|b| (b, *w)))
+            .filter_map(|((b, w), r)| b.as_ref().map(|b| (b, *w, *r)))
             .collect()
     }
 }
@@ -161,14 +199,10 @@ impl<'a> Gemma4Cuda<'a> {
             let name = |part: &str| format!("blk.{i}.{part}.weight");
             let hd = c.head_dim_of(i);
             let own_kv = i < c.first_shared_layer;
-            if own_kv && file.tensor(&name("attn_v")).is_none() {
-                return Err(Error::Unsupported(format!(
-                    "Layer {i} without attn_v on the GPU"
-                )));
-            }
+            // A layer without attn_v uses its keys as values (31B's global layers).
             let kv = |part: &str| -> Result<Option<GpuMatrix>> {
-                if own_kv {
-                    upload(matrix(file, &name(part), dim, c.kv_heads * hd)?).map(Some)
+                if own_kv && file.tensor(&name(part)).is_some() {
+                    upload(matrix(file, &name(part), dim, c.kv_heads_of(i) * hd)?).map(Some)
                 } else {
                     Ok(None)
                 }
@@ -191,11 +225,20 @@ impl<'a> Gemma4Cuda<'a> {
                 up: upload(matrix(file, &name("ffn_up"), dim, c.ffn_dims[i])?)?,
                 down: upload(matrix(file, &name("ffn_down"), c.ffn_dims[i], dim)?)?,
                 post_ffw_norm: up(vector(file, &name("post_ffw_norm"), dim)?)?,
-                inp_gate: upload(matrix(file, &name("inp_gate"), dim, pl)?)?,
-                proj: upload(matrix(file, &name("proj"), pl, dim)?)?,
-                post_norm: up(vector(file, &name("post_norm"), dim)?)?,
+                per_layer: if pl > 0 {
+                    Some((
+                        upload(matrix(file, &name("inp_gate"), dim, pl)?)?,
+                        upload(matrix(file, &name("proj"), pl, dim)?)?,
+                        up(vector(file, &name("post_norm"), dim)?)?,
+                    ))
+                } else {
+                    None
+                },
                 output_scale: vector(file, &name("layer_output_scale"), 1).map_or(1.0, |v| v[0]),
             });
+            if own_kv && layers[i].k.is_none() {
+                return Err(Error::Missing(format!("tensor blk.{i}.attn_k.weight")));
+            }
         }
         if file.tensor("output.weight").is_some() {
             return Err(Error::Unsupported(
@@ -203,10 +246,21 @@ impl<'a> Gemma4Cuda<'a> {
             ));
         }
         let embedding = matrix(file, "token_embd.weight", dim, c.vocab)?;
-        let proj_norm: Vec<f32> = vector(file, "per_layer_proj_norm.weight", pl)?
-            .into_iter()
-            .map(|w| w / 2f32.sqrt())
-            .collect();
+        let per_layer_inputs = if pl > 0 {
+            let proj_norm: Vec<f32> = vector(file, "per_layer_proj_norm.weight", pl)?
+                .into_iter()
+                .map(|w| w / 2f32.sqrt())
+                .collect();
+            let model_proj = matrix(file, "per_layer_model_proj.weight", dim, pl * c.layers)?;
+            Some(PerLayerInputs {
+                embedding: matrix(file, "per_layer_token_embd.weight", pl * c.layers, c.vocab)?,
+                model_proj_q8: GpuMatrix::upload_q8_0(&gpu, &model_proj)?,
+                model_proj: upload(model_proj)?,
+                proj_norm: up(proj_norm)?,
+            })
+        } else {
+            None
+        };
         let rope_factors = if file.tensor("rope_freqs.weight").is_some() {
             Some(up(vector(file, "rope_freqs.weight", c.head_dim / 2)?)?)
         } else {
@@ -216,23 +270,7 @@ impl<'a> Gemma4Cuda<'a> {
             precision: Precision::default(),
             output: upload(embedding)?,
             embedding,
-            per_layer_embedding: matrix(
-                file,
-                "per_layer_token_embd.weight",
-                pl * c.layers,
-                c.vocab,
-            )?,
-            per_layer_model_proj: upload(matrix(
-                file,
-                "per_layer_model_proj.weight",
-                dim,
-                pl * c.layers,
-            )?)?,
-            per_layer_model_proj_q8: GpuMatrix::upload_q8_0(
-                &gpu,
-                &matrix(file, "per_layer_model_proj.weight", dim, pl * c.layers)?,
-            )?,
-            per_layer_proj_norm: up(proj_norm)?,
+            per_layer_inputs,
             rope_factors,
             output_norm: up(vector(file, "output_norm.weight", dim)?)?,
             layers,
@@ -263,7 +301,8 @@ impl<'a> Gemma4Cuda<'a> {
     pub fn session_with_batch(&self, capacity: usize, batch: usize) -> Result<Gemma4CudaSession> {
         let c = &self.config;
         let batch = batch.clamp(1, capacity.max(1));
-        let f32s = |n: usize| self.gpu.alloc(n * 4).map_err(gpu_error);
+        // At least one value each: a model without per-layer inputs has none to keep.
+        let f32s = |n: usize| self.gpu.alloc(n.max(1) * 4).map_err(gpu_error);
         // Keys and values: f16 in 8-bit mode (half the memory), f32 when exact.
         let cache_bytes = if self.precision == Precision::Int8 {
             2
@@ -271,9 +310,23 @@ impl<'a> Gemma4Cuda<'a> {
             4
         };
         let cache_buffer = |n: usize| self.gpu.alloc(n * cache_bytes).map_err(gpu_error);
+        // On the Mac a sliding-window layer keeps its window and a batch's new positions
+        // (rounded to the attention kernel's chunk of 64), not every position: for 31B at
+        // 32K tokens, 1.6 GB instead of 27.
+        let rings: Vec<usize> = (0..c.layers)
+            .map(|l| {
+                let ring = (c.sliding_window + batch).next_multiple_of(64);
+                if cfg!(target_os = "macos") && c.is_swa[l] && ring < capacity {
+                    ring
+                } else {
+                    0
+                }
+            })
+            .collect();
         let cache = |l: usize| -> Result<Option<Buffer>> {
             if l < c.first_shared_layer {
-                cache_buffer(capacity * c.kv_heads * c.head_dim_of(l)).map(Some)
+                let rows = if rings[l] > 0 { rings[l] } else { capacity };
+                cache_buffer(rows * c.kv_heads_of(l) * c.head_dim_of(l)).map(Some)
             } else {
                 Ok(None)
             }
@@ -293,6 +346,9 @@ impl<'a> Gemma4Cuda<'a> {
             windows: (0..c.layers)
                 .map(|l| c.is_swa[l].then_some(c.sliding_window))
                 .collect(),
+            rings,
+            high: 0,
+            floor: 0,
             len: 0,
             capacity,
             batch,
@@ -306,8 +362,8 @@ impl<'a> Gemma4Cuda<'a> {
             per_layer: f32s(batch * per_layer)?,
             per_layer_proj: f32s(batch * per_layer)?,
             q: f32s(batch * c.heads * widest_head)?,
-            k_new: f32s(batch * c.kv_heads * widest_head)?,
-            v_new: f32s(batch * c.kv_heads * widest_head)?,
+            k_new: f32s(batch * c.widest_kv_heads() * widest_head)?,
+            v_new: f32s(batch * c.widest_kv_heads() * widest_head)?,
             attention: f32s(batch * c.heads * widest_head)?,
             gate: f32s(batch * widest_ffn)?,
             up: f32s(batch * widest_ffn)?,
@@ -343,16 +399,20 @@ impl<'a> Gemma4Cuda<'a> {
             let e = &mut s.embedding[i * dim..(i + 1) * dim];
             self.embedding.decode_row(token as usize, e);
             e.iter_mut().for_each(|v| *v *= embed_scale);
-            let p = &mut s.per_layer_host[i * pl..(i + 1) * pl];
-            self.per_layer_embedding.decode_row(token as usize, p);
-            p.iter_mut().for_each(|v| *v *= token_scale);
+            if let Some(inputs) = &self.per_layer_inputs {
+                let p = &mut s.per_layer_host[i * pl..(i + 1) * pl];
+                inputs.embedding.decode_row(token as usize, p);
+                p.iter_mut().for_each(|v| *v *= token_scale);
+            }
         }
         let t = tokens.len();
         let e = gpu_error;
         s.x.write_f32(&s.embedding[..t * dim]).map_err(e)?;
-        s.per_layer
-            .write_f32(&s.per_layer_host[..t * pl])
-            .map_err(e)?;
+        if pl > 0 {
+            s.per_layer
+                .write_f32(&s.per_layer_host[..t * pl])
+                .map_err(e)?;
+        }
         s.pos.write_i32(&[s.len as i32]).map_err(e)
     }
 
@@ -376,7 +436,7 @@ impl<'a> Gemma4Cuda<'a> {
         for l in layers {
             let layer = &self.layers[l];
             let hd = c.head_dim_of(l);
-            let kv_dim = c.kv_heads * hd;
+            let kv_dim = c.kv_heads_of(l) * hd;
             let (base, factors) = if c.is_swa[l] {
                 (c.rope_base_swa, None)
             } else {
@@ -385,10 +445,16 @@ impl<'a> Gemma4Cuda<'a> {
 
             let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
             layer.q.mul(&h, s.q.ptr())?;
-            let own = match (&layer.k, &layer.v, &s.keys[l], &s.values[l]) {
-                (Some(k), Some(v), Some(keys), Some(values)) => {
+            let own = match (&layer.k, &s.keys[l], &s.values[l]) {
+                (Some(k), Some(keys), Some(values)) => {
                     k.mul(&h, s.k_new.ptr())?;
-                    v.mul(&h, s.v_new.ptr())?;
+                    match &layer.v {
+                        Some(v) => v.mul(&h, s.v_new.ptr())?,
+                        // Keys as values, before either is normed.
+                        None => g
+                            .copy(s.v_new.ptr(), s.k_new.ptr(), t * kv_dim * 4)
+                            .map_err(e)?,
+                    }
                     Some((keys.ptr(), values.ptr()))
                 }
                 _ => None,
@@ -406,7 +472,7 @@ impl<'a> Gemma4Cuda<'a> {
                     v_norm: true,
                     cache: own,
                     heads: c.heads,
-                    kv_heads: c.kv_heads,
+                    kv_heads: c.kv_heads_of(l),
                     head_dim: hd,
                     rope_dims: hd,
                     rope_base: base,
@@ -415,6 +481,7 @@ impl<'a> Gemma4Cuda<'a> {
                     pos,
                     eps,
                     half_cache: s.half_cache,
+                    ring: s.rings[l],
                 },
                 t,
             )
@@ -427,7 +494,7 @@ impl<'a> Gemma4Cuda<'a> {
                     .expect("a source layer has its own keys"),
                 s.values[source].as_ref().expect("and values"),
             );
-            g.attention(
+            g.attention_ring(
                 s.half_cache,
                 s.q.ptr(),
                 keys.ptr(),
@@ -435,11 +502,12 @@ impl<'a> Gemma4Cuda<'a> {
                 s.attention.ptr(),
                 pos,
                 if c.is_swa[l] { c.sliding_window } else { 0 },
+                s.rings[source],
                 c.heads,
                 t,
                 hd,
                 kv_dim,
-                c.heads / c.kv_heads,
+                c.heads / c.kv_heads_of(l),
                 1.0,
             )
             .map_err(e)?;
@@ -479,6 +547,26 @@ impl<'a> Gemma4Cuda<'a> {
                 &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
                 s.projected.ptr(),
             )?;
+            let next = match self.layers.get(l + 1) {
+                Some(next) => &next.attn_norm,
+                None => &self.output_norm,
+            };
+            let Some((inp_gate, proj, post_norm)) = &layer.per_layer else {
+                // No per-layer input: the layer ends here.
+                g.residual_norm(
+                    s.x.ptr(),
+                    Some(s.projected.ptr()),
+                    Some(&layer.post_ffw_norm),
+                    layer.output_scale,
+                    Some(next),
+                    s.h.ptr(),
+                    t,
+                    dim,
+                    eps,
+                )
+                .map_err(e)?;
+                continue;
+            };
             g.residual_norm(
                 s.x.ptr(),
                 Some(s.projected.ptr()),
@@ -492,9 +580,7 @@ impl<'a> Gemma4Cuda<'a> {
             )
             .map_err(e)?;
 
-            layer
-                .inp_gate
-                .mul(&Input::new(g, s.x.ptr(), t, s.q8.as_ref()), s.small.ptr())?;
+            inp_gate.mul(&Input::new(g, s.x.ptr(), t, s.q8.as_ref()), s.small.ptr())?;
             g.geglu(
                 s.small.ptr(),
                 s.per_layer.f32_at(l * pl),
@@ -503,18 +589,14 @@ impl<'a> Gemma4Cuda<'a> {
                 t,
             )
             .map_err(e)?;
-            layer.proj.mul(
+            proj.mul(
                 &Input::new(g, s.small.ptr(), t, s.q8.as_ref()),
                 s.projected.ptr(),
             )?;
-            let next = match self.layers.get(l + 1) {
-                Some(next) => &next.attn_norm,
-                None => &self.output_norm,
-            };
             g.residual_norm(
                 s.x.ptr(),
                 Some(s.projected.ptr()),
-                Some(&layer.post_norm),
+                Some(post_norm),
                 layer.output_scale,
                 Some(next),
                 s.h.ptr(),
@@ -533,25 +615,27 @@ impl<'a> Gemma4Cuda<'a> {
         let g = &self.gpu;
         let e = gpu_error;
         let (dim, pl, eps) = (c.dim, c.per_layer_dim, c.norm_eps);
-        let proj = match (&self.per_layer_model_proj_q8, self.precision) {
-            (Some(q8), Precision::Int8) => q8,
-            _ => &self.per_layer_model_proj,
-        };
-        proj.mul(
-            &Input::new(g, s.x.ptr(), t, s.q8.as_ref()),
-            s.per_layer_proj.ptr(),
-        )?;
-        g.rms_norm_rows(
-            s.per_layer_proj.ptr(),
-            self.per_layer_proj_norm.ptr(),
-            s.per_layer_proj.ptr(),
-            t * c.layers,
-            pl,
-            eps * dim as f32,
-        )
-        .map_err(e)?;
-        g.add(s.per_layer.ptr(), s.per_layer_proj.ptr(), t * c.layers * pl)
+        if let Some(inputs) = &self.per_layer_inputs {
+            let proj = match (&inputs.model_proj_q8, self.precision) {
+                (Some(q8), Precision::Int8) => q8,
+                _ => &inputs.model_proj,
+            };
+            proj.mul(
+                &Input::new(g, s.x.ptr(), t, s.q8.as_ref()),
+                s.per_layer_proj.ptr(),
+            )?;
+            g.rms_norm_rows(
+                s.per_layer_proj.ptr(),
+                inputs.proj_norm.ptr(),
+                s.per_layer_proj.ptr(),
+                t * c.layers,
+                pl,
+                eps * dim as f32,
+            )
             .map_err(e)?;
+            g.add(s.per_layer.ptr(), s.per_layer_proj.ptr(), t * c.layers * pl)
+                .map_err(e)?;
+        }
         g.residual_norm(
             s.x.ptr(),
             None,
@@ -669,8 +753,10 @@ impl<'a> Gemma4Cuda<'a> {
                         .map_err(e)?;
                     g.copy(s.h.ptr(), row(&s.h, t - 1, dim), dim * 4)
                         .map_err(e)?;
-                    g.copy(s.per_layer.ptr(), row(&s.per_layer, t - 1, pl), pl * 4)
-                        .map_err(e)?;
+                    if pl > 0 {
+                        g.copy(s.per_layer.ptr(), row(&s.per_layer, t - 1, pl), pl * 4)
+                            .map_err(e)?;
+                    }
                 }
                 s.pos_last
                     .write_i32(&[(s.len + t - 1) as i32])

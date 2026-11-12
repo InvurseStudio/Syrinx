@@ -69,6 +69,22 @@ impl GpuMatrix {
     /// activations when the input has room for them and the weights have kernels.
     pub fn mul(&self, input: &Input, y: CuDevicePtr) -> Result<()> {
         let g = input.gpu;
+        // A few tokens (a draft's guesses): the weights read once, as for one token.
+        #[cfg(target_os = "macos")]
+        if input.tokens > 1
+            && g.matvec_multi(
+                self.kind,
+                self.data.ptr(),
+                input.x,
+                y,
+                self.rows,
+                self.cols,
+                input.tokens,
+            )
+            .map_err(gpu_error)?
+        {
+            return Ok(());
+        }
         if let Some(q8) = input.q8
             && Gpu::supports_8bit(self.kind)
             && self.cols.is_multiple_of(32)
@@ -226,10 +242,34 @@ pub(super) fn row(buffer: &Buffer, row: usize, width: usize) -> CuDevicePtr {
     buffer.f32_at(row * width)
 }
 
-/// A buffer of `capacity` positions (each the same size) to save, and how many of its
-/// last positions are worth keeping: `None` for all of them, `Some(w)` for a layer that
-/// only ever looks `w` positions back (a sliding window), so older ones are left out.
-pub(super) type Positions<'b> = (&'b Buffer, Option<usize>);
+/// A buffer of positions (each the same size) to save; how many of its last positions are
+/// worth keeping: `None` for all of them, `Some(w)` for a layer that only ever looks `w`
+/// positions back (a sliding window), so older ones are left out; and its ring: 0 for a
+/// buffer of `capacity` positions, each at its own row, or the number of rows of one that
+/// keeps only the last ones, position p at row p mod ring.
+pub(super) type Positions<'b> = (&'b Buffer, Option<usize>, usize);
+
+/// Bytes a position takes in a buffer.
+fn per_position(b: &Buffer, capacity: usize, ring: usize) -> usize {
+    b.len_bytes() / if ring > 0 { ring } else { capacity.max(1) }
+}
+
+/// Positions `range` of a buffer as runs of rows: (first row, first position, count). One
+/// run, or two where a ring wraps.
+fn runs(range: std::ops::Range<usize>, ring: usize) -> Vec<(usize, usize, usize)> {
+    if ring == 0 || range.is_empty() {
+        return vec![(range.start, range.start, range.len())];
+    }
+    let mut out = Vec::new();
+    let mut p = range.start;
+    while p < range.end {
+        let row = p % ring;
+        let n = (ring - row).min(range.end - p);
+        out.push((row, p, n));
+        p += n;
+    }
+    out
+}
 
 /// Which of `len` positions a buffer that keeps `window` of them saves.
 fn kept(len: usize, window: Option<usize>) -> std::ops::Range<usize> {
@@ -246,18 +286,19 @@ pub(super) fn save_state(
 ) -> Result<SavedState> {
     let total = positions
         .iter()
-        .map(|(b, w)| b.len_bytes() / capacity * kept(len, *w).len())
+        .map(|(b, w, r)| per_position(b, capacity, *r) * kept(len, *w).len())
         .chain(whole.iter().map(|b| b.len_bytes()))
         .sum();
     let mut bytes = vec![0u8; total];
     let mut at = 0;
-    for (b, w) in positions {
-        let per = b.len_bytes() / capacity;
-        let range = kept(len, *w);
-        let n = per * range.len();
-        b.read_bytes_at(per * range.start, &mut bytes[at..at + n])
-            .map_err(gpu_error)?;
-        at += n;
+    for (b, w, r) in positions {
+        let per = per_position(b, capacity, *r);
+        for (row, _, count) in runs(kept(len, *w), *r) {
+            let n = per * count;
+            b.read_bytes_at(per * row, &mut bytes[at..at + n])
+                .map_err(gpu_error)?;
+            at += n;
+        }
     }
     for b in whole {
         let n = b.len_bytes();
@@ -282,7 +323,7 @@ pub(super) fn load_state(
 ) -> Result<()> {
     let expected: usize = positions
         .iter()
-        .map(|(b, w)| b.len_bytes() / capacity * kept(saved.len, *w).len())
+        .map(|(b, w, r)| per_position(b, capacity, *r) * kept(saved.len, *w).len())
         .chain(whole.iter().map(|b| b.len_bytes()))
         .sum();
     if saved.bytes.len() != expected || upto > saved.len || saved.len > capacity {
@@ -292,23 +333,26 @@ pub(super) fn load_state(
             saved.len
         )));
     }
-    let trimmed = positions.iter().any(|(_, w)| kept(saved.len, *w).start > 0);
+    let trimmed = positions
+        .iter()
+        .any(|(_, w, _)| kept(saved.len, *w).start > 0);
     if (trimmed || !whole.is_empty()) && upto != saved.len {
         return Err(Error::Invalid(
             "this saved state can only be loaded whole".into(),
         ));
     }
     let mut at = 0;
-    for (b, w) in positions {
-        let per = b.len_bytes() / capacity;
+    for (b, w, r) in positions {
+        let per = per_position(b, capacity, *r);
         let range = kept(saved.len, *w);
-        let n = per
-            * range
-                .start
-                .max(range.end.min(upto))
-                .saturating_sub(range.start);
-        b.write_bytes_at(per * range.start, &saved.bytes[at..at + n])
-            .map_err(gpu_error)?;
+        let end = range.start.max(range.end.min(upto));
+        let mut from = at;
+        for (row, _, count) in runs(range.start..end, *r) {
+            let n = per * count;
+            b.write_bytes_at(per * row, &saved.bytes[from..from + n])
+                .map_err(gpu_error)?;
+            from += n;
+        }
         at += per * range.len();
     }
     for b in whole {

@@ -70,6 +70,18 @@ the tools well (it said yes to every skill, saved a poem to a file). It ran in t
 too (22/35, as before) and still runs on request (`--models Qwen3.5-0.8B-Q4_K_M.gguf`); it
 stays one of the engine's own test models. Results: `evals/one-engine.json`.
 
+## Larger models (Mac, 2026-11-11)
+
+Gemma 4 31B runs: per-layer key-value heads, no per-layer inputs and keys used as values
+are handled in the shared model code (`gemma4.rs`, `gemma4_cuda.rs`). It passes all 35
+cases on the Mac, about 10 s a case. Tuned for it, on Metal only: a sliding-window
+layer's cache kept as a ring (32K chats 29.5 → 4.4 GB), a 256-token prompt tile for whole
+1,024-token batches, and a 2–8-token Q6_K kernel. In the server, for both: `--draft`,
+Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer answers).
+**Not run on CUDA yet:** the 31B itself and `--draft`. CUDA keeps full caches
+(`attention_ring` and `qkv_prep` assert a ring of 0 there). Details:
+`evals/gemma-4-31B.md`.
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** `files.rs` makes the four changes (to the Trash, with undo as
