@@ -385,6 +385,81 @@ memory on all three; long prompts' products run at ~85% of the accelerators' F16
 ceiling. What's left is in guessing (a cheaper 4-token check would let Qwen take a
 third guess and help Gemma's chat guesses), and the short reads' fixed costs.
 
+**Twelfth pass: attention for a group of heads, a few tokens at once, longer guesses
+(2026-11-12, afternoon).** Where a 30K prompt's time went on Gemma 4 31B
+(`VIREO_METAL_PROFILE`): the matrix products 59%, the ten global layers' attention 25%
+(49 ms a batch, growing with the context), the sliding layers' 5%. The products run at
+51-57 TFLOPS on their own (`big_matmul_speed`; Q6_K a little ahead of F16 through the same
+tile), so they are at this design's ceiling; attention ran at ~20.
+
+- `attention_tcg` (vireo_tensor.metal): a prompt's attention with a key/value head's query
+  heads together. A threadgroup takes one key/value head and 16-32 rows of its queries
+  (several tokens of the group's heads), read as f16 from device memory (`qkv_prep` writes
+  them there too, regrouped; `q_group_half` for other callers), and each key and value
+  chunk once for the group, 128 or 256 positions at a time (64 a head before). Tiles
+  searched: 16-64 rows, 64-256 positions, 4 or 8 SIMD groups; the quickest leave a thread 32
+  of the output's numbers (512-wide heads 16 × 256 × 8, 256-wide 32 × 128 × 8, 128-wide
+  32 × 128 × 4). A batch of 1,024 at 30K positions, ms a layer: Gemma 31B's global layers
+  91 → 58, Qwen 3.8 27B 39 → 26, Muse 30B's global 30.4 → 13.7; sliding layers Gemma
+  1.86 → 1.44, Muse 2.14 → 1.11 (`tests/prompt_attention_speed.rs`). Rings are rounded to
+  256 positions for it. With the old chunk of 64 its sums are the old kernel's to the bit.
+- A short batch has few threadgroups, so its context is split into parts (about three
+  threadgroups a GPU core) that `attention_tcg_merge` adds up: 40 tokens at 30K, Qwen 27B
+  3.87 → 1.32 ms a layer, Muse 2.74 → 0.69.
+- 1 to 8 tokens the same way where it's quicker (`Gpu::grouped_few`): the one-token
+  kernels walk the context once a token and head, this reads it once. Gemma 31B's global
+  layers at 30K, 2 / 4 / 8 tokens: 1.09 → 0.58, 2.29 → 0.62, 4.98 → 0.80 ms. One token
+  only for Muse's global layers (0.26 → 0.08 ms at 30K); Gemma's and Qwen's read their
+  cache at memory speed already.
+- 8- and 16-token tiles for the matrix products (`matmul_tc_t8`, `_t16`, 256 columns a
+  step), and `Gpu::tile_beats_few` by weight type: the tile from 4 tokens for K-quants and
+  5 for the others, on any matrix over 4M weights (64M and 5 before). Gemma 31B's ffn_up,
+  µs at 3 / 4 / 5 / 8 tokens: few-token kernels 221 / 296 / 437 / 583, the 32-token tile
+  ~330, the 8-token one 250-260 (one token 194); ffn_down at 4: 400 → 252
+  (`big_few_or_tile`). 256 columns a step did nothing for whole batches (4.69 → 4.63 ms).
+  A slip found on the way: a tile whose step doesn't divide the columns dropped the last
+  columns (none of the old tiles' did).
+- `VIREO_METAL_ERRORS=1` says why the tensor kernels didn't compile: the backend falls
+  back to the kernels without them silently, as it must before the M5.
+
+A batch of n tokens after a chat of that length, ms, main → now (`tests/check_speed.rs`):
+
+| | 1 | 3 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| Gemma 4 31B at 2K | 52.5 | 67.6 → 67.0 | 96.6 → 71.7 | 120.4 → 74.3 | 101.0 → 80.0 |
+| Gemma 4 31B at 27K | 56.4 | 82.0 → 71.5 | 111.1 → 80.4 | 146.2 → 86.9 | 130.1 → 95.4 |
+| Qwen 3.8 27B at 2K | 46.5 | 52.4 → 52.5 | 67.5 → 57.7 | 96.7 → 69.0 | 96.4 → 73.8 |
+| Qwen 3.8 27B at 27K | 50.0 | 63.8 → 61.9 | 87.7 → 68.0 | 137.9 → 83.3 | 150.6 → 94.3 |
+| Muse 30B at 2K | 46.7 → 44.8 | 64.5 → 51.7 | 97.8 → 59.3 | 108.6 → 70.5 | 103.3 → 79.2 |
+| Muse 30B at 27K | 51.5 → 49.0 | 73.5 → 61.7 | 107.5 → 66.5 | 143.5 → 76.3 | 128.4 → 79.7 |
+
+Eight tokens now cost what four do, so the guessing takes more (vireo-server): guesses
+from the chat run up to 7 after a match of 8 tokens (3 after 4 before; the Mac only, a
+longer match guessing further), and Qwen's multi-token-prediction layer gives 3 a round
+(2 / 3 / 4 guesses: a copied document at 44 / 53 / 59 tokens/s, a new story at 30.1 / 29.6
+/ 26.5). Three replies through the server, tokens/s, main → now, every reply's text the
+same: Gemma 31B rewriting a document as a list 28-33 → 43, returning an edited code file
+30-35 → 62, a new story 18-19 → 18.4; Qwen 27B 42.5 → 53.2, 43.4 → 53.2, 29.5 → 29.6;
+Muse 30B 31.9 → 42.0, 32.2 → 45.3, 20.4 → 20.3.
+
+Whole reads and writes (`vireo-cli`, the speed report's prompts; the Mac ran hot and busy
+all afternoon, runs moving by 10-15%, so these are alternating runs): Muse 30K read 593 →
+662 tokens/s and writing after it 19.2 → 20.5; Gemma 31B's 30K read by kernel 63.8 / 65.1 s
+of GPU time → 59.6 / 61.7 (attention 19.7-20.5 → 14.0-14.4 s; the products ran 3-5% slower
+beside it, the GPU's heat budget); Qwen 27B 592 → 597 at 30K, 698-722 → 718-722 at 8K.
+Perplexity old / new attention: Qwen 27B 10.3910 / 10.3902, Muse 16.9149 / 16.9134. Nine
+eval cases on Gemma 4 E4B, Qwen 3.5 4B, Gemma 31B and Qwen 27B, main and now alternating:
+every reply the same to the token, and the time level (13.3-15.0 / 18.7-18.8 / 80.5-90.8 /
+82.5-93.6 s against 13.4-13.8 / 18.6-19.5 / 81.2-85.3 / 83.0-85.0): at the eval's ~2K
+contexts these changes cost and save little. Muse's reasoning on the rewrite ran 406
+tokens, not main's 41, with the same answer: exact mode gives 406 too, so main's was the
+f16 rounding's path. One test's limit moved: re-reading 10 tokens after a rewind differs
+by 0.02 in the logits in the default mode (1e-3 before), a short batch's parts each
+rounding probabilities to f16 against their own largest.
+
+`VIREO_TCG=off` and `VIREO_TCG_FEW=off` keep the old attention kernels, to compare. Not
+done: the CUDA side of any of it; the speed report's page (its numbers are the morning's).
+
 **Muse Glimmer 30B in vireo-server (2026-11-12).** A chat family of its own (`Family::Muse`,
 `muse-glimmer`), run by Gemma 4's model code. Its format is the template's: turns are
 `<|start|>role<|message|>…<|eot|>`; the system turn carries Vireo's system prompt (with the
