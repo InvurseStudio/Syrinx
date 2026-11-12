@@ -22,6 +22,7 @@ mod hard_cases;
 #[allow(dead_code)]
 mod json;
 mod pc;
+mod skill_cases;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -125,10 +126,12 @@ fn main() -> ExitCode {
             let run = ask(running.port, case);
             let verdict = match (&run.error, (case.check)(&run)) {
                 (Some(e), _) => Err(format!("error: {e}")),
-                (None, _) if !case.changes && !run.changes_made().is_empty() => Err(format!(
-                    "called {} when nobody asked for a change",
-                    run.changes_made()[0].tool
-                )),
+                (None, _) if !case.changes && !case.skills && !run.changes_made().is_empty() => {
+                    Err(format!(
+                        "called {} when nobody asked for a change",
+                        run.changes_made()[0].tool
+                    ))
+                }
                 (None, v) => v,
             };
             let tools: Vec<String> = run.calls.iter().map(|c| c.tool.clone()).collect();
@@ -153,17 +156,24 @@ fn main() -> ExitCode {
         let passed = runs.iter().filter(|r| r.1.is_ok()).count();
         let seconds: f64 = runs.iter().map(|r| r.2.seconds).sum();
         let calls: usize = runs.iter().map(|r| r.2.calls.len()).sum();
-        let part = |hard: bool, changes: bool| {
+        let part = |hard: bool, changes: bool, skills: bool| {
             let of: Vec<_> = runs
                 .iter()
-                .filter(|r| r.2.hard == hard && r.2.changes == changes)
+                .filter(|r| r.2.hard == hard && r.2.changes == changes && r.2.skill_case == skills)
                 .collect();
             (of.iter().filter(|r| r.1.is_ok()).count(), of.len())
         };
-        let ((easy_passed, easy), (hard_passed, hard)) = (part(false, false), part(true, false));
-        let (changes_passed, changes) = part(false, true);
+        let ((easy_passed, easy), (hard_passed, hard)) =
+            (part(false, false, false), part(true, false, false));
+        let (changes_passed, changes) = part(false, true, false);
+        let (skills_passed, skill_cases) = part(false, false, true);
+        // Skills picked where a case didn't ask for one: worth watching, not a failure.
+        let stray = runs
+            .iter()
+            .filter(|r| !r.2.skill_case && !r.2.skills.is_empty())
+            .count();
         println!(
-            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard, {changes_passed}/{changes} changes), {:.1} s a case on average, {calls} tool calls",
+            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard, {changes_passed}/{changes} changes, {skills_passed}/{skill_cases} skills; a skill in {stray} others), {:.1} s a case on average, {calls} tool calls",
             runs.len(),
             seconds / runs.len().max(1) as f64
         );
@@ -196,10 +206,12 @@ fn results_json(report: &Report, server_args: &[String]) -> String {
                         .map(|c| format!("{{\"tool\":{},\"args\":{}}}", json::string(&c.tool), to_json(&c.args)))
                         .collect();
                     format!(
-                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
+                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"skillCase\":{},\"skills\":[{}],\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
                         json::string(id),
                         run.hard,
                         run.changes,
+                        run.skill_case,
+                        run.skills.iter().map(|t| json::string(t)).collect::<Vec<_>>().join(","),
                         run.asked.iter().map(|t| json::string(t)).collect::<Vec<_>>().join(","),
                         verdict.is_ok(),
                         verdict.as_ref().err().map_or("null".into(), |p| json::string(p)),
@@ -284,8 +296,14 @@ impl Server {
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let stderr = child.stderr.take().unwrap();
         let sink = log.clone();
+        // With VIREO_DEBUG_CALLS set (the server reads it too), its "[calls]" lines, the
+        // scores behind each choice, are shown as they come.
+        let show = std::env::var_os("VIREO_DEBUG_CALLS").is_some();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if show && line.starts_with("[calls]") {
+                    eprintln!("    {line}");
+                }
                 sink.lock().unwrap().push(line);
             }
         });
@@ -333,6 +351,7 @@ fn ask(port: u16, case: &Case) -> Run {
     let tools: Vec<String> = CLIENT_TOOLS.iter().map(|t| json::string(t)).collect();
     run.hard = case.hard;
     run.changes = case.changes;
+    run.skill_case = case.skills;
     let mut pc = case.pc.clone();
     // The earlier turns, then the prompt.
     let messages: Vec<String> = case
@@ -368,6 +387,13 @@ fn ask(port: u16, case: &Case) -> Run {
             continue;
         };
         match event.str("type") {
+            // The skill the server picked comes as a use_skill call; it's kept apart from
+            // the model's own calls.
+            Some("tool_call") if event.str("tool") == Some("use_skill") => {
+                let args = event.get("args").cloned().unwrap_or(Value::Null);
+                run.skills.push(args.str("name").unwrap_or("").to_string());
+            }
+            Some("tool_result") if event.str("tool") == Some("use_skill") => {}
             Some("tool_call") => run.calls.push(Call {
                 tool: event.str("tool").unwrap_or("").to_string(),
                 args: event.get("args").cloned().unwrap_or(Value::Null),

@@ -33,6 +33,8 @@ pub struct Pc {
     git: BTreeMap<String, String>,
     /// Tools whose approvals the stand-in user declines.
     declines: Vec<String>,
+    /// `git diff` per project folder (lowercased), where a case sets one.
+    diffs: BTreeMap<String, String>,
 }
 
 fn key(path: &str) -> String {
@@ -65,6 +67,12 @@ impl Pc {
 
     pub fn git(mut self, folder: &str, status: &str) -> Self {
         self.git.insert(key(folder), status.to_string());
+        self
+    }
+
+    /// The project's `git diff` (otherwise a one-line change of a port).
+    pub fn diff(mut self, folder: &str, diff: &str) -> Self {
+        self.diffs.insert(key(folder), diff.to_string());
         self
     }
 
@@ -292,11 +300,13 @@ impl Pc {
                     .git
                     .iter()
                     .find(|(folder, _)| key(&path).starts_with(folder.as_str()))
-                    .map(|(_, status)| status.clone());
+                    .map(|(folder, status)| (folder.clone(), status.clone()));
                 match (tool, project) {
                     (_, None) => Err(format!("{path} isn't in a Git project.")),
-                    ("git_status", Some(status)) => Ok(status),
-                    (_, Some(_)) => Ok("diff --git a/src/main.rs b/src/main.rs\n-    let port = 3000;\n+    let port = 8080;".into()),
+                    ("git_status", Some((_, status))) => Ok(status),
+                    (_, Some((folder, _))) => Ok(self.diffs.get(&folder).cloned().unwrap_or_else(|| {
+                        "diff --git a/src/main.rs b/src/main.rs\n-    let port = 3000;\n+    let port = 8080;".into()
+                    })),
                 }
             }
             // The changes, as the app's WriteFileAsync, DeleteFile, RenameFile and MoveFile

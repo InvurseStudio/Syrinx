@@ -42,6 +42,7 @@ pub fn all() -> Vec<Case> {
             },
             hard: false,
             changes: true,
+            skills: false,
         },
         Case {
             id: "add-line",
@@ -72,6 +73,7 @@ pub fn all() -> Vec<Case> {
             },
             hard: false,
             changes: true,
+            skills: false,
         },
         Case {
             id: "rename",
@@ -99,6 +101,7 @@ pub fn all() -> Vec<Case> {
             },
             hard: false,
             changes: true,
+            skills: false,
         },
         Case {
             id: "move-found",
@@ -131,6 +134,7 @@ pub fn all() -> Vec<Case> {
             },
             hard: false,
             changes: true,
+            skills: false,
         },
         Case {
             id: "declined",
@@ -171,6 +175,7 @@ pub fn all() -> Vec<Case> {
             },
             hard: false,
             changes: true,
+            skills: false,
         },
         Case {
             id: "advice-only",
@@ -194,6 +199,7 @@ pub fn all() -> Vec<Case> {
             },
             hard: false,
             changes: true,
+            skills: false,
         },
     ]
 }

@@ -43,6 +43,10 @@ pub struct Run {
     pub asked: Vec<String>,
     /// The stand-in PC as the reply left it.
     pub pc: Pc,
+    /// Whether it was one of the cases about skills (`skill_cases.rs`).
+    pub skill_case: bool,
+    /// The skills the server picked for the reply (its use_skill calls).
+    pub skills: Vec<String>,
 }
 
 /// The tools that change files: they ask the user first.
@@ -99,8 +103,11 @@ pub struct Case {
     /// One of the harder cases (several steps, long results, follow-ups, recovering).
     pub hard: bool,
     /// One of the cases about changing files (`change_cases.rs`), counted apart. Any
-    /// other case fails if the reply changes a file: nobody asked it to.
+    /// other case fails if the reply changes a file, but a skill case may (translating
+    /// into a file).
     pub changes: bool,
+    /// One of the cases about skills (`skill_cases.rs`), counted apart.
+    pub skills: bool,
 }
 
 pub(crate) fn need(ok: bool, why: &str) -> Result<(), String> {
@@ -123,6 +130,7 @@ pub fn all() -> Vec<Case> {
     let mut all = easy();
     all.extend(crate::hard_cases::all());
     all.extend(crate::change_cases::all());
+    all.extend(crate::skill_cases::all());
     all
 }
 
@@ -137,6 +145,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default(),
             check: |r| {
                 need(!r.called("get_current_datetime").is_empty(), "didn't check the date")?;
@@ -157,6 +166,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default().file(
                 &format!(r"{docs}\notes.txt"),
                 "Shopping: eggs, flour, milk.\nThe code word for Friday is PELICAN.\n",
@@ -175,6 +185,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default()
                 .file(&format!(r"{docs}\Invoices\acme-november.pdf"), "Acme invoice")
                 .file(&format!(r"{docs}\Invoices\globex-october.pdf"), "Globex invoice")
@@ -196,6 +207,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default(),
             check: |r| {
                 r.only(&[])?;
@@ -209,6 +221,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default(),
             check: |r| {
                 r.only(&[])?;
@@ -222,6 +235,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default()
                 .file(&format!(r"{projects}\vireo\README.md"), "# Vireo\nA chat app.")
                 .file(&format!(r"{projects}\vireo\docs\secret.txt"), "Remember: the code word is HERON.")
@@ -240,6 +254,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default()
                 .file(&format!(r"{docs}\budget-2025.xlsx"), "old budget")
                 .file(&format!(r"{docs}\notes.txt"), "notes"),
@@ -260,6 +275,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default()
                 .file(&format!(r"{projects}\vireo\src\main.rs"), "fn main() {}")
                 .git(&format!(r"{projects}\vireo"), " M src/main.rs\n?? notes.md"),
@@ -276,6 +292,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default().file(&format!(r"{docs}\notes.txt"), "notes"),
             check: |r| {
                 need(r.calls.iter().any(|c| c.tool == "read_file"), "didn't try to read it")?;
@@ -292,6 +309,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default().file(&format!(r"{docs}\groceries.txt"), "apples $3\npears $4\nbread $5\n"),
             check: |r| {
                 need(r.calls.iter().any(|c| c.tool == "read_file" && c.points_at("path", "groceries.txt")), "didn't read it")?;
@@ -305,6 +323,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default()
                 .file(&format!(r"{docs}\a.txt"), "1450")
                 .file(&format!(r"{docs}\b.txt"), "1209"),
@@ -322,6 +341,7 @@ fn easy() -> Vec<Case> {
             history: vec![],
             hard: false,
             changes: false,
+            skills: false,
             pc: Pc::default()
                 .file(
                     &format!(r"{docs}\email.txt"),
