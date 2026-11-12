@@ -170,13 +170,16 @@ pub struct Lookup {
 /// tokens/s, returning an edited code file 217 → 445, a summary 217 → 212-216, a new story
 /// 219 → 216-217 (E4B: 125 → 165-196, 125 → 209-269, 125 → 128-131, 125 → 122-124).
 ///
-/// On the Mac a batch of up to 8 tokens costs a large model about 1.4 times one token
-/// (Gemma 4 31B: one 52 ms, four 72, eight 74), so a long match guesses further: up to 7
-/// after a run of 8. Elsewhere 3 after a run of 4, as measured there.
-pub const DEFAULT_LOOKUP: usize = if cfg!(target_os = "macos") { 7 } else { 3 };
+/// A batch of up to 8 tokens costs about 1.4 times one token (Gemma 4 31B on the M5 Max:
+/// one 52 ms, four 72, eight 74; Gemma 4 E4B on an RTX 5060 Laptop: 11.3, 13.3, 15.9), so
+/// a long match guesses further: up to 7 after a run of 8. On CUDA since the few-token
+/// kernels (it was 3 after a run of 4 while a check there cost two tokens' time), E4B, 400
+/// tokens, none / 3 / 7 guesses: rewriting a document as a list 83 / 143 / 157 tokens/s,
+/// returning an edited code file 86 / 199 / 313, a new story 85 / 86 / 86.
+pub const DEFAULT_LOOKUP: usize = 7;
 
 /// The longest and shortest runs of the chat's last tokens looked for, longest first.
-const LONGEST_RUN: usize = if cfg!(target_os = "macos") { 8 } else { 4 };
+const LONGEST_RUN: usize = 8;
 const SHORTEST_RUN: usize = 2;
 
 impl Lookup {

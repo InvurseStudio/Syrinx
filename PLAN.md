@@ -582,6 +582,7 @@ git), for checking our output and speed.
 | 2026-11-11 | **The quick Aurelia gauntlet through the Windows app on Vireo's own engine**, small models against the Mac's large ones (write-up: `docs/dev/test-gauntlet/runs/Aurelia-Quick-2026-11-11-small-models-notes.md`). Qwen 3.5 4B and 9B ran 12 of its 13 prompts (Q11 left out: no folder tasks yet), one model at a time, with fixes between runs, each measured with `vireo-eval` and its four new office cases (`office_cases.rs`). Fixed: a line after a skill's text to start on step 1 (Gemma 4 E2B described the steps instead); a second control request for skills (E2B took `fill-template` for an introduction); the tools preamble says to remember what people say about themselves; a repeated call refused on its own instead of ending all calls (Qwen 4B's Q5); `fill-template` only for a named template; each run's own chats, memory and approvals (`VIREO_CHATS_DIR` and the like: Claude's packaged app sees a layered `%LOCALAPPDATA%`) | Pass / Partial / Fail on the same 12 tasks: Qwen 3.5 4B 1 / 5 / 6 in 17.6 min, 9B 0 / 7 / 5 in 25.8 min, against the Nov 10 full run's Qwen 3.8 27B 11 / 1 / 0, Gemma 4 31B 9 / 3 / 0, Muse Glimmer 30B 9 / 3 / 0. Every tool call was well formed and reached its tool (memory, PDFs, register rows, Word templates filled with exact values, approvals; up to 21 calls a reply); 9B's card form matched Gemma 31B's. What the small models lack is judgment: both named the contractor the safety winner, and on approving over the limit 4B claimed it had approved and 9B tried to remember the approval. 9B's Q2 analysis was right throughout but ran out of the 2,048-token writing budget before the register. Eval after the fixes: Gemma 4 E2B 33/43, Qwen 3.5 4B 43/43; office cases E2B 0 → 2/4, Qwen 4B 3 → 4/4. Next: thinking in the engine, a per-model writing budget, skill picks on mixed requests |
 | 2026-11-12 | Windows tuning for the larger models (Qwen 3.5 4B and 9B, Gemma 4 E4B; see "Twelfth round"): the tensor-core matrix kernels' scales laid out by group so a warp reads them in pairs, their scaling as two fused multiply-adds, and a prompt batch of 1,024 on CUDA as on the Mac | Reading a prompt, against `main` (~2,000 / ~9,000 tokens): Qwen 4B +13% / +15%, 9B +11% / +8%, Gemma E4B +1.5% / +1.5%; generating unchanged. Perplexity (2 × 2,048 tokens of PLAN.md, 8-bit): Gemma E4B the same to every digit; Qwen 4B 11.7149 → 11.7239 and 9B 9.6416 → 9.6389 (exact 11.6965 and 9.6339: the fused sums round differently, within 8-bit mode's spread). Engine tests 70 and GPU 11 pass |
 | 2026-11-12 | Windows tuning, second pass (see "Thirteenth round"): one token's attention over an f16 cache rewritten (`attention_part_kv_*`: a block per key/value head and its query heads, a warp per position with the lanes splitting the head, parts sized from the kernel's real occupancy), and `residual_norm` reading a row into registers at once | Generating ~30K tokens deep, against `main`: Qwen 3.5 4B 19.4 → 32.9, 9B 14.5 → 20.8, Gemma 4 E4B 22.3 → 39.9 tokens/s overnight (llama.cpp 21.9, 16.4, 30.1); at full clocks the next morning 46.2 → 62.4, 33.5 → 43.0, 44.6 → 59.2 (llama.cpp 63.8, 41.9, 61.7: level); short chats +1–12%. `residual_norm` gives the same numbers; the new attention is within 1e-8 of f64 (the f16 test gains two cases 6,000 positions deep). Engine 70, GPU 11, server and eval tests pass; the full eval scores as `evals/more-tools.json` but for one borderline case on one model (`find-then-read`, failing as in earlier runs; `evals/windows-tuning.json`), 12.2 s a case against 14.0 |
+| 2026-11-12 | Windows tuning, third pass (see "Fourteenth round"): the Mac's fifth to twelfth passes measured on CUDA, and their CUDA side built. Few-token product kernels (`matvec8_few<2-8>_*`: the weights read once for 2 to 8 tokens), one token's attention for up to 8 tokens (`attention_part_kv`, a grid layer each), the convolution and DeltaNet stepping through their one-token kernels with the states kept (`Qwen35Cuda::can_rewind` on CUDA), a recorded graph for every batch of 1 to 64 tokens, tiles of 16 and 32 tokens for the tensor-core products. In the server: 7 guesses a round from the chat on CUDA too, Qwen guessing there on every size where the GPU has room for its steps, and picker sessions read in batches of 256 on CUDA | In 8-bit mode a batch of up to 8 tokens gives the logits of the same tokens read one at a time to the bit (Llama, Qwen 3.5, Gemma 4: difference 0.0), so guesses can't change a reply; the small tiles give the 64-token tile's numbers to the bit; rewinding Qwen after 0, 2, 4 or 5 of 5 guesses goes on to the bit. Against `main`, back to back: a 4-token check Gemma 4 E4B 21.9 → 13.1 ms, Qwen 3.5 4B 26.1 → 14.7; the full eval (43 cases) scores the same on all four models with no case changed, in 70 → 44, 98 → 73, 107 → 101 and 179 → 172 s (`evals/windows-short-batches.json`); copied replies 2-3 times as fast. Engine 73, GPU 14, server 60 tests pass. Not compiled on the Mac |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -980,6 +981,125 @@ comparison with llama.cpp shifts: at full clocks Vireo's per-token lead in short
 apart. Slow clocks favour Vireo's one-graph-per-token path, so benchmark in the
 Performance power scheme and say which one was used.
 
+**Fourteenth round: the Mac's passes on CUDA (2026-11-12, afternoon):**
+
+The Mac's fifth to twelfth passes were merged with "not done: the CUDA side of any of
+it". Measured first on this PC (`tests/check_speed.rs`, now for both backends; the
+Performance power scheme throughout), a batch of n tokens after a chat of 2,000, ms:
+
+| `main` | 1 written | 2 | 4 | 8 | 16 | 64 |
+|---|---|---|---|---|---|---|
+| Gemma 4 E2B | 5.9 | 12.2 | 12.2 | 12.4 | 12.6 | 13.6 |
+| Gemma 4 E4B | 10.7 | 22.7 | 21.9 | 22.3 | 22.5 | 24.5 |
+| Qwen 3.5 4B | 10.8 | 25.6 | 26.1 | 26.4 | 26.8 | 33.1 |
+| Qwen 3.5 9B | 17.8 | 44.5 | 47.0 | 47.5 | 46.6 | 54.9 |
+
+Two tokens cost what 64 did, two to two and a half times one: the tensor-core tile is
+unpacked through shared memory whatever it holds, and a batch's ~700 kernels were
+launched one by one (2-5 ms of the CPU's time that the GPU waits out), where one token
+replays a graph. So the chat's guesses (`--lookup`, on by default since the Mac's sixth
+pass) cost more here than they saved: nine eval cases on Gemma 4 E4B, 22.3 s of model
+time with them and 18.0 without, checking guesses 45% of it (28.6 ms a check against
+13.1 for a token). And the three picker sessions of the fifth pass, each with a prompt's
+buffers, left Qwen 3.5 9B's 8 GB with none free. Built:
+
+- **`matvec8_few<T>_*`** (T = 2 to 8; Q4_0, Q8_0, Q4_K, Q5_K, Q6_K): the dp4a
+  one-token kernels with T rows of x, each weight word multiplied by every token's while
+  it's in registers. The same sums in the same order: the same bits as one token at a
+  time (a test holds them to it). With several tokens' numbers in registers an SM holds
+  fewer warps, so the K-quants' kernels read the next step's weights before this step's
+  arithmetic (Q4_K, 9,216 × 2,560, 3 / 4 tokens: 65 → 47, 76 → 60 µs; two steps ahead no
+  better). Per product, µs at 1 / 2 / 4 / 8 tokens against the tile's 9: Gemma's Q4_0
+  gate 47 / 43 / 51 / 74 / 120, Qwen's Q4_K gate 40 / 42 / 60 / 110 / 100, Q6_K down
+  78 / 77 / 77 / 135 / 220. Q4_0 stays near the memory's speed to 8 tokens; the K-quants'
+  arithmetic (a scale and a minimum for each 32) costs ~10 µs a token past 4.
+- **One token's attention for up to 8 tokens** (`attention_part_kv`, f16 cache): a grid
+  layer a token, each at its own length, split into the parts one token is, so each gets
+  exactly the numbers it would alone. The convolution and the DeltaNet step through
+  their one-token kernels for up to 8 tokens (one launch each, the state in registers
+  throughout), not the chunked prompt kernels.
+- **A graph for every batch of 1 to 64 tokens**, by its length and the logits wanted,
+  recorded the first time (4-6 ms, about what a replay saves; copies inside the GPU
+  record too). Gemma 4 E4B, one token read as a batch: 16.0 → 10.8 ms.
+- **Tiles of 16 and 32 tokens** for the tensor-core products (`matmul8_t16_*`,
+  `_t32_*`: 8 warps of 16 rows, multiplying only the tokens there are): the 64-token
+  tile's numbers to the bit, 25-38% less a product at 9-16 tokens (Q4_0 gate 120 → 74 µs,
+  Q4_K 106 → 72). Two blocks an SM, which their fewer registers allow, was slower for
+  Q4_0 (74 → 86) and level for the rest.
+- **Qwen goes back on CUDA**: `delta_net` writes the state before a batch and after each
+  token but the last (`steps`), as the Mac's `delta_net_8` does, so `keep_steps` and
+  `rewind` work for states up to 128 wide (every Qwen 3.5): 0.3 GB for the 4B, 0.4 GB for
+  the 9B. The Mac's rewind test runs here now (to the bit, exact and 8-bit).
+
+The same batches now (ms; and 27,000 tokens deep, `main` → now):
+
+| now | 1 written | 2 | 4 | 8 | 16 | 64 | at 27K: 2 | 4 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| Gemma 4 E2B | 5.5 | 5.7 | 6.5 | 7.1 | 8.2 | 10.0 | 22.2 → 7.6 | 22.3 → 9.2 | 21.2 → 11.9 |
+| Gemma 4 E4B | 10.8 | 10.9 | 13.1 | 14.4 | 15.5 | 21.4 | 35.6 → 15.1 | 34.8 → 18.4 | 33.5 → 25.6 |
+| Qwen 3.5 4B | 10.7 | 11.7 | 14.7 | 25.4 | 22.4 | 29.6 | 43.2 → 17.3 | 43.3 → 25.5 | 43.4 → 44.1 |
+| Qwen 3.5 9B | 17.8 | 20.1 | 24.1 | 41.7 | 36.7 | 54.6 | 62.4 → 25.5 | 62.9 → 35.1 | 63.1 → 58.9 |
+
+In 8-bit mode a batch of up to 8 tokens now gives the logits of the same tokens read one
+at a time to the bit (`reading_in_batches_matches_one_token_at_a_time`: worst difference
+0.0 on Llama, Qwen 3.5 and Gemma 4, where the tile's rounding gave 0.4 to 6.7), so a
+round of guesses checked in one pass picks what one token at a time would: nine eval
+cases with the guesses on and off, every reply the same on Gemma 4 E4B and Qwen 3.5 4B
+(7 of 9 on `main`). Longer batches still round as the tiles do.
+
+In the server:
+
+- **7 guesses a round from the chat on CUDA too**, after a match of 8 tokens (3 after 4
+  while a check cost two tokens' time).
+- **Qwen guesses from the chat on CUDA on every size**, where the GPU has its steps'
+  memory free and 384 MB more when a reply starts (the Mac keeps it to large models: its
+  4B's check costs 1.5 times a token, here a check of 4 costs 1.4). Qwen 3.5 9B on this
+  PC doesn't: its 8 GB are full.
+- **Picker sessions read in batches of 256 on CUDA** (1,024 on the Mac): a session's
+  buffers grow with its batch, 0.4 GB each for Qwen 3.5 9B at 1,024. With three of them
+  and the chat's the GPU reported no memory free, Windows kept part of it in the PC's
+  memory, and a token took 27.3 ms over nine eval cases, not 19.5.
+
+Against `main`, back to back, each at its own defaults. Three 400-token replies through
+the server (tokens/s; guesses taken):
+
+| | A document rewritten as a list | A code file returned with an edit | A new story |
+|---|---|---|---|
+| Gemma 4 E2B | 128 → 288 (77%) | 154 → 479 (96%) | 130 → 158 (10%) |
+| Gemma 4 E4B | 74 → 156 (72%) | 96 → 305 (96%) | 72 → 86 (9%) |
+| Qwen 3.5 4B | 86 → 199 (85%) | (it answers in 73 tokens) | 87 → 84 (13%) |
+| Qwen 3.5 9B | 51 → 51 | 52 → 51 | 52 → 52 (no guesses: no memory for the steps) |
+
+(With its steps forced on, the 9B wrote the list at 91 tokens/s and the code file at
+157.) Gemma's story on `main` was slower than with no guesses at all (E4B 85): each of
+its failed checks cost two tokens. Qwen's story is 1-3% slower with guesses than
+without: a match of 2 tokens is right 13% of the time.
+
+Nine eval cases (datetime, read, list, no-tool-writing, find-then-read, git,
+three-steps, skill-summarize, skill-review), model time, the same passes: Gemma 4 E2B
+9.2 → 6.2 s, E4B 22.0 → 15.8, Qwen 3.5 4B 19.9 → 17.6, 9B 43.9 → 32.3 (its tokens 27.3 →
+19.5 ms: the pickers' memory). The full eval, 43 cases: 33, 39, 43 and 39 on both, no
+case changed either way, 70 → 44, 98 → 73, 107 → 101 and 179 → 172 s for all 43
+(`evals/windows-short-batches.json`; `main`'s run beside it for the times). Where an
+eval case's time goes now (E4B): writing 52%, checking guesses 25%, reads of 65-256
+tokens 10%, of 9-64 8%.
+
+- **Tried and dropped:** the K-quants' weights read two steps ahead (no better than
+  one); the small tiles at two blocks an SM; a session's buffers carved from one
+  allocation (with a model loaded, 50 allocations of 2 MB took 431 MB of the GPU's
+  memory and one of 400 MB took 400, but a session cost the same either way: the driver
+  takes memory ~320 MB at a time, and gives it back).
+- **Seen, not fixed:** a check of 7-8 tokens costs Qwen more than a read of 12 (4B: 25.4
+  against 22.6 ms), since the tile's products are cheaper than the few-token kernels' at
+  that many, but its numbers aren't one token's. Deep in a chat every token of a check
+  walks the context itself (Qwen 3.5 4B at 27K: 8 tokens 44 ms, one 16): one pass for
+  them all, as the Mac's `attention_tcg` does, is next. And the automatic context doesn't
+  count the sessions' own buffers: Qwen 3.5 9B is given 21,504 tokens (0.7 GB) of 1.9 GB
+  free, then takes ~1.3 GB more for the chat's and the pickers' buffers and its
+  checkpoints, so the GPU still runs full (at full speed since the pickers shrank).
+  Counting them would leave it ~7K tokens, or ~9K and the chat's guesses with fewer
+  pickers: a choice, not made here.
+
 **Long chats (2026-11-11):** vireo-server's context is now automatic by default: as
 many tokens as the GPU's free memory holds once the model is loaded (leaving 1 GB and a
 tenth of what's free), up to the model's trained length and 32,768, the length checked
@@ -1019,7 +1139,10 @@ models now generate level with llama.cpp at full clocks (96–103%).
 - **Generating**, at full clocks, is 14–18% ahead of llama.cpp in short chats and level
   (96–103%) ~31K tokens deep on the larger models (thirteenth round). What's left per
   token is mostly the weights' matrix-vector products (Gemma E4B, in the slower power
-  state: 12.8 of 26 ms, at ~270 GB/s), then deep in a chat its attention.
+  state: 12.8 of 26 ms, at ~270 GB/s), then deep in a chat its attention. Past one token
+  at a time it's guessing (fourteenth round): a check of 4 tokens costs 1.2-1.4 times
+  one in a short chat. Next there: one pass over the cache for a check's tokens deep in
+  a chat, and the K-quants' few-token arithmetic for 5-8 tokens.
 - **Reading a prompt**, at full clocks, is at 73–87% of llama.cpp at ~2K tokens and
   78–87% at ~31K (the 9B furthest behind). For long ones
   prompt attention is 30–35% of the time there (`attention_mma_256` and `_512`, ~3–4
@@ -1044,6 +1167,11 @@ models now generate level with llama.cpp at full clocks (96–103%).
     how big the budget should be by default.
 - **For larger models**: splitting a model between GPU and system memory (Muse Glimmer
   30B), mixture-of-experts layers (Gemma 4 26B-A4B, Qwen 3.6 35B-A3B), more than one GPU.
+- **Short reads** (9-64 tokens: tool results, new turns, the server's own questions)
+  cost 1.5-2 times one token (fourteenth round; 2-2.5 before): the tile's unpacking
+  through shared memory is what's left, at one block an SM.
+- **Memory on 8 GB**: the automatic context should count the sessions' own buffers (see
+  the fourteenth round's last note).
 - Nsight Compute: the counters are open on this PC now (all users); set them back to
   administrators only when the tuning is done.
 

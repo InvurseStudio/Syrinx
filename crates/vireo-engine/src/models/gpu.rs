@@ -203,6 +203,19 @@ pub(super) fn record(gpu: &Gpu, queue: impl FnOnce() -> Result<()>) -> Result<Gr
     graph
 }
 
+/// The longest batch replayed from a graph recorded for its length (CUDA): a draft's
+/// guesses, a tool's result, a new turn. Queuing a batch's kernels one by one costs the CPU
+/// 2-5 ms that the GPU waits out (Gemma 4 E4B, one token: 16.0 ms queued, 10.8 replayed);
+/// recording a length's graph costs 4-6 ms, once a session.
+#[cfg(not(target_os = "macos"))]
+pub(super) const GRAPH_TOKENS: usize = 64;
+
+/// Where a batch of `t` tokens' graph is kept, by `mode` (0 to 2: which outputs it makes).
+#[cfg(not(target_os = "macos"))]
+pub(super) fn graph_slot(t: usize, mode: usize) -> usize {
+    (t - 1) * 3 + mode
+}
+
 /// Logits on the GPU: room for one token's, grown when a batch's are asked for.
 pub(super) struct LogitsBuffer {
     buffer: Buffer,
