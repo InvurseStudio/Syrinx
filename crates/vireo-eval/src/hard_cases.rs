@@ -92,6 +92,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "long-log",
@@ -115,6 +116,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "find-by-content",
@@ -136,6 +138,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "which-report",
@@ -165,6 +168,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "relative-path",
@@ -190,6 +194,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "count",
@@ -209,6 +214,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "follow-up-file",
@@ -228,6 +234,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "follow-up-no-tool",
@@ -242,6 +249,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "explain-git",
@@ -259,6 +267,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "recover",
@@ -283,6 +292,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "deadline",
@@ -312,6 +322,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
         Case {
             id: "git-diff",
@@ -334,6 +345,7 @@ pub fn all() -> Vec<Case> {
             hard: true,
             changes: false,
             skills: false,
+            more: false,
         },
     ]
 }
@@ -355,7 +367,12 @@ mod tests {
     #[test]
     fn twelve_hard_cases_with_their_own_ids() {
         let all = crate::cases::all();
-        assert_eq!(all.iter().filter(|c| !c.changes && !c.skills).count(), 24);
+        assert_eq!(
+            all.iter()
+                .filter(|c| !c.changes && !c.skills && !c.more)
+                .count(),
+            24
+        );
         assert_eq!(all.iter().filter(|c| c.hard).count(), 12);
         let mut ids: Vec<_> = all.iter().map(|c| c.id).collect();
         ids.sort();

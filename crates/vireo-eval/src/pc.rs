@@ -35,6 +35,11 @@ pub struct Pc {
     declines: Vec<String>,
     /// `git diff` per project folder (lowercased), where a case sets one.
     diffs: BTreeMap<String, String>,
+    /// Workbooks by path (lowercased): their one sheet's rows, the first a header.
+    sheets: BTreeMap<String, Vec<Vec<String>>>,
+    /// A project's tests, build and linter, by folder (lowercased) and action: the
+    /// command, its exit code and its output.
+    commands: BTreeMap<(String, String), (String, i32, String)>,
 }
 
 fn key(path: &str) -> String {
@@ -67,6 +72,36 @@ impl Pc {
 
     pub fn git(mut self, folder: &str, status: &str) -> Self {
         self.git.insert(key(folder), status.to_string());
+        self
+    }
+
+    /// A workbook with one sheet ("Sheet1") of these rows, the first its header. It's also a
+    /// file, so listing and searching find it, and read_file gives the sheet, as the app's
+    /// read_file describes a workbook.
+    pub fn sheet(mut self, path: &str, rows: &[&[&str]]) -> Self {
+        let rows: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .collect();
+        let text = sheet_text(&rows);
+        self.sheets.insert(key(path), rows);
+        self.file(path, &text)
+    }
+
+    /// What a project's tests, build or linter (`action`: "tests", "build", "linter") run
+    /// and give, as the app's RunProjectCommandAsync reports it.
+    pub fn command(
+        mut self,
+        folder: &str,
+        action: &str,
+        command: &str,
+        exit: i32,
+        output: &str,
+    ) -> Self {
+        self.commands.insert(
+            (key(folder), action.to_string()),
+            (command.to_string(), exit, output.to_string()),
+        );
         self
     }
 
@@ -361,6 +396,68 @@ impl Pc {
                 self.move_item(&source, &destination)?;
                 Ok(format!("Moved successfully: {source} -> {destination}"))
             }
+            "read_spreadsheet" => {
+                let path = arg("path")?;
+                match self.sheets.get(&key(&path)) {
+                    Some(rows) => Ok(sheet_text(rows)),
+                    None if self.files.contains_key(&key(&path)) => {
+                        Err(format!("{path} isn't an Excel workbook (.xlsx)."))
+                    }
+                    None => Err(self.not_found(&path, format!("File not found: {path}"))),
+                }
+            }
+            // As the app's CreateWordDocumentAsync: ".docx" added where it's missing, and
+            // the path given back (the server words the result). Its text is the title,
+            // then the Markdown, so a case can read what was written.
+            "create_docx" => {
+                let mut path = arg("path")?;
+                if !path.to_lowercase().ends_with(".docx") {
+                    path.push_str(".docx");
+                }
+                if self.is_folder(&path) {
+                    return Err(format!("{path} is a folder."));
+                }
+                let text = format!(
+                    "{}\n\n{}",
+                    args.str("title").unwrap_or(""),
+                    args.str("content").unwrap_or("")
+                );
+                self.files.insert(key(&path), (path.clone(), text));
+                Ok(path)
+            }
+            "run_tests" | "run_build" | "run_linter" => {
+                let path = arg("path")?;
+                let action = &tool["run_".len()..];
+                let action = if action == "tests" { "tests" } else { action };
+                let found = self.commands.iter().find(|((folder, a), _)| {
+                    a == action && key(&path).starts_with(folder.as_str())
+                });
+                match found {
+                    None if !self.is_folder(&path) => {
+                        Err(self.not_found(&path, format!("Folder not found: {path}")))
+                    }
+                    None => Err(format!(
+                        "No {action} command found for {path}: no project file there sets one up."
+                    )),
+                    Some(((folder, _), (command, exit, output))) => {
+                        let folder = self
+                            .files
+                            .values()
+                            .map(|(p, _)| p)
+                            .find(|p| key(p).starts_with(&format!("{folder}\\")))
+                            .map_or(path.clone(), |p| p[..folder.len()].to_string());
+                        let words: Vec<String> =
+                            command.split(' ').map(crate::json::string).collect();
+                        Ok(format!(
+                            "{{\"ok\":{},\"path\":{},\"command\":[{}],\"exitCode\":{exit},\"output\":{}}}",
+                            *exit == 0,
+                            crate::json::string(&folder),
+                            words.join(","),
+                            crate::json::string(output)
+                        ))
+                    }
+                }
+            }
             // As the app's CheckChange: the change made on a copy, so its errors are the
             // change's own, and nothing here changes.
             "check_change" => {
@@ -374,6 +471,22 @@ impl Pc {
             other => Err(format!("This PC doesn't run {other}.")),
         }
     }
+}
+
+/// A sheet as the app's `Spreadsheet.Read` gives it: the sheet names, the range, then
+/// "Row | A | B" and a line a row.
+fn sheet_text(rows: &[Vec<String>]) -> String {
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let column = |i: usize| ((b'A' + i as u8) as char).to_string();
+    let range = format!("A1:{}{}", column(width - 1), rows.len().max(1));
+    let mut text = format!(
+        "Sheets: Sheet1\n\nSheet \"Sheet1\", {range} (used range {range})\nRow | {}\n",
+        (0..width).map(column).collect::<Vec<_>>().join(" | ")
+    );
+    for (i, row) in rows.iter().enumerate() {
+        text.push_str(&format!("{} | {}\n", i + 1, row.join(" | ")));
+    }
+    text
 }
 
 /// The words of a name, for comparing names: lowercase runs of letters or of digits, a
