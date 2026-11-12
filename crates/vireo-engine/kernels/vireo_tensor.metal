@@ -12,12 +12,17 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 // The tile (set by the backend, which sizes the grid to match): weight rows × tokens,
-// and the SIMD groups sharing it.
+// and the SIMD groups sharing it. Each kernel comes twice: matmul_tc_* with TC_TOKENS
+// tokens a tile, and matmul_tc_wide_* with TC_WIDE for a prompt's whole batches (a large
+// model's weights decoded half as often).
 #ifndef TC_ROWS
 #define TC_ROWS 32
 #endif
 #ifndef TC_TOKENS
 #define TC_TOKENS 128
+#endif
+#ifndef TC_WIDE
+#define TC_WIDE 256
 #endif
 #ifndef TC_SG
 #define TC_SG 4
@@ -27,7 +32,7 @@
 #endif
 #define TC_THREADS (32 * TC_SG)
 
-template <int KIND>
+template <int KIND, int TOK>
 kernel void matmul_tc(ARGS, KP) {
     device const u8* w = ARG_PTR(const u8, 0);
     device half* x = ARG_PTR(half, 1);  // the activations in f16 (to_half)
@@ -35,19 +40,19 @@ kernel void matmul_tc(ARGS, KP) {
     const int rows = ARG_INT(3), cols = ARG_INT(4), tokens = ARG_INT(5);
     const ulong row_bytes = mm_row_bytes<KIND>(cols);
     threadgroup half sa[TC_ROWS * TC_K];  // the weights' tile: [row][k]
-    const int row0 = gid.x * TC_ROWS, tok0 = gid.y * TC_TOKENS;
+    const int row0 = gid.x * TC_ROWS, tok0 = gid.y * TOK;
     // Decoding: the tile's runs of 32 numbers (TC_K / 32 a row) shared out among the threads.
     constexpr int RUNS = TC_K / 32, PER = (TC_ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
 
     // C (tokens × rows) = X (tokens × k) · Wᵀ; extents list the contiguous dimension first.
     mpp::tensor_ops::matmul2d<
-        mpp::tensor_ops::matmul2d_descriptor(TC_TOKENS, TC_ROWS, static_cast<int>(dynamic_extent), false, true, true,
+        mpp::tensor_ops::matmul2d_descriptor(TOK, TC_ROWS, static_cast<int>(dynamic_extent), false, true, true,
                                              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<TC_SG>>
         mm;
     auto t_w = tensor(sa, dextents<int32_t, 2>(TC_K, TC_ROWS));
     auto t_x = tensor(x, dextents<int32_t, 2>(cols, tokens), array<int, 2>({1, cols}));
-    auto acc = mm.get_destination_cooperative_tensor<decltype(t_x), decltype(t_w), float>();
+    auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x), decltype(t_w), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); i++) acc[i] = 0.0f;
 
     for (int k0 = 0; k0 < cols; k0 += TC_K) {
@@ -71,18 +76,25 @@ kernel void matmul_tc(ARGS, KP) {
     }
     // y holds a row of `rows` per token: C's rows are y's, the contiguous dimension rows.
     auto t_y = tensor(y + (ulong)tok0 * rows + row0,
-                      dextents<int32_t, 2>(min(TC_ROWS, rows - row0), min(TC_TOKENS, tokens - tok0)),
+                      dextents<int32_t, 2>(min(TC_ROWS, rows - row0), min(TOK, tokens - tok0)),
                       array<int, 2>({1, rows}));
     acc.store(t_y);
 }
 
-template [[host_name("matmul_tc_f32")]] kernel void matmul_tc<K_F32>(ARGS, KP);
-template [[host_name("matmul_tc_f16")]] kernel void matmul_tc<K_F16>(ARGS, KP);
-template [[host_name("matmul_tc_q4_0")]] kernel void matmul_tc<K_Q4_0>(ARGS, KP);
-template [[host_name("matmul_tc_q8_0")]] kernel void matmul_tc<K_Q8_0>(ARGS, KP);
-template [[host_name("matmul_tc_q4_k")]] kernel void matmul_tc<K_Q4_K>(ARGS, KP);
-template [[host_name("matmul_tc_q5_k")]] kernel void matmul_tc<K_Q5_K>(ARGS, KP);
-template [[host_name("matmul_tc_q6_k")]] kernel void matmul_tc<K_Q6_K>(ARGS, KP);
+template [[host_name("matmul_tc_f32")]] kernel void matmul_tc<K_F32, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_f16")]] kernel void matmul_tc<K_F16, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_q4_0")]] kernel void matmul_tc<K_Q4_0, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_wide_f32")]] kernel void matmul_tc<K_F32, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_f16")]] kernel void matmul_tc<K_F16, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_q4_0")]] kernel void matmul_tc<K_Q4_0, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_WIDE>(ARGS, KP);
 
 // The activations rounded to f16 for matmul_tc: 4 numbers a thread (n a multiple of 4).
 kernel void to_half(ARGS, KP) {
@@ -101,7 +113,10 @@ kernel void to_half(ARGS, KP) {
 // row's columns; masked causally and by the sliding window from the positions), and O
 // stays in a cooperative tensor, its rows rescaled as the maximum moves. The last chunk can
 // read up to AC − 1 positions past the context (into the buffer's slack, see
-// Context::new_buffer): their probabilities are 0.
+// Context::new_buffer): their probabilities are 0. In a ring (a sliding-window layer's
+// last positions only, see ring_row in vireo.metal) the chunks start at multiples of AC, as
+// the ring's size is one, so no chunk runs over the ring's end; the positions before the
+// window that brings in are masked the same way.
 template <int D, int AQ>
 kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
@@ -110,7 +125,7 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     device half* values = ARG_PTR(half, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     const int tokens = ARG_INT(10);
     constexpr int AC = 64, SG = 8, THREADS = 32 * SG, ROWS = AQ / SG, COLS = AC / 32;
@@ -151,9 +166,9 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     }
     BARRIER;
 
-    for (int start = lo; start <= last_row; start += AC) {
+    for (int start = ring > 0 ? lo - lo % AC : lo; start <= last_row; start += AC) {
         const int count = min(AC, last_row + 1 - start);
-        auto tk = tensor(keys + (ulong)start * kv_dim + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
+        auto tk = tensor(keys + ring_row(start, ring) * kv_dim + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_qk.run(tq, tk, ts);
         BARRIER;
         for (int jj = 0; jj < ROWS; jj++) {
@@ -184,7 +199,7 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
         BARRIER;
         for (uint16_t i = 0; i < co.get_capacity(); i++)
             if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
-        auto tv = tensor(values + (ulong)start * kv_dim + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
+        auto tv = tensor(values + ring_row(start, ring) * kv_dim + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_pv.run(tp, tv, co);
         BARRIER;
     }

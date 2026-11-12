@@ -40,7 +40,9 @@ pub struct Config {
     pub vocab: usize,
     pub norm_eps: f32,
     pub heads: usize,
-    pub kv_heads: usize,
+    /// Each layer's key-value heads: one count for the small models, a count per layer
+    /// for the large (31B has 16 on sliding-window layers and 4 on global ones).
+    pub kv_heads: Vec<usize>,
     /// Head size of global layers, and of sliding-window layers.
     pub head_dim: usize,
     pub head_dim_swa: usize,
@@ -51,6 +53,8 @@ pub struct Config {
     pub is_swa: Vec<bool>,
     /// Layers from here on reuse an earlier layer's keys and values.
     pub first_shared_layer: usize,
+    /// The width of each layer's per-layer input (E2B, E4B); 0 for models without them
+    /// (31B).
     pub per_layer_dim: usize,
     pub softcap: Option<f32>,
 }
@@ -83,7 +87,14 @@ impl Config {
             .iter()
             .map(|v| v.as_bool().unwrap_or(false))
             .collect();
-        if ffn_dims.len() != layers || is_swa.len() != layers {
+        let kv_heads = match list("attention.head_count_kv") {
+            Some(items) => items
+                .iter()
+                .map(|v| v.as_u64().unwrap_or(0) as usize)
+                .collect(),
+            None => vec![required(file, "attention.head_count_kv")?; layers],
+        };
+        if ffn_dims.len() != layers || is_swa.len() != layers || kv_heads.len() != layers {
             return Err(Error::Invalid(
                 "per-layer settings don't have one entry per layer".into(),
             ));
@@ -108,7 +119,7 @@ impl Config {
                 .arch_f64("attention.layer_norm_rms_epsilon")
                 .unwrap_or(1e-6) as f32,
             heads: required(file, "attention.head_count")?,
-            kv_heads: required(file, "attention.head_count_kv")?,
+            kv_heads,
             head_dim: required(file, "attention.key_length")?,
             head_dim_swa: required(file, "attention.key_length_swa")?,
             rope_base: file.arch_f64("rope.freq_base").unwrap_or(1_000_000.0) as f32,
@@ -116,15 +127,34 @@ impl Config {
             sliding_window: required(file, "attention.sliding_window")?,
             is_swa,
             first_shared_layer: layers - shared,
-            per_layer_dim: required(file, "embedding_length_per_layer_input")?,
+            per_layer_dim: file
+                .arch_u64("embedding_length_per_layer_input")
+                .unwrap_or(0) as usize,
             softcap: file.arch_f64("final_logit_softcapping").map(|v| v as f32),
         };
+        if c.kv_heads
+            .iter()
+            .any(|&k| k == 0 || !c.heads.is_multiple_of(k))
+        {
+            return Err(Error::Invalid(
+                "a layer's key-value heads don't divide its query heads".into(),
+            ));
+        }
         if c.first_shared_layer < 2 {
             return Err(Error::Invalid(
                 "too many layers share keys and values".into(),
             ));
         }
         Ok(c)
+    }
+
+    pub fn kv_heads_of(&self, layer: usize) -> usize {
+        self.kv_heads[layer]
+    }
+
+    /// The most key-value heads of any layer, for buffers every layer uses.
+    pub fn widest_kv_heads(&self) -> usize {
+        self.kv_heads.iter().copied().max().unwrap_or(0)
     }
 
     pub fn head_dim_of(&self, layer: usize) -> usize {
@@ -161,18 +191,22 @@ struct Layer<'a> {
     up: Matrix<'a>,
     down: Matrix<'a>,
     post_ffw_norm: Vec<f32>,
-    inp_gate: Matrix<'a>,
-    proj: Matrix<'a>,
-    post_norm: Vec<f32>,
+    /// The per-layer input's gate, projection and norm (models with them).
+    per_layer: Option<(Matrix<'a>, Matrix<'a>, Vec<f32>)>,
     output_scale: f32,
+}
+
+/// The per-layer inputs' embedding, projection and its norm (E2B, E4B).
+struct PerLayerInputs<'a> {
+    embedding: Matrix<'a>,
+    model_proj: Matrix<'a>,
+    proj_norm: Vec<f32>,
 }
 
 pub struct Gemma4<'a> {
     pub config: Config,
     embedding: Matrix<'a>,
-    per_layer_embedding: Matrix<'a>,
-    per_layer_model_proj: Matrix<'a>,
-    per_layer_proj_norm: Vec<f32>,
+    per_layer_inputs: Option<PerLayerInputs<'a>>,
     rope_factors: Option<Vec<f32>>,
     output_norm: Vec<f32>,
     layers: Vec<Layer<'a>>,
@@ -239,8 +273,8 @@ impl<'a> Gemma4<'a> {
             layers.push(Layer {
                 attn_norm: vector(file, &name("attn_norm"), dim)?,
                 q: matrix(file, &name("attn_q"), dim, c.heads * hd)?,
-                k: optional("attn_k", c.kv_heads * hd)?,
-                v: optional("attn_v", c.kv_heads * hd)?,
+                k: optional("attn_k", c.kv_heads_of(i) * hd)?,
+                v: optional("attn_v", c.kv_heads_of(i) * hd)?,
                 q_norm: vector(file, &name("attn_q_norm"), hd)?,
                 k_norm: if own_kv {
                     Some(vector(file, &name("attn_k_norm"), hd)?)
@@ -254,9 +288,15 @@ impl<'a> Gemma4<'a> {
                 up: matrix(file, &name("ffn_up"), dim, c.ffn_dims[i])?,
                 down: matrix(file, &name("ffn_down"), c.ffn_dims[i], dim)?,
                 post_ffw_norm: vector(file, &name("post_ffw_norm"), dim)?,
-                inp_gate: matrix(file, &name("inp_gate"), dim, pl)?,
-                proj: matrix(file, &name("proj"), pl, dim)?,
-                post_norm: vector(file, &name("post_norm"), dim)?,
+                per_layer: if pl > 0 {
+                    Some((
+                        matrix(file, &name("inp_gate"), dim, pl)?,
+                        matrix(file, &name("proj"), pl, dim)?,
+                        vector(file, &name("post_norm"), dim)?,
+                    ))
+                } else {
+                    None
+                },
                 output_scale: scale,
             });
             if own_kv && layers[i].k.is_none() {
@@ -275,14 +315,15 @@ impl<'a> Gemma4<'a> {
         };
         Ok(Self {
             embedding: matrix(file, "token_embd.weight", dim, c.vocab)?,
-            per_layer_embedding: matrix(
-                file,
-                "per_layer_token_embd.weight",
-                pl * c.layers,
-                c.vocab,
-            )?,
-            per_layer_model_proj: matrix(file, "per_layer_model_proj.weight", dim, pl * c.layers)?,
-            per_layer_proj_norm: vector(file, "per_layer_proj_norm.weight", pl)?,
+            per_layer_inputs: if pl > 0 {
+                Some(PerLayerInputs {
+                    embedding: matrix(file, "per_layer_token_embd.weight", pl * c.layers, c.vocab)?,
+                    model_proj: matrix(file, "per_layer_model_proj.weight", dim, pl * c.layers)?,
+                    proj_norm: vector(file, "per_layer_proj_norm.weight", pl)?,
+                })
+            } else {
+                None
+            },
             rope_factors,
             output_norm: vector(file, "output_norm.weight", dim)?,
             layers,
@@ -300,7 +341,7 @@ impl<'a> Gemma4<'a> {
         let c = &self.config;
         let cache = |l: usize| {
             if l < c.first_shared_layer {
-                vec![0.0; capacity * c.kv_heads * c.head_dim_of(l)]
+                vec![0.0; capacity * c.kv_heads_of(l) * c.head_dim_of(l)]
             } else {
                 Vec::new()
             }
@@ -317,8 +358,8 @@ impl<'a> Gemma4<'a> {
             per_layer: vec![0.0; c.per_layer_dim * c.layers],
             per_layer_proj: vec![0.0; c.per_layer_dim * c.layers],
             q: vec![0.0; c.heads * widest_head],
-            k: vec![0.0; c.kv_heads * widest_head],
-            v: vec![0.0; c.kv_heads * widest_head],
+            k: vec![0.0; c.widest_kv_heads() * widest_head],
+            v: vec![0.0; c.widest_kv_heads() * widest_head],
             attention: vec![0.0; c.heads * widest_head],
             projected: vec![0.0; c.dim],
             scores: vec![0.0; capacity],
@@ -368,38 +409,32 @@ impl<'a> Gemma4<'a> {
         self.embedding.decode_row(token as usize, &mut s.x);
         let embed_scale = (dim as f32).sqrt();
         s.x.iter_mut().for_each(|v| *v *= embed_scale);
-        self.per_layer_embedding
-            .decode_row(token as usize, &mut s.per_layer);
-        let token_scale = (pl as f32).sqrt() / 2f32.sqrt();
-        s.per_layer.iter_mut().for_each(|v| *v *= token_scale);
-        cpu::matvec(
-            pool,
-            &self.per_layer_model_proj,
-            &s.x,
-            &mut s.per_layer_proj,
-        );
-        let proj_norm: Vec<f32> = self
-            .per_layer_proj_norm
-            .iter()
-            .map(|w| w / 2f32.sqrt())
-            .collect();
-        for l in 0..c.layers {
-            let range = l * pl..(l + 1) * pl;
-            // RMSNorm of (W x) / sqrt(dim) with eps, written as llama.cpp does: eps × dim.
-            cpu::rms_norm(
-                &s.per_layer_proj[range.clone()],
-                &proj_norm,
-                eps * dim as f32,
-                &mut s.small,
-            );
-            for (p, v) in s.per_layer[range].iter_mut().zip(&s.small) {
-                *p += v;
+        if let Some(inputs) = &self.per_layer_inputs {
+            inputs
+                .embedding
+                .decode_row(token as usize, &mut s.per_layer);
+            let token_scale = (pl as f32).sqrt() / 2f32.sqrt();
+            s.per_layer.iter_mut().for_each(|v| *v *= token_scale);
+            cpu::matvec(pool, &inputs.model_proj, &s.x, &mut s.per_layer_proj);
+            let proj_norm: Vec<f32> = inputs.proj_norm.iter().map(|w| w / 2f32.sqrt()).collect();
+            for l in 0..c.layers {
+                let range = l * pl..(l + 1) * pl;
+                // RMSNorm of (W x) / sqrt(dim) with eps, written as llama.cpp does: eps × dim.
+                cpu::rms_norm(
+                    &s.per_layer_proj[range.clone()],
+                    &proj_norm,
+                    eps * dim as f32,
+                    &mut s.small,
+                );
+                for (p, v) in s.per_layer[range].iter_mut().zip(&s.small) {
+                    *p += v;
+                }
             }
         }
 
         for (l, layer) in self.layers.iter().enumerate() {
             let hd = c.head_dim_of(l);
-            let (q_dim, kv_dim) = (c.heads * hd, c.kv_heads * hd);
+            let (q_dim, kv_dim) = (c.heads * hd, c.kv_heads_of(l) * hd);
             let (base, factors) = if c.is_swa[l] {
                 (c.rope_base_swa, None)
             } else {
@@ -430,7 +465,7 @@ impl<'a> Gemma4<'a> {
             } else {
                 0
             };
-            let group = c.heads / c.kv_heads;
+            let group = c.heads / c.kv_heads_of(l);
             for head in 0..c.heads {
                 let q = &s.q[head * hd..(head + 1) * hd];
                 let kv = (head / group) * hd;
@@ -468,13 +503,15 @@ impl<'a> Gemma4<'a> {
             add(&mut s.x, &s.h);
 
             // The per-layer input.
-            cpu::matvec(pool, &layer.inp_gate, &s.x, &mut s.small);
-            for (g, &p) in s.small.iter_mut().zip(&s.per_layer[l * pl..(l + 1) * pl]) {
-                *g = self.gelu(*g) * p;
+            if let Some((inp_gate, proj, post_norm)) = &layer.per_layer {
+                cpu::matvec(pool, inp_gate, &s.x, &mut s.small);
+                for (g, &p) in s.small.iter_mut().zip(&s.per_layer[l * pl..(l + 1) * pl]) {
+                    *g = self.gelu(*g) * p;
+                }
+                cpu::matvec(pool, proj, &s.small, &mut s.projected);
+                cpu::rms_norm(&s.projected, post_norm, eps, &mut s.h);
+                add(&mut s.x, &s.h);
             }
-            cpu::matvec(pool, &layer.proj, &s.small, &mut s.projected);
-            cpu::rms_norm(&s.projected, &layer.post_norm, eps, &mut s.h);
-            add(&mut s.x, &s.h);
             if layer.output_scale != 1.0 {
                 s.x.iter_mut().for_each(|v| *v *= layer.output_scale);
             }
