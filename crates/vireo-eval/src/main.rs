@@ -350,6 +350,12 @@ impl Server {
                 std::env::temp_dir()
                     .join(format!("vireo-eval-approvals-{}.txt", std::process::id())),
             )
+            // Its own memory, which stays empty (the stand-in user declines remembering).
+            .env(
+                "VIREO_MEMORY_FILE",
+                std::env::temp_dir()
+                    .join(format!("vireo-eval-memory-{}.txt", std::process::id())),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

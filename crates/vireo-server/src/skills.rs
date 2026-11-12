@@ -344,12 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn the_macs_built_in_skills_load_and_three_suit_this_pc() {
+    fn the_macs_built_in_skills_load_and_six_suit_this_pc() {
         let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../server/builtin-skills");
         let all = load(Some(&folder), None);
         assert_eq!(
             all.len(),
-            10,
+            13,
             "{:?}",
             all.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
@@ -370,7 +370,14 @@ mod tests {
             .collect();
         assert_eq!(
             usable,
-            ["code-review", "summarize-document", "translate-document"]
+            [
+                "apply-policy",
+                "code-review",
+                "fill-template",
+                "process-invoices",
+                "summarize-document",
+                "translate-document"
+            ]
         );
         let review = all.iter().find(|s| s.name == "code-review").unwrap();
         assert_eq!(

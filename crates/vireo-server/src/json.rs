@@ -42,6 +42,50 @@ impl Value {
             _ => &[],
         }
     }
+
+    /// The value as compact JSON (an object's keys in order, as `BTreeMap` keeps them).
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+
+    fn write(&self, out: &mut String) {
+        match self {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => {
+                let _ = write!(out, "{}", *n as i64);
+            }
+            Value::Number(n) if n.is_finite() => {
+                let _ = write!(out, "{n}");
+            }
+            Value::Number(_) => out.push_str("null"),
+            Value::String(s) => out.push_str(&string(s)),
+            Value::Array(items) => {
+                out.push('[');
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write(out);
+                }
+                out.push(']');
+            }
+            Value::Object(map) => {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&string(k));
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
 }
 
 pub fn parse(text: &str) -> Result<Value, String> {
