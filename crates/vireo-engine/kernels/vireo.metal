@@ -62,6 +62,17 @@ static inline float block_sum(float v, threadgroup float* scratch, uint tid, uin
     return scratch[0];
 }
 
+// block_sum with one barrier, for a `scratch` (32 floats) no other call uses in the
+// kernel: every SIMD group adds up the partial sums itself, in the order block_sum's
+// first group does, so the result is the same to the bit.
+static inline float block_sum_once(float v, threadgroup float* scratch, uint tid, uint threads) {
+    const uint lane = tid & 31, warp = tid >> 5;
+    v = simd_sum(v);
+    if (lane == 0) scratch[warp] = v;
+    BARRIER;
+    return simd_sum(lane < (threads + 31) / 32 ? scratch[lane] : 0.0f);
+}
+
 static inline float block_max(float v, threadgroup float* scratch, uint tid, uint threads) {
     const uint lane = tid & 31, warp = tid >> 5;
     v = simd_max(v);
@@ -373,10 +384,16 @@ kernel void matvec_q6_k(ARGS, KP) {
     if ((int)tid < nrows) {                                 \
         float total = 0.0f;                                 \
         for (int g = 0; g < MV_SPLIT; g++) total += mv_parts[g][tid]; \
+        if (EPI == 1) {                                     \
+            /* tanh-GELU, times a row of argument 5: geglu's arithmetic */ \
+            const float u = ARG_PTR(const float, 5)[row0 + tid]; \
+            total = 0.5f * total * (1.0f + tanh(0.7978846f * total * (1.0f + 0.044715f * total * total))) * u; \
+        }                                                   \
         y[row0 + tid] = total;                              \
     }
 
-kernel void matvec_split_q8_0(ARGS, KP) {
+template <int EPI>
+kernel void matvec_split_q8_0_t(ARGS, KP) {
     MATVEC_ARGS
     MATVEC_ROWS_SPLIT
     const int blocks = cols / 32;
@@ -397,8 +414,11 @@ kernel void matvec_split_q8_0(ARGS, KP) {
     }
     MATVEC_STORE_SPLIT
 }
+template [[host_name("matvec_split_q8_0")]] kernel void matvec_split_q8_0_t<0>(ARGS, KP);
+template [[host_name("matvec_split_gelu_q8_0")]] kernel void matvec_split_q8_0_t<1>(ARGS, KP);
 
-kernel void matvec_split_q4_0(ARGS, KP) {
+template <int EPI>
+kernel void matvec_split_q4_0_t(ARGS, KP) {
     MATVEC_ARGS
     MATVEC_ROWS_SPLIT
     const int blocks = cols / 32;
@@ -419,8 +439,11 @@ kernel void matvec_split_q4_0(ARGS, KP) {
     }
     MATVEC_STORE_SPLIT
 }
+template [[host_name("matvec_split_q4_0")]] kernel void matvec_split_q4_0_t<0>(ARGS, KP);
+template [[host_name("matvec_split_gelu_q4_0")]] kernel void matvec_split_q4_0_t<1>(ARGS, KP);
 
-kernel void matvec_split_q4_k(ARGS, KP) {
+template <int EPI>
+kernel void matvec_split_q4_k_t(ARGS, KP) {
     MATVEC_ARGS
     MATVEC_ROWS_SPLIT
     const int blocks = cols / 256;
@@ -446,8 +469,11 @@ kernel void matvec_split_q4_k(ARGS, KP) {
     }
     MATVEC_STORE_SPLIT
 }
+template [[host_name("matvec_split_q4_k")]] kernel void matvec_split_q4_k_t<0>(ARGS, KP);
+template [[host_name("matvec_split_gelu_q4_k")]] kernel void matvec_split_q4_k_t<1>(ARGS, KP);
 
-kernel void matvec_split_q5_k(ARGS, KP) {
+template <int EPI>
+kernel void matvec_split_q5_k_t(ARGS, KP) {
     MATVEC_ARGS
     MATVEC_ROWS_SPLIT
     const int blocks = cols / 256;
@@ -475,8 +501,11 @@ kernel void matvec_split_q5_k(ARGS, KP) {
     }
     MATVEC_STORE_SPLIT
 }
+template [[host_name("matvec_split_q5_k")]] kernel void matvec_split_q5_k_t<0>(ARGS, KP);
+template [[host_name("matvec_split_gelu_q5_k")]] kernel void matvec_split_q5_k_t<1>(ARGS, KP);
 
-kernel void matvec_split_q6_k(ARGS, KP) {
+template <int EPI>
+kernel void matvec_split_q6_k_t(ARGS, KP) {
     MATVEC_ARGS
     MATVEC_ROWS_SPLIT
     const int blocks = cols / 256;
@@ -507,8 +536,11 @@ kernel void matvec_split_q6_k(ARGS, KP) {
     }
     MATVEC_STORE_SPLIT
 }
+template [[host_name("matvec_split_q6_k")]] kernel void matvec_split_q6_k_t<0>(ARGS, KP);
+template [[host_name("matvec_split_gelu_q6_k")]] kernel void matvec_split_q6_k_t<1>(ARGS, KP);
 
-// A few tokens' products at once (a draft's guesses, checked in one pass): y[t] = W x[t]
+// Q6_K's own few-token products, used for 2 and 3 tokens (matvec_few, below, is faster
+// from 4 on). A few tokens' products at once (a draft's guesses, checked in one pass): y[t] = W x[t]
 // for `tokens` ≤ MT tokens, rows of x and y a token each. The split kernel's layout, each
 // lane's share of a block's weights decoded once and used for every token, so the
 // weights are read once as for one token. The prompt kernels' tiles hold 128 tokens: for
@@ -571,11 +603,6 @@ kernel void matvec_multi_q6_k(ARGS, KP) {
 }
 template [[host_name("matvec_multi_q6_k_2")]] kernel void matvec_multi_q6_k<2, 4>(ARGS, KP);
 template [[host_name("matvec_multi_q6_k_3")]] kernel void matvec_multi_q6_k<3, 4>(ARGS, KP);
-template [[host_name("matvec_multi_q6_k_4")]] kernel void matvec_multi_q6_k<4, 2>(ARGS, KP);
-template [[host_name("matvec_multi_q6_k_5")]] kernel void matvec_multi_q6_k<5, 2>(ARGS, KP);
-template [[host_name("matvec_multi_q6_k_6")]] kernel void matvec_multi_q6_k<6, 2>(ARGS, KP);
-template [[host_name("matvec_multi_q6_k_7")]] kernel void matvec_multi_q6_k<7, 2>(ARGS, KP);
-template [[host_name("matvec_multi_q6_k_8")]] kernel void matvec_multi_q6_k<8, 2>(ARGS, KP);
 
 // One token's gate and up projections and the activation in one dispatch: y =
 // act(W_gate x) × (W_up x), act SiLU (0) or tanh-GELU (1). The split kernels with each
@@ -936,6 +963,73 @@ static inline ulong mm_row_bytes(int cols) {
     }
 }
 
+// A few tokens' products (up to 4: forced text, a short tool result, a draft's guesses):
+// y[t] = W x[t], rows of x and y a token each. The prompt kernels' tiles hold 128
+// tokens, so a handful cost as much as 128 (Gemma 4 E4B: 82-120 µs a matrix for 2
+// tokens, 18-30 for one). Here a threadgroup takes FEW_ROWS rows, its 4 SIMD groups
+// every 4th run of 256 columns (as the split kernels do), each lane 8 columns at a time:
+// each weight is decoded once and used for every token, so the weights are read once,
+// as for one token. MT is the most tokens (2 or 4); `tokens` may be fewer. On the M5
+// Max, of 1, 2, 4 and 8 rows a threadgroup, and 8 tokens at once (slower than two
+// dispatches of 4), 2 rows read fastest. Arguments: w, x, y, rows, cols, tokens.
+template <int KIND, int MT, int FEW_ROWS>
+kernel void matvec_few(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    device const u8* w = ARG_PTR(const u8, 0);
+    device const float* x = ARG_PTR(const float, 1);
+    device float* y = ARG_PTR(float, 2);
+    const int rows = ARG_INT(3), cols = ARG_INT(4), tokens = ARG_INT(5);
+    threadgroup float parts[4][FEW_ROWS][MT];
+    const int row0 = (int)gid.x * FEW_ROWS;
+    if (row0 >= rows) return;
+    const ulong row_bytes = mm_row_bytes<KIND>(cols);
+    const int blocks = cols / 32;
+    float acc[FEW_ROWS][MT];
+    for (int r = 0; r < FEW_ROWS; r++)
+        for (int t = 0; t < MT; t++) acc[r][t] = 0.0f;
+    // The 4 SIMD groups take every 4th run of 256 columns.
+    for (int k = ((int)sg * 32 + (int)lane) * 8; k < cols; k += 1024) {
+        float4 xa[MT], xb[MT];
+        for (int t = 0; t < MT; t++) {
+            if (t < tokens) {
+                xa[t] = f4(x + (ulong)t * cols + k);
+                xb[t] = f4(x + (ulong)t * cols + k + 4);
+            } else {
+                xa[t] = xb[t] = float4(0.0f);
+            }
+        }
+        for (int r = 0; r < FEW_ROWS; r++) {
+            if (row0 + r >= rows) break;
+            float v[8];
+            decode8<KIND>(w + (ulong)(row0 + r) * row_bytes, blocks, k, v);
+            const float4 va = float4(v[0], v[1], v[2], v[3]), vb = float4(v[4], v[5], v[6], v[7]);
+            for (int t = 0; t < MT; t++) acc[r][t] += dot(va, xa[t]) + dot(vb, xb[t]);
+        }
+    }
+    for (int r = 0; r < FEW_ROWS; r++)
+        for (int t = 0; t < MT; t++) {
+            const float part = simd_sum(acc[r][t]);
+            if (lane == 0) parts[sg][r][t] = part;
+        }
+    BARRIER;
+    if ((int)tid < FEW_ROWS * MT) {
+        const int r = (int)tid / MT, t = (int)tid % MT;
+        if (row0 + r < rows && t < tokens)
+            y[(ulong)t * rows + row0 + r] = ((parts[0][r][t] + parts[1][r][t]) + parts[2][r][t]) + parts[3][r][t];
+    }
+}
+
+#define FEW_KINDS(MT, FR)                                                                                 \
+    template [[host_name("matvec_few" #MT "_f32")]] kernel void matvec_few<K_F32, MT, FR>(ARGS, KP, uint, uint);   \
+    template [[host_name("matvec_few" #MT "_f16")]] kernel void matvec_few<K_F16, MT, FR>(ARGS, KP, uint, uint);   \
+    template [[host_name("matvec_few" #MT "_q4_0")]] kernel void matvec_few<K_Q4_0, MT, FR>(ARGS, KP, uint, uint); \
+    template [[host_name("matvec_few" #MT "_q8_0")]] kernel void matvec_few<K_Q8_0, MT, FR>(ARGS, KP, uint, uint); \
+    template [[host_name("matvec_few" #MT "_q4_k")]] kernel void matvec_few<K_Q4_K, MT, FR>(ARGS, KP, uint, uint); \
+    template [[host_name("matvec_few" #MT "_q5_k")]] kernel void matvec_few<K_Q5_K, MT, FR>(ARGS, KP, uint, uint); \
+    template [[host_name("matvec_few" #MT "_q6_k")]] kernel void matvec_few<K_Q6_K, MT, FR>(ARGS, KP, uint, uint);
+FEW_KINDS(2, 2)
+FEW_KINDS(4, 2)
+
 #define MM_ROWS 128
 #define MM_TOKENS 64
 #define MM_K 32
@@ -1129,7 +1223,7 @@ kernel void residual_norm(ARGS, KP) {
     device float* h = ARG_PTR(float, 5);
     const int n = ARG_INT(6);
     const float eps = ARG_F32(7);
-    threadgroup float scratch[32];
+    threadgroup float scratch[32], scratch2[32];
     const bool has_p = NONNULL(p), has_post = NONNULL(post), has_next = NONNULL(next);
     x += (ulong)gid.x * n;
     float p_scale = 1.0f;
@@ -1138,7 +1232,7 @@ kernel void residual_norm(ARGS, KP) {
         if (has_post) {
             float sum = 0.0f;
             for (int i = tid; i < n; i += tpg.x) sum += p[i] * p[i];
-            sum = block_sum(sum, scratch, tid, tpg.x);
+            sum = block_sum_once(sum, scratch2, tid, tpg.x);
             p_scale = 1.0f / sqrt(sum / (float)n + eps);
         }
     }
@@ -1151,7 +1245,7 @@ kernel void residual_norm(ARGS, KP) {
         sum += v * v;
     }
     if (!has_next) return;
-    sum = block_sum(sum, scratch, tid, tpg.x);
+    sum = block_sum_once(sum, scratch, tid, tpg.x);
     const float s = 1.0f / sqrt(sum / (float)n + eps);
     h += (ulong)gid.x * n;
     for (int i = tid; i < n; i += tpg.x) h[i] = x[i] * s * next[i];

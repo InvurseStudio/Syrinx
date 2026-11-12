@@ -891,11 +891,17 @@ struct Kept {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers saved at the end of the last prompt's history.
     checkpoint: Option<Qwen35Checkpoint>,
+    /// Qwen: its DeltaNet layers where a prompt parted from the one before (for a new
+    /// chat, the end of the system prompt and tools it shares with the last), so the
+    /// next new chat doesn't read them again.
+    base: Option<Qwen35Checkpoint>,
     /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
     scratch: Option<Qwen35Checkpoint>,
-    /// A small session apart, for questions the server asks the model itself (which tools a
-    /// request needs), so the chat's own cache is left as it is.
-    picker: Option<Session>,
+    /// Small sessions apart, for questions the server asks the model itself (which tools a
+    /// request needs, whether a skill fits), so the chat's own cache is left as it is.
+    /// One a kind of question (up to [`PICKERS`]), each going on from the start its last
+    /// question shares with the next ([`Model::ask`]).
+    pickers: Vec<Picker>,
     /// Each skill's share of yes for a request that fits no skill, by its question: this
     /// model's bias, scored once (`pick_skill`).
     skill_controls: HashMap<String, f64>,
@@ -904,6 +910,24 @@ struct Kept {
     /// since its saved state can only be loaded whole.
     history_end: usize,
 }
+
+/// A session for the server's own questions, and what's in it.
+struct Picker {
+    session: Session,
+    /// The tokens in the session: the last question read.
+    tokens: Vec<u32>,
+    /// Qwen: its DeltaNet layers where the last two questions part (their shared start).
+    checkpoint: Option<Qwen35Checkpoint>,
+    /// When it was last used (a count of questions), to reuse the oldest.
+    used: u64,
+}
+
+/// The most picker sessions kept: the change question, the skill questions and the group
+/// question each start their own way.
+const PICKERS: usize = 3;
+/// A question goes to a new or the oldest picker unless one shares at least this many
+/// tokens with it (more than the chat template's opening).
+const PICKER_MIN_SHARED: usize = 48;
 
 /// The context when the model's file doesn't say what it was trained for.
 const DEFAULT_CONTEXT: usize = 8192;
@@ -948,7 +972,79 @@ impl Model {
         Ok(n)
     }
 
-    /// Empties a session (the picker's, before each question).
+    /// Reads a question of the server's own (`ids`, from its start) in a picker session,
+    /// reading only what it doesn't share with the last question there; the last token's
+    /// logits. Gemma and Llama go back to the shared start; Qwen, whose DeltaNet state
+    /// can't be cut back, to a checkpoint saved where the last two questions parted (the
+    /// skill questions share their worked examples, ~230 tokens, and differ after).
+    fn ask(&self, kept: &mut Kept, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let count = kept.pickers.iter().map(|p| p.used).max().unwrap_or(0) + 1;
+        let best = (0..kept.pickers.len())
+            .max_by_key(|&i| shared_start(&kept.pickers[i].tokens, ids))
+            .filter(|&i| shared_start(&kept.pickers[i].tokens, ids) >= PICKER_MIN_SHARED);
+        let at = match best {
+            Some(i) => i,
+            None if kept.pickers.len() < PICKERS => {
+                kept.pickers.push(Picker {
+                    session: self.session(1024)?,
+                    tokens: Vec::new(),
+                    checkpoint: None,
+                    used: 0,
+                });
+                kept.pickers.len() - 1
+            }
+            None => (0..kept.pickers.len())
+                .min_by_key(|&i| kept.pickers[i].used)
+                .unwrap(),
+        };
+        let p = &mut kept.pickers[at];
+        p.used = count;
+        let shared = shared_start(&p.tokens, ids);
+        let mut from = match (self, &mut p.session) {
+            (Model::Llama(_), Session::Llama(s)) => {
+                s.truncate(shared);
+                shared
+            }
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(shared),
+            (Model::Qwen35(m), Session::Qwen35(s)) => {
+                if shared == s.len() {
+                    shared
+                } else if let Some(cp) = p.checkpoint.as_ref().filter(|c| c.len() <= shared) {
+                    m.restore(s, cp).map_err(e)?;
+                    cp.len()
+                } else {
+                    m.reset(s).map_err(e)?;
+                    p.checkpoint = None;
+                    0
+                }
+            }
+            _ => unreachable!("a session belongs to its model"),
+        };
+        // Qwen: a checkpoint where this question parts from the last, a few tokens early
+        // (the next may part a token sooner), if it's well past where reading starts.
+        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut p.session) {
+            let mark = shared.saturating_sub(8);
+            if mark >= from + 32 {
+                m.forward_batch(s, &ids[from..mark], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut p.checkpoint).map_err(e)?;
+                from = mark;
+            }
+        }
+        p.tokens.clear();
+        let logits = self.read(&mut p.session, &ids[from..]);
+        if logits.is_ok() {
+            p.tokens.extend_from_slice(ids);
+        } else {
+            // Unknown contents: start over next time.
+            p.checkpoint = None;
+            self.empty(&mut p.session)?;
+        }
+        logits
+    }
+
+    /// Empties a session.
     fn empty(&self, s: &mut Session) -> Result<(), String> {
         match (self, s) {
             (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
@@ -1080,15 +1176,34 @@ impl Model {
                 } else if let Some(cp) = kept.checkpoint.as_ref().filter(|c| c.len() <= shared) {
                     m.restore(s, cp).map_err(e)?;
                     cp.len()
+                } else if let Some(cp) = kept.base.as_ref().filter(|c| c.len() <= shared) {
+                    m.restore(s, cp).map_err(e)?;
+                    cp.len()
                 } else {
                     m.reset(s).map_err(e)?;
                     kept.checkpoint = None;
+                    kept.base = None;
                     0
                 }
             }
             _ => unreachable!("a session belongs to its model"),
         };
         kept.tokens.truncate(from);
+        let reused = from;
+        // Qwen, read from the start again: a checkpoint where this prompt parts from the
+        // last (a few tokens early, as the next may part a token sooner), when that's before
+        // the history's end: the system prompt and tools a new chat shares.
+        let mut from = from;
+        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut kept.session) {
+            let base_at = shared.saturating_sub(8);
+            if kept.base.is_none() && base_at >= from + 64 && base_at < mark {
+                m.forward_batch(s, &ids[from..base_at], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut kept.base).map_err(e)?;
+                kept.tokens.extend_from_slice(&ids[from..base_at]);
+                from = base_at;
+            }
+        }
         // Qwen: the history read on its own, and its DeltaNet saved where the next
         // turn's prompt will part from this one.
         let mut start = from;
@@ -1103,7 +1218,7 @@ impl Model {
         let logits = self.read(&mut kept.session, &ids[start..])?;
         kept.tokens.extend_from_slice(&ids[from..]);
         kept.history_end = mark;
-        Ok((logits, from))
+        Ok((logits, reused))
     }
 
     /// Reads `ids` after what the session holds; the last one's logits.
@@ -1136,11 +1251,12 @@ impl Model {
     fn reusable(&self, kept: &Kept, ids: &[u32]) -> usize {
         let shared = shared_start(&kept.tokens, ids);
         match &kept.session {
-            Session::Qwen35(s) if shared != s.len() => kept
-                .checkpoint
-                .as_ref()
+            Session::Qwen35(s) if shared != s.len() => [&kept.checkpoint, &kept.base]
+                .into_iter()
+                .flatten()
                 .map(|c| c.len())
                 .filter(|&n| n <= shared)
+                .max()
                 .unwrap_or(0),
             _ => shared,
         }
@@ -1199,6 +1315,7 @@ impl Model {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 s.import(state).map_err(e)?;
                 m.save(s, &mut kept.checkpoint).map_err(e)?;
+                kept.base = None;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1217,6 +1334,7 @@ impl Model {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 m.reset(s).map_err(|e| e.to_string())?;
                 kept.checkpoint = None;
+                kept.base = None;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1336,8 +1454,9 @@ fn engine(
                 session,
                 tokens: Vec::new(),
                 checkpoint: None,
+                base: None,
                 scratch: None,
-                picker: None,
+                pickers: Vec::new(),
                 skill_controls: HashMap::new(),
                 history_end: 0,
             })
@@ -1422,8 +1541,9 @@ fn engine(
                         session,
                         tokens: Vec::new(),
                         checkpoint: None,
+                        base: None,
                         scratch: None,
-                        picker: None,
+                        pickers: Vec::new(),
                         skill_controls: HashMap::new(),
                         history_end: 0,
                     })
@@ -1680,8 +1800,8 @@ fn reply(
     // `max_tokens` is the model's own writing; calls have their own limits (`MAX_CALLS`,
     // `MAX_CALL_TOKENS`), so a task of many calls still has room to answer.
     while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
-        let room = (max_tokens - generated.len())
-            .min(context.saturating_sub(kept.tokens.len() + 64));
+        let room =
+            (max_tokens - generated.len()).min(context.saturating_sub(kept.tokens.len() + 64));
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
         if ahead.is_empty() {
@@ -1986,12 +2106,7 @@ fn yes_share(
     let text =
         chat::history(family, None, "", &[question], &chat::today()) + chat::opening(family) + lead;
     let ids = tokenizer.encode(&text, false, true);
-    if kept.picker.is_none() {
-        kept.picker = Some(model.session(1024)?);
-    }
-    let session = kept.picker.as_mut().unwrap();
-    model.empty(session)?;
-    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
     let score = |word: &str| {
         let id = tokenizer.encode(&format!(" {word}"), false, false)[0];
         f64::from(logits[id as usize])
@@ -2042,12 +2157,7 @@ fn pick_groups(
         + chat::opening(family)
         + "Needs:";
     let ids = tokenizer.encode(&text, false, true);
-    if kept.picker.is_none() {
-        kept.picker = Some(model.session(1024)?);
-    }
-    let session = kept.picker.as_mut().unwrap();
-    model.empty(session)?;
-    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
     let scores: Vec<f64> = tools::GROUP_CHOICES
         .iter()
         .map(|(letter, _)| {
