@@ -138,6 +138,49 @@ the state by 0; the model tests caught it (logits off by up to 1.5 in batches of
 new test (`delta_net_in_chunks_matches_token_by_token`) checks the chunked DeltaNet on
 its own.
 
+**Fifth pass: agent work (2026-11-12).** Timing a reply in the server showed reading,
+not writing, is 80-90% of an eval case: the scoring questions (the change question and
+one per skill, ~280 tokens each) were read from empty every time, a new chat read its
+whole system prompt again on Qwen, and a batch of 2-128 tokens cost about as much as 128.
+Changes, each checked case by case against main (same scores to two decimals, same
+choices, same pass or fail):
+
+- `matvec_few` (Metal): 1-4 tokens' products with each weight decoded once for all of
+  them, any type, 2 rows a threadgroup split over its 4 SIMD groups; 5-8 tokens as two
+  side by side. Used for every 2-8-token input (Q6_K's own kernel stays for 2-3 tokens,
+  where it's faster). Per matrix, 2 / 4 tokens against the prompt kernels: Qwen 3.5 4B's
+  Q4_K ffn_gate 38 / 51 µs against 123, Gemma 4 E4B's Q4_0 ffn_down 31 / 42 against 197,
+  its 32-row ssm_alpha 4 against 38. A whole batch (ms, before → after): E2B 2 tokens
+  8.4 → 4.6, 8 tokens 8.6 → 6.4; E4B 19.8 → 7.9, 20.0 → 13.4; Qwen 4B 25.3 → 12.5,
+  33.4 → 23.1. Tried: 8 tokens in one dispatch (slower than two of 4 at any row count:
+  each SIMD group reads the 8 tokens' activations, ~14× the weights' bytes); 1, 4 and 8
+  rows a threadgroup.
+- The server (both platforms): up to 3 picker sessions, one a kind of question, each
+  going on from the start its last question shares with the next (Gemma rewinds; Qwen
+  restores a DeltaNet checkpoint saved where the last two parted), so a skill question
+  reads ~50 tokens, not ~280. And a second Qwen checkpoint where a prompt parts from the
+  one before (a new chat: the end of the system prompt and tools it shares with the
+  last), so a new chat no longer reads ~1,600 tokens again (330 ms on 4B).
+- The sampler (both): one pass for the likeliest candidates, the repetition penalty
+  applied to the recent tokens alone. A pick over 262K tokens: Gemma's settings 315 →
+  35 µs, Qwen's 293 → 24, greedy 243 → 19, with a repetition penalty 2,700 → 41.
+- Smaller, Metal: the per-layer input's GELU gate in its matrix product
+  (`matvec_split_gelu_*`, Gemma one token, +1-1.5%); `residual_norm`'s two sums with one
+  barrier each (6.9 → 6.4 µs, same bits); the first command buffer committed after 16
+  dispatches when the GPU is idle (+0.5-1%). `vireo-cli generate`'s argmax was a scalar
+  pass slow enough to show in its numbers (~0.3 ms a token).
+
+Six eval cases (datetime, read, list, no-tool-writing, find-then-read, git), main →
+now, seconds a case, all 6/6 both: Gemma 4 E2B 0.46 → 0.37, E4B 1.06 → 0.72, Qwen 3.5 4B
+1.95 → 1.05, 9B 3.35 → 1.72. Generating, 256 tokens from a short prompt (`vireo-cli`):
+Qwen 0.8B ~479, E2B ~223, E4B ~128 (llama.cpp 115), Qwen 4B ~145 (128), 9B ~90 (81).
+Reading prompts once warm is ahead of llama.cpp at every length measured (E2B 256 tokens
+~20K tokens/s against 13.6K; Qwen 4B ~4.8K against 3.4K); a fresh process's first read
+costs ~20-35 ms more (first use of the buffers). Kept out: fewer attention parts at short
+contexts (+0.5% there, much slower at 7K tokens); 4 or 8 rows a threadgroup in the
+one-token kernels (2 is fastest). Not measured yet: Gemma 4 31B, and anything on CUDA
+(the server changes are shared; the kernel changes are Metal's).
+
 **What limits speed now, and what's next:**
 
 - **Generating** reads the big matrices at memory speed, but a token is still a chain of
