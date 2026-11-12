@@ -57,6 +57,10 @@ body {
 }
 .wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 28px; }
 header { display: grid; gap: 10px; }
+.top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.theme { font: 500 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--fg-2); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.theme:hover { color: var(--fg); }
+.theme:focus-visible { outline: 2px solid var(--vireo); outline-offset: 2px; }
 .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--fg-3); }
 h1 { font-family: var(--display); font-weight: 600; font-size: clamp(28px, 4.4vw, 42px); line-height: 1.1; margin: 0; text-wrap: balance; letter-spacing: -.01em; }
 .lede { margin: 0; max-width: 68ch; color: var(--fg-2); }
@@ -111,7 +115,7 @@ td:first-child, td:nth-child(2) { font-family: var(--body); }
 
 <div class="wrap">
   <header>
-    <div class="eyebrow" id="eyebrow"></div>
+    <div class="top"><div class="eyebrow" id="eyebrow"></div><button class="theme" id="theme" type="button"></button></div>
     <h1 id="headline"></h1>
     <p class="lede" id="lede"></p>
   </header>
@@ -253,7 +257,9 @@ function draw(p) {
       const y = y0 + j * (BAR + GAP), w = Math.max(2, x(v) - LEFT);
       // bar with a rounded data end anchored to the baseline
       el("path", { d: `M${LEFT},${y} h${w - 4} a4,4 0 0 1 4,4 v${BAR - 8} a4,4 0 0 1 -4,4 h${-(w - 4)} z`, fill: `var(--${k})` }, svg);
-      const lab = el("text", { x: x(v) + 6, y: y + BAR - 2.5, "font-size": 11.5, fill: "var(--fg-2)", class: "num" }, svg);
+      // Vireo's label clears the "before" marker where that sits past the bar's end.
+      const end = k === "vireo" && p.before ? Math.max(x(v), x(p.before[i])) : x(v);
+      const lab = el("text", { x: end + 6, y: y + BAR - 2.5, "font-size": 11.5, fill: "var(--fg-2)", class: "num" }, svg);
       lab.textContent = fmt(v);
     });
     // "before" marker on the Vireo bar, with a 2px surface ring
@@ -296,6 +302,23 @@ function tip(ev, p, i, anchor) {
   tipEl.style.left = left + "px"; tipEl.style.top = top + "px";
 }
 function hideTip() { tipEl.hidden = true; }
+
+// Light or dark: follows the system unless chosen here (remembered) or with ?theme=dark|light.
+const themeBtn = document.getElementById("theme");
+const root = document.documentElement;
+const systemDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+const isDark = () => root.dataset.theme ? root.dataset.theme === "dark" : systemDark();
+function setTheme(t, keep) {
+  if (t) root.dataset.theme = t; else delete root.dataset.theme;
+  if (keep) { try { localStorage.setItem("vireo-speed-theme", t); } catch (e) {} }
+  themeBtn.textContent = isDark() ? "Light mode" : "Dark mode";
+  themeBtn.setAttribute("aria-label", `Switch to ${isDark() ? "light" : "dark"} mode`);
+}
+let saved = new URLSearchParams(location.search).get("theme");
+if (!saved) { try { saved = localStorage.getItem("vireo-speed-theme"); } catch (e) {} }
+setTheme(saved === "dark" || saved === "light" ? saved : null, false);
+themeBtn.addEventListener("click", () => setTheme(isDark() ? "light" : "dark", true));
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTheme(root.dataset.theme, false));
 
 const host = document.getElementById("panels");
 for (const p of PANELS) {
