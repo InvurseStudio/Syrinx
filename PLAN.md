@@ -300,7 +300,7 @@ git), for checking our output and speed.
 | 2026-11-11 | What the quick gauntlet still needed. **Lists and objects as tool arguments:** the grammar gained lists in any punctuation (Gemma 4's `[a,b]`, and objects with keys the model names) and values of several kinds told apart by their first byte (a spreadsheet's cell: text, a number, true/false, null); each family writes them as its template does (read from the GGUF files): Gemma 4's `format_argument` (bare keys in alphabetical order, `<|"|>` strings), Qwen 3.5's `tojson` inside `<parameter=...>`, Llama's JSON. That unlocks the app's `write_spreadsheet` (rows, with `start_cell` "append"), `fill_docx_template` (values) and `create_pptx` (slides), each approved and checked first (`check_change`). **Memory:** `remember` and `forget`, run by the server (`memory.rs`, one fact a line in `memories.txt`), the facts added to each chat's instructions in the Mac's words; offered in every chat, apart from the change question (remembering isn't a change to a file). **Chat search:** `search_chats`, run by the app over its own chats (`ChatSearch`, the asking chat left out). **Skills:** `fill-template`, `apply-policy` and `process-invoices` in `server/builtin-skills`, general procedures. A reply may make 20 calls (6 before), and `max_tokens` counts the model's writing, not its calls. **Scripted gauntlet:** `run-gauntlet.ps1` and the app's `--gauntlet` mode (`GauntletRunner`): each prompt a new chat through the app's own ChatStore and PcTools, approvals answered by the script's rule, a report with the answer key's hints after each prompt; the answer key's folder locked in every checkout for the run | Server 55 tests, grammar 11, app 295 (the runner end to end against a stand-in server, chat search, the new checks). Eval, plain run, against `evals/more-tools.json`: memory tools offered everywhere Gemma 4 E2B 33/39 and Qwen 3.5 4B 39/39 (the same), Qwen 8.0 to 8.9 s a case; with the three skills too, 33 and 39 again, 2.2 and 9.6 s a case (three more scoring passes), the new skills taken on three other cases, all still passing (`evals/gauntlet-tools.json`). In the installed app: a model started from Settings › Models, a note written after its approval and undone, a PDF read. Found there: a second copy of the app can start and stops the first one's engine; the Installed tab lists no model kept outside its folders |
 | 2026-11-11 | **The quick Aurelia gauntlet through the Windows app on Vireo's own engine**, small models against the Mac's large ones (write-up: `docs/dev/test-gauntlet/runs/Aurelia-Quick-2026-11-11-small-models-notes.md`). Qwen 3.5 4B and 9B ran 12 of its 13 prompts (Q11 left out: no folder tasks yet), one model at a time, with fixes between runs, each measured with `vireo-eval` and its four new office cases (`office_cases.rs`). Fixed: a line after a skill's text to start on step 1 (Gemma 4 E2B described the steps instead); a second control request for skills (E2B took `fill-template` for an introduction); the tools preamble says to remember what people say about themselves; a repeated call refused on its own instead of ending all calls (Qwen 4B's Q5); `fill-template` only for a named template; each run's own chats, memory and approvals (`VIREO_CHATS_DIR` and the like: Claude's packaged app sees a layered `%LOCALAPPDATA%`) | Pass / Partial / Fail on the same 12 tasks: Qwen 3.5 4B 1 / 5 / 6 in 17.6 min, 9B 0 / 7 / 5 in 25.8 min, against the Nov 10 full run's Qwen 3.8 27B 11 / 1 / 0, Gemma 4 31B 9 / 3 / 0, Muse Glimmer 30B 9 / 3 / 0. Every tool call was well formed and reached its tool (memory, PDFs, register rows, Word templates filled with exact values, approvals; up to 21 calls a reply); 9B's card form matched Gemma 31B's. What the small models lack is judgment: both named the contractor the safety winner, and on approving over the limit 4B claimed it had approved and 9B tried to remember the approval. 9B's Q2 analysis was right throughout but ran out of the 2,048-token writing budget before the register. Eval after the fixes: Gemma 4 E2B 33/43, Qwen 3.5 4B 43/43; office cases E2B 0 → 2/4, Qwen 4B 3 → 4/4. Next: thinking in the engine, a per-model writing budget, skill picks on mixed requests |
 | 2026-11-12 | Windows tuning for the larger models (Qwen 3.5 4B and 9B, Gemma 4 E4B; see "Twelfth round"): the tensor-core matrix kernels' scales laid out by group so a warp reads them in pairs, their scaling as two fused multiply-adds, and a prompt batch of 1,024 on CUDA as on the Mac | Reading a prompt, against `main` (~2,000 / ~9,000 tokens): Qwen 4B +13% / +15%, 9B +11% / +8%, Gemma E4B +1.5% / +1.5%; generating unchanged. Perplexity (2 × 2,048 tokens of PLAN.md, 8-bit): Gemma E4B the same to every digit; Qwen 4B 11.7149 → 11.7239 and 9B 9.6416 → 9.6389 (exact 11.6965 and 9.6339: the fused sums round differently, within 8-bit mode's spread). Engine tests 70 and GPU 11 pass |
-| 2026-11-12 | Windows tuning, second pass (see "Thirteenth round"): one token's attention over an f16 cache rewritten (`attention_part_kv_*`: a block per key/value head and its query heads, a warp per position with the lanes splitting the head, parts sized from the kernel's real occupancy), and `residual_norm` reading a row into registers at once | Generating ~30K tokens deep, against `main`: Qwen 3.5 4B 19.4 → 32.9, 9B 14.5 → 20.8, Gemma 4 E4B 22.3 → 39.9 tokens/s (llama.cpp 21.9, 16.4, 30.1); short chats +1–12%. `residual_norm` gives the same numbers; the new attention is within 1e-8 of f64 (the f16 test gains two cases 6,000 positions deep). Engine 70, GPU 11, server and eval tests pass; the full eval scores as `evals/more-tools.json` but for one borderline case on one model (`find-then-read`, failing as in earlier runs; `evals/windows-tuning.json`), 12.2 s a case against 14.0 |
+| 2026-11-12 | Windows tuning, second pass (see "Thirteenth round"): one token's attention over an f16 cache rewritten (`attention_part_kv_*`: a block per key/value head and its query heads, a warp per position with the lanes splitting the head, parts sized from the kernel's real occupancy), and `residual_norm` reading a row into registers at once | Generating ~30K tokens deep, against `main`: Qwen 3.5 4B 19.4 → 32.9, 9B 14.5 → 20.8, Gemma 4 E4B 22.3 → 39.9 tokens/s overnight (llama.cpp 21.9, 16.4, 30.1); at full clocks the next morning 46.2 → 62.4, 33.5 → 43.0, 44.6 → 59.2 (llama.cpp 63.8, 41.9, 61.7: level); short chats +1–12%. `residual_norm` gives the same numbers; the new attention is within 1e-8 of f64 (the f16 test gains two cases 6,000 positions deep). Engine 70, GPU 11, server and eval tests pass; the full eval scores as `evals/more-tools.json` but for one borderline case on one model (`find-then-read`, failing as in earlier runs; `evals/windows-tuning.json`), 12.2 s a case against 14.0 |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -682,6 +682,23 @@ repository's docs, the last with the story opening after it so the 9B keeps writ
   clock swing between ~180 MHz and ~2.6 GHz and cut prompt speed to a third. Don't
   sample clocks during a measured run.
 
+**The same, at full speed (2026-11-12, morning):** every number above (and in the
+twelfth round) was measured overnight with the laptop in a slower power state: by
+morning, on the Performance power scheme, both engines ran ~2.5–3.5× faster. Measured
+again the same way (tokens/s; `main` → this round / llama.cpp):
+
+| Model | Generating short | ~31K deep | Reading ~2,100 | Reading ~31K |
+|---|---|---|---|---|
+| Qwen 3.5 4B | 86.6 → 90.8 / 77.0 (118%) | 46.2 → 62.4 / 63.8 (98%) | 2,757 → 3,076 / 3,526 (87%) | 2,072 → 2,235 / 2,699 (83%) |
+| Qwen 3.5 9B | 50.4 → 53.7 / 47.1 (114%) | 33.5 → 43.0 / 41.9 (103%) | 1,446 → 1,626 / 2,232 (73%) | 1,308 → 1,417 / 1,819 (78%) |
+| Gemma 4 E4B | 80.9 → 90.0 / 78.9 (114%) | 44.6 → 59.2 / 61.7 (96%) | 5,519 → 5,536 / 6,396 (87%) | 3,915 → 3,929 / 4,506 (87%) |
+
+The gains over `main` hold (deep generation +28–35%, Qwen's prompts +8–12%), but the
+comparison with llama.cpp shifts: at full clocks Vireo's per-token lead in short chats is
+14–18% (not 19–37%), and deep in a long chat the two are level (96–103%), not 27–50%
+apart. Slow clocks favour Vireo's one-graph-per-token path, so benchmark in the
+Performance power scheme and say which one was used.
+
 **Long chats (2026-11-11):** vireo-server's context is now automatic by default: as
 many tokens as the GPU's free memory holds once the model is loaded (leaving 1 GB and a
 tenth of what's free), up to the model's trained length and 32,768, the length checked
@@ -704,7 +721,7 @@ prompt keeps the same share of llama.cpp's speed as a short one; the first reply
 Generating deep in a long chat fell behind, though: short chats were 19-25% ahead of
 llama.cpp, a 25K-token one 27-48% behind, in one token's attention (`attention_part_*`).
 The thirteenth round's `attention_part_kv` fixed that: ~31K tokens deep the larger
-models now generate 27–50% ahead of llama.cpp.
+models now generate level with llama.cpp at full clocks (96–103%).
 
 **What limits speed now, and what's next:**
 
@@ -718,10 +735,12 @@ models now generate 27–50% ahead of llama.cpp.
   reads, still not overlapped (cp.async into a second buffer would avoid the
   registers). Then the smaller kernels: `quantize_q8` (~4%) could be folded into the
   norms and `swiglu` that make its input.
-- **Generating** is 19–37% ahead of llama.cpp in short chats and 27–50% ahead ~31K tokens
-  deep on the larger models (thirteenth round). What's left per token is mostly the
-  weights' matrix-vector products (Gemma E4B: 12.8 of 26 ms), at ~270 GB/s.
-- **Reading a long prompt** is at 73–78% of llama.cpp at ~31K tokens (82–90% at 2K):
+- **Generating**, at full clocks, is 14–18% ahead of llama.cpp in short chats and level
+  (96–103%) ~31K tokens deep on the larger models (thirteenth round). What's left per
+  token is mostly the weights' matrix-vector products (Gemma E4B, in the slower power
+  state: 12.8 of 26 ms, at ~270 GB/s), then deep in a chat its attention.
+- **Reading a prompt**, at full clocks, is at 73–87% of llama.cpp at ~2K tokens and
+  78–87% at ~31K (the 9B furthest behind). For long ones
   prompt attention is 30–35% of the time there (`attention_mma_256` and `_512`, ~3–4
   TFLOPS), one block of 4 warps an SM (~70 KB of shared memory each), with "wait" the
   top stall. More warps an SM needs a different tiling (the queries out of shared

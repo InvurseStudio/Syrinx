@@ -112,6 +112,6 @@ Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer 
    `VIREO_BUILTIN_SKILLS`. The slash-command list should also follow the asking device's
    tools.
 6. **Small things:** three clippy warnings in `attach/` (from the Mac's code), one in
-   `vireo-cli`; prompt attention on CUDA for long prompts (73–78% of
-   llama.cpp at ~31K tokens; see PLAN.md, "What limits speed now"); the GPU performance counters on the Windows machine are open to all users
+   `vireo-cli`; prompt attention on CUDA for long prompts (78–87% of
+   llama.cpp at ~31K tokens at full clocks; see PLAN.md, "What limits speed now"); the GPU performance counters on the Windows machine are open to all users
    for Nsight and should go back to administrators only when the tuning is done.
