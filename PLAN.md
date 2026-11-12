@@ -378,13 +378,31 @@ b12228's llama-bench):
 |---|---|---|---|
 | Gemma 4 31B | 652-675 / 519 | 19.7-20.0 / 19.3 | 9.0 → 7.7 s (lookup drafting) |
 | Qwen 3.8 27B | 700-714 / 561 | 19.1-20.4 / 19.7 | 10.5 → 8.6 s (its own drafting layer) |
-| Muse Glimmer 30B | 766-855 / 635 | 22.2-22.8 / 21.4 | not in vireo-server yet |
+| Muse Glimmer 30B | 766-855 / 635 | 22.2-22.8 / 21.4 | 10.6 s (five other cases, lookup drafting; see below) |
 
 Writing one token at a time is within 5-10% of what the matrix kernels reach from
 memory on all three; long prompts' products run at ~85% of the accelerators' F16
 ceiling. What's left is in guessing (a cheaper 4-token check would let Qwen take a
-third guess and help Gemma's chat guesses), Muse's place in the server, and the short
-reads' fixed costs.
+third guess and help Gemma's chat guesses), and the short reads' fixed costs.
+
+**Muse Glimmer 30B in vireo-server (2026-11-12).** A chat family of its own (`Family::Muse`,
+`muse-glimmer`), run by Gemma 4's model code. Its format is the template's: turns are
+`<|start|>role<|message|>…<|eot|>`; the system turn carries Vireo's system prompt (with the
+Mac's note: knowledge cutoff, keep the reply short), `Reasoning strength: low.` (the Mac's
+setting for thinking off), the tools' declarations and the valid recipients; results come
+back as `<|start|>tool NAME<|message|><tool_output name="NAME">…</tool_output><|eot|>`. Each
+assistant message names its recipient first, so the reply loop has the model choose there,
+under the call grammar, each option scored whole: `to=user` (plain text from there),
+`to=self` (its reasoning, not shown), or a tool and its `<atem:function_calls>` block.
+`<|eom|>` opens another message. Muse can't do without reasoning: held to the user (no
+`to=self`), it wanted `self` at every turn and called no tool on any case (0 of 5). Given
+`self` it reasons briefly (18-144 tokens a reply) and passes all five. Reasoning is capped
+at 2,048 tokens a reply, then ended for it. Eval, `--cases datetime,read,list,git,three-steps
+--server-arg --context --server-arg 32768`: **5/5**, 10.6 s a case, 10 tool calls (three-steps
+read all three READMEs, then the right project's Git). Reading the 1,878-token first prompt
+849 tokens/s; writing 26.5-35.2 tokens/s with lookup drafting (53-72% of guesses taken),
+against 22-23 one at a time; each call takes ~0.9-1.4 s to write. Results:
+`evals/muse-glimmer-30B.json`.
 
 **What limits speed now, and what's next:**
 
