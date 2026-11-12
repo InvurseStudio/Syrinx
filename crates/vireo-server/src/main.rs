@@ -956,10 +956,12 @@ struct Picker {
 }
 
 /// Guesses a round from Qwen's multi-token-prediction layer. On Qwen 3.8 27B the first is
-/// right 86% of the time and the first two 64% (`tests/mtp.rs`), but checking 4 tokens
-/// costs 1.8 times one (the few-token products get dear past 3), so 2 a round beat 3:
-/// nine eval cases, alternating, 8.6 / 8.9 s a case against 9.1 / 9.3.
-const MTP_GUESSES: usize = 2;
+/// right 86% of the time, the first two 64% and all three 43% (`tests/mtp.rs`). While
+/// checking 4 tokens cost 1.8 times one, 2 a round beat 3; with the 8-token tile it costs
+/// 1.24 times one (46.7 ms one token, 57.7 four: `tests/check_speed.rs`), and through the
+/// server 2 / 3 / 4 guesses write a copied document at 44 / 53 / 59 tokens/s and a new
+/// story at 30.1 / 29.6 / 26.5: 3.
+const MTP_GUESSES: usize = 3;
 
 /// The most picker sessions kept: the change question, the skill questions and the group
 /// question each start their own way.
@@ -1488,8 +1490,9 @@ fn engine(
         }
     };
     let loaded = (|| -> Result<(Model, Tokenizer, Family, String), String> {
-        let family = Family::of(file.architecture())
-            .ok_or_else(|| format!("{path} isn't a Llama, Qwen 3.5, Gemma 4 or Muse Glimmer model"))?;
+        let family = Family::of(file.architecture()).ok_or_else(|| {
+            format!("{path} isn't a Llama, Qwen 3.5, Gemma 4 or Muse Glimmer model")
+        })?;
         let tokenizer = Tokenizer::from_gguf(file).map_err(|e| e.to_string())?;
         let gpu = Gpu::open().map_err(|e| format!("No GPU for the engine: {e}"))?;
         let gpu_name = gpu.info.name.clone();
@@ -2062,10 +2065,10 @@ fn reply(
         // Muse's message start is the grammar's, as Llama's brace is (its pick is left).
         let by_brace = muse_turn
             || start.brace && turn_start && {
-            let mut b = Vec::new();
-            tokenizer.token_bytes(next, false, &mut b);
-            b.first() == Some(&b'{')
-        };
+                let mut b = Vec::new();
+                tokenizer.token_bytes(next, false, &mut b);
+                b.first() == Some(&b'{')
+            };
         // Muse's message start is always a choice, and its <|eom|> (taken away unless it
         // may call or is thinking) always opens another message.
         let opens_call = if family == Family::Muse {
@@ -2361,8 +2364,7 @@ fn yes_share(
         role: "user".into(),
         content: question.to_string(),
     };
-    let text =
-        chat::history(family, None, "", &[question], &chat::today())
+    let text = chat::history(family, None, "", &[question], &chat::today())
         + chat::answer_opening(family)
         + lead;
     let ids = tokenizer.encode(&text, false, true);

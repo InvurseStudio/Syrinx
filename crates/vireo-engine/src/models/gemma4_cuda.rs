@@ -340,11 +340,11 @@ impl<'a> Gemma4Cuda<'a> {
         };
         let cache_buffer = |n: usize| self.gpu.alloc(n * cache_bytes).map_err(gpu_error);
         // On the Mac a sliding-window layer keeps its window and a batch's new positions
-        // (rounded to the attention kernel's chunk of 64), not every position: for 31B at
-        // 32K tokens, 1.6 GB instead of 27.
+        // (rounded to the attention kernels' longest chunk, 256), not every position: for
+        // 31B at 32K tokens, 1.6 GB instead of 27.
         let rings: Vec<usize> = (0..c.layers)
             .map(|l| {
-                let ring = (c.sliding_window + batch).next_multiple_of(64);
+                let ring = (c.sliding_window + batch).next_multiple_of(256);
                 if cfg!(target_os = "macos") && c.is_swa[l] && ring < capacity {
                     ring
                 } else {
