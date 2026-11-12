@@ -881,6 +881,10 @@ mod tests {
         assert!(none.contains("(none)"), "{none}");
     }
 
+    // macOS only: files.rs is the Mac's server-run tools (/tmp is /private/tmp there, /etc
+    // is there, Git is looked for where the Mac keeps it). On Windows the app runs these
+    // tools itself (PcTools); files.rs on Windows is a step of its own (HANDOFF.md).
+    #[cfg(target_os = "macos")]
     #[test]
     fn full_access_reaches_anywhere() {
         let h = home();
@@ -906,6 +910,10 @@ mod tests {
         assert_eq!(Access::from_request(None, vec![]), None);
     }
 
+    // macOS only: files.rs is the Mac's server-run tools (/tmp is /private/tmp there, /etc
+    // is there, Git is looked for where the Mac keeps it). On Windows the app runs these
+    // tools itself (PcTools); files.rs on Windows is a step of its own (HANDOFF.md).
+    #[cfg(target_os = "macos")]
     #[test]
     fn paths_are_standardized_like_the_macs() {
         assert_eq!(
@@ -1075,22 +1083,22 @@ mod tests {
         assert_eq!(
             run(&t, "file_exists", &[("path", "Documents/notes.txt")]),
             format!(
-                r#"{{"exists":true,"path":"{}/Documents/notes.txt","type":"file"}}"#,
-                h.0
+                r#"{{"exists":true,"path":{},"type":"file"}}"#,
+                crate::json::string(&format!("{}/Documents/notes.txt", h.0))
             )
         );
         assert_eq!(
             run(&t, "file_exists", &[("path", "Documents/budget.xlsx")]),
             format!(
-                r#"{{"exists":false,"path":"{}/Documents/budget.xlsx","type":null}}"#,
-                h.0
+                r#"{{"exists":false,"path":{},"type":null}}"#,
+                crate::json::string(&format!("{}/Documents/budget.xlsx", h.0))
             )
         );
         assert_eq!(
             run(&t, "file_exists", &[("path", "Documents")]),
             format!(
-                r#"{{"exists":true,"path":"{}/Documents","type":"directory"}}"#,
-                h.0
+                r#"{{"exists":true,"path":{},"type":"directory"}}"#,
+                crate::json::string(&format!("{}/Documents", h.0))
             )
         );
     }
@@ -1211,6 +1219,10 @@ mod tests {
 
     // ---- Git
 
+    // macOS only: files.rs is the Mac's server-run tools (/tmp is /private/tmp there, /etc
+    // is there, Git is looked for where the Mac keeps it). On Windows the app runs these
+    // tools itself (PcTools); files.rs on Windows is a step of its own (HANDOFF.md).
+    #[cfg(target_os = "macos")]
     #[test]
     fn git_status_and_diff_of_a_project() {
         let h = home();

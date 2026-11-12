@@ -49,8 +49,8 @@ use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary,
-    MTLMathFloatingPointFunctions, MTLMathMode,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLMathFloatingPointFunctions, MTLMathMode, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 use crate::tensor_type::TensorType;
@@ -80,7 +80,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unavailable(why) => write!(f, "no GPU: {why}"),
-            Error::Driver { call, code, name } => write!(f, "Metal's {call} failed: {name} ({code})"),
+            Error::Driver { call, code, name } => {
+                write!(f, "Metal's {call} failed: {name} ({code})")
+            }
             Error::Unsupported(kind) => write!(f, "{kind} has no GPU kernel yet"),
         }
     }
@@ -228,7 +230,9 @@ impl Context {
                     buffer_options(),
                 )
             },
-            _ => self.device.newBufferWithLength_options(length, buffer_options()),
+            _ => self
+                .device
+                .newBufferWithLength_options(length, buffer_options()),
         };
         let buffer = buffer.ok_or(Error::Driver {
             call: "newBuffer",
@@ -239,7 +243,8 @@ impl Context {
     }
 
     fn track(&self, buffer: &ProtocolObject<dyn MTLBuffer>, bytes: usize) {
-        self.residency.addAllocation(ProtocolObject::from_ref(buffer));
+        self.residency
+            .addAllocation(ProtocolObject::from_ref(buffer));
         self.lock().residency_dirty = true;
         let start = buffer.gpuAddress();
         self.allocations
@@ -308,9 +313,9 @@ impl Context {
         let hazard = state.blocked
             || match &d.access {
                 None => !state.pending.is_empty(),
-                Some(access) => access.iter().any(|&(b, w)| {
-                    state.pending.iter().any(|&(pb, pw)| pb == b && (w || pw))
-                }),
+                Some(access) => access
+                    .iter()
+                    .any(|&(b, w)| state.pending.iter().any(|&(pb, pw)| pb == b && (w || pw))),
             };
         let encoder = &state.open.as_ref().unwrap().encoder;
         if hazard {
@@ -472,7 +477,12 @@ impl Context {
         let staged = self.new_buffer(data.len(), Some(data))?;
         let encoder = self.encoder(&mut state)?;
         encoder.useResource_usage(ProtocolObject::from_ref(&*staged), MTLResourceUsage::Read);
-        let mut d = copy_dispatch(&self.copy, to.ptr + offset as u64, staged.gpuAddress(), data.len());
+        let mut d = copy_dispatch(
+            &self.copy,
+            to.ptr + offset as u64,
+            staged.gpuAddress(),
+            data.len(),
+        );
         d.access = self.access_of(&d);
         self.encode(&mut state, &d)?;
         state.staging.push(staged);
@@ -582,7 +592,8 @@ impl Buffer {
     /// Copies from f32 number `index` on into `out`, waiting for queued GPU work first.
     pub fn read_f32_at(&self, index: usize, out: &mut [f32]) -> Result<()> {
         assert!((index + out.len()) * 4 <= self.bytes);
-        let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len() * 4) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len() * 4) };
         self.context.read(self, index * 4, bytes)
     }
 }
@@ -624,7 +635,10 @@ impl Graph {
     /// Queues the whole recorded run.
     pub fn launch(&self) -> Result<()> {
         let mut state = self.context.lock();
-        assert!(state.recording.is_none(), "launching a graph while recording");
+        assert!(
+            state.recording.is_none(),
+            "launching a graph while recording"
+        );
         for d in &self.dispatches {
             self.context.encode(&mut state, d)?;
             self.context.profile_step(&mut state, d)?;
@@ -805,9 +819,10 @@ impl Gpu {
             let pso = device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|e| driver_error("newComputePipelineState", &e))?;
-            names
-                .borrow_mut()
-                .insert(Retained::as_ptr(&pso) as *const c_void as usize, name.to_string());
+            names.borrow_mut().insert(
+                Retained::as_ptr(&pso) as *const c_void as usize,
+                name.to_string(),
+            );
             Ok(pso)
         };
         let per_kind = |prefix: &str| -> Result<[Pso; 7]> {
@@ -822,7 +837,10 @@ impl Gpu {
             let mut v: [Option<Pso>; 7] = Default::default();
             for (slot, kind) in v.iter_mut().zip(KINDS) {
                 if !matches!(kind, TensorType::F32 | TensorType::F16) {
-                    *slot = Some(pipeline(&format!("{prefix}_{}", kind.name().to_lowercase()))?);
+                    *slot = Some(pipeline(&format!(
+                        "{prefix}_{}",
+                        kind.name().to_lowercase()
+                    ))?);
                 }
             }
             Ok(v)
@@ -842,7 +860,10 @@ impl Gpu {
             qkv_prep: pipeline("qkv_prep")?,
             attention: pipeline("attention")?,
             attention_h: pipeline("attention_h")?,
-            attention_part: [pipeline("attention_part_f32")?, pipeline("attention_part_f16")?],
+            attention_part: [
+                pipeline("attention_part_f32")?,
+                pipeline("attention_part_f16")?,
+            ],
             attention_combine: pipeline("attention_combine")?,
             attention_decode_wide: [
                 [
@@ -1402,7 +1423,9 @@ impl Gpu {
             let spread: u32 = if head_dim <= 128 { 4 } else { 2 };
             let threadgroups = (heads / hg) as u32;
             let cores = self.info.multiprocessors.max(1) as u32;
-            let parts = (spread * cores).div_ceil(threadgroups).clamp(1, MAX_DECODE_PARTS);
+            let parts = (spread * cores)
+                .div_ceil(threadgroups)
+                .clamp(1, MAX_DECODE_PARTS);
             let mut args = args.to_vec();
             args.push(Arg::Ptr(self.attention_parts.ptr()));
             args.push(Arg::Ptr(self.attention_counters.ptr()));
@@ -1498,12 +1521,7 @@ impl Gpu {
         } else {
             &self.kernels.attention
         };
-        self.run(
-            one,
-            (heads as u32, tokens as u32),
-            128,
-            &args,
-        )
+        self.run(one, (heads as u32, tokens as u32), 128, &args)
     }
 
     /// `gate = SiLU(gate) × up` over `tokens` rows of `n`; up's rows are `up_stride` apart.
@@ -1668,7 +1686,12 @@ impl Gpu {
                 Arg::I32(tokens as i32),
             ];
             let chunks = tokens.div_ceil(DELTA_CHUNK) as u32;
-            self.run(&self.kernels.delta_chunk_prep, (d.v_heads as u32, chunks), 256, &prep)?;
+            self.run(
+                &self.kernels.delta_chunk_prep,
+                (d.v_heads as u32, chunks),
+                256,
+                &prep,
+            )?;
             let scan = [
                 Arg::Ptr(d.scratch),
                 Arg::Ptr(d.state),
@@ -1807,7 +1830,9 @@ impl Gpu {
             "rows of {cols} aren't whole blocks of 32"
         );
         q8.x.store(x, Ordering::Relaxed);
-        if let (Some((_, to_half)), Some(half), true) = (&self.kernels.matmul_tc, &q8.half, tokens > 1) {
+        if let (Some((_, to_half)), Some(half), true) =
+            (&self.kernels.matmul_tc, &q8.half, tokens > 1)
+        {
             let n = tokens * cols;
             assert!(n * 2 <= half.len_bytes(), "the f16 buffer is too small");
             let args = [Arg::Ptr(x), Arg::Ptr(half.ptr()), Arg::I32(n as i32)];
@@ -1873,7 +1898,10 @@ impl Drop for Gpu {
         let total: f64 = profile.values().map(|v| v.0).sum();
         let mut rows: Vec<_> = profile.iter().collect();
         rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-        eprintln!("GPU time by kernel ({:.1} ms in all, each dispatch on its own):", total * 1e3);
+        eprintln!(
+            "GPU time by kernel ({:.1} ms in all, each dispatch on its own):",
+            total * 1e3
+        );
         for (name, (seconds, count)) in rows {
             eprintln!(
                 "  {:>8.2} ms {:>5.1}%  {:>7} × {:>7.1} µs  {name}",
