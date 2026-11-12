@@ -10,6 +10,7 @@ server (fonts come from Google Fonts and fall back to system fonts offline).
 |---|---|---|
 | `windows-rtx5060-2026-11-12.html` | ASUS TUF A14, RTX 5060 Laptop (8 GB), Windows 11 | llama.cpp b12262, CUDA build |
 | `mac-m5max-2026-11-12.html` | MacBook Pro, M5 Max (40-core GPU, 128 GB), macOS 27.2 | llama.cpp b12228 (Metal) and the shipped Vireo 0.9.0 (MLX) |
+| `mac-m5max-2026-11-12-pm.html` | The same Mac, after the afternoon's tuning (PLAN.md, "Twelfth pass") | The same; the Vireo engine and llama.cpp measured again (`prompts-mac/results-2026-11-12-pm.jsonl`), Vireo 0.9 from the morning |
 
 ## Making one for another machine (the Mac, say)
 

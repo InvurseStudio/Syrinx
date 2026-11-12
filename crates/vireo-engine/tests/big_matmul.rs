@@ -186,6 +186,61 @@ fn big_few_speed() {
     }
 }
 
+/// A few tokens through the few-token kernels (`matvec_multi`) and through the short
+/// batches' tiles (`matmul_8bit`), µs: where `Gpu::tile_beats_few` should switch.
+#[test]
+#[ignore]
+fn big_few_or_tile() {
+    let Some((file, gpu, names)) = setup() else {
+        return;
+    };
+    for name in names.split(',') {
+        let t = file.tensor(name).unwrap();
+        let (kind, cols, rows) = (t.kind.unwrap(), t.dims[0] as usize, t.dims[1] as usize);
+        let w = gpu
+            .upload_weights(kind, file.tensor_data(t).unwrap(), rows, cols)
+            .unwrap();
+        let x_gpu = gpu.upload_f32(&activations(cols * 32)).unwrap();
+        let q8 = gpu.alloc_q8(32, cols).unwrap();
+        gpu.quantize(x_gpu.ptr(), &q8, 32, cols).unwrap();
+        let y_gpu = gpu.alloc(rows * 32 * 4).unwrap();
+        let mut line = format!("{name:24} {:>5} {rows:>6}x{cols:<6}", kind.name());
+        for tokens in [2usize, 3, 4, 5, 6, 8, 12, 16, 24, 32] {
+            let few = (tokens <= 8).then(|| {
+                time(&gpu, || {
+                    gpu.matvec_multi(kind, w.ptr(), x_gpu.ptr(), y_gpu.ptr(), rows, cols, tokens)
+                        .unwrap();
+                })
+            });
+            let mut want = vec![0.0f32; rows * tokens];
+            y_gpu.read_f32(&mut want).unwrap();
+            let tile = time(&gpu, || {
+                gpu.matmul_8bit(kind, w.ptr(), &q8, y_gpu.ptr(), rows, cols, tokens)
+                    .unwrap();
+            });
+            if few.is_some() {
+                let mut got = vec![0.0f32; rows * tokens];
+                y_gpu.read_f32(&mut got).unwrap();
+                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let worst = want
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    worst <= scale * 0.02,
+                    "{name} at {tokens}: {worst} of {scale}"
+                );
+            }
+            line += &match few {
+                Some(f) => format!("  {tokens}: {:.0}/{:.0}", f * 1e6, tile * 1e6),
+                None => format!("  {tokens}: {:.0}", tile * 1e6),
+            };
+        }
+        eprintln!("{line}");
+    }
+}
+
 /// A large model's weights through every GPU path a batch size takes (one token, a few,
 /// a short and a long tile), each token's row against the CPU's exact product: the
 /// default mode's f16 activations keep it within ~1% of the row's largest value.

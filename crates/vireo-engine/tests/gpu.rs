@@ -636,12 +636,21 @@ fn gemma_sliding_window_rings_match_a_full_cache() {
             .zip(&rows[(n - 10) * vocab..])
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
+        // In the default mode a short batch's attention splits the context into parts
+        // (attention_tcg), each rounding its probabilities to f16 against its own largest:
+        // the same numbers to that rounding, not to the bit.
+        let same = if precision == Precision::Exact {
+            1e-3
+        } else {
+            0.1
+        };
         assert!(
-            worst_again < 1e-3,
+            worst_again < same,
             "{precision:?}: re-read logits differ by {worst_again}"
         );
-        // A hundred back, the ring has written over the window before it: start over.
-        assert_eq!(ring.truncate(n - 100), 0);
+        // Three hundred back, the ring (the window and the batch, rounded up to 256) has
+        // written over the window before it: start over.
+        assert_eq!(ring.truncate(n - 300), 0);
         assert_eq!(ring.len(), 0);
     }
 }
