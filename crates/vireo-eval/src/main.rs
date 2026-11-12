@@ -35,12 +35,13 @@ use cases::{Call, Case, Run};
 use json::Value;
 
 /// Small to large in each family: where a feature stops mattering shows along each.
-/// Models people choose today. Llama 3.2 1B (2024) isn't one any more; it stays the
-/// engine's reference in its own tests, and runs here on request (`--models`).
-const DEFAULT_MODELS: [&str; 5] = [
+/// Models people choose today. Llama 3.2 1B (2024) isn't one any more, and Qwen 3.5 0.8B
+/// was left out on 2026-11-11 (too small to use the tools well: it said yes to every skill
+/// and saved a poem to a file); both stay the engine's references in its own tests, and run
+/// here on request (`--models`).
+const DEFAULT_MODELS: [&str; 4] = [
     "gemma-4-E2B_q4_0-it.gguf",
     "gemma-4-E4B_q4_0-it.gguf",
-    "Qwen3.5-0.8B-Q4_K_M.gguf",
     "Qwen3.5-4B-Q4_K_M.gguf",
     "Qwen3.5-9B-Q4_K_M.gguf",
 ];

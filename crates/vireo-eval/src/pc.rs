@@ -592,10 +592,9 @@ mod tests {
             "{err}"
         );
         assert!(
-            run("list_directory", r"Documents\Reports")
+            !run("list_directory", r"Documents\Reports")
                 .unwrap_err()
-                .contains("Closest to what was asked: report-2025.txt")
-                == false,
+                .contains("Closest to what was asked"),
             "a folder's name is one word: reports isn't report"
         );
         // Nothing past the home folder.
