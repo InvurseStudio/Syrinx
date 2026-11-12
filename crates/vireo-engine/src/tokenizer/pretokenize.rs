@@ -22,6 +22,14 @@
 //! |\s*[\r\n]+|\s+(?!\S)|\s+
 //! ```
 //!
+//! Llama 4 ("llama4", also Muse Glimmer) splits words at case changes, GPT-4o style:
+//!
+//! ```text
+//! [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//! |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//! |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+//! ```
+//!
 //! This isn't a regular expression engine: it's a direct port of llama.cpp's hand-written
 //! matcher for this expression (`unicode_regex_split_custom_llama3`), step for step, so
 //! the words are exactly llama.cpp's.
@@ -36,6 +44,9 @@ pub enum PreTokenizer {
     Qwen2,
     /// Qwen 3.5 to 3.8 ("qwen35"): Qwen 2's split, with combining marks part of words.
     Qwen35,
+    /// Llama 4 and Muse Glimmer ("llama4"): words split at case changes, numbers up to
+    /// 3 digits, contractions kept on their word ([`split_llama4`]).
+    Llama4,
     /// Gemma 4: only newlines split the text (`[^\n]+|[\n]+`); BPE merges run over
     /// everything between them.
     Gemma4,
@@ -48,13 +59,14 @@ impl PreTokenizer {
             "llama3" | "llama-v3" | "llama-bpe" => Some(Self::Llama3),
             "qwen2" | "deepseek-r1-qwen" => Some(Self::Qwen2),
             "qwen35" => Some(Self::Qwen35),
+            "llama4" => Some(Self::Llama4),
             _ => None,
         }
     }
 
     fn max_digits(self) -> usize {
         match self {
-            Self::Llama3 => 3,
+            Self::Llama3 | Self::Llama4 => 3,
             Self::Qwen2 | Self::Qwen35 | Self::Gemma4 => 1,
         }
     }
@@ -66,6 +78,9 @@ impl PreTokenizer {
 
     /// Appends `text`'s words to `out`, in order. Together they are exactly `text`.
     pub fn split<'a>(self, text: &'a str, out: &mut Vec<&'a str>) {
+        if self == Self::Llama4 {
+            return split_llama4(text, out);
+        }
         if self == Self::Gemma4 {
             // Runs of newlines, and runs of everything else.
             let mut rest = text;
@@ -204,6 +219,138 @@ impl PreTokenizer {
     }
 }
 
+/// The Llama 4 expression (see the top of the file), alternative by alternative, each
+/// matched as a backtracking regex engine would: the first alternative that matches at a
+/// position wins, and within it the longest greedy match.
+fn split_llama4<'a>(text: &'a str, out: &mut Vec<&'a str>) {
+    use super::unicode::{is_lower_class, is_upper_class};
+    let chars: Vec<char> = text.chars().collect();
+    let mut byte_at = Vec::with_capacity(chars.len() + 1);
+    let mut offset = 0;
+    for c in &chars {
+        byte_at.push(offset);
+        offset += c.len_utf8();
+    }
+    byte_at.push(offset);
+    let n = chars.len();
+    let at = |i: usize| chars.get(i).copied();
+    let upper = |i: usize| at(i).is_some_and(is_upper_class);
+    let lower = |i: usize| at(i).is_some_and(is_lower_class);
+    let space = |i: usize| at(i).is_some_and(is_whitespace);
+    // [^\r\n\p{L}\p{N}]
+    let prefix =
+        |i: usize| at(i).is_some_and(|c| c != '\r' && c != '\n' && !is_letter(c) && !is_number(c));
+    // [^\s\p{L}\p{N}]
+    let other =
+        |i: usize| at(i).is_some_and(|c| !is_whitespace(c) && !is_letter(c) && !is_number(c));
+    // (?i:'s|'t|'re|'ve|'m|'ll|'d)? at i: its length.
+    let contraction = |i: usize| -> usize {
+        if at(i) != Some('\'') {
+            return 0;
+        }
+        let lc = |j: usize| at(j).map(|c| c.to_ascii_lowercase());
+        match (lc(i + 1), lc(i + 2)) {
+            (Some('r'), Some('e')) | (Some('v'), Some('e')) | (Some('l'), Some('l')) => 3,
+            (Some('s' | 't' | 'm' | 'd'), _) => 2,
+            _ => 0,
+        }
+    };
+    // Alternative 1 from `from`: upper* lower+ contraction?
+    let first_alt = |from: usize| -> Option<usize> {
+        let mut u = from;
+        while upper(u) {
+            u += 1;
+        }
+        // Backtrack the upper run until a lowercase-class character follows it.
+        let mut k = u;
+        loop {
+            if lower(k) {
+                let mut end = k + 1;
+                while lower(end) {
+                    end += 1;
+                }
+                return Some(end + contraction(end));
+            }
+            if k == from {
+                return None;
+            }
+            k -= 1;
+        }
+    };
+    // Alternative 2 from `from`: upper+ lower* contraction?
+    let second_alt = |from: usize| -> Option<usize> {
+        if !upper(from) {
+            return None;
+        }
+        let mut end = from + 1;
+        while upper(end) {
+            end += 1;
+        }
+        while lower(end) {
+            end += 1;
+        }
+        Some(end + contraction(end))
+    };
+    let mut pos = 0;
+    while pos < n {
+        let start = pos;
+        let with_prefix = |alt: &dyn Fn(usize) -> Option<usize>| {
+            (if prefix(start) { alt(start + 1) } else { None }).or_else(|| alt(start))
+        };
+        let end = with_prefix(&first_alt)
+            .or_else(|| with_prefix(&second_alt))
+            .or_else(|| {
+                // \p{N}{1,3}
+                let mut e = start;
+                while e < start + 3 && at(e).is_some_and(is_number) {
+                    e += 1;
+                }
+                (e > start).then_some(e)
+            })
+            .or_else(|| {
+                //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+                let first = if at(start) == Some(' ') {
+                    start + 1
+                } else {
+                    start
+                };
+                if !other(first) {
+                    return None;
+                }
+                let mut e = first;
+                while other(e) {
+                    e += 1;
+                }
+                while matches!(at(e), Some('\r' | '\n' | '/')) {
+                    e += 1;
+                }
+                Some(e)
+            })
+            .unwrap_or_else(|| {
+                let mut spaces = 0;
+                let mut after_last_newline = None;
+                while space(start + spaces) {
+                    if matches!(at(start + spaces), Some('\r' | '\n')) {
+                        after_last_newline = Some(start + spaces + 1);
+                    }
+                    spaces += 1;
+                }
+                match after_last_newline {
+                    // \s*[\r\n]+
+                    Some(e) => e,
+                    // \s+(?!\S): the last space starts the next word
+                    None if spaces > 1 && start + spaces < n => start + spaces - 1,
+                    // \s+
+                    None if spaces > 0 => start + spaces,
+                    // Nothing matched (can't happen for valid text, but never loop forever).
+                    None => start + 1,
+                }
+            });
+        out.push(&text[byte_at[start]..byte_at[end]]);
+        pos = end;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +422,24 @@ mod tests {
             ["cafe\u{301}", " ", "2", "0", "2", "6"]
         );
         assert_eq!(qwen35("I'M here"), ["I", "'M", " here"]);
+    }
+
+    #[test]
+    fn llama4_splits_at_case_changes() {
+        let w = |t| words(PreTokenizer::Llama4, t);
+        assert_eq!(
+            w("HelloWorld camelCase"),
+            ["Hello", "World", " camel", "Case"]
+        );
+        assert_eq!(w(" XMLHttpRequest"), [" XMLHttp", "Request"]);
+        // Contractions stay on their word, in either case.
+        assert_eq!(w("I'M HERE don't"), ["I'M", " HERE", " don't"]);
+        assert_eq!(w("abc123456 7"), ["abc", "123", "456", " ", "7"]);
+        assert_eq!(
+            w("path/to/file.rs\n\nend"),
+            ["path", "/to", "/file", ".rs", "\n\n", "end"]
+        );
+        assert_eq!(w("ÉCOLE école"), ["ÉCOLE", " école"]);
     }
 
     #[test]

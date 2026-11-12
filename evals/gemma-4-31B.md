@@ -78,10 +78,40 @@ questions, and writing calls under the grammar, which drafting doesn't do. On th
 24 cases alone (before the change and skill cases), it took 3.96 s a case.
 Results: `gemma-4-31B.json`, `gemma-4-31B-draft.json`.
 
+## Short reads (2026-11-11, PLAN.md "Seventh pass")
+
+An agent case is mostly short reads and writing. Nine eval cases (datetime, read, list,
+no-tool-writing, find-then-read, git, three-steps, skill-summarize, skill-review),
+`--context 32768`, 9/9 before and after:
+
+| | Before | After |
+|---|---|---|
+| A case on average | 9.0 s | **8.4 s** |
+| Reads of 9-64 tokens (78) | 15.5 s | **10.4 s** |
+| Reads of 65-256 tokens (58) | 12.8 s | 13.7 s (run-to-run noise) |
+| Writing, one token | 53.8 ms | 54.1 ms |
+| Checking 2-8 tokens of guesses | 68.8 ms | 70.4 ms |
+
+Short batches get tiles of their own size, and matrices with few rows and long ones
+(ffn_down, attn_output) split along the columns. `cargo test --release -p vireo-engine
+--test big_matmul -- --ignored --nocapture` with `VIREO_BIG_MODEL` set times a large
+model's products.
+
+## The other large models, for a fair comparison
+
+The same quantization as this model's (plain Q6_K, not a "UD" mix), from one publisher,
+downloaded 2026-11-11 into the app's model folder beside it and checked:
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf` (bartowski) | 23,860,565,728 | `539041d2cf400b02f53a53cae54339ea65103d276645a34a68eac1c8d69a9db3` |
+| `Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-Q6_K.gguf` (bartowski) | 23,414,418,720 | `7746e3dafcece07236a3826c8c3ee149a682d6f7fc9f0da9e24a4e481ccdb0bc` |
+
 ## Next
 
-- A faster 2–8-token kernel and small-batch attention: drafting's gain is bounded by them.
-- Draft tool calls too (the grammar would check guesses as the sampler does).
-- Qwen 3.8 27B uses the Qwen 3.5 design: it needs a GGUF (only the MLX copy is here).
-  Drafting needs a rewind Qwen's DeltaNet doesn't have.
-- 26B-A4B needs mixture-of-experts support; Muse Glimmer 30B needs its own model.
+- Writing is 37% of a case and at memory speed: drafting (E2B for long answers, tool
+  calls under the grammar) is the way past it.
+- Qwen 3.8 27B uses the Qwen 3.5 design; its GGUF is here now, not yet run. Drafting
+  needs a rewind Qwen's DeltaNet doesn't have.
+- 26B-A4B needs mixture-of-experts support; Muse Glimmer 30B needs its own model (its
+  GGUF is here now).

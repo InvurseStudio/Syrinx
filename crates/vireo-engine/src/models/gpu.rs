@@ -72,6 +72,9 @@ impl GpuMatrix {
         // A few tokens (a draft's guesses): the weights read once, as for one token.
         #[cfg(target_os = "macos")]
         if input.tokens > 1
+            && !(input.q8.is_some()
+                && Gpu::supports_8bit(self.kind)
+                && Gpu::tile_beats_few(self.rows, self.cols, input.tokens))
             && g.matvec_multi(
                 self.kind,
                 self.data.ptr(),

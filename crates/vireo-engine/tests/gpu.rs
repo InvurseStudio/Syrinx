@@ -1117,6 +1117,58 @@ fn continuing_a_session_matches_reading_from_the_start() {
     }
 }
 
+/// Qwen's DeltaNet cut back inside a draft's round (`keep_steps`, `rewind`): a batch of 5
+/// guesses read, then all but the first m of them undone, goes on as a session that read
+/// only those m (in their own batch, so the same kernels run), for every m.
+#[test]
+fn rewinding_qwen_undoes_a_drafts_guesses() {
+    let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") else {
+        return;
+    };
+    for (precision, tolerance) in [(Precision::Exact, 1e-4), (Precision::Int8, 0.05)] {
+        let Some(gpu) = open_gpu() else { return };
+        let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+        let ids = long_text(&tokenizer, false);
+        let p = ids.len() / 2;
+        let mut m = Qwen35Cuda::load(&file, gpu).unwrap();
+        m.set_precision(precision);
+        if !m.can_rewind() {
+            eprintln!("skipped: no DeltaNet rewind on this backend");
+            return;
+        }
+        for kept in [0, 2, 4, 5] {
+            let label = format!("Qwen 3.5, {precision:?}, {kept} of 5 guesses kept");
+            let mut s = m.session(ids.len() + 64).unwrap();
+            m.keep_steps(&mut s).unwrap();
+            m.forward_batch(&mut s, &ids[..p], Logits::None).unwrap();
+            m.forward_batch(&mut s, &ids[p..p + 5], Logits::All)
+                .unwrap();
+            assert!(m.rewind(&mut s, p + kept).unwrap(), "{label}: no rewind");
+            assert_eq!(s.len(), p + kept);
+            let got = m
+                .forward_batch(&mut s, &ids[p + kept..p + kept + 6], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let mut fresh = m.session(ids.len() + 64).unwrap();
+            m.forward_batch(&mut fresh, &ids[..p], Logits::None)
+                .unwrap();
+            if kept > 0 {
+                m.forward_batch(&mut fresh, &ids[p..p + kept], Logits::None)
+                    .unwrap();
+            }
+            let want = m
+                .forward_batch(&mut fresh, &ids[p + kept..p + kept + 6], Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            compare_logits(&label, &got, &want, tolerance);
+            // Not past the round's start.
+            assert!(!m.rewind(&mut s, p - 1).unwrap());
+        }
+    }
+}
+
 /// A session's state exported to system memory and imported into a new session (of
 /// another capacity) goes on exactly as the session it came from does: the same logits
 /// to the bit. Llama and Gemma can import part of a state (a shared start); Qwen's
@@ -1326,6 +1378,7 @@ fn delta_net_in_chunks_matches_token_by_token() {
                     k_heads,
                     eps: 1e-6,
                     scratch: if chunked { scratch.ptr() } else { 0 },
+                    steps: 0,
                 },
                 tokens,
             )
