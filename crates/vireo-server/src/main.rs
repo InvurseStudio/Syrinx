@@ -1489,7 +1489,7 @@ fn engine(
     };
     let loaded = (|| -> Result<(Model, Tokenizer, Family, String), String> {
         let family = Family::of(file.architecture())
-            .ok_or_else(|| format!("{path} isn't a Llama, Qwen 3.5 or Gemma 4 model"))?;
+            .ok_or_else(|| format!("{path} isn't a Llama, Qwen 3.5, Gemma 4 or Muse Glimmer model"))?;
         let tokenizer = Tokenizer::from_gguf(file).map_err(|e| e.to_string())?;
         let gpu = Gpu::open().map_err(|e| format!("No GPU for the engine: {e}"))?;
         let gpu_name = gpu.info.name.clone();
@@ -1505,7 +1505,8 @@ fn engine(
                     m
                 })?)
             }
-            Family::Gemma4 => {
+            // Muse Glimmer runs on Gemma 4's model code (`Config::muse`).
+            Family::Gemma4 | Family::Muse => {
                 Model::Gemma4(Gemma4Cuda::load(file, gpu).map_err(e).map(|mut m| {
                     m.set_precision(precision);
                     m
@@ -1888,6 +1889,17 @@ fn reply(
     let started = Instant::now();
     // Tool calls: the grammar they're written under, and how one starts.
     let grammar = Grammar::new(&tools::call_grammar(family, &callable));
+    // Muse's recipients without its reasoning (once it has used its budget), and without
+    // tools (once calls are used up, or none are offered).
+    let muse_grammars = (family == Family::Muse).then(|| {
+        (
+            Grammar::new(&tools::muse_call_grammar(&callable, false)),
+            Grammar::new(&tools::muse_call_grammar(&[], true)),
+        )
+    });
+    // Muse writing to itself, and the tokens it has so far this reply.
+    let mut thinking = false;
+    let mut thought = 0usize;
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
@@ -1938,11 +1950,25 @@ fn reply(
     // `max_tokens` is the model's own writing; calls have their own limits (`MAX_CALLS`,
     // `MAX_CALL_TOKENS`), so a task of many calls still has room to answer.
     while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        // Muse names each message's recipient first. With no call to make, the user: the
+        // model writes to them from here. Otherwise the call's grammar has it choose (the
+        // user is one of its options), below.
+        let muse_turn = family == Family::Muse && turn_start;
+        let may_think = thought < MUSE_THOUGHT_TOKENS;
+        if muse_turn && !may_call && !may_think {
+            let ids = tokenizer.encode(tools::MUSE_TO_USER, false, true);
+            if kept.tokens.len() + ids.len() + 64 > context {
+                break;
+            }
+            logits = model.feed(kept, &ids)?;
+            turn_start = false;
+            continue;
+        }
         let room =
             (max_tokens - generated.len()).min(context.saturating_sub(kept.tokens.len() + 64));
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
-        if ahead.is_empty() {
+        if ahead.is_empty() && !muse_turn {
             let guesses = match (drafter.as_deref_mut(), lookup.as_mut(), unread) {
                 (Some(d), _, _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
                 (None, Some(l), _) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
@@ -1981,7 +2007,7 @@ fn reply(
                 }
             }
         }
-        if !may_call && !offered.is_empty() {
+        if !may_call && !offered.is_empty() && !thinking {
             if let Some(t) = start_token {
                 logits[t as usize] = f32::NEG_INFINITY;
             }
@@ -2011,24 +2037,42 @@ fn reply(
                 logits[t as usize] = f32::NEG_INFINITY;
             }
         }
-        let next = sampler.pick(&logits, &generated);
-        if tokenizer.is_end_of_generation(next) {
+        let mut next = sampler.pick(&logits, &generated);
+        // Muse's reasoning ends its message with <|eom|>, here even when it would end its
+        // turn, or runs out of room: its answer is still to come.
+        if thinking
+            && (tokenizer.is_end_of_generation(next) || thought >= MUSE_THOUGHT_TOKENS)
+            && let Some(eom) = start_token
+        {
+            next = eom;
+        }
+        if tokenizer.is_end_of_generation(next) && !muse_turn {
             break;
         }
-        answer_due = false;
+        if !muse_turn && !thinking {
+            answer_due = false;
+        }
         if debug_calls() && turn_start {
             eprintln!(
                 "[calls] turn starts with {:?}",
                 tokenizer.decode(&[next], true)
             );
         }
-        let by_token = Some(next) == start_token;
-        let by_brace = start.brace && turn_start && {
+        let by_token = !muse_turn && Some(next) == start_token;
+        // Muse's message start is the grammar's, as Llama's brace is (its pick is left).
+        let by_brace = muse_turn
+            || start.brace && turn_start && {
             let mut b = Vec::new();
             tokenizer.token_bytes(next, false, &mut b);
             b.first() == Some(&b'{')
         };
-        let opens_call = may_call && (by_token || by_brace);
+        // Muse's message start is always a choice, and its <|eom|> (taken away unless it
+        // may call or is thinking) always opens another message.
+        let opens_call = if family == Family::Muse {
+            muse_turn || by_token
+        } else {
+            may_call && (by_token || by_brace)
+        };
         // The guess is taken when it's the token picked, for plain text; otherwise the
         // model goes back to before the guesses.
         let guessed = !opens_call && ahead.front().is_some_and(|(g, _)| *g == next);
@@ -2043,18 +2087,40 @@ fn reply(
                 model.next(&mut kept.session, next, &mut logits)?;
                 kept.tokens.push(next);
                 call_tokens += 1;
+                if family == Family::Muse {
+                    // Muse's <|eom|>: another message follows, its recipient chosen at its start.
+                    let ids = tokenizer.encode(chat::opening(family), false, true);
+                    logits = model.feed(kept, &ids)?;
+                    call_tokens += ids.len();
+                    turn_start = true;
+                    thinking = false;
+                    continue;
+                }
             }
             let call_started = Instant::now();
+            let grammar = match &muse_grammars {
+                Some((_, answers)) if !may_call => answers,
+                Some((no_thinking, _)) if !may_think => no_thinking,
+                _ => &grammar,
+            };
             let text = write_call(
                 model,
                 kept,
                 tokenizer,
                 trie,
-                &grammar,
+                grammar,
                 &mut logits,
                 &mut call_tokens,
                 context,
             )?;
+            if family == Family::Muse
+                && (text == tools::MUSE_TO_USER || text == tools::MUSE_TO_SELF)
+            {
+                // To the user, or to itself (not shown): plain text from here.
+                turn_start = false;
+                thinking = text == tools::MUSE_TO_SELF;
+                continue;
+            }
             let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
             calls += 1;
@@ -2112,8 +2178,14 @@ fn reply(
             continue;
         }
         turn_start = false;
-        generated.push(next);
-        if Some(next) == channel.0 {
+        if thinking {
+            thought += 1;
+        } else {
+            generated.push(next);
+        }
+        if thinking {
+            // Muse's reasoning: the model's, not the reply's.
+        } else if Some(next) == channel.0 {
             in_channel = true;
         } else if Some(next) == channel.1 {
             in_channel = false;
@@ -2162,12 +2234,17 @@ fn reply(
     flush_text(job, &mut pending);
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}{}.",
+        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}{}{}.",
         ids.len(),
         ids.len() - reused,
         (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),
-        generated.len() + call_tokens,
-        (generated.len() + call_tokens) as f64 / seconds.max(1e-9),
+        generated.len() + call_tokens + thought,
+        (generated.len() + call_tokens + thought) as f64 / seconds.max(1e-9),
+        if thought > 0 {
+            format!(", {thought} of them reasoning")
+        } else {
+            String::new()
+        },
         if job.stop.load(Ordering::Relaxed) {
             ", stopped"
         } else {
@@ -2197,7 +2274,7 @@ fn reply(
             .unwrap_or_default()
     );
     let _ = job.out.send(Out::Done {
-        tokens: generated.len() + call_tokens,
+        tokens: generated.len() + call_tokens + thought,
         seconds,
     });
     Ok(())
@@ -2285,7 +2362,9 @@ fn yes_share(
         content: question.to_string(),
     };
     let text =
-        chat::history(family, None, "", &[question], &chat::today()) + chat::opening(family) + lead;
+        chat::history(family, None, "", &[question], &chat::today())
+        + chat::answer_opening(family)
+        + lead;
     let ids = tokenizer.encode(&text, false, true);
     let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
     let score = |word: &str| {
@@ -2335,7 +2414,7 @@ fn pick_groups(
     };
     // The answer opens with the examples' "Needs:", so its next token is the letter.
     let text = chat::history(family, None, "", &[question], &chat::today())
-        + chat::opening(family)
+        + chat::answer_opening(family)
         + "Needs:";
     let ids = tokenizer.encode(&text, false, true);
     let logits = model.ask(kept, &ids[..ids.len().min(1000)])?;
@@ -2397,6 +2476,9 @@ fn debug_calls() -> bool {
 /// The most tool calls one reply makes: enough for a task over several files (read a
 /// guide, six invoices and a register, work out the sums, write the rows).
 const MAX_CALLS: usize = 20;
+/// The most tokens Muse may reason in, a reply (at "Reasoning strength: low"). Past it
+/// its reasoning message is ended for it and it answers or calls without more.
+const MUSE_THOUGHT_TOKENS: usize = 2048;
 /// The most tokens one call may take: a document's text or a spreadsheet's rows at most.
 const MAX_CALL_TOKENS: usize = 4096;
 /// The most of a tool's result the model reads, in characters (about 2,000 tokens).

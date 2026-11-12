@@ -931,7 +931,68 @@ pub fn declarations(family: Family, tools: &[Tool]) -> String {
             .iter()
             .map(|t| format!("<|tool>{}<tool|>", gemma_declaration(t)))
             .collect(),
+        Family::Muse => muse_declarations(tools),
     }
+}
+
+/// Muse's template's `render_tool_defs`, then its `render_system_meta` (the recipients
+/// the tools add), as its system turn writes them. A tool's namespace is its name up to a
+/// dot; Vireo's names have none, so each tool is its own.
+fn muse_declarations(tools: &[Tool]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "In this environment you have access to a set of tools you can use to answer the user's question.\n\n\
+         You can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n\
+         <atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n\
+         <atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n\
+         </atem:invoke>\n</atem:function_calls>\n\n\
+         String and scalar parameters should be specified as is, while lists and objects should use JSON format. \
+         Note that spaces for string values are not stripped. The output is not expected to be valid XML and is \
+         parsed with regular expressions.\n\
+         Here are the functions available in JSONSchema format:\n// Tool metadata\n",
+    );
+    let mut namespaces: Vec<&str> = Vec::new();
+    for t in tools {
+        let ns = t.name.split('.').next().unwrap_or(t.name);
+        if !namespaces.contains(&ns) {
+            namespaces.push(ns);
+        }
+    }
+    for ns in &namespaces {
+        out.push_str(&format!(
+            "{{\"name\": {}, \"description\": \"\"}}\n",
+            json_string(ns)
+        ));
+    }
+    out.push_str("// Function schemas");
+    for t in tools {
+        let J::Obj(fields) = declaration(t) else {
+            unreachable!()
+        };
+        let Some((_, J::Obj(function))) = fields.into_iter().find(|(k, _)| k == "function") else {
+            unreachable!()
+        };
+        out.push('\n');
+        J::Obj(function).compact(&mut out);
+    }
+    out.push_str(
+        "\n\nHere's an example of how to call a function in the tool set:\n\
+         (If the tool namespace is not specified, invoke the function directly as `example_function_name` rather \
+         than `example_tool_name.example_function_name`)\n\n\
+         to=example_tool_name.example_function_name\n\n\
+         <atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n\
+         <atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n\
+         <atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\n\
+         that can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
+    );
+    out.push_str("\n\n# Valid recipients: \"self\"");
+    for ns in &namespaces {
+        out.push_str(&format!(", \"{ns}.*\""));
+    }
+    out.push_str(", \"user\".");
+    out
 }
 
 // ---- Calling them -----------------------------------------------------------------------
@@ -1074,8 +1135,23 @@ pub fn call_start(family: Family) -> Start {
             token: "<|python_tag|>",
             brace: true,
         },
+        // Muse chooses each message's recipient at its start (`call_grammar`, from
+        // `chat::opening`); a message that ends with <|eom|> has another after it, so
+        // that's where a call may start mid-reply.
+        Family::Muse => Start {
+            token: "<|eom|>",
+            brace: false,
+        },
     }
 }
+
+/// Muse's recipient, as `call_grammar` writes it, when the message is to the user: plain
+/// text follows.
+pub const MUSE_TO_USER: &str = " to=user<|message|>";
+/// The same to itself: its reasoning, which the user isn't shown. Muse can't do without
+/// it (the Mac's server can only lower its strength); held to the user, every eval case
+/// went unanswered by a tool.
+pub const MUSE_TO_SELF: &str = " to=self<|message|>";
 
 /// What the system prompt says first when there are tools: what they're for, in a line,
 /// so a small model doesn't answer that it can't reach the user's files.
@@ -1090,7 +1166,8 @@ pub fn call_tokens(family: Family) -> &'static [&'static str] {
 }
 
 /// The grammar a call to one of `tools` is written under, from just after its start (for
-/// Llama, from the turn's start).
+/// Llama, from the turn's start; for Muse, from the message's start, with the user as a
+/// recipient too: `MUSE_TO_USER`).
 pub fn call_grammar(family: Family, tools: &[Tool]) -> Schema {
     match family {
         Family::Llama => {
@@ -1169,7 +1246,58 @@ pub fn call_grammar(family: Family, tools: &[Tool]) -> Schema {
                 ),
             ])
         }
+        Family::Muse => muse_call_grammar(tools, true),
     }
+}
+
+/// Muse's message start: its recipient (the user, itself if `may_think`, or one of
+/// `tools`), then for a tool the call.
+pub fn muse_call_grammar(tools: &[Tool], may_think: bool) -> Schema {
+    const END: &str = "</atem:parameter>\n";
+    let value = |p: &Param| match p.kind {
+        Kind::Text => Schema::Text {
+            until: END.into(),
+            max_bytes: Some(MAX_ARGUMENT),
+        },
+        other => Schema::Seq(vec![json_value(other), Schema::Literal(END.into())]),
+    };
+    let style = RecordStyle {
+        open: String::new(),
+        key_open: "<atem:parameter name=\"".into(),
+        key_close: "\">".into(),
+        separator: String::new(),
+        close: "</atem:invoke>\n</atem:function_calls>".into(),
+        json_keys: false,
+    };
+    let mut options = vec![(
+        MUSE_TO_USER.strip_prefix(" to=").unwrap().to_string(),
+        Schema::Seq(vec![]),
+    )];
+    if may_think {
+        options.push((
+            MUSE_TO_SELF.strip_prefix(" to=").unwrap().to_string(),
+            Schema::Seq(vec![]),
+        ));
+    }
+    options.extend(tools.iter().map(|t| {
+        (
+            format!("{}<|message|>", t.name),
+            Schema::Seq(vec![
+                Schema::Literal(format!(
+                    "<atem:function_calls>\n<atem:invoke name=\"{}\">\n",
+                    t.name
+                )),
+                Schema::Record {
+                    fields: fields(&t.params, value),
+                    style: style.clone(),
+                },
+            ]),
+        )
+    }));
+    Schema::Seq(vec![
+        Schema::Literal(" to=".into()),
+        Schema::Branch(options),
+    ])
 }
 
 fn fields(params: &[Param], value: impl Fn(&Param) -> Schema) -> Vec<Property> {
@@ -1278,9 +1406,50 @@ fn gemma_json(s: &str) -> Option<(String, &str)> {
 }
 
 /// A call written under `call_grammar` for `tools`, read back. The grammar guarantees its
-/// shape.
+/// shape. (Muse's message to the user, `MUSE_TO_USER`, is no call: `None`.)
 pub fn parse_call(family: Family, text: &str, tools: &[Tool]) -> Option<Call> {
+    let kind_of = |tool: &str, key: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == tool)
+            .and_then(|t| t.params.iter().find(|p| p.name == key))
+            .map(|p| p.kind)
+    };
+    // A value written as is (text, or a whole number) or, for a list or object, as JSON.
+    let plain_or_json = |kind: Option<Kind>, value: &str| -> Option<Arg> {
+        Some(match kind {
+            Some(Kind::Text) => Arg::Text(value.to_string()),
+            Some(Kind::List(_) | Kind::Object(_) | Kind::Map | Kind::Cell) => {
+                Arg::Json(json::parse(value).ok()?.to_json())
+            }
+            _ => value
+                .parse::<i64>()
+                .map_or_else(|_| Arg::Text(value.to_string()), Arg::Integer),
+        })
+    };
     match family {
+        Family::Muse => {
+            let (tool, rest) = text.strip_prefix(" to=")?.split_once("<|message|>")?;
+            if tool == "user" || tool == "self" {
+                return None;
+            }
+            let mut rest = rest
+                .strip_prefix("<atem:function_calls>\n<atem:invoke name=\"")?
+                .strip_prefix(tool)?
+                .strip_prefix("\">\n")?;
+            let mut args = Vec::new();
+            while let Some(after) = rest.strip_prefix("<atem:parameter name=\"") {
+                let (key, after) = after.split_once("\">")?;
+                let (value, after) = after.split_once("</atem:parameter>\n")?;
+                args.push((key.to_string(), plain_or_json(kind_of(tool, key), value)?));
+                rest = after;
+            }
+            rest.strip_prefix("</atem:invoke>\n</atem:function_calls>")?;
+            Some(Call {
+                tool: tool.to_string(),
+                args,
+            })
+        }
         Family::Llama => {
             let v = json::parse(text).ok()?;
             let tool = v.str("name")?.to_string();
@@ -1295,28 +1464,11 @@ pub fn parse_call(family: Family, text: &str, tools: &[Tool]) -> Option<Call> {
         Family::Qwen35 => {
             let rest = text.strip_prefix("\n<function=")?;
             let (tool, mut rest) = rest.split_once(">\n")?;
-            let kind_of = |key: &str| {
-                tools
-                    .iter()
-                    .find(|t| t.name == tool)
-                    .and_then(|t| t.params.iter().find(|p| p.name == key))
-                    .map(|p| p.kind)
-            };
             let mut args = Vec::new();
             while let Some(after) = rest.strip_prefix("<parameter=") {
                 let (key, after) = after.split_once(">\n")?;
                 let (value, after) = after.split_once("\n</parameter>\n")?;
-                let arg = match kind_of(key) {
-                    Some(Kind::Text) => Arg::Text(value.to_string()),
-                    // A list or object, in JSON.
-                    Some(Kind::List(_) | Kind::Object(_) | Kind::Map | Kind::Cell) => {
-                        Arg::Json(json::parse(value).ok()?.to_json())
-                    }
-                    _ => value
-                        .parse::<i64>()
-                        .map_or_else(|_| Arg::Text(value.to_string()), Arg::Integer),
-                };
-                args.push((key.to_string(), arg));
+                args.push((key.to_string(), plain_or_json(kind_of(tool, key), value)?));
                 rest = after;
             }
             Some(Call {
@@ -1354,7 +1506,8 @@ pub fn parse_call(family: Family, text: &str, tools: &[Tool]) -> Option<Call> {
 /// and special-token text after it.
 /// A call as the model would write it, from the token that starts it, for a call the
 /// server writes into a reply itself (the skill it picked, as `use_skill`). Text arguments
-/// only; `parse_call` reads it back.
+/// only; `parse_call` reads it back. (Muse's, from just after `chat::opening`: its
+/// recipient, then the call.)
 pub fn call_text(family: Family, call: &Call) -> String {
     let start = call_start(family).token;
     let texts: Vec<(&str, &str)> = call
@@ -1379,6 +1532,16 @@ pub fn call_text(family: Family, call: &Call) -> String {
                 .map(|(k, v)| format!("{k}:{QUOTE}{v}{QUOTE}"))
                 .collect();
             format!("{start}call:{}{{{}}}", call.tool, params.join(","))
+        }
+        Family::Muse => {
+            let params: String = texts
+                .iter()
+                .map(|(k, v)| format!("<atem:parameter name=\"{k}\">{v}</atem:parameter>\n"))
+                .collect();
+            let tool = &call.tool;
+            format!(
+                " to={tool}<|message|><atem:function_calls>\n<atem:invoke name=\"{tool}\">\n{params}</atem:invoke>\n</atem:function_calls>"
+            )
         }
         Family::Llama => {
             let params: Vec<String> = texts
@@ -1410,6 +1573,13 @@ pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, 
             format!("<tool_call|><|tool_response>response:{tool}{{value:{QUOTE}"),
             result.into(),
             format!("{QUOTE}}}<tool_response|>"),
+        ),
+        // The template ends a call's message with <|eot|> when the tool's turn follows,
+        // and the assistant's next message names its recipient again.
+        Family::Muse => (
+            format!("<|eot|><|start|>tool {tool}<|message|><tool_output name=\"{tool}\">\n"),
+            result.into(),
+            "\n</tool_output><|eot|><|start|>assistant".into(),
         ),
     }
 }
@@ -1614,6 +1784,31 @@ mod tests {
             Some(sorted)
         );
         assert_eq!(
+            written(
+                Family::Muse,
+                " to=search_files<|message|><atem:function_calls>\n<atem:invoke name=\"search_files\">\n<atem:parameter name=\"pattern\">tax \"2026\"</atem:parameter>\n<atem:parameter name=\"directory\">C:\\Users\\me</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
+            ),
+            Some(want.clone())
+        );
+        assert_eq!(
+            written(
+                Family::Muse,
+                " to=get_current_datetime<|message|><atem:function_calls>\n<atem:invoke name=\"get_current_datetime\">\n</atem:invoke>\n</atem:function_calls>"
+            ),
+            Some(Call {
+                tool: "get_current_datetime".into(),
+                args: vec![]
+            })
+        );
+        // Muse's message to the user, or to itself, is a choice of the same grammar, and no
+        // call; without thinking, it may not write to itself.
+        assert_eq!(written(Family::Muse, MUSE_TO_USER), None);
+        assert_eq!(written(Family::Muse, MUSE_TO_SELF), None);
+        let tools = offered(&["read_file".into()], false);
+        let g = Grammar::new(&muse_call_grammar(&tools, false));
+        assert!(!g.matcher().advance_all(MUSE_TO_SELF.as_bytes()));
+        assert!(g.matcher().advance_all(MUSE_TO_USER.as_bytes()));
+        assert_eq!(
             written(Family::Gemma4, "call:get_current_datetime{}"),
             Some(Call {
                 tool: "get_current_datetime".into(),
@@ -1658,6 +1853,10 @@ mod tests {
         spreadsheet(
             Family::Llama,
             r#"{"name": "write_spreadsheet", "parameters": {"path": "Invoices/R.xlsx", "start_cell": "append", "rows": [["INV-1001", 1234.5, null], ["x", true]]}}"#,
+        );
+        spreadsheet(
+            Family::Muse,
+            " to=write_spreadsheet<|message|><atem:function_calls>\n<atem:invoke name=\"write_spreadsheet\">\n<atem:parameter name=\"path\">Invoices/R.xlsx</atem:parameter>\n<atem:parameter name=\"start_cell\">append</atem:parameter>\n<atem:parameter name=\"rows\">[[\"INV-1001\", 1234.5, null], [\"x\", true]]</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
         );
 
         // A template's values: keys the model names.
@@ -1758,6 +1957,26 @@ mod tests {
         assert!(gemma.contains(
             "<|tool>declaration:get_current_datetime{description:<|\"|>Get the current date, time and day of the week.<|\"|>,parameters:{type:<|\"|>OBJECT<|\"|>}}<tool|>"
         ));
+        let muse = declarations(Family::Muse, &tools);
+        assert!(muse.starts_with(
+            "In this environment you have access to a set of tools you can use to answer the user's question.\n\n"
+        ));
+        assert!(muse.contains(
+            "Here are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"read_file\", \"description\": \"\"}\n"
+        ));
+        assert!(muse.contains(
+            "// Function schemas\n{\"name\": \"read_file\", \"description\": \"Read a text file"
+        ));
+        assert!(muse.contains("\"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\""));
+        assert!(muse.contains(
+            "\n{\"name\": \"get_current_datetime\", \"description\": \"Get the current date, time and day of the week.\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}\n"
+        ));
+        assert!(muse.contains(
+            "multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"read_file.*\", \"get_current_datetime.*\""
+        ));
+        assert!(muse.contains("}\n\nHere's an example of how to call a function"));
+        assert!(muse.ends_with(", \"user\"."), "{muse}");
+        assert_eq!(declarations(Family::Muse, &[]), "");
         assert_eq!(
             tools.len(),
             5,
@@ -1777,6 +1996,13 @@ mod tests {
             tool: "use_skill".into(),
             args: vec![("name".into(), Arg::Text("code-review".into()))],
         };
+        // Muse's, after the turn's opening: its recipient, then the call.
+        let text = call_text(Family::Muse, &call);
+        assert_eq!(
+            text,
+            " to=use_skill<|message|><atem:function_calls>\n<atem:invoke name=\"use_skill\">\n<atem:parameter name=\"name\">code-review</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
+        );
+        assert_eq!(parse_call(Family::Muse, &text, &[]), Some(call.clone()));
         for family in [Family::Qwen35, Family::Llama, Family::Gemma4] {
             let text = call_text(family, &call);
             let start = call_start(family).token;
@@ -1787,6 +2013,24 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn muses_results_come_back_as_its_template_writes_them() {
+        let (before, body, after) = after_call(Family::Muse, "read_file", "hello");
+        assert_eq!(
+            before,
+            "<|eot|><|start|>tool read_file<|message|><tool_output name=\"read_file\">\n"
+        );
+        assert_eq!(body, "hello");
+        // The next message's recipient is the model's to choose again.
+        assert_eq!(
+            after,
+            format!(
+                "\n</tool_output><|eot|>{}",
+                crate::chat::opening(Family::Muse)
+            )
+        );
     }
 
     #[test]
@@ -1848,7 +2092,7 @@ mod tests {
             "Move a.pdf to Invoices/a.pdf"
         );
         // Each family declares them and writes a call to one, content and all.
-        for family in [Family::Qwen35, Family::Llama, Family::Gemma4] {
+        for family in [Family::Qwen35, Family::Llama, Family::Gemma4, Family::Muse] {
             let declared = declarations(family, &tools);
             assert!(
                 declared.contains("new_name") && declared.contains("Asks the user for approval")
