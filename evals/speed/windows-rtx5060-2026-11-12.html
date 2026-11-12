@@ -142,14 +142,14 @@ const REPORT = {
   title: "Vireo Engine vs llama.cpp",
   eyebrow: "Vireo core prototype · Windows · 12 Nov 2026",
   headline: "Vireo's own engine against llama.cpp, on a small laptop GPU",
-  lede: "Same GGUF files, same GPU, run back to back. Vireo now generates faster than llama.cpp in short chats and keeps level with it 31,000 tokens into a conversation. Reading prompts is where it still trails.",
+  lede: "Same GGUF files, same GPU, run back to back. Vireo now generates faster than llama.cpp in short chats and keeps level with it 31,000 tokens into a conversation. Replies that copy from the chat come out two to four times as fast, because Vireo guesses those tokens and checks several in one pass. Reading prompts is where it still trails.",
   rig: [
     { label: "Laptop", value: "ASUS TUF Gaming A14", detail: "FA401GM · on mains, Performance power plan" },
     { label: "GPU", value: "GeForce RTX 5060 Laptop", detail: "8 GB · Blackwell, 26 SMs · driver 621.14" },
     { label: "CPU · memory", value: "AMD Ryzen AI 9 465", detail: "31 GB system memory" },
     { label: "Software", value: "Windows 11 · CUDA 13.5", detail: "llama.cpp b12262 (CUDA build) · Vireo in 8-bit mode" },
   ],
-  labels: { now: "Vireo engine, now", other: "llama.cpp", before: "Vireo before this week's tuning" },
+  labels: { now: "Vireo engine, now", other: "llama.cpp", before: "Vireo before tuning" },
   models: [
     { name: "Qwen 3.5 4B", quant: "Q4_K_M" },
     { name: "Qwen 3.5 9B", quant: "Q4_K_M" },
@@ -168,8 +168,17 @@ const REPORT = {
     { title: "Reading a long prompt", sub: "~31,000 tokens",
       before: [2072, 1308, 3915], vireo: [2235, 1417, 3929], other: [2699, 1819, 4506],
       note: "Prompt attention is a third of the time here. It's the next thing to rework." },
+    { title: "Rewriting a document as a list", sub: "through the server · ~800-token request · 400 tokens",
+      before: [86.4, 51.2, 73.5], vireo: [200.7, 50.5, 157.4], other: [82.6, 52.1, 73.7],
+      note: "Vireo guesses up to 7 tokens from the chat and checks them in one pass, which now costs 1.2 to 1.4 times one token (it was two). 72–85% of the guesses are taken. Qwen 3.5 9B doesn't guess on this laptop: 8 GB leaves no room for the states it needs to undo a wrong guess." },
+    { title: "Returning a code file with an edit", sub: "through the server · ~600-token request · up to 400 tokens",
+      before: [85.3, 51.9, 96.4], vireo: [85.7, 51.3, 306.2], other: [80.9, 52.3, 74.4],
+      note: "Nearly all copying: Gemma takes 96% of its guesses. Qwen 3.5 4B answers this one in 73 tokens, too few to show a gain." },
+    { title: "Writing a new story", sub: "through the server · short request · 400 tokens",
+      before: [86.7, 52.0, 71.5], vireo: [85.0, 52.1, 86.1], other: [84.4, 53.6, 74.7],
+      note: "Nothing to copy, so guesses rarely land (9–13%). Before this pass each failed check cost Gemma two tokens' time and guessing made it slower; now a check is cheap enough not to." },
   ],
-  method: "How it was measured: Vireo with <code>vireo-cli generate --gpu</code> on three prompts (a 27-token story opening, ~2,100 tokens and ~31,000 tokens of the project's docs), greedy, 64–128 tokens generated; llama.cpp with <code>llama-bench -ngl 99 -fa 1</code> (<code>-p 2048</code>, <code>-p 31000</code>, <code>-n 128</code>, <code>-n 64 -d 30000</code>). “Before” is the build from <code>main</code> ahead of the two tuning rounds, run alternately with the new one. Laptop GPU clocks drift a few percent between runs, so compare within a row.",
+  method: "How it was measured: Vireo with <code>vireo-cli generate --gpu</code> on three prompts (a 27-token story opening, ~2,100 tokens and ~31,000 tokens of the project's docs), greedy, 64–128 tokens generated; llama.cpp with <code>llama-bench -ngl 99 -fa 1</code> (<code>-p 2048</code>, <code>-p 31000</code>, <code>-n 128</code>, <code>-n 64 -d 30000</code>). “Before” is the build from <code>main</code> ahead of the two tuning rounds, run alternately with the new one. The last three panels are whole replies through each engine's server at temperature 0, from a later pass the same day (PLAN.md, “Fourteenth round”): <code>vireo-server</code> at its defaults against <code>llama-server -ngl 99 -fa on</code>, the same request to each, speeds from each server's own timings; there “before” is <code>main</code> ahead of that pass. Every guessed token is checked by the model, and in 8-bit mode a checked batch gives the same numbers as one token at a time, so the text is what Vireo would write without guessing. Laptop GPU clocks drift a few percent between runs, so compare within a row.",
 };
 </script>
 <script>

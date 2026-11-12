@@ -99,6 +99,10 @@ pub struct Gemma4CudaSession {
     /// Keys and values in f16 (8-bit mode) rather than f32.
     half_cache: bool,
     graph: Option<Graph>,
+    /// Graphs for batches of up to `GRAPH_TOKENS` tokens, by their number and the logits
+    /// wanted (`graph_slot`), each recorded the first time such a batch is read (CUDA).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    few_graphs: Vec<Option<Graph>>,
 }
 
 impl Gemma4CudaSession {
@@ -410,6 +414,7 @@ impl<'a> Gemma4Cuda<'a> {
             )?,
             half_cache: self.precision == Precision::Int8,
             graph: None,
+            few_graphs: Vec::new(),
         })
     }
 
@@ -799,49 +804,90 @@ impl<'a> Gemma4Cuda<'a> {
             },
             0.0,
         );
-        let c = &self.config;
-        let (all, shared) = (0..c.layers, c.first_shared_layer..c.layers);
         let batch = s.batch;
         for (b, chunk) in tokens.chunks(batch).enumerate() {
             let t = chunk.len();
             let last_chunk = b * batch + t == tokens.len();
             self.upload_inputs(s, chunk)?;
-            if logits == Logits::All {
-                self.queue_layers(s, t, all.clone(), s.pos.ptr())?;
-                s.len += t;
-                self.logits_into(s, 0, t, b * batch * vocab)?;
-                continue;
-            }
-            // The layers that share an earlier layer's keys and values leave nothing for
-            // later tokens: a token's pass through them only makes its own logits. So
-            // they run for the one token whose logits are wanted, and for no other.
-            self.queue_layers(s, t, 0..c.first_shared_layer, s.pos.ptr())?;
-            if logits == Logits::Last && last_chunk {
-                if t > 1 {
-                    // The last token's state to row 0, where a one-token pass reads it.
-                    let g = &self.gpu;
-                    let (dim, pl) = (c.dim, c.per_layer_dim * c.layers);
-                    let e = gpu_error;
-                    g.copy(s.x.ptr(), row(&s.x, t - 1, dim), dim * 4)
-                        .map_err(e)?;
-                    g.copy(s.h.ptr(), row(&s.h, t - 1, dim), dim * 4)
-                        .map_err(e)?;
-                    if pl > 0 {
-                        g.copy(s.per_layer.ptr(), row(&s.per_layer, t - 1, pl), pl * 4)
-                            .map_err(e)?;
-                    }
+            // Where the last token is, for its pass through the shared layers.
+            s.pos_last
+                .write_i32(&[(s.len + t - 1) as i32])
+                .map_err(gpu_error)?;
+            let wanted = match logits {
+                Logits::Last if !last_chunk => Logits::None,
+                wanted => wanted,
+            };
+            // A short batch (a draft's guesses, a tool's result) replays a graph recorded
+            // for its length, as one token does: launching the kernels one by one costs
+            // more than running them.
+            #[cfg(not(target_os = "macos"))]
+            let replayed = if t <= super::gpu::GRAPH_TOKENS {
+                let mode = match wanted {
+                    Logits::All => 0,
+                    Logits::Last => 1,
+                    Logits::None => 2,
+                };
+                let slot = super::gpu::graph_slot(t, mode);
+                if s.few_graphs.len() <= slot {
+                    s.few_graphs.resize_with(slot + 1, || None);
                 }
-                s.pos_last
-                    .write_i32(&[(s.len + t - 1) as i32])
-                    .map_err(gpu_error)?;
-                self.queue_layers(s, 1, shared.clone(), s.pos_last.ptr())?;
-                self.logits_into(s, 0, 1, 0)?;
+                if s.few_graphs[slot].is_none() {
+                    let graph = record(&self.gpu, || self.queue_batch(s, t, wanted))?;
+                    s.few_graphs[slot] = Some(graph);
+                }
+                let graph = s.few_graphs[slot].as_ref().unwrap();
+                graph.launch().map_err(gpu_error)?;
+                true
+            } else {
+                false
+            };
+            #[cfg(target_os = "macos")]
+            let replayed = false;
+            if !replayed {
+                self.queue_batch(s, t, wanted)?;
             }
             s.len += t;
+            match wanted {
+                Logits::All => self.logits_into(s, 0, t, b * batch * vocab)?,
+                Logits::Last => self.logits_into(s, 0, 1, 0)?,
+                Logits::None => {}
+            }
         }
         Ok(match logits {
             Logits::None => None,
             _ => Some(&s.logits),
         })
+    }
+
+    /// Queues the layers for the `t` tokens in `s.x`, for the logits `wanted`: every
+    /// token's (their final norms in `s.h`'s rows), the last token's (in row 0), or none.
+    fn queue_batch(&self, s: &Gemma4CudaSession, t: usize, wanted: Logits) -> Result<()> {
+        let c = &self.config;
+        let (all, shared) = (0..c.layers, c.first_shared_layer..c.layers);
+        if wanted == Logits::All {
+            return self.queue_layers(s, t, all, s.pos.ptr());
+        }
+        // The layers that share an earlier layer's keys and values leave nothing for
+        // later tokens: a token's pass through them only makes its own logits. So
+        // they run for the one token whose logits are wanted, and for no other.
+        self.queue_layers(s, t, 0..c.first_shared_layer, s.pos.ptr())?;
+        if wanted == Logits::Last {
+            if t > 1 {
+                // The last token's state to row 0, where a one-token pass reads it.
+                let g = &self.gpu;
+                let (dim, pl) = (c.dim, c.per_layer_dim * c.layers);
+                let e = gpu_error;
+                g.copy(s.x.ptr(), row(&s.x, t - 1, dim), dim * 4)
+                    .map_err(e)?;
+                g.copy(s.h.ptr(), row(&s.h, t - 1, dim), dim * 4)
+                    .map_err(e)?;
+                if pl > 0 {
+                    g.copy(s.per_layer.ptr(), row(&s.per_layer, t - 1, pl), pl * 4)
+                        .map_err(e)?;
+                }
+            }
+            self.queue_layers(s, 1, shared, s.pos_last.ptr())?;
+        }
+        Ok(())
     }
 }
