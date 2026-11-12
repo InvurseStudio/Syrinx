@@ -85,8 +85,19 @@ layer's cache kept as a ring (32K chats 29.5 → 4.4 GB), a 256-token prompt til
 1,024-token batches, and a 2–8-token Q6_K kernel. In the server, for both: `--draft`,
 Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer answers).
 **Not run on CUDA yet:** the 31B itself and `--draft`. CUDA keeps full caches
-(`attention_ring` and `qkv_prep` assert a ring of 0 there). Details:
+(`attention_ring` and `qkv_prep` assert a ring of 0 there; and Muse Glimmer's `sigmoid_mul`
+has no CUDA kernel). Details:
 `evals/gemma-4-31B.md`.
+
+## After pulling on the Mac (the Windows pass of 2026-11-12)
+
+Shared code changed behind `cfg(target_os = "macos")` switches and **not compiled on a
+Mac**: `gemma4_cuda.rs` and `qwen35_cuda.rs` (`forward_batch` queues a batch through
+`queue_batch`, replayed from a graph on CUDA only), `vireo-server` (`PICKER_BATCH`, 1,024
+on the Mac as before; Qwen's steps kept only if `keep_steps` succeeds, not an error
+otherwise; `DEFAULT_LOOKUP` and `LONGEST_RUN` now one value for both, the Mac's),
+`tests/check_speed.rs` (runs on both; Qwen goes back through a checkpoint). Run
+`cargo test --release` and a few eval cases there; nothing should measure differently.
 
 ## To do, roughly in order
 
@@ -105,8 +116,12 @@ Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer 
    the start they share with the last one, in up to 3 picker sessions, and Qwen keeps a
    checkpoint at the end of a system prompt new chats share (PLAN.md, "Fifth pass"). Six
    eval cases ran 20-49% faster on the Mac with the same scores and results. **On
-   Windows:** run the eval to check the same there (the server code is shared). Next: a
-   skill one step at a time, its answer's headings forced.
+   Windows:** done on 2026-11-12 (PLAN.md, "Fourteenth round"): the Mac's passes cost
+   time on CUDA as merged (a check of the chat's guesses took two tokens' time), so their
+   CUDA side was built: few-token kernels, graphs for short batches, 16- and 32-token
+   tiles, Qwen going back. The full eval scores the same as before on all four models, in
+   24-37% less time on the Gemmas, 4-6% on the Qwens. Next: a skill one step at a time,
+   its answer's headings forced.
 5. **Skills in the packaged Mac app:** the server finds the built-in skills by walking up
    to the repository's `server/builtin-skills`. A packaged app has to copy them in and set
    `VIREO_BUILTIN_SKILLS`. The slash-command list should also follow the asking device's

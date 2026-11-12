@@ -298,8 +298,12 @@ struct Kernels {
     quantize_q8: CuFunction,
     /// 8-bit activations, in the order of `KINDS_8`.
     matvec8: [CuFunction; 5],
+    /// The same for a few tokens at once: by `FEW_SIZES`, then `KINDS_8`.
+    matvec8_few: [[CuFunction; 5]; FEW_SIZES.len()],
     /// On the tensor cores: only on compute capability 8.0 and later.
     matmul8: Option<[CuFunction; 5]>,
+    /// The same with tiles of 16 and of 32 tokens, for batches of up to that many.
+    matmul8_small: Option<[[CuFunction; 5]; 2]>,
 }
 
 /// The weight types with 8-bit-activation kernels, in the order of `Kernels::matvec8`.
@@ -310,6 +314,10 @@ const KINDS_8: [TensorType; 5] = [
     TensorType::Q5_K,
     TensorType::Q6_K,
 ];
+
+/// The few-token matrix-vector kernels' sizes (`matvec8_few<T>_*` in vireo.cu): a batch
+/// takes the smallest that holds it.
+const FEW_SIZES: [usize; 7] = [2, 3, 4, 5, 6, 7, 8];
 
 /// The weight types with kernels, in the order of `Kernels::matvec` and `matmul`.
 const KINDS: [TensorType; 7] = [
@@ -573,6 +581,17 @@ impl Gpu {
                     }
                     out
                 },
+                matvec8_few: {
+                    let mut out = [[std::ptr::null_mut(); 5]; FEW_SIZES.len()];
+                    for (row, size) in out.iter_mut().zip(FEW_SIZES) {
+                        for (slot, kind) in row.iter_mut().zip(KINDS_8) {
+                            let name =
+                                format!("matvec8_few{size}_{}", kind.name().to_lowercase());
+                            *slot = function(&name)?;
+                        }
+                    }
+                    out
+                },
                 matmul8: if tensor_cores {
                     let mut out = [std::ptr::null_mut(); 5];
                     for (slot, kind) in out.iter_mut().zip(KINDS_8) {
@@ -582,8 +601,22 @@ impl Gpu {
                 } else {
                     None
                 },
+                matmul8_small: if tensor_cores {
+                    let mut out = [[std::ptr::null_mut(); 5]; 2];
+                    for (row, tile) in out.iter_mut().zip([16, 32]) {
+                        for (slot, kind) in row.iter_mut().zip(KINDS_8) {
+                            let name = format!("matmul8_t{tile}_{}", kind.name().to_lowercase());
+                            *slot = function(&name)?;
+                        }
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
             };
-            let parts_bytes = 64 * MAX_PARTS.max(MAX_PARTS_KV) as usize * (2 + 512) * 4;
+            // Twice what one token's 64 heads of 512 in the most parts need: a few tokens of
+            // any model here fit with all their parts.
+            let parts_bytes = 2 * 64 * MAX_PARTS.max(MAX_PARTS_KV) as usize * (2 + 512) * 4;
             let mut ptr = 0;
             let r = (context.driver.cuMemAlloc_v2)(&mut ptr, parts_bytes);
             context.check("cuMemAlloc", r)?;
@@ -1008,9 +1041,11 @@ impl Gpu {
             Arg::I32(group as i32),
             Arg::F32(scale),
         ];
-        if tokens == 1 && heads <= 64 {
+        let kv_few = half_cache && matches!(head_dim, 64 | 128 | 256 | 512);
+        if (tokens == 1 || (kv_few && tokens <= Self::FEW_TOKENS)) && heads <= 64 {
             // One token: split each head's context into parts so every SM has work (about
-            // four blocks per SM), then merge them.
+            // four blocks per SM), then merge them. A few tokens (over an f16 cache): the
+            // same, a grid layer each.
             let sms = self.info.multiprocessors.max(1) as u32;
             let kv_kernel = match head_dim {
                 64 => Some(0),
@@ -1026,10 +1061,17 @@ impl Gpu {
                 // more than a sliding window fills 32 positions of each.
                 let (kernel, per_sm) = self.kernels.attention_part_kv[i];
                 let blocks = (heads / group * group.div_ceil(4)) as u32;
+                let layers = tokens as u32;
                 let mut parts = (per_sm * sms / blocks).clamp(1, MAX_PARTS_KV);
                 if window > 0 {
                     parts = parts.min((window as u32).div_ceil(32)).max(1);
                 }
+                // A few tokens split their contexts as one does, so each gets exactly the
+                // numbers it would alone (the GPU is as full: there's a token's work each).
+                // Fewer parts only if their partial rows wouldn't fit (no model here).
+                let row_bytes = (2 + head_dim) * 4;
+                let room = self.attention_parts.len_bytes() / (tokens * heads * row_bytes);
+                parts = parts.min(room as u32).max(1);
                 let part_args = [
                     Arg::Ptr(q),
                     Arg::Ptr(keys),
@@ -1040,17 +1082,19 @@ impl Gpu {
                     Arg::I32(kv_dim as i32),
                     Arg::I32(group as i32),
                     Arg::F32(scale),
+                    Arg::I32(heads as i32),
                 ];
-                self.run(kernel, (blocks, parts), 128, &part_args)?;
+                self.run_3d(kernel, (blocks, parts, layers), 128, 0, &part_args)?;
                 let combine = [
                     Arg::Ptr(self.attention_parts.ptr()),
                     Arg::Ptr(out),
                     Arg::I32(parts as i32),
                     Arg::I32(head_dim as i32),
                 ];
+                // A block per token and head: their rows follow one another.
                 return self.run(
                     self.kernels.attention_combine,
-                    (heads as u32, 1),
+                    ((heads * tokens) as u32, 1),
                     128,
                     &combine,
                 );
@@ -1226,8 +1270,9 @@ impl Gpu {
         tokens: usize,
     ) -> Result<()> {
         assert!((2..=8).contains(&kernel), "convolution of {kernel}");
-        if tokens > 1 {
-            // A prompt: every token and channel at once, then the history moved along.
+        if tokens > Self::FEW_TOKENS {
+            // A prompt: every token and channel at once, then the history moved along. (A
+            // few tokens walk through the one-token kernel: one launch, not two.)
             let conv = [
                 Arg::Ptr(current),
                 Arg::Ptr(history),
@@ -1275,8 +1320,13 @@ impl Gpu {
     }
 
     pub fn delta_net(&self, d: &DeltaNet, tokens: usize) -> Result<()> {
-        assert!(d.steps == 0, "the CUDA DeltaNet keeps no per-token states");
         let n = d.n;
+        // Only the one-token kernel with the state in registers keeps its steps.
+        assert!(
+            d.steps == 0 || (tokens <= Self::FEW_TOKENS && n <= 128 && n.is_multiple_of(8)),
+            "DeltaNet steps are kept for up to {} tokens of states up to 128",
+            Self::FEW_TOKENS
+        );
         assert!(
             n <= 256 && n.is_multiple_of(32),
             "state size {n}: the kernel takes multiples of 32 up to 256"
@@ -1298,7 +1348,11 @@ impl Gpu {
             Arg::F32(d.eps),
             Arg::I32(tokens as i32),
         ];
-        if tokens > 1 && n <= 128 && n.is_multiple_of(32) && d.scratch != 0 {
+        // A few tokens step through the one-token kernel (the state in registers
+        // throughout): a fraction of the chunked kernels' time, and exactly one token at a
+        // time's numbers.
+        let prompt = tokens > Self::FEW_TOKENS;
+        if prompt && n <= 128 && n.is_multiple_of(32) && d.scratch != 0 {
             // A prompt in chunks of 64 tokens (delta_chunk_prep and delta_chunk_scan in
             // vireo.cu), between the norms for every token at once.
             let rows = (tokens * 2 * d.k_heads) as u32;
@@ -1352,7 +1406,7 @@ impl Gpu {
             let rows = (tokens * d.v_heads) as u32;
             return self.run(self.kernels.delta_out, (rows, 1), n as u32, &out);
         }
-        if tokens > 1 && n <= 128 && n.is_multiple_of(32) {
+        if prompt && n <= 128 && n.is_multiple_of(32) {
             // A prompt: the norms for every token at once, the state update split over
             // blocks of 16 columns, then the output norm for every token at once.
             let rows = (tokens * 2 * d.k_heads) as u32;
@@ -1393,11 +1447,13 @@ impl Gpu {
         }
         if n <= 128 && n.is_multiple_of(8) {
             // The state in registers: 4 threads to a column.
+            let mut with_steps = args.to_vec();
+            with_steps.push(Arg::Ptr(d.steps));
             return self.run(
                 self.kernels.delta_net,
                 (d.v_heads as u32, 1),
                 4 * n as u32,
-                &args,
+                &with_steps,
             );
         }
         self.run(
@@ -1407,6 +1463,9 @@ impl Gpu {
             &args,
         )
     }
+
+    /// The most tokens the few-token kernels take at once.
+    pub const FEW_TOKENS: usize = FEW_SIZES[FEW_SIZES.len() - 1];
 
     /// Whether a weight of this type has kernels for 8-bit activations.
     pub fn supports_8bit(kind: TensorType) -> bool {
@@ -1483,6 +1542,25 @@ impl Gpu {
                 &args,
             );
         }
+        if let Some(size) = FEW_SIZES.iter().position(|&s| s >= tokens) {
+            // A few tokens: the weights read once, as for one, and multiplied by each.
+            let args = [
+                Arg::Ptr(w),
+                Arg::Ptr(q8.q.ptr()),
+                Arg::Ptr(q8.scales.ptr()),
+                Arg::Ptr(y),
+                Arg::I32(rows as i32),
+                Arg::I32(cols as i32),
+                Arg::I32(tokens as i32),
+            ];
+            let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK * 2);
+            return self.run(
+                self.kernels.matvec8_few[size][index],
+                (grid, 1),
+                ROWS_PER_BLOCK * 32,
+                &args,
+            );
+        }
         match self.kernels.matmul8 {
             Some(kernels) => {
                 let args = [
@@ -1495,11 +1573,18 @@ impl Gpu {
                     Arg::I32(cols as i32),
                     Arg::I32(tokens as i32),
                 ];
+                // A short batch takes a tile of 16 or 32 tokens: a tile of 64 costs the
+                // same for 9 tokens as for 64.
+                let (kernel, tile) = match (self.kernels.matmul8_small, tokens) {
+                    (Some(small), 0..=16) => (small[0][index], 16),
+                    (Some(small), 17..=32) => (small[1][index], 32),
+                    _ => (kernels[index], TILE_TOKENS),
+                };
                 let grid = (
                     (rows as u32).div_ceil(TILE_ROWS),
-                    (tokens as u32).div_ceil(TILE_TOKENS),
+                    (tokens as u32).div_ceil(tile),
                 );
-                self.run(kernels[index], grid, 256, &args)
+                self.run(kernel, grid, 256, &args)
             }
             None => {
                 // No tensor cores: the 8-bit matrix-vector kernel for each token.
@@ -1587,8 +1672,8 @@ pub struct DeltaNet {
     /// Room for a prompt in chunks ([`Gpu::delta_scratch_floats`]), or 0 to run it token
     /// by token.
     pub scratch: CuDevicePtr,
-    /// The Metal backend's per-token states for undoing a draft's guesses; not built for
-    /// CUDA yet, so always 0 here ([`crate::models::qwen35_cuda::Qwen35Cuda::can_rewind`]).
+    /// Room for the state before a batch of up to [`Gpu::FEW_TOKENS`] tokens and after each
+    /// of them but the last (a whole state each), for undoing a draft's guesses, or 0.
     pub steps: CuDevicePtr,
 }
 

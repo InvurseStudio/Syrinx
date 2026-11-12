@@ -114,6 +114,9 @@ pub struct Qwen35CudaSession {
     /// Keys and values in f16 (8-bit mode) rather than f32.
     half_cache: bool,
     graph: Option<Graph>,
+    /// Graphs for batches of up to `GRAPH_TOKENS` tokens, by their number and the outputs
+    /// wanted, each recorded the first time such a batch is read (CUDA).
+    few_graphs: Vec<Option<Graph>>,
     /// With [`Qwen35Cuda::keep_steps`]: for each DeltaNet layer, room for its state before
     /// a batch of up to [`STEP_TOKENS`] and after each of its tokens but the last, and for
     /// its convolution's history then the batch's inputs, so the batch can be cut back
@@ -166,6 +169,11 @@ struct MtpMark {
 const STEP_TOKENS: usize = 8;
 
 impl Qwen35CudaSession {
+    /// Whether short batches keep their DeltaNet steps ([`Qwen35Cuda::keep_steps`]).
+    pub fn keeps_steps(&self) -> bool {
+        self.steps.is_some()
+    }
+
     /// Whether it keeps the multi-token-prediction layer's cache up ([`Qwen35Cuda::use_mtp`]).
     pub fn keeps_mtp(&self) -> bool {
         self.mtp.is_some()
@@ -491,6 +499,7 @@ impl<'a> Qwen35Cuda<'a> {
             )?,
             half_cache: self.precision == Precision::Int8,
             graph: None,
+            few_graphs: Vec::new(),
             steps: None,
             stepped: None,
             mtp: None,
@@ -797,9 +806,20 @@ impl<'a> Qwen35Cuda<'a> {
     }
 
     /// Whether [`Qwen35Cuda::keep_steps`] and [`Qwen35Cuda::rewind`] work here: on the
-    /// Mac (the CUDA DeltaNet kernel doesn't keep its steps yet).
+    /// Mac, and on CUDA for states the one-token DeltaNet kernel holds in registers (up to
+    /// 128 wide, every Qwen 3.5 so far).
     pub fn can_rewind(&self) -> bool {
-        cfg!(target_os = "macos")
+        cfg!(target_os = "macos") || (self.config.state <= 128 && self.config.state.is_multiple_of(8))
+    }
+
+    /// The GPU memory [`Qwen35Cuda::keep_steps`] takes for a session (Qwen 3.5 4B: 0.3 GB,
+    /// 9B: 0.4 GB).
+    pub fn steps_bytes(&self) -> usize {
+        let c = &self.config;
+        let channels = 2 * c.k_heads * c.state + c.v_heads * c.state;
+        let state = c.v_heads * c.state * c.state;
+        let layers = (0..c.layers).filter(|&l| !c.is_full_attention(l)).count();
+        layers * (STEP_TOKENS * state + (c.conv_kernel - 1 + STEP_TOKENS) * channels) * 4
     }
 
     /// From now on, batches of up to [`STEP_TOKENS`] read into `s` keep each DeltaNet
@@ -807,18 +827,18 @@ impl<'a> Qwen35Cuda<'a> {
     /// guesses): for each layer, `STEP_TOKENS` states (Qwen 3.8 27B: 48 × 25 MB) written
     /// as the batch goes, about a millisecond a round there. Allocated once.
     pub fn keep_steps(&self, s: &mut Qwen35CudaSession) -> Result<()> {
-        assert!(self.can_rewind(), "DeltaNet steps are kept on the Mac only");
+        assert!(self.can_rewind(), "this model's DeltaNet steps can't be kept");
         if s.steps.is_some() {
             return Ok(());
         }
+        // Short batches are queued with their steps from here on: recorded again.
+        s.few_graphs.clear();
         let c = &self.config;
         let g = &self.gpu;
         let channels = 2 * c.k_heads * c.state + c.v_heads * c.state;
         let state = c.v_heads * c.state * c.state;
-        let steps = s
-            .memory
-            .iter()
-            .filter(|m| matches!(m, Memory::DeltaNet { .. }))
+        let steps = (0..c.layers)
+            .filter(|&l| !c.is_full_attention(l))
             .map(|_| {
                 Ok((
                     g.alloc(STEP_TOKENS * state * 4).map_err(gpu_error)?,
@@ -1214,7 +1234,35 @@ impl<'a> Qwen35Cuda<'a> {
                 Logits::Last if last_chunk => Outputs::Last,
                 _ => Outputs::None,
             };
-            self.queue_layers(s, t, outputs, keep)?;
+            // A short batch (a draft's guesses, a tool's result) replays a graph recorded
+            // for its length, as one token does: launching the kernels one by one costs
+            // more than running them.
+            #[cfg(not(target_os = "macos"))]
+            let replayed = if t <= super::gpu::GRAPH_TOKENS {
+                let mode = match outputs {
+                    Outputs::All => 0,
+                    Outputs::Last => 1,
+                    Outputs::None => 2,
+                };
+                let slot = super::gpu::graph_slot(t, mode);
+                if s.few_graphs.len() <= slot {
+                    s.few_graphs.resize_with(slot + 1, || None);
+                }
+                if s.few_graphs[slot].is_none() {
+                    let graph = record(&self.gpu, || self.queue_layers(s, t, outputs, keep))?;
+                    s.few_graphs[slot] = Some(graph);
+                }
+                let graph = s.few_graphs[slot].as_ref().unwrap();
+                graph.launch().map_err(e)?;
+                true
+            } else {
+                false
+            };
+            #[cfg(target_os = "macos")]
+            let replayed = false;
+            if !replayed {
+                self.queue_layers(s, t, outputs, keep)?;
+            }
             s.len += t;
             // Row of the last token's hidden state: every row was kept, or only it in row 0.
             let last_row = if outputs == Outputs::All { t - 1 } else { 0 };
