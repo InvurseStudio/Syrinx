@@ -13,7 +13,7 @@ in: there is one Cargo workspace, here in `VireoPrototype/`, and both machines b
 |---|---|
 | `crates/vireo-engine` model code, GGUF, tokenizers, grammar, CPU path | Shared |
 | GPU backend | Per platform: CUDA on Windows (`src/cuda`, `kernels/vireo.cu`), Metal on the Mac (`src/metal`, `kernels/*.metal`). On macOS `src/metal` stands in for the `cuda` module, with the same API |
-| Backend tuning | Per platform, behind `cfg(target_os = "macos")`: the prompt batch (`DEFAULT_BATCH`, 1,024 on the Mac, 512 on CUDA) and the Mac's fused gate-up-activation for one token (`mul_glu`) |
+| Backend tuning | Per platform, behind `cfg(target_os = "macos")`: the Mac's fused gate-up-activation for one token (`mul_glu`). The prompt batch (`DEFAULT_BATCH`) is 1,024 on both |
 | `crates/vireo-server` (tools, approvals, skills, attachments, chat cache) | Shared |
 | `crates/vireo-eval` (35 cases) | Shared |
 | Folders | Shared code (`store::data_dir`): `%LOCALAPPDATA%\VireoPrototype` on Windows, `~/Library/Application Support/VireoPrototype` on the Mac |
@@ -112,6 +112,6 @@ Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer 
    `VIREO_BUILTIN_SKILLS`. The slash-command list should also follow the asking device's
    tools.
 6. **Small things:** three clippy warnings in `attach/` (from the Mac's code), one in
-   `vireo-cli`; the long-chat attention kernel on CUDA (27–48% behind llama.cpp at 25K
-   tokens); the GPU performance counters on the Windows machine are open to all users
+   `vireo-cli`; prompt attention on CUDA for long prompts (78–87% of
+   llama.cpp at ~31K tokens at full clocks; see PLAN.md, "What limits speed now"); the GPU performance counters on the Windows machine are open to all users
    for Nsight and should go back to administrators only when the tuning is done.
