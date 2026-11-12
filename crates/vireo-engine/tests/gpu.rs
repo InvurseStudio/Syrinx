@@ -577,6 +577,75 @@ fn reading_in_batches_matches_one_token_at_a_time() {
     }
 }
 
+/// On the Mac a Gemma sliding-window layer keeps only its window and a batch's new
+/// positions, in a ring. Read in batches of 64 (a ring of 576 for E2B's window of 512),
+/// a text of over 1,700 tokens wraps it three times; its logits match a session that
+/// keeps every position (its batch makes the ring longer than the text: no ring) read a
+/// token at a time. And a rewind inside the ring keeps its place, while one past what the
+/// ring still holds starts over.
+#[cfg(target_os = "macos")]
+#[test]
+fn gemma_sliding_window_rings_match_a_full_cache() {
+    let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") else {
+        return;
+    };
+    let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+    let paragraph = "The engine reads a prompt in batches: every weight is decoded once for many \
+                     tokens, and attention looks at a block of keys for a block of queries. When \
+                     it writes a reply, it replays one recorded graph per token. ";
+    let ids = tokenizer.encode(&paragraph.repeat(40), true, false);
+    assert!(ids.len() > 1700, "{} tokens", ids.len());
+    for (precision, worst, mean) in [(Precision::Exact, 1e-3, 1e-4), (Precision::Int8, 1.0, 0.01)] {
+        let Some(gpu) = open_gpu() else { return };
+        let mut m = Gemma4Cuda::load(&file, gpu).unwrap();
+        m.set_precision(precision);
+        let mut ring = m.session_with_batch(ids.len(), 64).unwrap();
+        let mut full = m.session_with_batch(ids.len(), 1500).unwrap();
+        assert!(
+            ring.cache_bytes_per_position() < full.cache_bytes_per_position(),
+            "the ring should take less memory"
+        );
+        let mut rows = Vec::new();
+        check_batches_match_tokens(
+            &format!("Gemma 4 ring, {precision:?}"),
+            worst,
+            mean,
+            &ids,
+            &mut |ids| {
+                rows = m
+                    .forward_batch(&mut ring, ids, Logits::All)
+                    .unwrap()
+                    .unwrap()
+                    .to_vec();
+                rows.clone()
+            },
+            &mut |id| m.forward(&mut full, id, true).unwrap().unwrap().to_vec(),
+        );
+
+        // Ten tokens back is inside the ring: reading them again gives the same logits.
+        let n = ids.len();
+        assert_eq!(ring.truncate(n - 10), n - 10);
+        let again = m
+            .forward_batch(&mut ring, &ids[n - 10..], Logits::All)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let vocab = again.len() / 10;
+        let worst_again = again
+            .iter()
+            .zip(&rows[(n - 10) * vocab..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst_again < 1e-3,
+            "{precision:?}: re-read logits differ by {worst_again}"
+        );
+        // A hundred back, the ring has written over the window before it: start over.
+        assert_eq!(ring.truncate(n - 100), 0);
+        assert_eq!(ring.len(), 0);
+    }
+}
+
 /// The France prompt's next-token probabilities (read in one batch) and greedy answer
 /// (generated a token at a time) with the given precision.
 fn france(file: &GgufFile, prompt: &str, precision: Precision) -> (Vec<f32>, String) {
@@ -1283,6 +1352,74 @@ fn delta_net_in_chunks_matches_token_by_token() {
         assert!(
             ws <= 1e-4 * scale(&s1).max(1.0),
             "{tokens} tokens: states differ by {ws}"
+        );
+    }
+}
+
+/// How long a large Gemma takes for one token and for a few at once (a draft's guesses):
+/// set VIREO_BIG_GEMMA to its GGUF file. Prints, checks nothing; run with --ignored.
+#[test]
+#[ignore]
+fn time_small_batches_on_a_big_gemma() {
+    let Ok(path) = std::env::var("VIREO_BIG_GEMMA") else {
+        return;
+    };
+    let file = GgufFile::open(path).unwrap();
+    let Some(gpu) = open_gpu() else { return };
+    let m = Gemma4Cuda::load(&file, gpu).unwrap();
+    let mut s = m.session(32768).unwrap();
+    let n: u32 = std::env::var("VIREO_PROMPT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let prompt: Vec<u32> = (0..n).map(|i| 1000 + i % 5000).collect();
+    let started = std::time::Instant::now();
+    m.forward_batch(&mut s, &prompt, Logits::Last).unwrap();
+    eprintln!(
+        "{n}-token prompt: {:.2} s ({:.0} tokens/s)",
+        started.elapsed().as_secs_f64(),
+        f64::from(n) / started.elapsed().as_secs_f64()
+    );
+    let base = s.len();
+    let time = |label: &str, f: &mut dyn FnMut()| {
+        f();
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            f();
+        }
+        eprintln!("{label}: {:.1} ms", started.elapsed().as_secs_f64() * 100.0);
+    };
+    time("1 token", &mut || {
+        m.forward(&mut s, 1234, true).unwrap();
+        s.truncate(base);
+    });
+    let counts: Vec<usize> = std::env::var("VIREO_BATCHES")
+        .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect())
+        .unwrap_or_else(|_| vec![2, 3, 4, 5, 8]);
+    for n in counts {
+        let ids: Vec<u32> = (0..n as u32).map(|i| 2000 + i).collect();
+        time(&format!("{n} tokens, all logits"), &mut || {
+            m.forward_batch(&mut s, &ids, Logits::All).unwrap();
+            s.truncate(base);
+        });
+        time(&format!("{n} tokens, last logits"), &mut || {
+            m.forward_batch(&mut s, &ids, Logits::Last).unwrap();
+            s.truncate(base);
+        });
+    }
+}
+
+/// The neural accelerators' kernels compiled, on a GPU that has them: a compile error in
+/// vireo_tensor.metal otherwise only shows as slower prompts (the backend falls back).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_tensor_kernels_compile_where_the_gpu_has_them() {
+    let Some(gpu) = open_gpu() else { return };
+    if gpu.info.name.contains("M5") {
+        assert!(
+            Gpu::supports_8bit(vireo_engine::TensorType::Q6_K),
+            "{}: the tensor kernels didn't compile",
+            gpu.info.name
         );
     }
 }

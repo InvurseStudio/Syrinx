@@ -881,6 +881,7 @@ impl Gpu {
     /// [`QkvPrep`].
     pub fn qkv_prep(&self, p: &QkvPrep, tokens: usize) -> Result<()> {
         assert!(p.head_dim <= 512, "head size {} is over 512", p.head_dim);
+        assert_eq!(p.ring, 0, "no rings on CUDA");
         let kv = p.cache.is_some();
         let (k_cache, v_cache) = p.cache.unwrap_or((0, 0));
         let args = [
@@ -917,6 +918,32 @@ impl Gpu {
             (slots as u32, (tokens as u32).div_ceil(8)),
             threads,
             &args,
+        )
+    }
+
+    /// [`Gpu::attention`], for the Metal backend's rings, which this one doesn't have.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_ring(
+        &self,
+        half_cache: bool,
+        q: CuDevicePtr,
+        keys: CuDevicePtr,
+        values: CuDevicePtr,
+        out: CuDevicePtr,
+        pos: CuDevicePtr,
+        window: usize,
+        ring: usize,
+        heads: usize,
+        tokens: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        group: usize,
+        scale: f32,
+    ) -> Result<()> {
+        assert_eq!(ring, 0, "no rings on CUDA");
+        self.attention(
+            half_cache, q, keys, values, out, pos, window, heads, tokens, head_dim, kv_dim, group,
+            scale,
         )
     }
 
@@ -1467,6 +1494,8 @@ pub struct QkvPrep {
     pub eps: f32,
     /// The cache holds f16 (8-bit mode), not f32.
     pub half_cache: bool,
+    /// Rings (see the Metal backend's `attention_ring`) are Metal's only: 0 here.
+    pub ring: usize,
 }
 
 /// What [`Gpu::delta_net`] works on: token t's convolved `[q | k | v]` is row t of

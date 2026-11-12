@@ -117,7 +117,7 @@ impl Qwen35CudaSession {
     pub fn cache_bytes_per_position(&self) -> usize {
         self.attention_buffers()
             .iter()
-            .map(|(b, _)| b.len_bytes())
+            .map(|(b, _, _)| b.len_bytes())
             .sum::<usize>()
             / self.capacity.max(1)
     }
@@ -150,7 +150,7 @@ impl Qwen35CudaSession {
         self.memory
             .iter()
             .flat_map(|m| match m {
-                Memory::Attention { keys, values } => vec![(keys, None), (values, None)],
+                Memory::Attention { keys, values } => vec![(keys, None, 0), (values, None, 0)],
                 Memory::DeltaNet { .. } => vec![],
             })
             .collect()
@@ -481,6 +481,7 @@ impl<'a> Qwen35Cuda<'a> {
                             pos: s.pos.ptr(),
                             eps: c.norm_eps,
                             half_cache: s.half_cache,
+                            ring: 0,
                         },
                         t,
                     )
