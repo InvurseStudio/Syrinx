@@ -695,6 +695,10 @@ struct Kernels {
     /// The same for heads of 128, 256 and 512 with a SIMD group a position (lanes across
     /// the head), over f32 and f16 caches.
     attention_decode_wide: [[Pso; 3]; 2],
+    /// The same with each key and value row read once for all the query heads that share
+    /// it, over f32 and f16 caches, for heads of 256 and 512, by how many heads a SIMD
+    /// group holds (index = that number; see [`GROUP_HEADS`]).
+    attention_decode_group: [[[Option<Pso>; 5]; 2]; 2],
     /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
     attention_tiled_h: [Pso; 4],
@@ -838,6 +842,11 @@ const ATTENTION_TC_TOKENS: [u32; 4] = [32, 32, 32, 16];
 const BUFFER_SLACK: usize = 128 * 1024;
 /// The most parts one token's attention is split into.
 const MAX_PARTS: u32 = 16;
+/// attention_decode_group's builds: for heads of 256 and 512, how many heads a SIMD group
+/// may hold (their queries and outputs in registers, so fewer for wider heads).
+const GROUP_HEADS: [(usize, &[usize]); 2] = [(256, &[1, 2, 3, 4]), (512, &[1, 2])];
+/// attention_decode_group's threadgroup scratch, in floats (GROUP_SCRATCH in vireo.metal).
+const GROUP_SCRATCH: usize = 7936;
 /// The most parts attention_decode splits a context into.
 const MAX_DECODE_PARTS: u32 = 64;
 
@@ -982,6 +991,19 @@ impl Gpu {
                                 v[c][i][j] =
                                     Some(pipeline(&format!("attention_decode_{cache}_{d}_{hg}"))?);
                             }
+                        }
+                    }
+                }
+                v
+            },
+            attention_decode_group: {
+                let mut v: [[[Option<Pso>; 5]; 2]; 2] = Default::default();
+                for (c, cache) in ["f32", "f16"].iter().enumerate() {
+                    for (i, (d, hs)) in GROUP_HEADS.iter().enumerate() {
+                        for &h in *hs {
+                            v[c][i][h] = Some(pipeline(&format!(
+                                "attention_decode_group_{cache}_{d}_{h}"
+                            ))?);
                         }
                     }
                 }
@@ -1681,6 +1703,24 @@ impl Gpu {
             // at every split tried, the repeated reads coming from the cache. Narrow heads
             // want more parts (Llama's 64: 340 tokens/s generating at 2,500 tokens with
             // twice as many, against 315); 256- and 512-wide heads fewer.
+            // Full attention over wide heads that share a key/value head: each key and value
+            // row read once for the group (see attention_decode_group), three threadgroups
+            // a GPU core (the quickest of 2, 3, 4 and 6 on the M5 Max for Qwen 3.8 27B and
+            // Gemma 4 31B's global layers).
+            if let Some(kernel) = self.group_kernel(half_cache, head_dim, group, heads, window) {
+                let kv_heads = (heads / group) as u32;
+                let cores = self.info.multiprocessors.max(1) as u32;
+                let parts = (3 * cores)
+                    .div_ceil(kv_heads * tokens as u32)
+                    .clamp(1, (64 * MAX_DECODE_PARTS) / (heads as u32 * tokens as u32))
+                    .min(MAX_DECODE_PARTS);
+                let mut args = args.to_vec();
+                args.push(Arg::Ptr(self.attention_parts.ptr()));
+                args.push(Arg::Ptr(self.attention_counters.ptr()));
+                // At least 64 positions a part: a short context uses fewer of them.
+                args.push(Arg::I32(64));
+                return self.run_3d(kernel, (kv_heads, parts, tokens as u32), 256, 0, &args);
+            }
             let (j, hg) = (0, 1);
             let spread: u32 = if head_dim <= 128 { 4 } else { 2 };
             let threadgroups = (heads / hg) as u32;
@@ -1786,6 +1826,36 @@ impl Gpu {
             &self.kernels.attention
         };
         self.run(one, (heads as u32, tokens as u32), 128, &args)
+    }
+
+    /// attention_decode_group for this layer, if it's one the kernel is quicker for: full
+    /// attention (no window), heads of 256 or 512, and at least 4 query heads to a key/value
+    /// head. A SIMD group holds as many of a group's heads as divide it, up to 4 for heads of
+    /// 256 (Qwen 3.8 27B: 3) and 2 for 512; more spilled registers. Measured on the M5 Max,
+    /// one token at 30K positions: Qwen 3.8 27B 762 → 235 µs a layer, Gemma 4 31B's global
+    /// layers 1287 → 483 µs, both quicker from ~2K positions and ~10 µs slower at 64. The
+    /// sliding layers (Gemma's 2 heads a key/value head, 1024 positions at most) were slower
+    /// with it, and so was Muse 30B (2 key/value heads, 128 wide: its cache stays in the
+    /// GPU's caches anyway).
+    fn group_kernel(
+        &self,
+        half_cache: bool,
+        head_dim: usize,
+        group: usize,
+        heads: usize,
+        window: usize,
+    ) -> Option<&Pso> {
+        if window > 0 || group < 4 || !heads.is_multiple_of(group) {
+            return None;
+        }
+        let i = GROUP_HEADS.iter().position(|(d, _)| *d == head_dim)?;
+        let h = GROUP_HEADS[i].1.iter().rev().copied().find(|&h| {
+            let slices = group / h;
+            group.is_multiple_of(h)
+                && slices <= 8
+                && (group + 8 / slices) * head_dim <= GROUP_SCRATCH
+        })?;
+        self.kernels.attention_decode_group[usize::from(half_cache)][i][h].as_ref()
     }
 
     /// `gate = SiLU(gate) × up` over `tokens` rows of `n`; up's rows are `up_stride` apart.
