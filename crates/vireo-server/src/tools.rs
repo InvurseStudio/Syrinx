@@ -303,6 +303,11 @@ pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
     }
 }
 
+/// Every tool's name, offered or not.
+pub fn all_names() -> Vec<&'static str> {
+    catalog().iter().map(|t| t.name).collect()
+}
+
 /// The tools a reply offers: the server's own, and those of the app's that it runs.
 pub fn offered(client_tools: &[String]) -> Vec<Tool> {
     catalog()
@@ -806,6 +811,48 @@ pub fn parse_call(family: Family, text: &str) -> Option<Call> {
 /// where the model goes on. Three parts: special-token text before the result, the
 /// result itself (read as plain text, so nothing in it can pass for a special token),
 /// and special-token text after it.
+/// A call as the model would write it, from the token that starts it, for a call the
+/// server writes into a reply itself (the skill it picked, as `use_skill`). Text arguments
+/// only; `parse_call` reads it back.
+pub fn call_text(family: Family, call: &Call) -> String {
+    let start = call_start(family).token;
+    let texts: Vec<(&str, &str)> = call
+        .args
+        .iter()
+        .filter_map(|(k, v)| match v {
+            Arg::Text(s) => Some((k.as_str(), s.as_str())),
+            Arg::Integer(_) => None,
+        })
+        .collect();
+    match family {
+        Family::Qwen35 => {
+            let params: String = texts
+                .iter()
+                .map(|(k, v)| format!("<parameter={k}>\n{v}\n</parameter>\n"))
+                .collect();
+            format!("{start}\n<function={}>\n{params}</function>\n", call.tool)
+        }
+        Family::Gemma4 => {
+            let params: Vec<String> = texts
+                .iter()
+                .map(|(k, v)| format!("{k}:{QUOTE}{v}{QUOTE}"))
+                .collect();
+            format!("{start}call:{}{{{}}}", call.tool, params.join(","))
+        }
+        Family::Llama => {
+            let params: Vec<String> = texts
+                .iter()
+                .map(|(k, v)| format!("{}: {}", json::string(k), json::string(v)))
+                .collect();
+            format!(
+                "{start}{{\"name\": {}, \"parameters\": {{{}}}}}",
+                json::string(&call.tool),
+                params.join(", ")
+            )
+        }
+    }
+}
+
 pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, String) {
     match family {
         Family::Qwen35 => (
@@ -1016,6 +1063,24 @@ mod tests {
     fn the_date_reads_like_the_macs() {
         let n = now();
         assert!(n.ends_with("(local time)") && n.contains(", 20"), "{n}");
+    }
+
+    #[test]
+    fn a_call_the_server_writes_reads_back() {
+        let call = Call {
+            tool: "use_skill".into(),
+            args: vec![("name".into(), Arg::Text("code-review".into()))],
+        };
+        for family in [Family::Qwen35, Family::Llama, Family::Gemma4] {
+            let text = call_text(family, &call);
+            let start = call_start(family).token;
+            assert!(text.starts_with(start), "{text}");
+            assert_eq!(
+                parse_call(family, &text[start.len()..]),
+                Some(call.clone()),
+                "{text}"
+            );
+        }
     }
 
     #[test]

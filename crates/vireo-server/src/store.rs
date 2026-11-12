@@ -2,7 +2,7 @@
 //! after them (`vireo_engine::models::SavedState`), so going back to a chat, or opening
 //! it after a restart, reads only what's new in it.
 //!
-//! Saved in `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\`, a file per chat, written
+//! Saved in `chat-cache\<model>\` in the prototype's folder (`data_dir`), a file per chat, written
 //! by a thread of their own so switching chats doesn't wait for the disk. The newest
 //! states stay in memory as well. The oldest files go once they take more than the
 //! budget. A file is:
@@ -51,8 +51,26 @@ pub fn model_key(path: &Path, precision: &str) -> String {
 
 /// The default folder for `key`'s saved chats.
 pub fn default_dir(key: &str) -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    base.join("VireoPrototype").join("chat-cache").join(key)
+    data_dir().join("chat-cache").join(key)
+}
+
+/// The prototype's own folder: `~/Library/Application Support/VireoPrototype` on the Mac
+/// (where the Mac prototype app keeps its chats), `%LOCALAPPDATA%\VireoPrototype`
+/// elsewhere. The same as the Mac engine's copy (`VireoPrototype/Mac/Engine`).
+pub fn data_dir() -> PathBuf {
+    let base = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map_or_else(
+            || PathBuf::from("."),
+            |home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+            },
+        )
+    } else {
+        std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
+    };
+    base.join("VireoPrototype")
 }
 
 pub struct Entry {

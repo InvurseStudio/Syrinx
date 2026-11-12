@@ -4,7 +4,8 @@
 //! Replies can call tools (reading, finding and changing files and Git's status and
 //! diff, which the app runs on the PC, and the date and time), each call written under its
 //! grammar (`tools.rs`). The ones that change files wait for the user's approval in the
-//! app first. Skills come next.
+//! app first. Skills (SKILL.md, as the Mac's) are picked by scoring and read by the model
+//! as the result of a `use_skill` call the server writes in (`skills.rs`).
 //!
 //! The routes, as `server/api_server.py` answers them:
 //!   POST   /api/pairing/claim          {code, name} → {token}
@@ -14,7 +15,7 @@
 //!   GET    /api/capabilities           the tools
 //!   POST   /api/agent/client-tool-result a PC tool's result, from the app
 //!   POST   /api/agent/confirm          {id, approved, remember}: the user's answer to an approval
-//!   GET    /api/skill-library/commands no skills
+//!   GET    /api/skill-library/commands the skills this PC can follow, for slash commands
 //!   GET    /api/assistant/approvals    and /activity: empty
 //!   POST   /api/chat/completions       the reply as server-sent events
 //!   POST   /api/chat/runs/{id}/stop    stops a reply
@@ -24,6 +25,7 @@ mod chat;
 mod http;
 mod json;
 mod sample;
+mod skills;
 mod store;
 mod tools;
 
@@ -51,18 +53,20 @@ const USAGE: &str = "\
 Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact]
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
-                    [--changes declared|scored|offered]
+                    [--changes declared|scored|offered] [--skills on|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
 prints. --context is the most tokens a chat keeps: auto (the default) is as many as the
 GPU's free memory holds once the model is loaded, up to the model's own limit; --exact runs f32
-arithmetic. Chats' caches are saved in %LOCALAPPDATA%\\VireoPrototype\\chat-cache (or
+arithmetic. Chats' caches are saved in the prototype's folder (on Windows
+%LOCALAPPDATA%\\VireoPrototype, on the Mac ~/Library/Application Support/VireoPrototype),
+in chat-cache (or
 --chat-cache's folder; off for none), so going back to a chat reads only what's new.
 
 The tools that change files are offered when one scored question says the request asks
 for a change (--changes), and each waits for the user's approval in the app. The kinds
-the user always allows are kept in %LOCALAPPDATA%\\VireoPrototype\\approvals.txt.
+the user always allows are kept in approvals.txt in that folder.
 
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
 and --with-app (stop when the app does: when its end of standard input closes), and
@@ -86,6 +90,9 @@ struct Options {
     /// kept from a change it wanted called another tool); `offered`, always. Measured
     /// 2026-11-11 (PLAN.md).
     changes: Changes,
+    /// Skills picked by scoring and written in as a `use_skill` call (`--skills on`, the
+    /// default), or none (`off`).
+    skills: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -118,6 +125,7 @@ fn main() -> ExitCode {
     let mut scored_groups = false;
     let mut heal = true;
     let mut changes = Changes::Declared;
+    let mut use_skills = true;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -165,6 +173,10 @@ fn main() -> ExitCode {
                 };
                 i += 1;
             }
+            "--skills" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                use_skills = value.unwrap() == "on";
+                i += 1;
+            }
             "--score-choices" if matches!(value.map(String::as_str), Some("on" | "off")) => {
                 score_choices = value.unwrap() == "on";
                 i += 1;
@@ -200,6 +212,7 @@ fn main() -> ExitCode {
         heal,
         scored_groups,
         changes,
+        skills: use_skills,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -292,8 +305,8 @@ type ToolWaits = Arc<Mutex<HashMap<String, Sender<Result<String, String>>>>>;
 struct Approvals {
     /// By approval id: where the answer (approved, remember) goes.
     waiting: Mutex<HashMap<String, Sender<(bool, bool)>>>,
-    /// Tools the user said not to ask about again, kept in
-    /// %LOCALAPPDATA%\VireoPrototype\approvals.txt (a tool a line), as the Mac keeps
+    /// Tools the user said not to ask about again, kept in approvals.txt in the
+    /// prototype's folder (`store::data_dir`), a tool a line, as the Mac's server keeps
     /// approvals.json.
     always: Mutex<Vec<String>>,
 }
@@ -307,9 +320,7 @@ impl Approvals {
         if let Some(file) = std::env::var_os("VIREO_APPROVALS_FILE") {
             return PathBuf::from(file);
         }
-        let base =
-            std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-        base.join("VireoPrototype").join("approvals.txt")
+        store::data_dir().join("approvals.txt")
     }
 
     fn load() -> Vec<String> {
@@ -339,7 +350,7 @@ impl Approvals {
 // ---- Pairing ---------------------------------------------------------------------------
 
 /// The code shown when the server starts, and the tokens it has given out, kept in
-/// %LOCALAPPDATA%\VireoPrototype\server-pairings.txt (a token and a device name a line)
+/// server-pairings.txt in the prototype's folder (a token and a device name a line)
 /// so the app stays paired across restarts.
 struct Pairing {
     code: String,
@@ -359,9 +370,7 @@ fn random_u64() -> u64 {
 
 impl Pairing {
     fn file() -> PathBuf {
-        let base =
-            std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-        base.join("VireoPrototype").join("server-pairings.txt")
+        store::data_dir().join("server-pairings.txt")
     }
 
     fn load() -> Self {
@@ -501,7 +510,15 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             );
         }
         ("GET", "/api/skill-library/commands") => {
-            http::respond(&mut stream, 200, "{\"skills\":[]}")
+            let names: Vec<String> = pc_skills(&tools::all_names())
+                .iter()
+                .map(|s| format!("{{\"name\":{}}}", json::string(&s.name)))
+                .collect();
+            http::respond(
+                &mut stream,
+                200,
+                &format!("{{\"skills\":[{}]}}", names.join(",")),
+            )
         }
         // The assistant's inbox and activity log, which the app polls: empty here.
         ("GET", "/api/assistant/approvals") => {
@@ -727,6 +744,9 @@ struct Kept {
     /// A small session apart, for questions the server asks the model itself (which tools a
     /// request needs), so the chat's own cache is left as it is.
     picker: Option<Session>,
+    /// Each skill's share of yes for a request that fits no skill, by its question: this
+    /// model's bias, scored once (`pick_skill`).
+    skill_controls: HashMap<String, f64>,
     /// Where the last prompt's history ends (its tokens are still the session's first):
     /// Gemma's chat is saved up to there, which the next turn and a retry both start with,
     /// since its saved state can only be loaded whole.
@@ -1131,6 +1151,7 @@ fn engine(
                 checkpoint: None,
                 scratch: None,
                 picker: None,
+                skill_controls: HashMap::new(),
                 history_end: 0,
             })
         }
@@ -1185,6 +1206,7 @@ fn engine(
                         checkpoint: None,
                         scratch: None,
                         picker: None,
+                        skill_controls: HashMap::new(),
                         history_end: 0,
                     })
                 }
@@ -1316,6 +1338,34 @@ fn reply(
             offered.retain(|t| t.asks.is_none());
         }
     }
+    // The skill the request asks for, if one fits: its instructions come in as the result
+    // of a use_skill call, written after the request, before the model writes.
+    let mut skill_ids = Vec::new();
+    if options().skills
+        && !offered.is_empty()
+        && let Some(request) = job.messages.last()
+        && let Some(skill) = pick_skill(model, kept, tokenizer, family, &offered, &request.content)?
+    {
+        let call = tools::Call {
+            tool: "use_skill".into(),
+            args: vec![("name".into(), tools::Arg::Text(skill.name.clone()))],
+        };
+        let result = skills::instructions(&skill);
+        let (before, body, after) = tools::after_call(family, "use_skill", &result);
+        skill_ids = tokenizer.encode(&tools::call_text(family, &call), false, true);
+        skill_ids.extend(tokenizer.encode(&before, false, true));
+        skill_ids.extend(tokenizer.encode(&body, false, false));
+        skill_ids.extend(tokenizer.encode(&after, false, true));
+        let _ = job.out.send(Out::Event(format!(
+            "{{\"type\":\"tool_call\",\"tool\":\"use_skill\",\"args\":{}}}",
+            call.args_json()
+        )));
+        let _ = job.out.send(Out::Event(format!(
+            "{{\"type\":\"tool_result\",\"tool\":\"use_skill\",\"result\":{}}}",
+            json::string(&preview(&result))
+        )));
+        eprintln!("Skill: {} ({} tokens)", skill.name, skill_ids.len());
+    }
     let declared = tools::declarations(family, &offered);
     // With tools, the system prompt opens with what they're for.
     let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
@@ -1340,6 +1390,7 @@ fn reply(
         let mut ids = tokenizer.encode(&text, false, true);
         let mark = ids.len();
         ids.extend_from_slice(&opening);
+        ids.extend_from_slice(&skill_ids);
         if ids.len() + max_tokens <= context || first + 1 >= job.messages.len() {
             break (ids, mark);
         }
@@ -1538,6 +1589,96 @@ fn reply(
 /// The tool groups a request needs, asked of the model in its picker session: one pass
 /// over a short multiple-choice question, its answer letters scored. Groups at least
 /// `GROUP_SHARE` likely are offered (the likeliest always, unless it's "none").
+/// The skills this PC can follow with these tools (`skills::usable`).
+fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
+    let built_in = skills::built_in_folder();
+    let user = skills::user_folder();
+    skills::load(built_in.as_deref(), user.as_deref())
+        .into_iter()
+        .filter(|s| skills::usable(s, tools))
+        .collect()
+}
+
+/// The skill a request asks for: the one it names (an app's slash command), or the one
+/// that fits best by scoring (`skills::fit_question`, a pass each), if its share of " yes"
+/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the share it gets for a
+/// request that fits no skill (`skills::CONTROL`, scored once per skill while this model
+/// runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
+/// for every request) so picks none, as before skills, instead of a wrong one.
+fn pick_skill(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    family: Family,
+    offered: &[tools::Tool],
+    request: &str,
+) -> Result<Option<skills::Skill>, String> {
+    const SKILL_SHARE: f64 = 0.5;
+    const OVER_CONTROL: f64 = 0.4;
+    let names: Vec<&str> = offered.iter().map(|t| t.name).collect();
+    let mut skills = pc_skills(&names);
+    if let Some(skill) = skills::named(request, &skills) {
+        return Ok(Some(skill.clone()));
+    }
+    let mut best: Option<(f64, usize)> = None;
+    for (i, skill) in skills.iter().enumerate() {
+        let question = skills::fit_question(skill, request);
+        let share = yes_share(model, kept, tokenizer, family, &question, "Fits:")?;
+        let control_question = skills::fit_question(skill, skills::CONTROL);
+        let control = match kept.skill_controls.get(&control_question) {
+            Some(c) => *c,
+            None => {
+                let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
+                kept.skill_controls.insert(control_question, c);
+                c
+            }
+        };
+        if debug_calls() {
+            eprintln!(
+                "[calls] skill {}: {share:.2} (control {control:.2})",
+                skill.name
+            );
+        }
+        if share >= SKILL_SHARE
+            && share - control >= OVER_CONTROL
+            && best.is_none_or(|(b, _)| share > b)
+        {
+            best = Some((share, i));
+        }
+    }
+    Ok(best.map(|(_, i)| skills.swap_remove(i)))
+}
+
+/// The share of " yes" against " no" as the next word after `question`, asked as a user
+/// turn and answered from `lead` ("Fits:"), in the picker's own session.
+fn yes_share(
+    model: &Model,
+    kept: &mut Kept,
+    tokenizer: &Tokenizer,
+    family: Family,
+    question: &str,
+    lead: &str,
+) -> Result<f64, String> {
+    let question = Message {
+        role: "user".into(),
+        content: question.to_string(),
+    };
+    let text =
+        chat::history(family, None, "", &[question], &chat::today()) + chat::opening(family) + lead;
+    let ids = tokenizer.encode(&text, false, true);
+    if kept.picker.is_none() {
+        kept.picker = Some(model.session(1024)?);
+    }
+    let session = kept.picker.as_mut().unwrap();
+    model.empty(session)?;
+    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
+    let score = |word: &str| {
+        let id = tokenizer.encode(&format!(" {word}"), false, false)[0];
+        f64::from(logits[id as usize])
+    };
+    Ok(1.0 / (1.0 + (score("no") - score("yes")).exp()))
+}
+
 /// Whether a request asks to change files, scored in one pass over a question with worked
 /// examples (`tools::change_question`), as `pick_groups` scores groups. "Yes" needs only
 /// `CHANGE_SHARE`: hiding a change the user asked for costs more than an approval they
@@ -1550,26 +1691,14 @@ fn asks_for_change(
     request: &str,
 ) -> Result<bool, String> {
     const CHANGE_SHARE: f64 = 0.3;
-    let question = Message {
-        role: "user".into(),
-        content: tools::change_question(request),
-    };
-    let text = chat::history(family, None, "", &[question], &chat::today())
-        + chat::opening(family)
-        + "Changes:";
-    let ids = tokenizer.encode(&text, false, true);
-    if kept.picker.is_none() {
-        kept.picker = Some(model.session(1024)?);
-    }
-    let session = kept.picker.as_mut().unwrap();
-    model.empty(session)?;
-    let logits = model.read(session, &ids[..ids.len().min(1000)])?;
-    let score = |word: &str| {
-        let id = tokenizer.encode(&format!(" {word}"), false, false)[0];
-        f64::from(logits[id as usize])
-    };
-    let (yes, no) = (score("yes"), score("no"));
-    let share = 1.0 / (1.0 + (no - yes).exp());
+    let share = yes_share(
+        model,
+        kept,
+        tokenizer,
+        family,
+        &tools::change_question(request),
+        "Changes:",
+    )?;
     if debug_calls() {
         eprintln!("[calls] asks for a change: {share:.2}");
     }
@@ -1949,7 +2078,9 @@ fn on_this_pc(path: &str) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        std::env::var_os("USERPROFILE").map_or(path.clone(), |home| PathBuf::from(home).join(&path))
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map_or(path.clone(), |home| PathBuf::from(home).join(&path))
     }
 }
 
