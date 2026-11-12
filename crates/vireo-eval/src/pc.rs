@@ -460,6 +460,92 @@ impl Pc {
                     }
                 }
             }
+            // As the app's WriteSpreadsheetAsync: rows written from a cell, or after the last
+            // row with "append"; a new workbook made when there's none.
+            "write_spreadsheet" => {
+                let path = arg("path")?;
+                let rows: Vec<Vec<String>> = match args.get("rows") {
+                    Some(Value::Array(rows)) => rows
+                        .iter()
+                        .map(|r| match r {
+                            Value::Array(cells) => cells
+                                .iter()
+                                .map(|c| match c {
+                                    Value::String(s) => s.clone(),
+                                    Value::Null => String::new(),
+                                    other => other.to_json(),
+                                })
+                                .collect(),
+                            other => vec![other.to_json()],
+                        })
+                        .collect(),
+                    _ => return Err("Missing argument: rows".into()),
+                };
+                if self.is_folder(&path) {
+                    return Err(format!("{path} is a folder."));
+                }
+                let start = args.str("start_cell").unwrap_or("A1").trim().to_lowercase();
+                let sheet = self.sheets.entry(key(&path)).or_default();
+                let first = if start == "append" {
+                    sheet.len()
+                } else {
+                    start
+                        .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                        .parse::<usize>()
+                        .map_or(0, |n| n.saturating_sub(1))
+                };
+                for (i, row) in rows.iter().enumerate() {
+                    let at = first + i;
+                    if at < sheet.len() {
+                        sheet[at] = row.clone();
+                    } else {
+                        sheet.push(row.clone());
+                    }
+                }
+                let text = sheet_text(sheet);
+                self.files.insert(key(&path), (path.clone(), text));
+                Ok(format!("Wrote {} rows to {path}.", rows.len()))
+            }
+            // As the app's FillTemplateAsync: each {{name}} replaced, saved under a new name
+            // (beside the template when it's a name alone).
+            "fill_docx_template" => {
+                let template = arg("template")?;
+                let Some((_, text)) = self.files.get(&key(&template)).cloned() else {
+                    return Err(self.not_found(&template, format!("File not found: {template}")));
+                };
+                let target = args.str("path").unwrap_or("").trim().to_string();
+                let mut path = if target.contains(['/', '\\']) {
+                    full(&target)
+                } else {
+                    let folder = template.rsplit_once('\\').map_or(HOME, |(f, _)| f);
+                    format!("{folder}\\{target}")
+                };
+                if !path.to_lowercase().ends_with(".docx") {
+                    path.push_str(".docx");
+                }
+                if key(&path) == key(&template) {
+                    return Err("Save the filled document under a new name, so the template stays as it is.".into());
+                }
+                let mut filled = text;
+                let mut names = Vec::new();
+                if let Some(Value::Object(values)) = args.get("values") {
+                    for (name, value) in values {
+                        let value = match value {
+                            Value::String(s) => s.clone(),
+                            other => other.to_json(),
+                        };
+                        let mark = format!("{{{{{}}}}}", name.trim_matches(['{', '}']));
+                        if filled.contains(&mark) {
+                            names.push(name.clone());
+                        }
+                        filled = filled.replace(&mark, &value);
+                    }
+                } else {
+                    return Err("values must name each placeholder and its text.".into());
+                }
+                self.files.insert(key(&path), (path.clone(), filled));
+                Ok(format!("Document saved successfully: {path}\nFilled: {}.", names.join(", ")))
+            }
             // As the app's CheckChange: the change made on a copy, so its errors are the
             // change's own, and nothing here changes.
             "check_change" => {

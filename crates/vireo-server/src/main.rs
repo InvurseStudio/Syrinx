@@ -1921,9 +1921,9 @@ fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
 
 /// The skill a request asks for: the one it names (an app's slash command), or the one
 /// that fits best by scoring (`skills::fit_question`, a pass each), if its share of " yes"
-/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the share it gets for a
-/// request that fits no skill (`skills::CONTROL`, scored once per skill while this model
-/// runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
+/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the highest share it gets
+/// for requests that fit no skill (`skills::CONTROLS`, scored once per skill while this
+/// model runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
 /// for every request) so picks none, as before skills, instead of a wrong one.
 fn pick_skill(
     model: &Model,
@@ -1944,15 +1944,19 @@ fn pick_skill(
     for (i, skill) in skills.iter().enumerate() {
         let question = skills::fit_question(skill, request);
         let share = yes_share(model, kept, tokenizer, family, &question, "Fits:")?;
-        let control_question = skills::fit_question(skill, skills::CONTROL);
-        let control = match kept.skill_controls.get(&control_question) {
-            Some(c) => *c,
-            None => {
-                let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
-                kept.skill_controls.insert(control_question, c);
-                c
-            }
-        };
+        let mut control: f64 = 0.0;
+        for request in skills::CONTROLS {
+            let control_question = skills::fit_question(skill, request);
+            let c = match kept.skill_controls.get(&control_question) {
+                Some(c) => *c,
+                None => {
+                    let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
+                    kept.skill_controls.insert(control_question, c);
+                    c
+                }
+            };
+            control = control.max(c);
+        }
         if debug_calls() {
             eprintln!(
                 "[calls] skill {}: {share:.2} (control {control:.2})",
