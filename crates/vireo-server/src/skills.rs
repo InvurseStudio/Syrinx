@@ -214,13 +214,19 @@ pub fn load(built_in: Option<&Path>, user: Option<&Path>) -> Vec<Skill> {
     all
 }
 
-/// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`, or the repository's
-/// `server/builtin-skills` found above this program (it runs from `target/release`).
+/// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`; `builtin-skills` beside this
+/// program, where an installed app keeps them (the Windows prototype's install script
+/// copies them there); or the repository's `server/builtin-skills` found above it (it
+/// runs from `target/release`).
 pub fn built_in_folder() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VIREO_BUILTIN_SKILLS") {
         return Some(PathBuf::from(dir));
     }
     let exe = std::env::current_exe().ok()?;
+    let beside = exe.parent()?.join("builtin-skills");
+    if beside.is_dir() {
+        return Some(beside);
+    }
     exe.ancestors()
         .skip(1)
         .take(6)
@@ -275,8 +281,9 @@ pub fn named<'a>(request: &str, skills: &'a [Skill]) -> Option<&'a Skill> {
 }
 
 /// A request no skill fits, scored against each skill to learn how far a model says yes
-/// to anything (`pick_skill` in main.rs).
-pub const CONTROL: &str = "What is 17 times 23?";
+/// to anything (`pick_skill` in main.rs). A plain fact: arithmetic ("What is 17 times
+/// 23?", the first control) is near `analyze-data`, and Gemma 4 E2B said yes to it there.
+pub const CONTROL: &str = "What's the capital of France?";
 
 /// The question that scores whether one skill fits a request, with worked examples (of
 /// made-up skills, so none is favoured), ending where " yes" or " no" goes.

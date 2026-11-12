@@ -1,12 +1,15 @@
-//! The read-only tools this server runs on the Mac it's on: reading, listing and searching
-//! files, and Git's status and diff. The app and the server share the Mac, so the server
-//! reaches the files itself rather than asking the app (`client_tool_request`, which stays
-//! for an app on another PC). The answers are worded as the Windows app's `PcTools` and
-//! the eval's stand-in PC (`vireo-eval`'s `pc.rs`) word theirs, so the model reads them the
-//! same way. Nothing here changes a file: tools that do will come with approvals.
+//! The file tools this server runs on the machine it's on, Mac or PC: reading, listing and
+//! searching files, and Git's status and diff. When the app and the server share a machine
+//! the server reaches the files itself rather than asking the app (`client_tool_request`,
+//! which stays for an app that runs them, as the Windows app does). The answers are worded
+//! as the Windows app's `PcTools` and the eval's stand-in PC (`vireo-eval`'s `pc.rs`) word
+//! theirs, so the model reads them the same way.
 //!
 //! What a chat may reach is its access level, sent with each chat: the home folder without
-//! `~/Library`, the folders the user chose (sent with it), or the whole Mac.
+//! `~/Library` (on Windows, without AppData), the folders the user chose (sent with it), or
+//! the whole machine. Paths are the machine's own: `/` on the Mac, drive letters and `\` on
+//! Windows, compared ignoring case on both. PDFs and Word documents are read with the Mac's
+//! own readers there, and with the server's (`attach/`) elsewhere.
 
 use std::fs;
 use std::io::Read;
@@ -32,7 +35,19 @@ const RICH_TEXT_EXTENSIONS: [&str; 5] = ["docx", "doc", "rtf", "rtfd", "odt"];
 /// Documents these tools can't read yet.
 const UNREAD_DOCUMENTS: [&str; 6] = ["xlsx", "xlsm", "pptx", "pages", "numbers", "key"];
 
-/// How much of the Mac a chat may reach (the app's `AgentAccess`).
+/// The machine's path separator.
+#[cfg(windows)]
+pub const SEP: char = '\\';
+#[cfg(not(windows))]
+pub const SEP: char = '/';
+
+/// What the answers call this machine.
+#[cfg(target_os = "macos")]
+const MACHINE: &str = "Mac";
+#[cfg(not(target_os = "macos"))]
+const MACHINE: &str = "PC";
+
+/// How much of the machine a chat may reach (the app's `AgentAccess`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Access {
     /// The user's folder, without `~/Library`.
@@ -75,16 +90,20 @@ impl Files {
         }
     }
 
-    /// For the user this server runs as.
+    /// For the user this server runs as: `HOME`, or on Windows `USERPROFILE`.
     pub fn for_user(access: Access) -> Files {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        Files::new(&home, access)
+        let home = if cfg!(windows) {
+            std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
+        } else {
+            std::env::var("HOME")
+        };
+        Files::new(&home.unwrap_or_else(|_| SEP.to_string()), access)
     }
 
-    /// `~/Library` holds other apps' data and sign-ins, so home access leaves it out (as
-    /// the Windows app leaves out AppData).
+    /// `~/Library` holds other apps' data and sign-ins, so home access leaves it out, as
+    /// the Windows app leaves out AppData (which this leaves out on Windows).
     fn library(&self) -> String {
-        format!("{}/Library", self.home)
+        join(&self.home, if cfg!(windows) { "AppData" } else { "Library" })
     }
 
     /// Runs one of the tools: its answer, or what went wrong, worded for the model.
@@ -100,7 +119,7 @@ impl Files {
             ),
             "git_status" => self.git_status(&arg(call, "path")?),
             "git_diff" => self.git_diff(&arg(call, "path")?),
-            other => Err(format!("{other} can't run on this Mac.")),
+            other => Err(format!("{other} can't run on this {MACHINE}.")),
         }
     }
 
@@ -115,15 +134,21 @@ impl Files {
         }
         if expanded == "~" {
             expanded = "";
-        } else if let Some(rest) = expanded.strip_prefix("~/") {
+        } else if let Some(rest) = expanded
+            .strip_prefix("~/")
+            .or_else(|| expanded.strip_prefix("~\\"))
+        {
             expanded = rest;
         }
-        let full = standardized(&if expanded.starts_with('/') {
+        let full = standardized(&if is_absolute(expanded) {
             expanded.to_string()
+        } else if cfg!(windows) && (expanded.starts_with('/') || expanded.starts_with('\\')) {
+            // The root of the home folder's drive.
+            format!("{}{expanded}", self.home.get(..2).unwrap_or(""))
         } else if expanded.is_empty() {
             self.home.clone()
         } else {
-            format!("{}/{expanded}", self.home)
+            join(&self.home, expanded)
         });
         match &self.access {
             Access::Full => Ok(full),
@@ -149,7 +174,8 @@ impl Files {
                 }
                 if is_within(&full, &self.library()) {
                     return Err(format!(
-                        "{full} is in ~/Library, which these tools can't reach."
+                        "{full} is in {}, which these tools can't reach.",
+                        if cfg!(windows) { "AppData" } else { "~/Library" }
                     ));
                 }
                 Ok(full)
@@ -195,7 +221,7 @@ impl Files {
         }
         if UNREAD_DOCUMENTS.contains(&ext.as_str()) {
             return Err(format!(
-                "{name} is a document this Mac's tools can't read yet. read_file can read text files, PDFs and Word documents."
+                "{name} is a document this {MACHINE}'s tools can't read yet. read_file can read text files, PDFs and Word documents."
             ));
         }
         let size = meta.len();
@@ -366,7 +392,7 @@ impl Files {
                         continue;
                     }
                     if name_matches(&name, &words) {
-                        results.push(format!("{full}/ (folder name matches)"));
+                        results.push(format!("{full}{SEP} (folder name matches)"));
                     }
                     if depth < MAX_SEARCH_DEPTH {
                         queue.push((full, depth + 1));
@@ -500,17 +526,13 @@ impl Files {
 
 /// Runs Git with its output and errors together, giving up after `GIT_TIMEOUT`.
 pub fn git(arguments: &[&str], folder: &str) -> Result<(i32, String), String> {
-    let Some(git) = [
-        "/usr/bin/git",
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-    ]
-    .into_iter()
-    .find(|p| Path::new(p).is_file()) else {
-        return Err(
+    let Some(git) = git_program() else {
+        return Err(if cfg!(target_os = "macos") {
             "Git isn't installed on this Mac. Installing Xcode's command line tools adds it."
-                .into(),
-        );
+                .into()
+        } else {
+            "Git isn't installed on this PC, or isn't on its PATH.".into()
+        });
     };
     let (mut reader, writer) = std::io::pipe().map_err(|e| format!("Couldn't run Git: {e}"))?;
     let errors = writer
@@ -557,11 +579,95 @@ pub fn git(arguments: &[&str], folder: &str) -> Result<(i32, String), String> {
     ))
 }
 
+/// Where Git is: on the Mac, where Xcode's tools or Homebrew put it; elsewhere, on the PATH
+/// (and Git for Windows' own folder).
+fn git_program() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return [
+            "/usr/bin/git",
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .map(str::to_string);
+    }
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .chain(
+            cfg!(windows)
+                .then(|| std::path::PathBuf::from(r"C:\Program Files\Git\cmd\git.exe")),
+        )
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 // ---- Helpers ----------------------------------------------------------------------------
+
+/// Whether a path names a place by itself: `/…` on the Mac; on Windows a drive (`C:\…`)
+/// or a network share (`\\server\share\…`).
+pub fn is_absolute(path: &str) -> bool {
+    if cfg!(windows) {
+        let b = path.as_bytes();
+        (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+            || path.starts_with("\\\\")
+            || path.starts_with("//")
+    } else {
+        path.starts_with('/')
+    }
+}
+
+/// A path with `.` and `..` worked out and no doubled or trailing separator. On Windows,
+/// `/` read as `\`, and the drive letter upper case (`C:\Users\me`).
+#[cfg(windows)]
+pub fn standardized(path: &str) -> String {
+    let p = path.replace('/', "\\");
+    let b = p.as_bytes();
+    let (prefix, rest): (String, &str) =
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            (format!("{}:\\", p[..1].to_uppercase()), &p[2..])
+        } else if let Some(unc) = p.strip_prefix("\\\\") {
+            let mut parts = unc.splitn(3, '\\');
+            let (server, share) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            (format!("\\\\{server}\\{share}\\"), parts.next().unwrap_or(""))
+        } else {
+            (String::new(), p.as_str())
+        };
+    let absolute = !prefix.is_empty();
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('\\') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|p| *p != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            p => parts.push(p),
+        }
+    }
+    let joined = parts.join("\\");
+    if absolute {
+        if joined.is_empty() {
+            prefix
+        } else {
+            format!("{prefix}{joined}")
+        }
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
 
 /// A path with `.` and `..` worked out, no doubled or trailing `/`, and `/private` left off
 /// where the rest names the same place (`/var`, `/tmp`), as the Mac's
 /// `standardizingPath` writes it.
+#[cfg(not(windows))]
 pub fn standardized(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
@@ -597,15 +703,16 @@ pub fn standardized(path: &str) -> String {
     result
 }
 
-/// The Mac's disks are case-insensitive by default, so paths are compared that way.
+/// The Mac's disks are case-insensitive by default, and Windows' always are, so paths are
+/// compared that way.
 pub fn is_within(path: &str, folder: &str) -> bool {
     let p = path.to_lowercase();
     let f = folder.to_lowercase();
     p == f
-        || p.starts_with(&if f == "/" {
-            "/".to_string()
+        || p.starts_with(&if f.ends_with(SEP) {
+            f.clone()
         } else {
-            format!("{f}/")
+            format!("{f}{SEP}")
         })
 }
 
@@ -643,23 +750,24 @@ pub fn is_file_name(text: &str) -> bool {
 }
 
 fn join(folder: &str, name: &str) -> String {
-    if folder == "/" {
-        format!("/{name}")
+    if folder.ends_with(SEP) {
+        format!("{folder}{name}")
     } else {
-        format!("{folder}/{name}")
+        format!("{folder}{SEP}{name}")
     }
 }
 
 fn parent(path: &str) -> String {
-    match path.rfind('/') {
-        Some(0) => "/".into(),
+    match path.rfind(SEP) {
+        // The root: "/", or a drive's "C:\".
+        Some(i) if i == 0 || path[..i].ends_with(':') => path[..=i].into(),
         Some(i) => path[..i].into(),
         None => ".".into(),
     }
 }
 
 fn file_name(path: &str) -> String {
-    path.rsplit('/').next().unwrap_or(path).to_string()
+    path.rsplit([SEP, '/']).next().unwrap_or(path).to_string()
 }
 
 fn is_dir(path: &str) -> bool {
@@ -674,7 +782,7 @@ fn is_symlink(path: &str) -> bool {
 fn names_in(folder: &str) -> Result<Vec<String>, String> {
     let entries = fs::read_dir(folder).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
-            "this Mac doesn't give permission to see it".to_string()
+            format!("this {MACHINE} doesn't give permission to see it")
         }
         std::io::ErrorKind::NotFound => "it isn't there".to_string(),
         _ => e.to_string(),
@@ -757,20 +865,27 @@ mod documents {
     }
 }
 
+/// Off the Mac, PDFs and Word documents through the server's own readers (`attach/`, the
+/// ones attachments use); RTF and OpenDocument aren't read yet.
 #[cfg(not(target_os = "macos"))]
 mod documents {
-    pub fn pdf_text(_path: &str) -> Option<String> {
-        None
+    pub fn pdf_text(path: &str) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        crate::attach::pdf::text(&bytes).ok()
     }
-    pub fn rich_text(_path: &str) -> Option<String> {
-        None
+    pub fn rich_text(path: &str) -> Option<String> {
+        if !path.to_lowercase().ends_with(".docx") {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        crate::attach::docx::text(&bytes).ok()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     //! `LocalToolsTests` from the app, where these tools were before, on a home folder made
-    //! for each test.
+    //! for each test. Written in the Mac's paths; `windows_tests` has Windows'.
     use super::*;
 
     struct Home(String);
@@ -1274,5 +1389,130 @@ mod tests {
             failure(&t, "git_status", &[("path", "Nowhere")]),
             format!("Project directory not found: {}/Nowhere", h.0)
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    //! The tools on Windows: its paths, its home folder without AppData, and documents read
+    //! with the server's own readers.
+    use super::*;
+
+    struct Home(String);
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn home() -> Home {
+        let base = std::env::temp_dir().join(format!("FileTools-{:016x}", crate::random_u64()));
+        let home = Home(standardized(&base.to_string_lossy()));
+        for (file, text) in [
+            (r"Documents\notes.txt", "The code word for Friday is PELICAN."),
+            (r"Documents\Invoices\acme-november.txt", "Acme, CAD 1,200"),
+            (r"Projects\garden\plan.md", "Plant tomatoes in May."),
+            (r"AppData\Local\secret.txt", "secret"),
+        ] {
+            let path = join(&home.0, file);
+            fs::create_dir_all(parent(&path)).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), r"\tests\fixtures");
+        for name in ["note.pdf", "report.docx"] {
+            fs::copy(
+                format!(r"{fixtures}\{name}"),
+                join(&home.0, &format!(r"Documents\{name}")),
+            )
+            .unwrap();
+        }
+        home
+    }
+
+    fn run(files: &Files, tool: &str, args: &[(&str, &str)]) -> Result<String, String> {
+        files.run(&Call {
+            tool: tool.into(),
+            args: args
+                .iter()
+                .map(|(k, v)| (k.to_string(), Arg::Text(v.to_string())))
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn paths_are_windows_paths() {
+        assert_eq!(standardized(r"c:\Users\me\.\Documents\..\Desktop\"), r"C:\Users\me\Desktop");
+        assert_eq!(standardized("C:/Users/me/Documents"), r"C:\Users\me\Documents");
+        assert_eq!(standardized(r"C:\"), r"C:\");
+        assert_eq!(standardized(r"C:\.."), r"C:\");
+        assert_eq!(standardized(r"\\server\share\a\..\b"), r"\\server\share\b");
+        assert!(is_absolute(r"D:\x") && is_absolute(r"\\server\share") && !is_absolute(r"Documents\x"));
+        assert!(is_within(r"C:\Users\Me\documents", r"c:\users\me"));
+        assert!(!is_within(r"C:\Users\meg", r"C:\Users\me"));
+        assert!(is_within(r"C:\anything", r"C:\"));
+        assert_eq!(parent(r"C:\Users\me"), r"C:\Users");
+        assert_eq!(parent(r"C:\Users"), r"C:\");
+        assert_eq!(file_name(r"C:\Users\me\notes.txt"), "notes.txt");
+        assert_eq!(join(r"C:\", "Users"), r"C:\Users");
+    }
+
+    #[test]
+    fn the_home_folder_without_appdata() {
+        let h = home();
+        let t = Files::new(&h.0, Access::Home);
+        let notes = join(&h.0, r"Documents\notes.txt");
+        // Relative, with either slash, from ~, and in full.
+        for path in [r"Documents\notes.txt", "Documents/notes.txt", r"~\Documents\notes.txt", &notes] {
+            assert_eq!(t.resolve(path), Ok(notes.clone()), "{path}");
+        }
+        assert!(t.resolve(r"AppData\Local\secret.txt").unwrap_err().contains("AppData"));
+        assert!(t.resolve(r"C:\Windows\win.ini").unwrap_err().contains("outside the user's folder"));
+        assert_eq!(
+            run(&t, "read_file", &[("path", r"Documents\notes.txt")]),
+            Ok("The code word for Friday is PELICAN.".into())
+        );
+        assert_eq!(
+            run(&t, "list_directory", &[("path", "Documents")]),
+            Ok("[dir]  Invoices\n[file] note.pdf\n[file] notes.txt\n[file] report.docx".into())
+        );
+        // Listing the home folder leaves AppData's insides out of a deep listing.
+        let deep = run(&t, "list_directory", &[("path", "~"), ("depth", "3")]).unwrap();
+        assert!(!deep.contains("secret.txt"), "{deep}");
+        let found = run(&t, "search_files", &[("pattern", "invoices"), ("directory", "~")]).unwrap();
+        assert!(
+            found.contains(&format!(r"{}\Documents\Invoices\ (folder name matches)", h.0)),
+            "{found}"
+        );
+        let found = run(&t, "search_files", &[("pattern", "tomatoes"), ("directory", "Projects")]).unwrap();
+        assert!(found.contains(r"garden\plan.md:1: Plant tomatoes in May."), "{found}");
+        assert_eq!(
+            run(&t, "read_file", &[("path", r"Documents\nowhere.txt")]),
+            Err(format!(r"File not found: {}\Documents\nowhere.txt", h.0))
+        );
+    }
+
+    #[test]
+    fn pdfs_and_word_documents_are_read_with_the_servers_readers() {
+        let h = home();
+        let t = Files::new(&h.0, Access::Home);
+        let pdf = run(&t, "read_file", &[("path", r"Documents\note.pdf")]).unwrap();
+        assert!(pdf.contains("The launch code is BLUE HERON 42."), "{pdf}");
+        let docx = run(&t, "read_file", &[("path", r"Documents\report.docx")]).unwrap();
+        assert!(docx.starts_with("Quarterly report\n"), "{docx}");
+    }
+
+    #[test]
+    fn git_is_found_on_the_path() {
+        if git_program().is_none() {
+            return; // no Git on this PC
+        }
+        let h = home();
+        let project = join(&h.0, r"Projects\garden");
+        git(&["init", "-q"], &project).unwrap();
+        let t = Files::new(&h.0, Access::Home);
+        let status = run(&t, "git_status", &[("path", r"Projects\garden")]).unwrap();
+        assert!(status.contains("plan.md"), "{status}");
+        assert!(status.contains(&crate::json::string(&project)), "{status}");
     }
 }
