@@ -1793,7 +1793,7 @@ fn reply(
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
-    let (mut calls, mut call_tokens) = (0usize, 0usize);
+    let (mut calls, mut call_tokens, mut repeats) = (0usize, 0usize, 0usize);
     let mut turn_start = true;
     // Once calls are used up (or the model repeats one), it may only answer: the tokens
     // that start a call are taken away from it.
@@ -1943,10 +1943,18 @@ fn reply(
                 json::string(&call.tool)
             )));
             // The same call again, with the same arguments, would get the same answer: a
-            // small model can loop on one. It isn't run again, and the model must answer.
+            // small model can loop on one. It isn't run again. The first time, the model may
+            // still call another tool (Qwen 3.5 4B repeated a sum in the test gauntlet, then had
+            // no way left to fill the template it was asked to); the second, it must answer.
             let repeated = last_call.as_ref() == Some(&call);
-            let result = if repeated {
+            if repeated {
+                repeats += 1;
+            }
+            let result = if repeated && repeats >= 2 {
                 "This is the same call as the last one, and its result is above. Answer the user from it now."
+                    .to_string()
+            } else if repeated {
+                "This is the same call as the last one, and its result is above. Go on from it: call the next tool the task needs, or answer."
                     .to_string()
             } else {
                 match run_tool(&call, &offered, job) {
@@ -1954,7 +1962,7 @@ fn reply(
                     None => break, // stopped while the app ran it
                 }
             };
-            if repeated || calls == MAX_CALLS {
+            if repeats >= 2 || calls == MAX_CALLS {
                 may_call = false;
             }
             last_call = Some(call.clone());
@@ -2079,9 +2087,9 @@ fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
 
 /// The skill a request asks for: the one it names (an app's slash command), or the one
 /// that fits best by scoring (`skills::fit_question`, a pass each), if its share of " yes"
-/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the share it gets for a
-/// request that fits no skill (`skills::CONTROL`, scored once per skill while this model
-/// runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
+/// is at least `SKILL_SHARE` and at least `OVER_CONTROL` above the highest share it gets
+/// for requests that fit no skill (`skills::CONTROLS`, scored once per skill while this
+/// model runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
 /// for every request) so picks none, as before skills, instead of a wrong one.
 fn pick_skill(
     model: &Model,
@@ -2102,15 +2110,19 @@ fn pick_skill(
     for (i, skill) in skills.iter().enumerate() {
         let question = skills::fit_question(skill, request);
         let share = yes_share(model, kept, tokenizer, family, &question, "Fits:")?;
-        let control_question = skills::fit_question(skill, skills::CONTROL);
-        let control = match kept.skill_controls.get(&control_question) {
-            Some(c) => *c,
-            None => {
-                let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
-                kept.skill_controls.insert(control_question, c);
-                c
-            }
-        };
+        let mut control: f64 = 0.0;
+        for request in skills::CONTROLS {
+            let control_question = skills::fit_question(skill, request);
+            let c = match kept.skill_controls.get(&control_question) {
+                Some(c) => *c,
+                None => {
+                    let c = yes_share(model, kept, tokenizer, family, &control_question, "Fits:")?;
+                    kept.skill_controls.insert(control_question, c);
+                    c
+                }
+            };
+            control = control.max(c);
+        }
         if debug_calls() {
             eprintln!(
                 "[calls] skill {}: {share:.2} (control {control:.2})",

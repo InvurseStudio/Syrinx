@@ -52,12 +52,14 @@ pub struct Run {
 }
 
 /// The tools that change files: they ask the user first.
-pub const CHANGE_TOOLS: [&str; 5] = [
+pub const CHANGE_TOOLS: [&str; 7] = [
     "write_file",
     "rename_file",
     "move_file",
     "delete_file",
     "create_docx",
+    "write_spreadsheet",
+    "fill_docx_template",
 ];
 
 impl Run {
@@ -143,6 +145,7 @@ pub fn all() -> Vec<Case> {
     all.extend(crate::change_cases::all());
     all.extend(crate::skill_cases::all());
     all.extend(crate::more_cases::all());
+    all.extend(crate::office_cases::all());
     all
 }
 
