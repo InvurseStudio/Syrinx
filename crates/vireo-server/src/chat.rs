@@ -10,6 +10,9 @@ pub enum Family {
     Llama,
     Qwen35,
     Gemma4,
+    /// Muse Glimmer: Gemma 4's layer with other choices, run by the same model code
+    /// (`Gemma4Cuda`, `Config::muse`), with a chat format of its own.
+    Muse,
 }
 
 impl Family {
@@ -18,12 +21,14 @@ impl Family {
             "llama" => Some(Family::Llama),
             "qwen35" => Some(Family::Qwen35),
             "gemma4" => Some(Family::Gemma4),
+            "muse-glimmer" => Some(Family::Muse),
             _ => None,
         }
     }
 
-    /// Recommended sampling (model_profiles.py: Qwen 0.6 / 0.95 / top-k 20, Gemma 4 1.0
-    /// / 0.95 / 64, others 0.7 / 0.9).
+    /// Recommended sampling (model_profiles.py: Qwen 0.6 / 0.95 / top-k 20, Gemma 4 and
+    /// Muse 1.0 / 0.95 / 64, others 0.7 / 0.9). Muse's generation_config.json asks for
+    /// greedy decoding; its model card's settings are these.
     pub fn sampling(self) -> Settings {
         match self {
             Family::Qwen35 => Settings {
@@ -32,7 +37,7 @@ impl Family {
                 top_k: 20,
                 ..Settings::default()
             },
-            Family::Gemma4 => Settings {
+            Family::Gemma4 | Family::Muse => Settings {
                 temperature: 1.0,
                 top_p: 0.95,
                 top_k: 64,
@@ -69,8 +74,29 @@ pub fn opening(family: Family) -> &'static str {
         // Thinking off: the template's empty thought.
         Family::Qwen35 => "<|im_start|>assistant\n<think>\n\n</think>\n\n",
         Family::Gemma4 => "<|turn>model\n",
+        // Muse's turn names its recipient next: the reply loop has the model choose
+        // between the user and a tool (`tools::call_grammar`).
+        Family::Muse => "<|start|>assistant",
     }
 }
+
+/// The reply's turn opened for a plain answer (for a question the server asks the model
+/// itself): `opening`, with Muse's recipient the user.
+pub fn answer_opening(family: Family) -> &'static str {
+    match family {
+        Family::Muse => "<|start|>assistant to=user<|message|>",
+        other => opening(other),
+    }
+}
+
+/// Muse thinks to itself in a message `to=self`; thinking off, it isn't offered one, and
+/// its template's switch is set as the Mac's server sets it for thinking off.
+pub const MUSE_REASONING: &str = "Reasoning strength: low.";
+
+/// What the Mac's server adds to a system prompt of Vireo's for Muse (model_profiles.py's
+/// `system_note`): the knowledge cutoff its own default system turn gives, and a line for
+/// replies it would otherwise run on.
+pub const MUSE_NOTE: &str = "Knowledge cutoff: January 4, 2026.\n\nKeep the final reply short: the result, then the points the user must know. Do not restate rules, file contents or your steps, do not list the sources again, and do not offer a menu of next steps. Never shorten a draft, a document or a list the user asked for.";
 
 /// The system prompt, the tools' declarations (`tools::declarations`, or "" for none) and
 /// `messages`, without the reply's turn. The declarations go where each template puts
@@ -147,8 +173,61 @@ pub fn history(
                 out.push_str("<turn|>\n");
             }
         }
+        Family::Muse => {
+            out.push_str("<|begin_of_text|><|start|>system<|message|>");
+            match system {
+                Some(s) => {
+                    out.push_str(s);
+                    out.push_str("\n\n");
+                    out.push_str(MUSE_NOTE);
+                }
+                // The template's own system turn, when the chat has none.
+                None => {
+                    out.push_str(
+                        "You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: ",
+                    );
+                    out.push_str(&iso_date(today));
+                    out.push('.');
+                }
+            }
+            out.push_str("\n\n");
+            out.push_str(MUSE_REASONING);
+            out.push_str("\n\n");
+            if tools.is_empty() {
+                out.push_str("# Valid recipients: \"self\", \"user\".");
+            } else {
+                // The tools' declarations end with the recipients they add.
+                out.push_str(tools);
+            }
+            out.push_str("<|eot|>");
+            for m in messages {
+                if m.role == "assistant" {
+                    out.push_str("<|start|>assistant to=user<|message|>");
+                } else {
+                    out.push_str("<|start|>user<|message|>");
+                }
+                out.push_str(m.content.trim());
+                out.push_str("<|eot|>");
+            }
+        }
     }
     out
+}
+
+/// "2026-11-12" (the Muse template's `strftime_now('%Y-%m-%d')`) from `today`'s
+/// "12 Nov 2026"; `today` itself if it isn't one.
+fn iso_date(today: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: Vec<&str> = today.split(' ').collect();
+    match parts[..] {
+        [day, month, year] => match MONTHS.iter().position(|m| *m == month) {
+            Some(i) => format!("{year}-{:02}-{day}", i + 1),
+            None => today.to_string(),
+        },
+        _ => today.to_string(),
+    }
 }
 
 /// An earlier reply without any thinking in it (the templates leave past thoughts out).
@@ -229,6 +308,36 @@ mod tests {
                  Cutting Knowledge Date: December 2023\nToday Date: 11 Nov 2026\n\n<|eot_id|>"
             )
         );
+    }
+
+    #[test]
+    fn writes_muses_turns_as_its_template_does() {
+        // No system prompt: the template's own system turn, with the date.
+        assert_eq!(
+            prompt(Family::Muse, None, &chat(), "12 Nov 2026"),
+            "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\n\
+             Knowledge cutoff: 2026-01-04.\nCurrent date: 2026-11-12.\n\nReasoning strength: low.\n\n\
+             # Valid recipients: \"self\", \"user\".<|eot|>\
+             <|start|>user<|message|>Hi<|eot|><|start|>assistant to=user<|message|>Hello!<|eot|>\
+             <|start|>user<|message|>And you?<|eot|><|start|>assistant"
+        );
+        // A system prompt replaces the template's, with the Mac's note after it; the tools'
+        // declarations bring their recipients.
+        let text = history(Family::Muse, Some("Be brief."), "TOOLS", &chat()[..1], "x");
+        assert_eq!(
+            text,
+            format!(
+                "<|begin_of_text|><|start|>system<|message|>Be brief.\n\n{MUSE_NOTE}\n\n\
+                 Reasoning strength: low.\n\nTOOLS<|eot|><|start|>user<|message|>Hi<|eot|>"
+            )
+        );
+        assert_eq!(
+            answer_opening(Family::Muse),
+            "<|start|>assistant to=user<|message|>"
+        );
+        assert_eq!(answer_opening(Family::Gemma4), opening(Family::Gemma4));
+        assert_eq!(Family::of(Some("muse-glimmer")), Some(Family::Muse));
+        assert_eq!(iso_date("05 Jan 2027"), "2027-01-05");
     }
 
     #[test]

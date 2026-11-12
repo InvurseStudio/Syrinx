@@ -18,6 +18,7 @@ mod bpe;
 mod byte_map;
 mod pretokenize;
 pub mod unicode;
+mod unicode_case_tables;
 mod unicode_tables;
 
 use std::fmt;
@@ -186,7 +187,7 @@ impl Tokenizer {
 
         // llama.cpp's defaults for each pre-tokenizer, then the file's own settings.
         let (default_add_bos, ignore_merges) = match pre {
-            PreTokenizer::Llama3 => (true, true),
+            PreTokenizer::Llama3 | PreTokenizer::Llama4 => (true, true),
             PreTokenizer::Qwen2 | PreTokenizer::Qwen35 => (false, false),
             PreTokenizer::Gemma4 => (true, false),
         };

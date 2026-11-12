@@ -12,9 +12,10 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 // The tile (set by the backend, which sizes the grid to match): weight rows × tokens,
-// and the SIMD groups sharing it. Each kernel comes twice: matmul_tc_* with TC_TOKENS
-// tokens a tile, and matmul_tc_wide_* with TC_WIDE for a prompt's whole batches (a large
-// model's weights decoded half as often).
+// and the SIMD groups sharing it. Each kernel comes four times: matmul_tc_* with TC_TOKENS
+// tokens a tile, matmul_tc_wide_* with TC_WIDE for a prompt's whole batches (a large
+// model's weights decoded half as often), and matmul_tc_t32_* and matmul_tc_t64_* for
+// short batches (SMALL_TILES in src/metal/mod.rs: no multiplying of padding).
 #ifndef TC_ROWS
 #define TC_ROWS 32
 #endif
@@ -38,6 +39,13 @@ kernel void matmul_tc(ARGS, KP) {
     device half* x = ARG_PTR(half, 1);  // the activations in f16 (to_half)
     device float* y = ARG_PTR(float, 2);
     const int rows = ARG_INT(3), cols = ARG_INT(4), tokens = ARG_INT(5);
+    // Split along the columns (gid.z of `splits`, each a whole number of TC_K steps): a
+    // short batch of a matrix with few rows and long ones (ffn_down, attn_output) has too
+    // few threadgroups otherwise. Each split's sums go to its own rows of `parts`, which
+    // sum_parts adds up in order.
+    const int splits = ARG_INT(6);
+    const int chunk = (cols / TC_K + splits - 1) / splits * TC_K;
+    const int k_begin = (int)gid.z * chunk, k_end = min(cols, k_begin + chunk);
     const ulong row_bytes = mm_row_bytes<KIND>(cols);
     threadgroup half sa[TC_ROWS * TC_K];  // the weights' tile: [row][k]
     const int row0 = gid.x * TC_ROWS, tok0 = gid.y * TOK;
@@ -55,7 +63,7 @@ kernel void matmul_tc(ARGS, KP) {
     auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x), decltype(t_w), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); i++) acc[i] = 0.0f;
 
-    for (int k0 = 0; k0 < cols; k0 += TC_K) {
+    for (int k0 = k_begin; k0 < k_end; k0 += TC_K) {
         for (int part = 0; part < PER; part++) {
             const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
             if (lr >= TC_ROWS) break;
@@ -75,6 +83,7 @@ kernel void matmul_tc(ARGS, KP) {
         BARRIER;
     }
     // y holds a row of `rows` per token: C's rows are y's, the contiguous dimension rows.
+    if (splits > 1) y = ARG_PTR(float, 7) + (ulong)gid.z * rows * tokens;
     auto t_y = tensor(y + (ulong)tok0 * rows + row0,
                       dextents<int32_t, 2>(min(TC_ROWS, rows - row0), min(TOK, tokens - tok0)),
                       array<int, 2>({1, rows}));
@@ -88,6 +97,34 @@ template [[host_name("matmul_tc_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_TOKENS
 template [[host_name("matmul_tc_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_TOKENS>(ARGS, KP);
 template [[host_name("matmul_tc_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_TOKENS>(ARGS, KP);
 template [[host_name("matmul_tc_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_t32_f32")]] kernel void matmul_tc<K_F32, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t32_f16")]] kernel void matmul_tc<K_F16, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q4_0")]] kernel void matmul_tc<K_Q4_0, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q8_0")]] kernel void matmul_tc<K_Q8_0, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q4_k")]] kernel void matmul_tc<K_Q4_K, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q5_k")]] kernel void matmul_tc<K_Q5_K, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q6_k")]] kernel void matmul_tc<K_Q6_K, 32>(ARGS, KP);
+template [[host_name("matmul_tc_t64_f32")]] kernel void matmul_tc<K_F32, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t64_f16")]] kernel void matmul_tc<K_F16, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q4_0")]] kernel void matmul_tc<K_Q4_0, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q8_0")]] kernel void matmul_tc<K_Q8_0, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q4_k")]] kernel void matmul_tc<K_Q4_K, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q5_k")]] kernel void matmul_tc<K_Q5_K, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q6_k")]] kernel void matmul_tc<K_Q6_K, 64>(ARGS, KP);
+template [[host_name("matmul_tc_t96_f32")]] kernel void matmul_tc<K_F32, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_f16")]] kernel void matmul_tc<K_F16, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_q4_0")]] kernel void matmul_tc<K_Q4_0, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_q8_0")]] kernel void matmul_tc<K_Q8_0, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_q4_k")]] kernel void matmul_tc<K_Q4_K, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_q5_k")]] kernel void matmul_tc<K_Q5_K, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_q6_k")]] kernel void matmul_tc<K_Q6_K, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t192_f32")]] kernel void matmul_tc<K_F32, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_f16")]] kernel void matmul_tc<K_F16, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_q4_0")]] kernel void matmul_tc<K_Q4_0, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_q8_0")]] kernel void matmul_tc<K_Q8_0, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_q4_k")]] kernel void matmul_tc<K_Q4_K, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_q5_k")]] kernel void matmul_tc<K_Q5_K, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_q6_k")]] kernel void matmul_tc<K_Q6_K, 192>(ARGS, KP);
 template [[host_name("matmul_tc_wide_f32")]] kernel void matmul_tc<K_F32, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_f16")]] kernel void matmul_tc<K_F16, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q4_0")]] kernel void matmul_tc<K_Q4_0, TC_WIDE>(ARGS, KP);
@@ -95,6 +132,18 @@ template [[host_name("matmul_tc_wide_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_W
 template [[host_name("matmul_tc_wide_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_WIDE>(ARGS, KP);
+
+// matmul_tc's splits added up, in order: y[i] = parts[0][i] + parts[1][i] + ...
+kernel void sum_parts(ARGS, KP) {
+    device const float* parts = ARG_PTR(const float, 0);
+    device float* y = ARG_PTR(float, 1);
+    const int n = ARG_INT(2), splits = ARG_INT(3);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= n) return;
+    float total = parts[i];
+    for (int z = 1; z < splits; z++) total += parts[(ulong)z * n + i];
+    y[i] = total;
+}
 
 // The activations rounded to f16 for matmul_tc: 4 numbers a thread (n a multiple of 4).
 kernel void to_half(ARGS, KP) {

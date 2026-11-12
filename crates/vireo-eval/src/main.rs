@@ -369,11 +369,12 @@ impl Server {
         let stderr = child.stderr.take().unwrap();
         let sink = log.clone();
         // With VIREO_DEBUG_CALLS set (the server reads it too), its "[calls]" lines, the
-        // scores behind each choice, are shown as they come.
+        // scores behind each choice, are shown as they come, with each reply's speeds
+        // ("Reply:") and its calls ("Tool:").
         let show = std::env::var_os("VIREO_DEBUG_CALLS").is_some();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if show && line.starts_with("[calls]") {
+                if show && ["[calls]", "Reply:", "Tool:"].iter().any(|p| line.starts_with(p)) {
                     eprintln!("    {line}");
                 }
                 sink.lock().unwrap().push(line);

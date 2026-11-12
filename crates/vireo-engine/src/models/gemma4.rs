@@ -57,11 +57,21 @@ pub struct Config {
     /// (31B).
     pub per_layer_dim: usize,
     pub softcap: Option<f32>,
+    /// Muse Glimmer (`muse-glimmer`), Gemma 4's layer with other choices (see
+    /// `gemma4_cuda.rs`): the embeddings RMS-normed rather than scaled, values not normed,
+    /// attention scaled by 1/sqrt(head size), no RoPE on global layers, SiLU, a sigmoid
+    /// gate (`attn_gate`) on each head's output, and logits times `logit_scale`. GPU
+    /// (Metal) only.
+    pub muse: bool,
+    /// The logits' multiplier before the softcap (Muse: `logit_scale`; Gemma 1).
+    pub logit_scale: f32,
 }
 
 impl Config {
     pub fn from_gguf(file: &GgufFile) -> Result<Self> {
-        if file.architecture() != Some("gemma4") {
+        let arch = file.architecture().unwrap_or("");
+        let muse = arch == "muse-glimmer";
+        if arch != "gemma4" && !muse {
             return Err(Error::Unsupported(format!(
                 "The {:?} architecture with the Gemma 4 forward pass",
                 file.architecture().unwrap_or("unnamed")
@@ -69,7 +79,7 @@ impl Config {
         }
         let layers = required(file, "block_count")?;
         let list = |key: &str| -> Option<Vec<Value>> {
-            file.get(&format!("gemma4.{key}"))?
+            file.get(&format!("{arch}.{key}"))?
                 .as_array()
                 .map(<[_]>::to_vec)
         };
@@ -82,7 +92,7 @@ impl Config {
         };
         let is_swa: Vec<bool> = list("attention.sliding_window_pattern")
             .ok_or_else(|| {
-                Error::Missing("gemma4.attention.sliding_window_pattern setting".into())
+                Error::Missing(format!("{arch}.attention.sliding_window_pattern setting"))
             })?
             .iter()
             .map(|v| v.as_bool().unwrap_or(false))
@@ -110,6 +120,8 @@ impl Config {
             .and_then(Value::as_array)
             .map(<[_]>::len)
             .ok_or_else(|| Error::Missing("vocabulary".into()))?;
+        let head_dim = required(file, "attention.key_length")?;
+        let rope_base = file.arch_f64("rope.freq_base").unwrap_or(1_000_000.0) as f32;
         let c = Self {
             layers,
             dim: required(file, "embedding_length")?,
@@ -120,10 +132,17 @@ impl Config {
                 .unwrap_or(1e-6) as f32,
             heads: required(file, "attention.head_count")?,
             kv_heads,
-            head_dim: required(file, "attention.key_length")?,
-            head_dim_swa: required(file, "attention.key_length_swa")?,
-            rope_base: file.arch_f64("rope.freq_base").unwrap_or(1_000_000.0) as f32,
-            rope_base_swa: file.arch_f64("rope.freq_base_swa").unwrap_or(10_000.0) as f32,
+            head_dim,
+            // Muse's heads and RoPE base are the same on both kinds of layer.
+            head_dim_swa: match file.arch_u64("attention.key_length_swa") {
+                Some(v) => v as usize,
+                None if muse => head_dim,
+                None => required(file, "attention.key_length_swa")?,
+            },
+            rope_base,
+            rope_base_swa: file
+                .arch_f64("rope.freq_base_swa")
+                .map_or(if muse { rope_base } else { 10_000.0 }, |v| v as f32),
             sliding_window: required(file, "attention.sliding_window")?,
             is_swa,
             first_shared_layer: layers - shared,
@@ -131,6 +150,8 @@ impl Config {
                 .arch_u64("embedding_length_per_layer_input")
                 .unwrap_or(0) as usize,
             softcap: file.arch_f64("final_logit_softcapping").map(|v| v as f32),
+            muse,
+            logit_scale: file.arch_f64("logit_scale").map_or(1.0, |v| v as f32),
         };
         if c.kv_heads
             .iter()
@@ -256,6 +277,11 @@ impl Session {
 impl<'a> Gemma4<'a> {
     pub fn load(file: &'a GgufFile, pool: Pool) -> Result<Self> {
         let c = Config::from_gguf(file)?;
+        if c.muse {
+            return Err(Error::Unsupported(
+                "Muse Glimmer on the CPU (it runs on the GPU only)".into(),
+            ));
+        }
         let (dim, pl) = (c.dim, c.per_layer_dim);
         let mut layers = Vec::with_capacity(c.layers);
         for i in 0..c.layers {

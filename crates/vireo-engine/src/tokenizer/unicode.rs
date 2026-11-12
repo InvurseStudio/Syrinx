@@ -9,8 +9,10 @@
 
 use std::cmp::Ordering;
 
+use super::unicode_case_tables::{LOWER, UPPER};
 use super::unicode_tables::{LETTERS, MARKS, NUMBERS};
 
+pub use super::unicode_case_tables::CASE_UNICODE_VERSION;
 pub use super::unicode_tables::UNICODE_VERSION;
 
 fn in_table(table: &[(u32, u32)], c: char) -> bool {
@@ -42,6 +44,28 @@ pub fn is_letter(c: char) -> bool {
 #[inline]
 pub fn is_mark(c: char) -> bool {
     !c.is_ascii() && in_table(MARKS, c)
+}
+
+/// The Llama 4 split's "upper" class, [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]: a letter that
+/// isn't lowercase, or a mark.
+#[inline]
+pub fn is_upper_class(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_uppercase()
+    } else {
+        (in_table(LETTERS, c) && !in_table(LOWER, c)) || in_table(MARKS, c)
+    }
+}
+
+/// The Llama 4 split's "lower" class, [\p{Ll}\p{Lm}\p{Lo}\p{M}]: a letter that isn't
+/// uppercase or titlecase, or a mark.
+#[inline]
+pub fn is_lower_class(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_lowercase()
+    } else {
+        (in_table(LETTERS, c) && !in_table(UPPER, c)) || in_table(MARKS, c)
+    }
 }
 
 /// Unicode general category N.
