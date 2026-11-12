@@ -275,8 +275,9 @@ pub fn named<'a>(request: &str, skills: &'a [Skill]) -> Option<&'a Skill> {
 }
 
 /// A request no skill fits, scored against each skill to learn how far a model says yes
-/// to anything (`pick_skill` in main.rs).
-pub const CONTROL: &str = "What is 17 times 23?";
+/// to anything (`pick_skill` in main.rs). A plain fact: arithmetic ("What is 17 times
+/// 23?", the first control) is near `analyze-data`, and Gemma 4 E2B said yes to it there.
+pub const CONTROL: &str = "What's the capital of France?";
 
 /// The question that scores whether one skill fits a request, with worked examples (of
 /// made-up skills, so none is favoured), ending where " yes" or " no" goes.
