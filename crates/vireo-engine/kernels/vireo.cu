@@ -849,11 +849,14 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
                         float* y, int rows, int cols, int tokens) {
     // 128 columns a step: 64 tensor-core products per warp between syncs. Rows of 128
     // bytes padded to 144 in shared memory, so reading fragments has no bank conflicts.
-    constexpr int K = 128, KS = K + 16, NG = K / GROUP, NX = K / 32, NS = K / 16;
+    constexpr int K = 128, KS = K + 16, NG = K / GROUP, NX = K / 32;
     __shared__ __align__(16) u8 wq[M8_ROWS][KS];
     __shared__ __align__(16) u8 xqs[M8_TOKENS][KS];
-    __shared__ float w_scale[M8_ROWS][NG], w_min[M8_ROWS][NG];
-    __shared__ float x_scale[M8_TOKENS][NX], x_sum[M8_TOKENS][NS];
+    // Scales by group, then row or token, so a warp reads them in pairs (a row's scale
+    // with its minimum; a thread's two tokens' scales or sums) without bank conflicts.
+    // x_sum is per 32 columns: the pairs of 16 added as they're stored.
+    __shared__ __align__(16) float2 w_sm[NG][M8_ROWS];
+    __shared__ __align__(16) float x_scale[NX][M8_TOKENS], x_sum[NX][M8_TOKENS];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, tig = lane & 3;
     const int row0 = blockIdx.x * M8_ROWS, tok0 = blockIdx.y * M8_TOKENS;
@@ -972,10 +975,8 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
             *reinterpret_cast<uint4*>(&wq[r][p * 64 + 16]) = lo[1];
             *reinterpret_cast<uint4*>(&wq[r][p * 64 + 32]) = hi[0];
             *reinterpret_cast<uint4*>(&wq[r][p * 64 + 48]) = hi[1];
-            w_scale[r][2 * p] = s1;
-            w_min[r][2 * p] = m1;
-            w_scale[r][2 * p + 1] = s2;
-            w_min[r][2 * p + 1] = m2;
+            w_sm[2 * p][r] = make_float2(s1, m1);
+            w_sm[2 * p + 1][r] = make_float2(s2, m2);
         } else if constexpr (KIND == K_Q6_K) {
             // Q6_K: a step of 128 columns is half a block, 4 runs of 32. One thread per row
             // and pair of runs (p and p + 2), which share their 4-bit bytes (low and high
@@ -1005,10 +1006,10 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
             *reinterpret_cast<uint4*>(&wq[r][p * 32 + 16]) = lo[1];
             *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32]) = hi[0];
             *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32 + 16]) = hi[1];
-            w_scale[r][2 * p] = sc[0];
-            w_scale[r][2 * p + 1] = sc[1];
-            w_scale[r][2 * (p + 2)] = sc[2];
-            w_scale[r][2 * (p + 2) + 1] = sc[3];
+            w_sm[2 * p][r].x = sc[0];
+            w_sm[2 * p + 1][r].x = sc[1];
+            w_sm[2 * (p + 2)][r].x = sc[2];
+            w_sm[2 * (p + 2) + 1][r].x = sc[3];
         } else {
             // The weights: 128 rows × 8 runs of 16, 4 runs a thread.
 #pragma unroll
@@ -1029,10 +1030,7 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
                     }
                 }
                 *reinterpret_cast<uint4*>(&wq[r][h * 16]) = q;
-                if (GROUP == 16 || (h & 1) == 0) {
-                    w_scale[r][GROUP == 16 ? h : h / 2] = scale;
-                    w_min[r][GROUP == 16 ? h : h / 2] = 0.0f;
-                }
+                if (GROUP == 16 || (h & 1) == 0) w_sm[GROUP == 16 ? h : h / 2][r].x = scale;
             }
         }
         // x: 64 tokens × 8 runs of 16, 2 a thread.
@@ -1040,8 +1038,12 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
         for (int i = 0; i < 2; i++) {
             const int c = tid + i * 256, t = c >> 3, h = c & 7;
             *reinterpret_cast<uint4*>(&xqs[t][h * 16]) = raw.xq[i];
-            x_sum[t][h] = raw.xsum[i];
-            if ((h & 1) == 0) x_scale[t][h / 2] = raw.xscale[i];
+            // The runs h and h + 1 of a group are on neighbouring lanes.
+            const float sum32 = raw.xsum[i] + __shfl_xor_sync(0xFFFFFFFFu, raw.xsum[i], 1);
+            if ((h & 1) == 0) {
+                x_scale[h / 2][t] = raw.xscale[i];
+                x_sum[h / 2][t] = sum32;
+            }
         }
     };
 
@@ -1109,27 +1111,40 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
 #pragma unroll
                 for (int h = 0; h < 2; h++) {
                     const int r = wr + mi * 16 + gid + h * 8;
-                    ws[mi][h] = w_scale[r][g];
-                    wm[mi][h] = has_min ? w_min[r][g] : 0.0f;
+                    if constexpr (has_min) {
+                        const float2 sm = w_sm[g][r];
+                        ws[mi][h] = sm.x;
+                        wm[mi][h] = -sm.y;
+                    } else {
+                        ws[mi][h] = w_sm[g][r].x;
+                        wm[mi][h] = 0.0f;
+                    }
                 }
 #pragma unroll
-            for (int ni = 0; ni < 4; ni++)
-#pragma unroll
-                for (int j = 0; j < 2; j++) {
-                    const int t = wt + ni * 8 + tig * 2 + j;
-                    xsc[ni][j] = x_scale[t][g * GROUP / 32];
-                    xsm[ni][j] = has_min ? x_sum[t][2 * g] + x_sum[t][2 * g + 1] : 0.0f;
+            for (int ni = 0; ni < 4; ni++) {
+                const int t = wt + ni * 8 + tig * 2;
+                const float2 s = *reinterpret_cast<const float2*>(&x_scale[g * GROUP / 32][t]);
+                xsc[ni][0] = s.x;
+                xsc[ni][1] = s.y;
+                if constexpr (has_min) {
+                    const float2 m = *reinterpret_cast<const float2*>(&x_sum[g][t]);
+                    xsm[ni][0] = m.x;
+                    xsm[ni][1] = m.y;
+                } else {
+                    xsm[ni][0] = xsm[ni][1] = 0.0f;
                 }
+            }
 #pragma unroll
             for (int mi = 0; mi < 2; mi++)
 #pragma unroll
                 for (int ni = 0; ni < 4; ni++)
 #pragma unroll
                     for (int i = 0; i < 4; i++) {
+                        // Two fused multiply-adds straight into the sum (the minimum's term
+                        // added on its own, not first subtracted from the product).
                         const int h = i >> 1, j = i & 1;
-                        float v = (float)c[mi][ni][i] * (ws[mi][h] * xsc[ni][j]);
-                        if (has_min) v -= wm[mi][h] * xsm[ni][j];
-                        acc[mi][ni][i] += v;
+                        acc[mi][ni][i] = fmaf((float)c[mi][ni][i], ws[mi][h] * xsc[ni][j], acc[mi][ni][i]);
+                        if (has_min) acc[mi][ni][i] = fmaf(wm[mi][h], xsm[ni][j], acc[mi][ni][i]);
                     }
         }
         __syncthreads();
@@ -1436,6 +1451,59 @@ extern "C" __global__ void residual_norm(float* x, const float* p, const float* 
                                          const float* next, float* h, int n, float eps) {
     __shared__ float scratch[32];
     x += (size_t)blockIdx.x * n;
+    // Rows of up to R numbers a thread (6,144 at 256 threads): every number read into
+    // registers at once, so the reads overlap instead of each waiting on the last (one
+    // token's norm is one block: its time is the reads' latency). The same sums in the
+    // same order as the loop below.
+    constexpr int R = 24;
+    const int bd = blockDim.x, tid = threadIdx.x;
+    if (n <= R * bd) {
+        float xv[R], pv[R], wv[R];
+        if (p) p += (size_t)blockIdx.x * n;
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            const int i = tid + j * bd;
+            xv[j] = i < n ? x[i] : 0.0f;
+            pv[j] = p && i < n ? p[i] : 0.0f;
+            wv[j] = post && i < n ? post[i] : 0.0f;
+        }
+        float p_scale = 1.0f;
+        if (p && post) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+                if (tid + j * bd < n) sum += pv[j] * pv[j];
+            sum = block_sum(sum, scratch);
+            p_scale = 1.0f / sqrtf(sum / (float)n + eps);
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            const int i = tid + j * bd;
+            if (i >= n) break;
+            float v = xv[j];
+            if (p) v += post ? pv[j] * p_scale * wv[j] : pv[j];
+            if (scale != 1.0f) v *= scale;
+            xv[j] = v;
+            x[i] = v;
+            sum += v * v;
+        }
+        if (!next) return;
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            const int i = tid + j * bd;
+            wv[j] = i < n ? next[i] : 0.0f;
+        }
+        sum = block_sum(sum, scratch);
+        const float s = 1.0f / sqrtf(sum / (float)n + eps);
+        h += (size_t)blockIdx.x * n;
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            const int i = tid + j * bd;
+            if (i < n) h[i] = xv[j] * s * wv[j];
+        }
+        return;
+    }
     float p_scale = 1.0f;
     if (p) {
         p += (size_t)blockIdx.x * n;
@@ -1707,6 +1775,189 @@ extern "C" __global__ void attention_part_f16(const float* q, const __half* keys
                                               int group, float scale) {
     attention_part<__half>(q, keys, values, partial, pos, window, hd, kv_dim, group, scale);
 }
+
+// attention_part for an f16 cache (8-bit mode), reading each key and value once for all
+// the query heads that share them. Block (x, part): x is a key/value head and a set of up
+// to 4 of its query heads (`group` / 4 rounded up sets a head); part as in attention_part.
+// Each of the 4 warps takes every 4th position of the part, its lanes splitting the head
+// (HD / 32 numbers each, read as 4–32 contiguous bytes, so a warp reads a row whole), and
+// keeps an online softmax per query head in base 2; the warps are merged at the end into
+// attention_part's partial rows (natural-log maximum), for attention_combine.
+template <int N>
+__device__ __forceinline__ void halves_to_float(const __half* p, float (&out)[N]) {
+    if constexpr (N >= 8) {
+#pragma unroll
+        for (int i = 0; i < N / 8; i++) {
+            const uint4 u = reinterpret_cast<const uint4*>(p)[i];
+            const u32 w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&w[j]));
+                out[i * 8 + 2 * j] = f.x;
+                out[i * 8 + 2 * j + 1] = f.y;
+            }
+        }
+    } else if constexpr (N == 4) {
+        const uint2 u = *reinterpret_cast<const uint2*>(p);
+        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+        const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+        out[0] = a.x, out[1] = a.y, out[2] = b.x, out[3] = b.y;
+    } else {
+        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(p));
+        out[0] = a.x, out[1] = a.y;
+    }
+}
+
+template <int HD>
+__device__ void attention_part_kv(const float* q, const __half* keys, const __half* values, float* partial,
+                                  const int* pos, int window, int kv_dim, int group, float scale) {
+    constexpr int PER = HD / 32, G = 4, WARPS = 4;
+    __shared__ float wm[WARPS][G], wl[WARPS][G];
+    __shared__ __align__(16) float wacc[WARPS][G][HD];
+    const int sets = (group + G - 1) / G;
+    const int kvh = blockIdx.x / sets, set = blockIdx.x % sets;
+    const int head0 = kvh * group + set * G, ng = min(G, group - set * G);
+    const int part = blockIdx.y, parts = gridDim.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int len = *pos + 1;
+    const int first = window > 0 ? max(0, len - window) : 0;
+    const int share = (len - first + parts - 1) / parts;
+    const int lo = first + part * share, hi = min(len, lo + share);
+
+    // The queries, scaled so a score is in base 2.
+    const float qscale = scale * 1.4426950408889634f;
+    float qr[G][PER];
+#pragma unroll
+    for (int g = 0; g < G; g++)
+#pragma unroll
+        for (int e = 0; e < PER; e++)
+            qr[g][e] = g < ng ? q[(size_t)(head0 + g) * HD + lane * PER + e] * qscale : 0.0f;
+
+    float m[G], l[G], acc[G][PER];
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < PER; e++) acc[g][e] = 0.0f;
+    }
+    const size_t off = (size_t)kvh * HD + lane * PER;
+    // The scores of positions in N, all heads at once: the dot products, then their sums
+    // across the warp together, so the shuffles overlap. (Heads past ng have zero queries.)
+    auto scores = [&](const float (&k)[PER], float (&sc)[G]) {
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float s = 0.0f;
+#pragma unroll
+            for (int e = 0; e < PER; e++) s = fmaf(qr[g][e], k[e], s);
+            sc[g] = s;
+        }
+    };
+    auto reduce = [&](float (&sc)[G]) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+            for (int g = 0; g < G; g++) sc[g] += __shfl_xor_sync(0xFFFFFFFFu, sc[g], o);
+    };
+    // U positions a step (4, or 2 for 512-wide heads, by registers), all read before any is
+    // used so more reads are in flight, and one rescaling of the sums for them all.
+    constexpr int U = HD >= 512 ? 2 : 4;
+    int at = lo + warp;
+    for (; at + (U - 1) * WARPS < hi; at += U * WARPS) {
+        float k[U][PER], v[U][PER], sc[U][G];
+#pragma unroll
+        for (int u = 0; u < U; u++) halves_to_float(keys + (size_t)(at + u * WARPS) * kv_dim + off, k[u]);
+#pragma unroll
+        for (int u = 0; u < U; u++) halves_to_float(values + (size_t)(at + u * WARPS) * kv_dim + off, v[u]);
+#pragma unroll
+        for (int u = 0; u < U; u++) scores(k[u], sc[u]);
+#pragma unroll
+        for (int u = 0; u < U; u++) reduce(sc[u]);
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float mn = m[g];
+#pragma unroll
+            for (int u = 0; u < U; u++) mn = fmaxf(mn, sc[u][g]);
+            const float c = exp2f(m[g] - mn);
+            float p[U], psum = 0.0f;
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                p[u] = exp2f(sc[u][g] - mn);
+                psum += p[u];
+            }
+            m[g] = mn;
+            l[g] = fmaf(l[g], c, psum);
+#pragma unroll
+            for (int e = 0; e < PER; e++) {
+                float pv = p[0] * v[0][e];
+#pragma unroll
+                for (int u = 1; u < U; u++) pv = fmaf(p[u], v[u][e], pv);
+                acc[g][e] = fmaf(acc[g][e], c, pv);
+            }
+        }
+    }
+    for (; at < hi; at += WARPS) {
+        float k[PER], v[PER], sc[G];
+        halves_to_float(keys + (size_t)at * kv_dim + off, k);
+        halves_to_float(values + (size_t)at * kv_dim + off, v);
+        scores(k, sc);
+        reduce(sc);
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            const float mn = fmaxf(m[g], sc[g]);
+            const float c = exp2f(m[g] - mn), p = exp2f(sc[g] - mn);
+            m[g] = mn;
+            l[g] = fmaf(l[g], c, p);
+#pragma unroll
+            for (int e = 0; e < PER; e++) acc[g][e] = fmaf(acc[g][e], c, p * v[e]);
+        }
+    }
+
+    // Merge the warps.
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        if (lane == 0) {
+            wm[warp][g] = m[g];
+            wl[warp][g] = l[g];
+        }
+#pragma unroll
+        for (int e = 0; e < PER; e++) wacc[warp][g][lane * PER + e] = acc[g][e];
+    }
+    __syncthreads();
+    for (int g = 0; g < ng; g++) {
+        float mx = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < WARPS; w++) mx = fmaxf(mx, wm[w][g]);
+        float f[WARPS];
+#pragma unroll
+        for (int w = 0; w < WARPS; w++) f[w] = mx == -INFINITY ? 0.0f : exp2f(wm[w][g] - mx);
+        float* out = partial + ((size_t)(head0 + g) * parts + part) * (2 + HD);
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+#pragma unroll
+            for (int w = 0; w < WARPS; w++) total += f[w] * wl[w][g];
+            out[0] = mx * 0.6931471805599453f;  // natural log; -inf for an empty part
+            out[1] = total;
+        }
+        for (int d = threadIdx.x; d < HD; d += 32 * WARPS) {
+            float a = 0.0f;
+#pragma unroll
+            for (int w = 0; w < WARPS; w++) a += f[w] * wacc[w][g][d];
+            out[2 + d] = a;
+        }
+    }
+}
+
+#define ATTENTION_PART_KV(HD)                                                                             \
+    extern "C" __global__ void __launch_bounds__(128, 2) attention_part_kv_##HD(                           \
+        const float* q, const __half* keys, const __half* values, float* partial, const int* pos,           \
+        int window, int kv_dim, int group, float scale) {                                                   \
+        attention_part_kv<HD>(q, keys, values, partial, pos, window, kv_dim, group, scale);                \
+    }
+ATTENTION_PART_KV(64)
+ATTENTION_PART_KV(128)
+ATTENTION_PART_KV(256)
+ATTENTION_PART_KV(512)
 
 // Merges attention_part's parts: one block per head.
 extern "C" __global__ void attention_combine(const float* partial, float* out, int parts, int hd) {

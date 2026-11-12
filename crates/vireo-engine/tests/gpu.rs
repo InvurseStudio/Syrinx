@@ -888,15 +888,18 @@ fn eight_bit_kernels_agree_and_stay_close_to_exact() {
 fn attention_over_an_f16_cache_matches_f64() {
     use vireo_engine::half::{f16_to_f32, f32_to_f16};
     let Some(gpu) = open_gpu() else { return };
-    // (head size, query heads, key/value heads, sliding window, scale)
-    for (hd, heads, kv_heads, window, scale) in [
-        (64, 8, 2, 0, 0.125),
-        (128, 8, 2, 0, 0.088),
-        (256, 8, 2, 0, 0.0625),
-        (256, 8, 1, 40, 1.0),
-        (512, 8, 1, 0, 1.0),
+    // (head size, query heads, key/value heads, sliding window, scale, first position,
+    // tokens): the last two deep in a long context, where one token's attention is split
+    // into many parts.
+    for (hd, heads, kv_heads, window, scale, p0, tokens) in [
+        (64, 8, 2, 0, 0.125, 30, 100),
+        (128, 8, 2, 0, 0.088, 30, 100),
+        (256, 8, 2, 0, 0.0625, 30, 100),
+        (256, 8, 1, 40, 1.0, 30, 100),
+        (512, 8, 1, 0, 1.0, 30, 100),
+        (512, 8, 2, 0, 1.0, 6000, 3),
+        (256, 16, 4, 0, 1.0, 6000, 3),
     ] {
-        let (p0, tokens) = (30, 100);
         let len = p0 + tokens;
         let kv_dim = kv_heads * hd;
         let wave = |i: usize, k: usize| (((i * k) % 1009) as f32 / 504.5 - 1.0) * 0.6;
@@ -988,7 +991,10 @@ fn attention_over_an_f16_cache_matches_f64() {
             "head size {hd}, window {window}: batch off by {batch:.1e}, one at a time {single:.1e} (largest {largest:.2})"
         );
         assert!(single <= largest * 1e-5, "one at a time: {single}");
-        assert!(batch <= largest * 2e-3, "batch: {batch}");
+        // The tensor cores' error comes from f16 softmax weights times values of up to 0.6,
+        // so it doesn't shrink with the output, which averages towards 0 over thousands of
+        // positions: bound it by at least 0.05's share.
+        assert!(batch <= largest.max(0.05) * 2e-3, "batch: {batch}");
     }
 }
 
