@@ -1429,3 +1429,326 @@ fn the_tensor_kernels_compile_where_the_gpu_has_them() {
         );
     }
 }
+
+/// Each matrix-vector kernel's time and bandwidth on real weights (Qwen 3.5 4B, Gemma 4
+/// E4B), dispatched back to back into one output. Prints, checks nothing; --ignored.
+#[test]
+#[ignore]
+fn time_matvec_kernels() {
+    let Some(gpu) = open_gpu() else { return };
+    let sets: [(&str, &[&str]); 3] = [
+        (
+            "gemma-4-E2B_q4_0-it.gguf",
+            &[
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.attn_output.weight",
+                "blk.0.attn_k.weight",
+                "blk.0.proj.weight",
+                "blk.0.inp_gate.weight",
+            ],
+        ),
+        (
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            &[
+                "token_embd.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.attn_qkv.weight",
+                "blk.0.ssm_out.weight",
+                "blk.3.attn_q.weight",
+                "blk.3.attn_k.weight",
+                "blk.3.attn_v.weight",
+                "blk.0.ssm_alpha.weight",
+            ],
+        ),
+        (
+            "gemma-4-E4B_q4_0-it.gguf",
+            &[
+                "token_embd.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.attn_k.weight",
+                "blk.0.attn_output.weight",
+            ],
+        ),
+    ];
+    for (name, tensors) in sets {
+        let Some(file) = model(name) else { continue };
+        eprintln!("{name}");
+        for &t in tensors {
+            let w = matrix(&file, t);
+            // Copies enough to fill ~1 GB, taken in turn, so the weights come from memory
+            // as in a real token rather than from the GPU's cache.
+            let copies = (1usize << 30).div_ceil(w.data.len()).clamp(1, 64);
+            let weights: Vec<_> = (0..copies)
+                .map(|_| gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap())
+                .collect();
+            let x = gpu.upload_f32(&vec![0.01; w.cols]).unwrap();
+            let y = gpu.alloc(w.rows * 4).unwrap();
+            let reps = 256;
+            let run = || {
+                for i in 0..reps {
+                    let wp = weights[i % copies].ptr();
+                    gpu.matvec(w.kind, wp, x.ptr(), y.ptr(), w.rows, w.cols)
+                        .unwrap();
+                }
+                gpu.synchronize().unwrap();
+            };
+            run();
+            let started = Instant::now();
+            run();
+            let us = started.elapsed().as_secs_f64() * 1e6 / reps as f64;
+            let gbs = w.data.len() as f64 / us / 1e3;
+            eprintln!(
+                "  {t:28} {:?} {:>6} × {:>5}: {us:8.1} µs  {gbs:6.0} GB/s",
+                w.kind, w.rows, w.cols
+            );
+        }
+    }
+}
+
+/// Reading short prompts again and again in one session, as a server does (each read
+/// after the first). Prints; --ignored. VIREO_MODEL picks the file in models/.
+#[test]
+#[ignore]
+fn time_short_prompts() {
+    let name = std::env::var("VIREO_MODEL").unwrap_or("gemma-4-E2B_q4_0-it.gguf".into());
+    let Some(file) = model(&name) else { return };
+    let Some(gpu) = open_gpu() else { return };
+    let time = |label: &str, f: &mut dyn FnMut()| {
+        let started = Instant::now();
+        f();
+        let first = started.elapsed().as_secs_f64() * 1e3;
+        let started = Instant::now();
+        for _ in 0..5 {
+            f();
+        }
+        eprintln!(
+            "{label}: first {first:.1} ms, then {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3 / 5.0
+        );
+    };
+    let counts: Vec<usize> = std::env::var("VIREO_COUNTS")
+        .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect())
+        .unwrap_or(vec![64, 256, 512, 1024, 2048]);
+    if name.starts_with("gemma") {
+        let m = Gemma4Cuda::load(&file, gpu).unwrap();
+        let mut s = m.session(8192).unwrap();
+        let all = std::env::var_os("VIREO_ALL").is_some();
+        let base: Vec<u32> = (0..500u32).map(|i| 1000 + i % 5000).collect();
+        m.forward_batch(&mut s, &base, Logits::Last).unwrap();
+        time("1 token, generating", &mut || {
+            s.truncate(500);
+            m.forward(&mut s, 1234, true).unwrap();
+        });
+        for &n in &counts {
+            let prompt: Vec<u32> = (0..n as u32).map(|i| 1000 + i % 5000).collect();
+            time(&format!("{n} tokens"), &mut || {
+                s.truncate(if all { 500 } else { 0 });
+                m.forward_batch(
+                    &mut s,
+                    &prompt,
+                    if all { Logits::All } else { Logits::Last },
+                )
+                .unwrap();
+            });
+        }
+    } else {
+        let m = Qwen35Cuda::load(&file, gpu).unwrap();
+        let mut s = m.session(8192).unwrap();
+        for &n in &counts {
+            let prompt: Vec<u32> = (0..n as u32).map(|i| 1000 + i % 5000).collect();
+            time(&format!("{n} tokens"), &mut || {
+                m.reset(&mut s).unwrap();
+                m.forward_batch(&mut s, &prompt, Logits::Last).unwrap();
+            });
+        }
+    }
+}
+
+/// matvec_few against one token at a time on real weights of every type the test models
+/// have, and its time against the prompt kernels (`--ignored` prints the times only when
+/// VIREO_TIME is set).
+#[cfg(target_os = "macos")]
+#[test]
+fn few_token_products_match_one_token_at_a_time() {
+    let Some(gpu) = open_gpu() else { return };
+    let timing = std::env::var_os("VIREO_TIME").is_some();
+    let sets: [(&str, &[&str]); 3] = [
+        (
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            &[
+                "blk.0.ffn_down.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.attn_qkv.weight",
+                "blk.0.ssm_alpha.weight",
+                "blk.3.attn_k.weight",
+            ],
+        ),
+        (
+            "gemma-4-E4B_q4_0-it.gguf",
+            &[
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.attn_k.weight",
+            ],
+        ),
+        ("gemma-4-E2B_q4_0-it.gguf", &["per_layer_model_proj.weight"]),
+    ];
+    for (name, tensors) in sets {
+        let Some(file) = model(name) else { continue };
+        for &t in tensors {
+            let w = matrix(&file, t);
+            let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
+            let max_t = Gpu::MULTI_TOKENS;
+            let x: Vec<f32> = (0..max_t * w.cols)
+                .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x).unwrap();
+            let y_one = gpu.alloc(max_t * w.rows * 4).unwrap();
+            let y_few = gpu.alloc(max_t * w.rows * 4).unwrap();
+            for tokens in [2, 3, 4, 7, 8] {
+                for i in 0..tokens {
+                    let (xt, yt) = (x_gpu.f32_at(i * w.cols), y_one.f32_at(i * w.rows));
+                    gpu.matvec(w.kind, weights.ptr(), xt, yt, w.rows, w.cols)
+                        .unwrap();
+                }
+                gpu.matvec_few(
+                    w.kind,
+                    weights.ptr(),
+                    x_gpu.ptr(),
+                    y_few.ptr(),
+                    w.rows,
+                    w.cols,
+                    tokens,
+                )
+                .unwrap();
+                let mut one = vec![0.0; tokens * w.rows];
+                let mut few = vec![0.0; tokens * w.rows];
+                y_one.read_f32(&mut one).unwrap();
+                y_few.read_f32(&mut few).unwrap();
+                let range = one.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let worst = one
+                    .iter()
+                    .zip(&few)
+                    .fold(0f32, |a, (p, q)| a.max((p - q).abs()));
+                assert!(
+                    worst <= 1e-4 * range.max(1.0),
+                    "{t} ({:?}), {tokens} tokens: off by {worst} of {range}",
+                    w.kind
+                );
+            }
+            if !timing {
+                continue;
+            }
+            let q8 = gpu.alloc_q8(max_t, w.cols).unwrap();
+            let time = |f: &dyn Fn()| {
+                for _ in 0..20 {
+                    f();
+                }
+                gpu.synchronize().unwrap();
+                let started = Instant::now();
+                for _ in 0..200 {
+                    f();
+                }
+                gpu.synchronize().unwrap();
+                started.elapsed().as_secs_f64() * 1e6 / 200.0
+            };
+            let mut line = format!("{t:28} {:?} {:>6} × {:>5}:", w.kind, w.rows, w.cols);
+            for tokens in [2, 4, 8] {
+                let few = time(&|| {
+                    gpu.matvec_few(
+                        w.kind,
+                        weights.ptr(),
+                        x_gpu.ptr(),
+                        y_few.ptr(),
+                        w.rows,
+                        w.cols,
+                        tokens,
+                    )
+                    .unwrap()
+                });
+                let prompt = time(&|| {
+                    if Gpu::supports_8bit(w.kind) && w.cols.is_multiple_of(32) {
+                        gpu.quantize(x_gpu.ptr(), &q8, tokens, w.cols).unwrap();
+                        gpu.matmul_8bit(
+                            w.kind,
+                            weights.ptr(),
+                            &q8,
+                            y_one.ptr(),
+                            w.rows,
+                            w.cols,
+                            tokens,
+                        )
+                        .unwrap();
+                    } else {
+                        gpu.matmul(
+                            w.kind,
+                            weights.ptr(),
+                            x_gpu.ptr(),
+                            y_one.ptr(),
+                            w.rows,
+                            w.cols,
+                            tokens,
+                        )
+                        .unwrap();
+                    }
+                });
+                let multi = time(&|| {
+                    gpu.matvec_multi(
+                        w.kind,
+                        weights.ptr(),
+                        x_gpu.ptr(),
+                        y_one.ptr(),
+                        w.rows,
+                        w.cols,
+                        tokens,
+                    )
+                    .unwrap();
+                });
+                line +=
+                    &format!("  {tokens}: {few:6.1} / multi {multi:6.1} / prompt {prompt:6.1} µs");
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// What a dispatch costs on its own: a chain of tiny dependent ones (each adds into the
+/// same buffer) against independent ones (each into its own). Prints; --ignored.
+#[test]
+#[ignore]
+fn time_dispatch_chain() {
+    let Some(gpu) = open_gpu() else { return };
+    let n = 2048;
+    let bufs: Vec<_> = (0..512)
+        .map(|_| gpu.upload_f32(&vec![1.0; n]).unwrap())
+        .collect();
+    let src = gpu.upload_f32(&vec![1.0; n]).unwrap();
+    let time = |label: &str, f: &dyn Fn()| {
+        f();
+        gpu.synchronize().unwrap();
+        let started = Instant::now();
+        for _ in 0..10 {
+            f();
+        }
+        gpu.synchronize().unwrap();
+        eprintln!(
+            "{label}: {:.2} µs a dispatch",
+            started.elapsed().as_secs_f64() * 1e6 / 5120.0
+        );
+    };
+    time("dependent", &|| {
+        for _ in 0..512 {
+            gpu.add(bufs[0].ptr(), src.ptr(), n).unwrap();
+        }
+    });
+    time("independent", &|| {
+        for b in &bufs {
+            gpu.add(b.ptr(), src.ptr(), n).unwrap();
+        }
+    });
+}

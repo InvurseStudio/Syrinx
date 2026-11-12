@@ -280,10 +280,16 @@ pub fn named<'a>(request: &str, skills: &'a [Skill]) -> Option<&'a Skill> {
     skills.iter().find(|s| s.name == name.trim())
 }
 
-/// A request no skill fits, scored against each skill to learn how far a model says yes
-/// to anything (`pick_skill` in main.rs). A plain fact: arithmetic ("What is 17 times
-/// 23?", the first control) is near `analyze-data`, and Gemma 4 E2B said yes to it there.
-pub const CONTROL: &str = "What's the capital of France?";
+/// Requests no skill fits, scored against each skill to learn how far a model says yes to
+/// anything (`pick_skill` in main.rs): a skill is picked only well above the highest. A
+/// plain fact (arithmetic, "What is 17 times 23?", was near `analyze-data`, and Gemma 4 E2B
+/// said yes to it there); someone saying who they are, which Gemma 4 E2B took for
+/// `fill-template` in the test gauntlet. (A short note to write was tried as a third: it
+/// stopped `write-document` from fitting a memo, on Gemma 4 E2B and Qwen 3.5 4B alike.)
+pub const CONTROLS: [&str; 2] = [
+    "What's the capital of France?",
+    "I'm Sam Reyes, I run the front desk at a bakery in Leeds.",
+];
 
 /// The question that scores whether one skill fits a request, with worked examples (of
 /// made-up skills, so none is favoured), ending where " yes" or " no" goes.
@@ -309,9 +315,20 @@ pub fn fit_question(skill: &Skill, request: &str) -> String {
 }
 
 /// The `use_skill` result the model reads, as the Mac's `SkillLibrary.read` gives it.
+/// The skill's text is followed by a line saying to start: written into the reply by the
+/// server (the model didn't ask for it), a small model otherwise describes the steps it
+/// would take and asks whether to go on (Gemma 4 E2B in the test gauntlet).
 pub fn instructions(skill: &Skill) -> String {
-    format!("Skill \"{}\":\n\n{}", skill.name, skill.instructions)
+    format!(
+        "Skill \"{}\":\n\n{}\n\n{START}",
+        skill.name,
+        skill.instructions.trim_end()
+    )
 }
+
+/// What follows a skill's text in its `use_skill` result.
+pub const START: &str = "Do the task now, following these steps: start with step 1 and call \
+                         the tool it names. Don't describe the steps or ask whether to go on.";
 
 #[cfg(test)]
 mod tests {
@@ -344,12 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn the_macs_built_in_skills_load_and_three_suit_this_pc() {
+    fn the_macs_built_in_skills_load_and_six_suit_this_pc() {
         let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../server/builtin-skills");
         let all = load(Some(&folder), None);
         assert_eq!(
             all.len(),
-            10,
+            13,
             "{:?}",
             all.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
@@ -370,7 +387,14 @@ mod tests {
             .collect();
         assert_eq!(
             usable,
-            ["code-review", "summarize-document", "translate-document"]
+            [
+                "apply-policy",
+                "code-review",
+                "fill-template",
+                "process-invoices",
+                "summarize-document",
+                "translate-document"
+            ]
         );
         let review = all.iter().find(|s| s.name == "code-review").unwrap();
         assert_eq!(
