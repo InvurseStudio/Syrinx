@@ -9,7 +9,7 @@ server (fonts come from Google Fonts and fall back to system fonts offline).
 
 | Report | Machine | Against |
 |---|---|---|
-| `windows-rtx5060-2026-11-12.html` | ASUS TUF A14, RTX 5060 Laptop (8 GB), Windows 11 | llama.cpp b12262, CUDA build |
+| `windows-rtx5060-2026-11-12.html` (and a dark image of it without the table, `windows-rtx5060-2026-11-12-dark.png`) | ASUS TUF A14, RTX 5060 Laptop (8 GB), Windows 11 | llama.cpp b12262, CUDA build |
 | `mac-m5max-2026-11-12.html` | MacBook Pro, M5 Max (40-core GPU, 128 GB), macOS 27.2 | llama.cpp b12228 (Metal) and the shipped Vireo 0.9.0 (MLX) |
 | `mac-m5max-2026-11-12-pm.html` | The same Mac, after the afternoon's tuning (PLAN.md, "Twelfth pass") | The same; the Vireo engine and llama.cpp measured again (`prompts-mac/results-2026-11-12-pm.jsonl`), Vireo 0.9 from the morning |
 
@@ -27,6 +27,8 @@ server (fonts come from Google Fonts and fall back to system fonts offline).
      model. `before` (Vireo before a tuning round) is optional: leave it out of every
      panel and the markers, legend entry and table columns disappear. Keep or rewrite
      each panel's `note` for that platform.
+   - Both reports have a light/dark switch (they follow the system until one is chosen;
+     `?theme=dark` or `?theme=light` in the address sets it).
    - `labels.beforeShort` (optional) names the `before` series in tooltips and the table
      (default "Vireo before"); `labels.beforeVerdict: true` gives each panel a second
      verdict against it. The Mac report uses both, with `before` holding the shipped
