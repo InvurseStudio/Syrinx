@@ -214,13 +214,19 @@ pub fn load(built_in: Option<&Path>, user: Option<&Path>) -> Vec<Skill> {
     all
 }
 
-/// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`, or the repository's
-/// `server/builtin-skills` found above this program (it runs from `target/release`).
+/// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`; `builtin-skills` beside this
+/// program, where an installed app keeps them (the Windows prototype's install script
+/// copies them there); or the repository's `server/builtin-skills` found above it (it
+/// runs from `target/release`).
 pub fn built_in_folder() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VIREO_BUILTIN_SKILLS") {
         return Some(PathBuf::from(dir));
     }
     let exe = std::env::current_exe().ok()?;
+    let beside = exe.parent()?.join("builtin-skills");
+    if beside.is_dir() {
+        return Some(beside);
+    }
     exe.ancestors()
         .skip(1)
         .take(6)
