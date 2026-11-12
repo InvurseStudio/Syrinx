@@ -4,16 +4,23 @@
 //! scores the reply: the tools it called, their arguments, and the answer. Replies are
 //! greedy (temperature 0), so a run gives the same scores every time.
 //!
-//! Twelve easy cases (`cases.rs`), twelve harder ones (`hard_cases.rs`) and the ones
-//! that change files (`change_cases.rs`), counted apart in the report. The stand-in app
-//! answers approvals as the case's user does (`Pc::declining`), and any case not about
-//! changes fails if the reply changes a file.
+//! Twelve easy cases (`cases.rs`), twelve harder ones (`hard_cases.rs`), the ones that
+//! change files (`change_cases.rs`), skills (`skill_cases.rs`) and the later tools
+//! (`more_cases.rs`), counted apart in the report. The stand-in app answers approvals as
+//! the case's user does (`Pc::declining`), and any case not about changes fails if the
+//! reply changes a file.
 //!
-//!   vireo-eval [--models a.gguf,b.gguf] [--cases read,git] [--out results.json]
+//!   vireo-eval [--full | --models a.gguf,b.gguf] [--cases read,git] [--out results.json]
 //!              [--server-arg <arg>]...
 //!
-//! Models are paths, or names in VireoPrototype/models; every test model by default.
-//! `--server-arg` passes an argument on to vireo-server, to compare a feature on and off.
+//! By default a short run on two models, one from each family (`QUICK_MODELS`, about 6
+//! minutes for every case on the RTX 5060): the check while developing. `--full` runs all
+//! four eval models (`FULL_MODELS`, about 18 minutes), for in-depth testing and the record
+//! kept in `evals/` before a pull request. `--cases` takes case ids or categories (easy,
+//! hard, changes, skills, more): a new tool or skill is checked on its own cases, and the
+//! whole set saved for in-depth runs. `--models` names others: paths, or names in
+//! VireoPrototype/models. `--server-arg` passes an argument on to vireo-server, to compare
+//! a feature on and off.
 
 mod cases;
 mod change_cases;
@@ -21,6 +28,7 @@ mod hard_cases;
 #[path = "../../vireo-server/src/json.rs"]
 #[allow(dead_code)]
 mod json;
+mod more_cases;
 mod pc;
 mod skill_cases;
 
@@ -34,20 +42,41 @@ use std::time::Instant;
 use cases::{Call, Case, Run};
 use json::Value;
 
-/// Small to large in each family: where a feature stops mattering shows along each.
-/// Models people choose today. Llama 3.2 1B (2024) isn't one any more, and Qwen 3.5 0.8B
-/// was left out on 2026-11-11 (too small to use the tools well: it said yes to every skill
-/// and saved a poem to a file); both stay the engine's references in its own tests, and run
-/// here on request (`--models`).
-const DEFAULT_MODELS: [&str; 4] = [
+/// The short run's models: the smallest Gemma, where tools break first, and the Qwen that
+/// does as well as the 9B in a third of the time (2026-11-11: 39 and 38 of 39).
+const QUICK_MODELS: [&str; 2] = ["gemma-4-E2B_q4_0-it.gguf", "Qwen3.5-4B-Q4_K_M.gguf"];
+
+/// `--full`: small to large in each family, where a feature stops mattering shows along
+/// each. Models people choose today. Llama 3.2 1B (2024) isn't one any more, and Qwen 3.5
+/// 0.8B was left out on 2026-11-11 (too small to use the tools well: it said yes to every
+/// skill and saved a poem to a file); both stay the engine's references in its own tests,
+/// and run here on request (`--models`).
+const FULL_MODELS: [&str; 4] = [
     "gemma-4-E2B_q4_0-it.gguf",
     "gemma-4-E4B_q4_0-it.gguf",
     "Qwen3.5-4B-Q4_K_M.gguf",
     "Qwen3.5-9B-Q4_K_M.gguf",
 ];
 const TOKEN: &str = "vireo-eval";
+
+/// A case's category, which `--cases` takes as well as ids: `--cases more` runs only the
+/// later tools' cases, `--cases skills` the skills', so a new tool or skill is checked on
+/// its own cases in a minute or two.
+fn category(case: &Case) -> &'static str {
+    if case.more {
+        "more"
+    } else if case.skills {
+        "skills"
+    } else if case.changes {
+        "changes"
+    } else if case.hard {
+        "hard"
+    } else {
+        "easy"
+    }
+}
 /// The PC tools the stand-in app runs (its `clientTools`).
-const CLIENT_TOOLS: [&str; 11] = [
+const CLIENT_TOOLS: [&str; 16] = [
     "read_file",
     "list_directory",
     "search_files",
@@ -58,6 +87,11 @@ const CLIENT_TOOLS: [&str; 11] = [
     "rename_file",
     "move_file",
     "delete_file",
+    "read_spreadsheet",
+    "create_docx",
+    "run_tests",
+    "run_build",
+    "run_linter",
     // Not a tool: the server checks a change with it before asking for approval.
     "check_change",
 ];
@@ -66,8 +100,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut models, mut only, mut out, mut server_args) =
         (Vec::new(), Vec::new(), None, Vec::new());
+    let mut full = false;
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--full" {
+            full = true;
+            i += 1;
+            continue;
+        }
         let value = args.get(i + 1).cloned();
         match (args[i].as_str(), value) {
             ("--models", Some(v)) => models = v.split(',').map(str::to_string).collect(),
@@ -76,7 +116,7 @@ fn main() -> ExitCode {
             ("--server-arg", Some(v)) => server_args.push(v),
             _ => {
                 eprintln!(
-                    "Usage: vireo-eval [--models a,b] [--cases a,b] [--out file.json] [--server-arg arg]..."
+                    "Usage: vireo-eval [--full | --models a,b] [--cases a,b] [--out file.json] [--server-arg arg]..."
                 );
                 return ExitCode::FAILURE;
             }
@@ -84,7 +124,8 @@ fn main() -> ExitCode {
         i += 2;
     }
     if models.is_empty() {
-        models = DEFAULT_MODELS.iter().map(|s| s.to_string()).collect();
+        let set: &[&str] = if full { &FULL_MODELS } else { &QUICK_MODELS };
+        models = set.iter().map(|s| s.to_string()).collect();
     }
     let here = std::env::current_exe()
         .ok()
@@ -102,8 +143,15 @@ fn main() -> ExitCode {
 
     let cases: Vec<Case> = cases::all()
         .into_iter()
-        .filter(|c| only.is_empty() || only.iter().any(|o| o == c.id))
+        .filter(|c| only.is_empty() || only.iter().any(|o| o == c.id || o == category(c)))
         .collect();
+    if cases.is_empty() {
+        eprintln!(
+            "No cases match --cases {}: give case ids or a category (easy, hard, changes, skills, more).",
+            only.join(",")
+        );
+        return ExitCode::FAILURE;
+    }
     let mut report = Vec::new();
     for model in &models {
         let path = if Path::new(model).exists() {
@@ -127,7 +175,12 @@ fn main() -> ExitCode {
             let run = ask(running.port, case);
             let verdict = match (&run.error, (case.check)(&run)) {
                 (Some(e), _) => Err(format!("error: {e}")),
-                (None, _) if !case.changes && !case.skills && !run.changes_made().is_empty() => {
+                (None, _)
+                    if !case.changes
+                        && !case.skills
+                        && !case.more
+                        && !run.changes_made().is_empty() =>
+                {
                     Err(format!(
                         "called {} when nobody asked for a change",
                         run.changes_made()[0].tool
@@ -157,24 +210,32 @@ fn main() -> ExitCode {
         let passed = runs.iter().filter(|r| r.1.is_ok()).count();
         let seconds: f64 = runs.iter().map(|r| r.2.seconds).sum();
         let calls: usize = runs.iter().map(|r| r.2.calls.len()).sum();
-        let part = |hard: bool, changes: bool, skills: bool| {
+        let part = |hard: bool, changes: bool, skills: bool, more: bool| {
             let of: Vec<_> = runs
                 .iter()
-                .filter(|r| r.2.hard == hard && r.2.changes == changes && r.2.skill_case == skills)
+                .filter(|r| {
+                    r.2.hard == hard
+                        && r.2.changes == changes
+                        && r.2.skill_case == skills
+                        && r.2.more_case == more
+                })
                 .collect();
             (of.iter().filter(|r| r.1.is_ok()).count(), of.len())
         };
-        let ((easy_passed, easy), (hard_passed, hard)) =
-            (part(false, false, false), part(true, false, false));
-        let (changes_passed, changes) = part(false, true, false);
-        let (skills_passed, skill_cases) = part(false, false, true);
+        let ((easy_passed, easy), (hard_passed, hard)) = (
+            part(false, false, false, false),
+            part(true, false, false, false),
+        );
+        let (changes_passed, changes) = part(false, true, false, false);
+        let (skills_passed, skill_cases) = part(false, false, true, false);
+        let (more_passed, more_cases) = part(false, false, false, true);
         // Skills picked where a case didn't ask for one: worth watching, not a failure.
         let stray = runs
             .iter()
             .filter(|r| !r.2.skill_case && !r.2.skills.is_empty())
             .count();
         println!(
-            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard, {changes_passed}/{changes} changes, {skills_passed}/{skill_cases} skills; a skill in {stray} others), {:.1} s a case on average, {calls} tool calls",
+            "  {passed}/{} passed ({easy_passed}/{easy} easy, {hard_passed}/{hard} hard, {changes_passed}/{changes} changes, {skills_passed}/{skill_cases} skills, {more_passed}/{more_cases} more tools; a skill in {stray} others), {:.1} s a case on average, {calls} tool calls",
             runs.len(),
             seconds / runs.len().max(1) as f64
         );
@@ -207,11 +268,12 @@ fn results_json(report: &Report, server_args: &[String]) -> String {
                         .map(|c| format!("{{\"tool\":{},\"args\":{}}}", json::string(&c.tool), to_json(&c.args)))
                         .collect();
                     format!(
-                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"skillCase\":{},\"skills\":[{}],\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
+                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"skillCase\":{},\"moreCase\":{},\"skills\":[{}],\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
                         json::string(id),
                         run.hard,
                         run.changes,
                         run.skill_case,
+                        run.more_case,
                         run.skills.iter().map(|t| json::string(t)).collect::<Vec<_>>().join(","),
                         run.asked.iter().map(|t| json::string(t)).collect::<Vec<_>>().join(","),
                         verdict.is_ok(),
@@ -353,6 +415,7 @@ fn ask(port: u16, case: &Case) -> Run {
     run.hard = case.hard;
     run.changes = case.changes;
     run.skill_case = case.skills;
+    run.more_case = case.more;
     let mut pc = case.pc.clone();
     // The earlier turns, then the prompt.
     let messages: Vec<String> = case

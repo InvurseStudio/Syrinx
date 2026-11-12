@@ -34,7 +34,8 @@ written on one machine is written for both, and measured with `vireo-eval` on bo
    `LocalEngine.swift` now build and find `vireo-server` in `VireoPrototype/target/release`;
    `LocalEngineTests` was updated for that layout. Not run (no Swift here).
 4. Run the eval on Metal and save it beside the others:
-   `cargo run --release -p vireo-eval -- --out evals/mac.json`. The Mac's last run,
+   `cargo run --release -p vireo-eval -- --full --out evals/mac.json` (a plain run is
+   the short one, two models). The Mac's last run,
    `evals/mac-baseline.json`, has only the first 24 cases.
 
 ## What the server does now (both platforms)
