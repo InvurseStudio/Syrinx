@@ -817,3 +817,56 @@ mod tests {
         assert!(note.ends_with("\n\nAnd the total?"));
     }
 }
+
+/// Every PDF and Word file in a test folder (`VIREO_DOCUMENTS_DIR`, such as the gauntlet's
+/// Aurelia Minerals folder) read to text: skipped when it isn't set.
+#[cfg(test)]
+mod folder_tests {
+    #[test]
+    fn every_document_in_the_folder_reads() {
+        let Some(dir) = std::env::var_os("VIREO_DOCUMENTS_DIR") else {
+            return;
+        };
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        let mut read = 0;
+        while let Some(folder) = stack.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.to_string_lossy().to_lowercase();
+                if !(name.ends_with(".pdf") || name.ends_with(".docx")) {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                let text = super::extract(&name, &bytes)
+                    .unwrap_or_else(|e| panic!("{}: {}", path.display(), e.detail))
+                    .text;
+                assert!(text.trim().len() > 20, "{}: {text:?}", path.display());
+                eprintln!("read {} ({} chars): {}", path.display(), text.len(), text.lines().next().unwrap_or(""));
+                read += 1;
+            }
+        }
+        eprintln!("{read} documents read");
+    }
+}
+
+/// Prints one document's text as a model would get it (`VIREO_DOCUMENT`): skipped when it
+/// isn't set. For checking test files by eye.
+#[cfg(test)]
+mod one_document {
+    #[test]
+    fn print_the_document() {
+        let Some(path) = std::env::var_os("VIREO_DOCUMENT") else {
+            return;
+        };
+        let name = std::path::PathBuf::from(&path).to_string_lossy().to_lowercase();
+        let bytes = std::fs::read(&path).unwrap();
+        match super::extract(&name, &bytes) {
+            Ok(x) => eprintln!("----\n{}\n----", x.text),
+            Err(e) => eprintln!("can't read it: {}", e.detail),
+        }
+    }
+}
