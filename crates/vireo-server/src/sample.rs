@@ -81,6 +81,7 @@ impl Sampler {
 
     pub fn pick(&mut self, logits: &[f32], recent: &[u32]) -> u32 {
         let s = self.settings;
+        // The recent tokens' penalized logits (only these differ from `logits`).
         let mut penalized: Vec<(u32, f32)> = Vec::new();
         if s.repetition_penalty != 1.0 {
             let start = recent.len().saturating_sub(PENALTY_WINDOW);
@@ -96,32 +97,35 @@ impl Sampler {
                 }
             }
         }
-        let logit = |id: u32| {
-            penalized
-                .iter()
-                .find(|&&(p, _)| p == id)
-                .map_or(logits[id as usize], |&(_, v)| v)
-        };
-        if s.temperature <= 0.0 {
-            return (0..logits.len() as u32)
-                .max_by(|&a, &b| logit(a).total_cmp(&logit(b)))
-                .unwrap_or(0);
-        }
-        let keep = if s.top_k > 0 {
+        let keep = if s.temperature <= 0.0 {
+            1
+        } else if s.top_k > 0 {
             s.top_k
         } else {
             MOST_CANDIDATES
         }
         .min(logits.len());
-        self.candidates.clear();
-        self.candidates
-            .extend((0..logits.len() as u32).map(|id| (id, logit(id))));
+        // The likeliest `keep` by the raw logits, plus as many more as there are penalized
+        // tokens (each may drop out); then the penalized ones swapped for their new values.
+        top_n(logits, keep + penalized.len(), &mut self.candidates);
+        if !penalized.is_empty() {
+            self.candidates
+                .retain(|c| !penalized.iter().any(|&(p, _)| p == c.0));
+            self.candidates
+                .extend(penalized.iter().filter(|p| p.1 > f32::NEG_INFINITY));
+        }
+        if self.candidates.is_empty() {
+            return 0;
+        }
         if keep < self.candidates.len() {
             self.candidates
                 .select_nth_unstable_by(keep - 1, |a, b| b.1.total_cmp(&a.1));
             self.candidates.truncate(keep);
         }
         self.candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if s.temperature <= 0.0 {
+            return self.candidates[0].0;
+        }
         let top = self.candidates[0].1;
         let mut total = 0.0f32;
         for c in &mut self.candidates {
@@ -147,6 +151,38 @@ impl Sampler {
             }
         }
         self.candidates[kept - 1].0
+    }
+}
+
+/// The `n` largest of `values` (by value, in no order) into `out`, as (index, value), in
+/// one pass: only values over the smallest kept so far are taken, and the list is cut back
+/// to `n` whenever it doubles. Infinitely small and NaN values are never taken.
+fn top_n(values: &[f32], n: usize, out: &mut Vec<(u32, f32)>) {
+    out.clear();
+    if n == 0 {
+        return;
+    }
+    let cap = (2 * n).max(n + 256);
+    let mut floor = f32::NEG_INFINITY;
+    for (chunk_at, chunk) in values.chunks(64).enumerate() {
+        // Most chunks hold nothing over the floor: a branch-free check first.
+        if !chunk.iter().fold(false, |any, &v| any | (v > floor)) {
+            continue;
+        }
+        for (i, &v) in chunk.iter().enumerate() {
+            if v > floor {
+                out.push(((chunk_at * 64 + i) as u32, v));
+                if out.len() >= cap {
+                    out.select_nth_unstable_by(n - 1, |a, b| b.1.total_cmp(&a.1));
+                    out.truncate(n);
+                    floor = out[n - 1].1;
+                }
+            }
+        }
+    }
+    if out.len() > n {
+        out.select_nth_unstable_by(n - 1, |a, b| b.1.total_cmp(&a.1));
+        out.truncate(n);
     }
 }
 
@@ -191,5 +227,148 @@ mod tests {
             1,
         );
         assert_eq!(s.pick(&logits, &[1]), 2);
+    }
+}
+
+#[cfg(test)]
+mod top_n_tests {
+    use super::*;
+
+    fn noise(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 1_000_000) as f32 / 50_000.0 - 10.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn top_n_matches_a_full_sort() {
+        for (len, n, seed) in [
+            (10, 3, 1),
+            (1000, 1, 2),
+            (5000, 64, 3),
+            (262_144, 1024, 4),
+            (300, 300, 5),
+        ] {
+            let mut values = noise(len, seed);
+            values[len / 2] = f32::NEG_INFINITY;
+            let mut got = Vec::new();
+            top_n(&values, n, &mut got);
+            let mut want: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
+            want.sort_by(|a, b| b.total_cmp(a));
+            want.truncate(n);
+            let mut got_values: Vec<f32> = got.iter().map(|c| c.1).collect();
+            got_values.sort_by(|a, b| b.total_cmp(a));
+            assert_eq!(got_values, want, "len {len}, n {n}");
+            assert!(got.iter().all(|&(i, v)| values[i as usize] == v));
+        }
+    }
+
+    #[test]
+    fn penalized_greedy_matches_a_full_scan() {
+        let logits = noise(50_000, 9);
+        let mut order: Vec<u32> = (0..logits.len() as u32).collect();
+        order.sort_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+        // The 40 likeliest were just said, and are pushed down.
+        let recent: Vec<u32> = order[..40].to_vec();
+        for penalty in [1.5f32, 0.7] {
+            let adjusted = |id: u32| {
+                let l = logits[id as usize];
+                if !recent.contains(&id) {
+                    l
+                } else if l > 0.0 {
+                    l / penalty
+                } else {
+                    l * penalty
+                }
+            };
+            let want = (0..logits.len() as u32)
+                .max_by(|&a, &b| adjusted(a).total_cmp(&adjusted(b)))
+                .unwrap();
+            let mut s = Sampler::new(
+                Settings {
+                    temperature: 0.0,
+                    repetition_penalty: penalty,
+                    ..Settings::default()
+                },
+                1,
+            );
+            assert_eq!(s.pick(&logits, &recent), want, "penalty {penalty}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+
+    /// Time a pick over a 262,144-token vocabulary. Prints; run with --ignored.
+    #[test]
+    #[ignore]
+    fn time_pick() {
+        let mut state = 12345u64;
+        let logits: Vec<f32> = (0..262_144)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 10_000) as f32 / 500.0 - 10.0
+            })
+            .collect();
+        let recent: Vec<u32> = (0..200).map(|i| i * 37).collect();
+        for (label, settings) in [
+            (
+                "greedy",
+                Settings {
+                    temperature: 0.0,
+                    ..Settings::default()
+                },
+            ),
+            (
+                "gemma",
+                Settings {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                    top_k: 64,
+                    ..Settings::default()
+                },
+            ),
+            (
+                "qwen",
+                Settings {
+                    temperature: 0.6,
+                    top_p: 0.95,
+                    top_k: 20,
+                    ..Settings::default()
+                },
+            ),
+            ("no top-k", Settings::default()),
+            (
+                "gemma + penalty 1.1",
+                Settings {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                    top_k: 64,
+                    repetition_penalty: 1.1,
+                    ..Settings::default()
+                },
+            ),
+        ] {
+            let mut s = Sampler::new(settings, 7);
+            s.pick(&logits, &recent);
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(s.pick(&logits, &recent));
+            }
+            eprintln!(
+                "{label}: {:.0} µs a pick",
+                started.elapsed().as_secs_f64() * 1e4
+            );
+        }
     }
 }
