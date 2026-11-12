@@ -2,7 +2,8 @@
 
 One page per machine comparing Vireo's own engine with llama.cpp on the same GGUF files:
 four workloads (writing a reply, writing deep in a long chat, reading a short prompt,
-reading a long one), each a bar chart per model, with the machine's specs, a table of
+reading a long one; the Windows page also has three whole replies through the servers),
+each a bar chart per model, with the machine's specs, a table of
 every number and how they were measured. Open a report in any browser; it needs no
 server (fonts come from Google Fonts and fall back to system fonts offline).
 
@@ -47,6 +48,13 @@ The Windows numbers came from:
   Qwen 3.5 9B writing instead of ending its turn). The prompt and generation speeds are
   the CLI's last line.
 - llama.cpp: `llama-bench -ngl 99 -fa 1 -p 2048,31000 -n 128` and `-p 0 -n 64 -d 30000`.
+- The three reply panels (added after the afternoon's pass, PLAN.md "Fourteenth round"):
+  whole replies through each engine's server at temperature 0, 400 tokens at most, the
+  same user message to each (a README excerpt to rewrite as a list, 40 lines of Rust to
+  return with a variable renamed, a story to write): `vireo-server` at its defaults
+  (`/api/chat/completions`, the speed from its `Reply:` log line) against
+  `llama-server -ngl 99 -fa on -c 8192` (`/v1/chat/completions`, `timings`), the second
+  of two rounds.
 
 Measure on mains power in the fastest power mode, and say which: on the Windows
 laptop a slower power state made both engines ~3× slower and shifted the comparison

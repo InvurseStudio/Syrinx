@@ -910,6 +910,11 @@ fn attention_over_an_f16_cache_matches_f64() {
         (256, 16, 4, 0, 1.0, 6000, 3),
         (256, 24, 4, 0, 0.0625, 6000, 3),
         (512, 32, 4, 0, 1.0, 3000, 8),
+        // A few tokens at once (a draft's guesses): the one-token kernel, a grid layer each.
+        (64, 8, 2, 0, 0.125, 700, 5),
+        (128, 8, 2, 40, 0.088, 300, 4),
+        (256, 8, 1, 40, 1.0, 300, 2),
+        (256, 16, 4, 0, 0.0625, 2000, 7),
     ] {
         let len = p0 + tokens;
         let kv_dim = kv_heads * hd;
@@ -1815,4 +1820,207 @@ fn time_dispatch_chain() {
             gpu.add(b.ptr(), src.ptr(), n).unwrap();
         }
     });
+}
+
+/// The CUDA backend's few-token products (8-bit activations, 2 to 8 tokens in one pass over
+/// the weights) against one token at a time, on real weights of every 8-bit type the test
+/// models have: the same numbers. With VIREO_TIME set, also each one's time against one
+/// token's and the tensor-core tile's (9 tokens).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn few_token_8bit_products_match_one_token_at_a_time() {
+    let Some(gpu) = open_gpu() else { return };
+    let timing = std::env::var_os("VIREO_TIME").is_some();
+    let sets: [(&str, &[&str]); 3] = [
+        (
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            &[
+                "blk.0.ffn_down.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.attn_qkv.weight",
+                "blk.0.ssm_alpha.weight",
+                "blk.3.attn_k.weight",
+            ],
+        ),
+        (
+            "gemma-4-E4B_q4_0-it.gguf",
+            &[
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.attn_k.weight",
+            ],
+        ),
+        ("Qwen3.5-0.8B-Q4_K_M.gguf", &["blk.0.ssm_beta.weight", "blk.0.ffn_up.weight"]),
+    ];
+    for (name, tensors) in sets {
+        let Some(file) = model(name) else { continue };
+        for &t in tensors {
+            let w = matrix(&file, t);
+            if !Gpu::supports_8bit(w.kind) || !w.cols.is_multiple_of(32) {
+                continue;
+            }
+            let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
+            let most = 9;
+            let x: Vec<f32> = (0..most * w.cols)
+                .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x).unwrap();
+            let q8_one = gpu.alloc_q8(1, w.cols).unwrap();
+            let q8 = gpu.alloc_q8(most, w.cols).unwrap();
+            let y_one = gpu.alloc(most * w.rows * 4).unwrap();
+            let y_few = gpu.alloc(most * w.rows * 4).unwrap();
+            for tokens in 2..=Gpu::FEW_TOKENS {
+                for i in 0..tokens {
+                    gpu.quantize(x_gpu.f32_at(i * w.cols), &q8_one, 1, w.cols)
+                        .unwrap();
+                    let yt = y_one.f32_at(i * w.rows);
+                    gpu.matmul_8bit(w.kind, weights.ptr(), &q8_one, yt, w.rows, w.cols, 1)
+                        .unwrap();
+                }
+                gpu.quantize(x_gpu.ptr(), &q8, tokens, w.cols).unwrap();
+                gpu.matmul_8bit(
+                    w.kind,
+                    weights.ptr(),
+                    &q8,
+                    y_few.ptr(),
+                    w.rows,
+                    w.cols,
+                    tokens,
+                )
+                .unwrap();
+                let mut one = vec![0.0; tokens * w.rows];
+                let mut few = vec![0.0; tokens * w.rows];
+                y_one.read_f32(&mut one).unwrap();
+                y_few.read_f32(&mut few).unwrap();
+                let range = one.iter().fold(0f32, |a, v| a.max(v.abs()));
+                assert!(range > 0.0, "{t}: all zeros");
+                let worst = one
+                    .iter()
+                    .zip(&few)
+                    .fold(0f32, |a, (p, q)| a.max((p - q).abs()));
+                // The same sums in the same order: the same bits, so a batch of guesses
+                // rounds to the same 8-bit activations as the tokens read one by one.
+                assert!(
+                    worst == 0.0,
+                    "{t} ({:?}), {tokens} tokens: off by {worst} of {range}",
+                    w.kind
+                );
+            }
+            if !timing {
+                continue;
+            }
+            // Copies taken in turn, so the weights come from memory as in a real token.
+            let copies = (1usize << 28).div_ceil(w.data.len()).clamp(1, 32);
+            let more: Vec<_> = (0..copies)
+                .map(|_| gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap())
+                .collect();
+            let time = |tokens: usize| {
+                gpu.quantize(x_gpu.ptr(), &q8, tokens, w.cols).unwrap();
+                let run = || {
+                    for i in 0..128 {
+                        let wp = more[i % copies].ptr();
+                        gpu.matmul_8bit(w.kind, wp, &q8, y_few.ptr(), w.rows, w.cols, tokens)
+                            .unwrap();
+                    }
+                    gpu.synchronize().unwrap();
+                };
+                run();
+                let started = Instant::now();
+                run();
+                started.elapsed().as_secs_f64() * 1e6 / 128.0
+            };
+            let mut line = format!("{t:24} {:?} {:>6} x {:>5}, us:", w.kind, w.rows, w.cols);
+            for tokens in 1..=most {
+                line += &format!("  {tokens}: {:.0}", time(tokens));
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// The tensor-core products' tiles of 16 and 32 tokens (batches of 9 to 32) give exactly
+/// what the 64-token tile gives for the same tokens: the same whole-number sums, scaled in
+/// the same order. With VIREO_TIME set, each batch's time too.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn short_batch_tiles_match_the_64_token_tile() {
+    let Some(gpu) = open_gpu() else { return };
+    let timing = std::env::var_os("VIREO_TIME").is_some();
+    let sets: [(&str, &[&str]); 2] = [
+        (
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            &[
+                "blk.0.ffn_down.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.attn_qkv.weight",
+                "blk.0.ssm_alpha.weight",
+            ],
+        ),
+        (
+            "gemma-4-E4B_q4_0-it.gguf",
+            &["blk.0.ffn_gate.weight", "blk.0.ffn_down.weight", "blk.0.attn_k.weight"],
+        ),
+    ];
+    for (name, tensors) in sets {
+        let Some(file) = model(name) else { continue };
+        for &t in tensors {
+            let w = matrix(&file, t);
+            if !Gpu::supports_8bit(w.kind) || !w.cols.is_multiple_of(32) {
+                continue;
+            }
+            let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
+            let most = 64;
+            let x: Vec<f32> = (0..most * w.cols)
+                .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x).unwrap();
+            let q8 = gpu.alloc_q8(most, w.cols).unwrap();
+            let y = gpu.alloc(most * w.rows * 4).unwrap();
+            gpu.quantize(x_gpu.ptr(), &q8, most, w.cols).unwrap();
+            let run = |tokens: usize| {
+                gpu.matmul_8bit(w.kind, weights.ptr(), &q8, y.ptr(), w.rows, w.cols, tokens)
+                    .unwrap();
+            };
+            run(most);
+            let mut whole = vec![0.0; most * w.rows];
+            y.read_f32(&mut whole).unwrap();
+            assert!(whole.iter().any(|v| *v != 0.0), "{t}: all zeros");
+            for tokens in [9, 15, 16, 17, 31, 32] {
+                run(tokens);
+                let mut got = vec![0.0; tokens * w.rows];
+                y.read_f32(&mut got).unwrap();
+                assert!(
+                    got == whole[..tokens * w.rows],
+                    "{t} ({:?}), {tokens} tokens: not the 64-token tile's numbers",
+                    w.kind
+                );
+            }
+            if !timing {
+                continue;
+            }
+            let copies = (1usize << 28).div_ceil(w.data.len()).clamp(1, 32);
+            let more: Vec<_> = (0..copies)
+                .map(|_| gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap())
+                .collect();
+            let time = |tokens: usize| {
+                let run = || {
+                    for i in 0..128 {
+                        let wp = more[i % copies].ptr();
+                        gpu.matmul_8bit(w.kind, wp, &q8, y.ptr(), w.rows, w.cols, tokens)
+                            .unwrap();
+                    }
+                    gpu.synchronize().unwrap();
+                };
+                run();
+                let started = Instant::now();
+                run();
+                started.elapsed().as_secs_f64() * 1e6 / 128.0
+            };
+            let mut line = format!("{t:24} {:?} {:>6} x {:>5}, us:", w.kind, w.rows, w.cols);
+            for tokens in [1, 8, 9, 16, 17, 32, 33, 64] {
+                line += &format!("  {tokens}: {:.0}", time(tokens));
+            }
+            eprintln!("{line}");
+        }
+    }
 }

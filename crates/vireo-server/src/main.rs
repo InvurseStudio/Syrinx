@@ -966,6 +966,13 @@ const MTP_GUESSES: usize = 3;
 /// The most picker sessions kept: the change question, the skill questions and the group
 /// question each start their own way.
 const PICKERS: usize = 3;
+/// The most tokens a picker session reads at once. Its questions are a few hundred tokens,
+/// mostly shared with the last one, and a session's buffers grow with its batch: at 1,024
+/// Qwen 3.5 9B's are 0.4 GB a session, and three pickers on top of the chat's left an 8 GB
+/// GPU with none free (Windows then keeps GPU memory in the PC's: a token took 27 ms, not
+/// 19.5, over nine eval cases). 256 on CUDA: 0.1 GB each. The Mac keeps 1,024, as measured
+/// there.
+const PICKER_BATCH: usize = if cfg!(target_os = "macos") { 1024 } else { 256 };
 /// A question goes to a new or the oldest picker unless one shares at least this many
 /// tokens with it (more than the chat template's opening).
 const PICKER_MIN_SHARED: usize = 48;
@@ -978,6 +985,9 @@ const AUTO_CONTEXT_MAX: usize = 32768;
 /// GPU memory `--context auto` leaves free: for the display and other programs on a PC
 /// whose GPU also drives the screen (and a tenth of what's free on top).
 const GPU_HEADROOM: usize = 1 << 30;
+/// GPU memory left free after a Qwen session's DeltaNet steps (kept so the chat's guesses
+/// can be undone): without it Windows moves GPU memory into the PC's, and everything slows.
+const STEPS_HEADROOM: usize = 384 << 20;
 
 /// How many tokens `ids` starts with that `tokens` does too, leaving at least the last of
 /// `ids` to read again (for its logits).
@@ -1068,7 +1078,7 @@ impl Model {
             Some(i) => i,
             None if kept.pickers.len() < PICKERS => {
                 kept.pickers.push(Picker {
-                    session: self.session(1024)?,
+                    session: self.picker_session()?,
                     tokens: Vec::new(),
                     checkpoint: None,
                     used: 0,
@@ -1152,6 +1162,22 @@ impl Model {
             Model::Llama(m) => Session::Llama(m.session(capacity).map_err(e)?),
             Model::Qwen35(m) => Session::Qwen35(m.session(capacity).map_err(e)?),
             Model::Gemma4(m) => Session::Gemma4(m.session(capacity).map_err(e)?),
+        })
+    }
+
+    /// A session for the server's own questions: 1,024 positions, read on CUDA in batches
+    /// of [`PICKER_BATCH`], since a session's buffers are sized by its batch.
+    fn picker_session(&self) -> Result<Session, String> {
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let (capacity, batch) = (1024, PICKER_BATCH);
+        Ok(match self {
+            Model::Llama(m) => Session::Llama(m.session_with_batch(capacity, batch).map_err(e)?),
+            Model::Qwen35(m) => {
+                Session::Qwen35(m.session_with_batch(capacity, batch).map_err(e)?)
+            }
+            Model::Gemma4(m) => {
+                Session::Gemma4(m.session_with_batch(capacity, batch).map_err(e)?)
+            }
         })
     }
 
@@ -1922,17 +1948,21 @@ fn reply(
     }
     // Without a draft model: guesses from the chat itself, for a model that can go back.
     // Qwen goes back through the DeltaNet steps its chat session keeps for short batches:
-    // to draft with its multi-token-prediction layer, or from the chat on a large model.
-    // On a small one a check of a few tokens costs too much against one token for the
-    // chat's guesses to pay (Qwen 3.5 4B, eight eval cases: writing 5.5 → 5.9 s; 27B 58.4
-    // → 52.9 s).
+    // to draft with its multi-token-prediction layer, or from the chat. On the Mac only on
+    // a large model: on a small one a check of a few tokens costs too much against one
+    // token for the chat's guesses to pay (Qwen 3.5 4B, eight eval cases: writing 5.5 →
+    // 5.9 s; 27B 58.4 → 52.9 s). On CUDA a check of 4 costs Qwen 3.5 4B 1.4 times one
+    // token, and it pays on every size (4B rewriting a document as a list 86 → 199
+    // tokens/s, 9B returning an edited code file 52 → 157; a new story 1-3% slower),
+    // where the GPU has the memory for the steps besides what's kept free.
     let can_go_back = match (model, &mut kept.session) {
         (Model::Gemma4(_) | Model::Llama(_), _) => true,
-        (Model::Qwen35(m), Session::Qwen35(s))
-            if m.can_rewind() && (s.keeps_mtp() || m.config.dim >= 5120) =>
-        {
-            m.keep_steps(s).map_err(|e| e.to_string())?;
-            true
+        (Model::Qwen35(m), Session::Qwen35(s)) if m.can_rewind() => {
+            let pays = s.keeps_mtp() || m.config.dim >= 5120 || !cfg!(target_os = "macos");
+            let room = cfg!(target_os = "macos")
+                || s.keeps_steps()
+                || m.gpu().free_memory() >= m.steps_bytes() + STEPS_HEADROOM;
+            pays && room && m.keep_steps(s).is_ok()
         }
         _ => false,
     };
