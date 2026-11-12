@@ -90,7 +90,7 @@ impl CudaSession {
     pub fn cache_bytes_per_position(&self) -> usize {
         self.cache_buffers()
             .iter()
-            .map(|(b, _)| b.len_bytes())
+            .map(|(b, _, _)| b.len_bytes())
             .sum::<usize>()
             / self.capacity.max(1)
     }
@@ -120,7 +120,7 @@ impl CudaSession {
         self.keys
             .iter()
             .chain(&self.values)
-            .map(|b| (b, None))
+            .map(|b| (b, None, 0))
             .collect()
     }
 }
@@ -294,6 +294,7 @@ impl<'a> LlamaCuda<'a> {
                     pos: s.pos.ptr(),
                     eps: c.norm_eps,
                     half_cache: s.half_cache,
+                    ring: 0,
                 },
                 t,
             )

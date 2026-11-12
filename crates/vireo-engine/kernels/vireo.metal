@@ -508,6 +508,75 @@ kernel void matvec_split_q6_k(ARGS, KP) {
     MATVEC_STORE_SPLIT
 }
 
+// A few tokens' products at once (a draft's guesses, checked in one pass): y[t] = W x[t]
+// for `tokens` ≤ MT tokens, rows of x and y a token each. The split kernel's layout, each
+// lane's share of a block's weights decoded once and used for every token, so the
+// weights are read once as for one token. The prompt kernels' tiles hold 128 tokens: for
+// 2 to 8 they do 16 to 64 times the arithmetic needed (Gemma 4 31B checking 4 guesses:
+// about 190 ms against 50 for one token). Arguments: w, x, y, rows, cols; one kernel a
+// token count, unrolled.
+// MR rows a threadgroup (MULTI_ROWS: 8 for up to 4 tokens, 4 above), so the tokens'
+// activations, read again by every threadgroup, cost no more than one token's do in the
+// single-token kernels; each block's x is loaded once for all of its rows.
+template <int MT, int MR>
+kernel void matvec_multi_q6_k(ARGS, KP) {
+    MATVEC_ARGS
+    threadgroup float mv_parts[MV_SPLIT][MR * MT];
+    const int lane = tid & 31, sgi = tid >> 5;
+    const int row0 = gid.x * MR;
+    if (row0 >= rows) return;
+    const int nrows = min(MR, rows - row0);
+    float sum[MR][MT];
+    for (int r = 0; r < MR; r++)
+        for (int t = 0; t < MT; t++) sum[r][t] = 0.0f;
+    const int blocks = cols / 256;
+    const ulong row_bytes = (ulong)blocks * Q6K_BYTES;
+    const int sub = lane >> 4, hf = (lane & 15) >> 3, l = (lane & 7) * 4;
+    for (int b = sub + 2 * sgi; b < blocks; b += 2 * MV_SPLIT) {
+        float4 xv[MT][4];
+        for (int t = 0; t < MT; t++) {
+            device const float* xb = x + (ulong)t * cols + b * 256 + hf * 128 + l;
+            for (int k = 0; k < 4; k++) xv[t][k] = f4(xb + k * 32);
+        }
+        for (int r = 0; r < MR; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
+            const float d = half_at(block + 208);
+            const u32 ql0 = u32_at4(block + hf * 64 + l), ql1 = u32_at4(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + hf * 32 + l);
+            device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
+            for (int k = 0; k < 4; k++) {
+                const u32 low = ((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4);
+                const float f = d * (float)sc[2 * k];
+                const float4 wq = f * float4(small_int((low & 0xF) | (((qh >> (2 * k)) & 3) << 4), 32.0f),
+                                             small_int(((low >> 8) & 0xF) | (((qh >> (8 + 2 * k)) & 3) << 4), 32.0f),
+                                             small_int(((low >> 16) & 0xF) | (((qh >> (16 + 2 * k)) & 3) << 4), 32.0f),
+                                             small_int(((low >> 24) & 0xF) | (((qh >> (24 + 2 * k)) & 3) << 4), 32.0f));
+                for (int t = 0; t < MT; t++) sum[r][t] += dot(wq, xv[t][k]);
+            }
+        }
+    }
+    for (int r = 0; r < MR; r++)
+        for (int t = 0; t < MT; t++) {
+            const float part = simd_sum(sum[r][t]);
+            if (lane == 0) mv_parts[sgi][r * MT + t] = part;
+        }
+    BARRIER;
+    for (int i = tid; i < nrows * MT; i += tpg.x) {
+        const int r = i / MT, t = i % MT;
+        float total = 0.0f;
+        for (int g = 0; g < MV_SPLIT; g++) total += mv_parts[g][r * MT + t];
+        y[(ulong)t * rows + row0 + r] = total;
+    }
+}
+template [[host_name("matvec_multi_q6_k_2")]] kernel void matvec_multi_q6_k<2, 4>(ARGS, KP);
+template [[host_name("matvec_multi_q6_k_3")]] kernel void matvec_multi_q6_k<3, 4>(ARGS, KP);
+template [[host_name("matvec_multi_q6_k_4")]] kernel void matvec_multi_q6_k<4, 2>(ARGS, KP);
+template [[host_name("matvec_multi_q6_k_5")]] kernel void matvec_multi_q6_k<5, 2>(ARGS, KP);
+template [[host_name("matvec_multi_q6_k_6")]] kernel void matvec_multi_q6_k<6, 2>(ARGS, KP);
+template [[host_name("matvec_multi_q6_k_7")]] kernel void matvec_multi_q6_k<7, 2>(ARGS, KP);
+template [[host_name("matvec_multi_q6_k_8")]] kernel void matvec_multi_q6_k<8, 2>(ARGS, KP);
+
 // One token's gate and up projections and the activation in one dispatch: y =
 // act(W_gate x) × (W_up x), act SiLU (0) or tanh-GELU (1). The split kernels with each
 // threadgroup taking 2 rows of both matrices (as 4 rows: r & 1 the row, r >> 1 which
@@ -1088,6 +1157,11 @@ kernel void residual_norm(ARGS, KP) {
     for (int i = tid; i < n; i += tpg.x) h[i] = x[i] * s * next[i];
 }
 
+// Where a position's keys and values sit in a layer's cache: its row, or for a ring (a
+// sliding-window layer that keeps only the last `ring` positions) its row modulo the ring.
+// The ring travels in the window argument's high 16 bits (see Gpu::attention).
+inline ulong ring_row(int t, int ring) { return (ulong)(ring > 0 ? t % ring : t); }
+
 // See qkv_prep in vireo.cu.
 #define QKV_TOKENS 8
 kernel void qkv_prep(ARGS, KP) {
@@ -1106,7 +1180,7 @@ kernel void qkv_prep(ARGS, KP) {
     const int neox = ARG_INT(17);
     device const int* pos = ARG_PTR(const int, 18);
     const float eps = ARG_F32(19);
-    const int half_cache = ARG_INT(20), tokens = ARG_INT(21);
+    const int half_cache = ARG_INT(20), tokens = ARG_INT(21), ring = ARG_INT(22);
 
     threadgroup float scratch[32];
     threadgroup float buf[512];
@@ -1135,7 +1209,7 @@ kernel void qkv_prep(ARGS, KP) {
             dst = q_dst + ((ulong)t * heads + h) * hd;
         } else {
             src = (kind == 1 ? k_src : v_src) + (ulong)t * kv_dim + h * hd;
-            const ulong at_cache = (ulong)at * kv_dim + h * hd;
+            const ulong at_cache = ring_row(at, ring) * kv_dim + h * hd;
             const ulong cache = kind == 1 ? k_cache : v_cache;
             if (half_cache)
                 half_dst = reinterpret_cast<device half*>(cache) + at_cache;
@@ -1195,7 +1269,7 @@ kernel void attention_one(ARGS, KP) {
     device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), hd = ARG_INT(6), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, hd = ARG_INT(6), kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     threadgroup float scratch[32];
     threadgroup float qs[512];
@@ -1214,7 +1288,7 @@ kernel void attention_one(ARGS, KP) {
         const int at = start + tid;
         float s = -INFINITY;
         if (at < len) {
-            device const KV* k = keys + (ulong)at * kv_dim + kv;
+            device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
             float dot = 0.0f;
             for (int d = 0; d < hd; d += 4) {
                 const float4 kv4 = load4(k + d);
@@ -1236,8 +1310,8 @@ kernel void attention_one(ARGS, KP) {
             const int d = tid + j * 128;
             if (d >= hd) break;
             float a = acc[j] * correction;
-            device const KV* v = values + (ulong)start * kv_dim + kv + d;
-            for (int i = 0; i < count; i++) a += ps[i] * load1(v + (ulong)i * kv_dim);
+            device const KV* v = values + kv + d;
+            for (int i = 0; i < count; i++) a += ps[i] * load1(v + ring_row(start + i, ring) * kv_dim);
             acc[j] = a;
         }
         max_so_far = new_max;
@@ -1260,7 +1334,7 @@ kernel void attention_part(ARGS, KP) {
     device const KV* values = ARG_PTR(const KV, 2);
     device float* partial = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), hd = ARG_INT(6), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, hd = ARG_INT(6), kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     threadgroup float scratch[32];
     threadgroup float qs[512];
@@ -1280,7 +1354,7 @@ kernel void attention_part(ARGS, KP) {
         const int at = start + tid;
         float s = -INFINITY;
         if (at < hi) {
-            device const KV* k = keys + (ulong)at * kv_dim + kv;
+            device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
             float dot = 0.0f;
             for (int d = 0; d < hd; d += 4) {
                 const float4 kv4 = load4(k + d);
@@ -1302,8 +1376,8 @@ kernel void attention_part(ARGS, KP) {
             const int d = tid + j * 128;
             if (d >= hd) break;
             float a = acc[j] * correction;
-            device const KV* v = values + (ulong)start * kv_dim + kv + d;
-            for (int i = 0; i < count; i++) a += ps[i] * load1(v + (ulong)i * kv_dim);
+            device const KV* v = values + kv + d;
+            for (int i = 0; i < count; i++) a += ps[i] * load1(v + ring_row(start + i, ring) * kv_dim);
             acc[j] = a;
         }
         max_so_far = new_max;
@@ -1367,7 +1441,7 @@ kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
     device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
@@ -1396,7 +1470,7 @@ kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
         float s[HG];
         for (int h = 0; h < HG; h++) s[h] = 0.0f;
         if (at < hi) {
-            device const KV* k = keys + (ulong)at * kv_dim + kv;
+            device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
             for (int d = 0; d < D; d += 4) {
                 const float4 k4 = load4(k + d);
                 for (int h = 0; h < HG; h++) {
@@ -1416,9 +1490,9 @@ kernel void attention_decode(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
             m[h] = new_max;
         }
         const int count = min(32, hi - base);
-        device const KV* v = values + (ulong)base * kv_dim + kv + lane * DPL;
+        device const KV* v = values + kv + lane * DPL;
         for (int i = 0; i < count; i++) {
-            device const KV* vr = v + (ulong)i * kv_dim;
+            device const KV* vr = v + ring_row(base + i, ring) * kv_dim;
             float vv[DPL];
             for (int j = 0; j < DPL; j++) vv[j] = load1(vr + j);
             for (int h = 0; h < HG; h++) {
@@ -1515,7 +1589,7 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
@@ -1535,7 +1609,7 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     float m = -INFINITY, l = 0.0f, o[DPL];
     for (int j = 0; j < DPL; j++) o[j] = 0.0f;
     for (int at = lo + (int)sg; at < hi; at += SG) {
-        device const KV* k = keys + (ulong)at * kv_dim + kv;
+        device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
         float dot = 0.0f;
         for (int j = 0; j < DPL; j += 4) {
             const float4 k4 = load4(k + j);
@@ -1546,7 +1620,7 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
         const float correction = exp(m - new_max);
         const float p = exp(s - new_max);
         l = l * correction + p;
-        device const KV* v = values + (ulong)at * kv_dim + kv;
+        device const KV* v = values + ring_row(at, ring) * kv_dim + kv;
         for (int j = 0; j < DPL; j += 4) {
             const float4 v4 = load4(v + j);
             o[j] = o[j] * correction + p * v4.x;
@@ -1625,7 +1699,7 @@ kernel void attention_tiled(ARGS, KP) {
     device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     const int tokens = ARG_INT(10);
     constexpr int HD = LANES * PER, ROWS = 256 / LANES;
@@ -1656,8 +1730,8 @@ kernel void attention_tiled(ARGS, KP) {
             const int r = (i * 4) / HD, d = (i * 4) % HD;
             float4 kv4 = float4(0.0f), vv4 = float4(0.0f);
             if (r < count) {
-                kv4 = load4(keys + (ulong)(start + r) * kv_dim + kv + d);
-                vv4 = load4(values + (ulong)(start + r) * kv_dim + kv + d);
+                kv4 = load4(keys + ring_row(start + r, ring) * kv_dim + kv + d);
+                vv4 = load4(values + ring_row(start + r, ring) * kv_dim + kv + d);
             }
             *reinterpret_cast<threadgroup float4*>(&ks[r][d]) = kv4;
             *reinterpret_cast<threadgroup float4*>(&vs[r][d]) = vv4;
@@ -1738,7 +1812,7 @@ kernel void attention_flash(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]]
     device const half* values = ARG_PTR(const half, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     const int tokens = ARG_INT(10);
     constexpr int THREADS = 128, BLOCKS = QT / 8 * (D / 8) / 4;  // O's blocks per SIMD group
@@ -1783,7 +1857,7 @@ kernel void attention_flash(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]]
             const int r = (i * 4) / D, d = (i * 4) % D;
             half4 k4 = half4(0.0h), v4 = half4(0.0h);
             if (r < count) {
-                const ulong at = (ulong)(start + r) * kv_dim + kv + d;
+                const ulong at = ring_row(start + r, ring) * kv_dim + kv + d;
                 k4 = *reinterpret_cast<device const half4*>(keys + at);
                 v4 = *reinterpret_cast<device const half4*>(values + at);
             }
@@ -1878,7 +1952,7 @@ kernel void attention_flash2(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
     device const half* values = ARG_PTR(const half, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5), kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     const int tokens = ARG_INT(10);
     constexpr int THREADS = 32 * SG, BLOCKS = QT / 8 * (D / 8) / SG;
@@ -1921,7 +1995,7 @@ kernel void attention_flash2(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
         for (int i = tid; i < C * D / 4; i += THREADS) {
             const int r = (i * 4) / D, d = (i * 4) % D;
             half4 k4 = half4(0.0h);
-            if (r < count) k4 = *reinterpret_cast<device const half4*>(keys + (ulong)(start + r) * kv_dim + kv + d);
+            if (r < count) k4 = *reinterpret_cast<device const half4*>(keys + ring_row(start + r, ring) * kv_dim + kv + d);
             *reinterpret_cast<threadgroup half4*>(skv + r * D + d) = k4;
         }
         BARRIER;
@@ -1940,7 +2014,7 @@ kernel void attention_flash2(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]
         for (int i = tid; i < C * D / 4; i += THREADS) {
             const int r = (i * 4) / D, d = (i * 4) % D;
             half4 v4 = half4(0.0h);
-            if (r < count) v4 = *reinterpret_cast<device const half4*>(values + (ulong)(start + r) * kv_dim + kv + d);
+            if (r < count) v4 = *reinterpret_cast<device const half4*>(values + ring_row(start + r, ring) * kv_dim + kv + d);
             *reinterpret_cast<threadgroup half4*>(skv + r * D + d) = v4;
         }
         if ((int)tid < QT * ROW_THREADS) {

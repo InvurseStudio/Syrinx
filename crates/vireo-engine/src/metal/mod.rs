@@ -652,6 +652,8 @@ struct Kernels {
     /// The quantized ones with each row pair split over the threadgroup's 4 SIMD groups
     /// (none for F32 and F16).
     matvec_split: [Option<Pso>; 7],
+    /// A few tokens at once (see [`Gpu::matvec_multi`]): Q6_K so far.
+    matvec_q6_k_multi: Vec<Pso>,
     /// One token's gate and up projections with the activation (Gpu::matvec_glu).
     matvec_glu: [Option<Pso>; 7],
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
@@ -659,6 +661,8 @@ struct Kernels {
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
     /// with the kernel that rounds the activations.
     matmul_tc: Option<([Pso; 7], Pso)>,
+    /// The same with the wide tile, for long batches (TC_WIDE).
+    matmul_tc_wide: Option<[Pso; 7]>,
     rms_norm: Pso,
     residual_norm: Pso,
     qkv_prep: Pso,
@@ -757,11 +761,21 @@ const TILE_ROWS: u32 = 64;
 const TILE_TOKENS: u32 = 32;
 /// The tensor kernel's tile (matmul_tc in vireo_tensor.metal): weight rows, tokens and
 /// SIMD groups. Of the shapes tried on the M5 Max (16–128 rows, 64–256 tokens, 2–8
-/// groups), 32 × 128 × 4 read prompts fastest on all three test models; with it, 128
-/// columns a step (TC_K) was ~3% faster for Gemma 4 than 64, and level for Qwen 3.5.
+/// groups), 32 × 128 × 4 read prompts fastest on the small test models at first; with
+/// it, 128 columns a step (TC_K) was ~3% faster for Gemma 4 than 64, and level for Qwen
+/// 3.5. Long batches take a wider one (TC_WIDE): of the shapes tried on Gemma 4 31B's
+/// 6,144-token prompt, 32 × 256 × 4 678 tokens/s, 64 × 128 × 4 655, 64 × 256 × 8 652,
+/// 32 × 256 × 8 600.
 fn tensor_tile() -> (u32, u32, u32) {
     (32, 128, 4)
 }
+
+/// The wide tile's tokens (TC_WIDE), for a prompt's whole batches of at least
+/// [`WIDE_TOKENS`]: on Gemma 4 31B, a 6,144-token prompt 533 → 678 tokens/s, E2B 22.4K →
+/// 23.9K and E4B 7.3K → 8.0K, Qwen 3.5 4B level. Not for shorter batches: the eval's
+/// prompts and tool results, mostly under 1,024 tokens, read 10–20% slower with it.
+const TC_WIDE: u32 = 256;
+const WIDE_TOKENS: usize = 1024;
 /// attention_flash's tokens per threadgroup, for head sizes 64, 128, 256 and 512.
 const FLASH_TOKENS: [u32; 4] = [32, 32, 16, 8];
 /// attention_flash2's tokens and threads per threadgroup, for the same head sizes.
@@ -794,7 +808,7 @@ impl Gpu {
         // With the tensor kernels where Metal compiles them (it can't before the M5 and A19).
         let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
         let with_tensors = format!(
-            "{SOURCE}\n#define TC_ROWS {tc_rows}\n#define TC_TOKENS {tc_tokens}\n#define TC_SG {tc_sg}\n{TENSOR_SOURCE}"
+            "{SOURCE}\n#define TC_ROWS {tc_rows}\n#define TC_TOKENS {tc_tokens}\n#define TC_WIDE {TC_WIDE}\n#define TC_SG {tc_sg}\n{TENSOR_SOURCE}"
         );
         let (library, tensor_ops) = match device
             .newLibraryWithSource_options_error(&NSString::from_str(&with_tensors), Some(&options))
@@ -848,10 +862,18 @@ impl Gpu {
         let kernels = Kernels {
             matvec: per_kind("matvec")?,
             matvec_split: quantized("matvec_split")?,
+            matvec_q6_k_multi: (2..=Self::MULTI_TOKENS)
+                .map(|n| pipeline(&format!("matvec_multi_q6_k_{n}")))
+                .collect::<Result<_>>()?,
             matvec_glu: quantized("matvec_glu")?,
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
                 Some((per_kind("matmul_tc")?, pipeline("to_half")?))
+            } else {
+                None
+            },
+            matmul_tc_wide: if tensor_ops {
+                Some(per_kind("matmul_tc_wide")?)
             } else {
                 None
             },
@@ -1206,6 +1228,55 @@ impl Gpu {
         self.run(kernel, (grid, 1), ROWS_PER_BLOCK * 32, &args)
     }
 
+    /// The most tokens [`Gpu::matvec_multi`] takes at once (MT in vireo.metal).
+    pub const MULTI_TOKENS: usize = 8;
+
+    /// `y[t] = W x[t]` for 2 to [`Gpu::MULTI_TOKENS`] tokens, `x` and `y` a row of f32 a
+    /// token, reading W once as for one token: a draft's guesses checked in one pass.
+    /// False, having done nothing, for a type without such a kernel (Q6_K has one).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_multi(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        tokens: usize,
+    ) -> Result<bool> {
+        if kind != TensorType::Q6_K || !(2..=Self::MULTI_TOKENS).contains(&tokens) {
+            return Ok(false);
+        }
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+        ];
+        self.run(
+            &self.kernels.matvec_q6_k_multi[tokens - 2],
+            // Rows a threadgroup: MULTI_ROWS in vireo.metal.
+            (
+                (rows as u32).div_ceil(match tokens {
+                    2 => 4,
+                    3 => 4,
+                    4 => 2,
+                    5 => 2,
+                    6 => 2,
+                    7 => 2,
+                    8 => 2,
+                    _ => 2,
+                }),
+                1,
+            ),
+            128,
+            &args,
+        )?;
+        Ok(true)
+    }
+
     /// One token's gate and up projections and the activation in one dispatch: `y =
     /// act(W_gate x) × (W_up x)`, act SiLU (`gelu` false) or tanh-GELU, both matrices
     /// `rows` × `cols` of type `kind`. What two `matvec`s and `swiglu`/`geglu` do, with
@@ -1357,6 +1428,7 @@ impl Gpu {
             Arg::F32(p.eps),
             Arg::I32(p.half_cache as i32),
             Arg::I32(tokens as i32),
+            Arg::I32(p.ring as i32),
         ];
         let slots = p.heads + if kv { 2 * p.kv_heads } else { 0 };
         let threads = (p.head_dim.div_ceil(32) * 32).min(256) as u32;
@@ -1387,9 +1459,46 @@ impl Gpu {
         group: usize,
         scale: f32,
     ) -> Result<()> {
+        self.attention_ring(
+            half_cache, q, keys, values, out, pos, window, 0, heads, tokens, head_dim, kv_dim,
+            group, scale,
+        )
+    }
+
+    /// [`Gpu::attention`] over a cache that keeps a sliding-window layer's last `ring`
+    /// positions only, position p at row p mod `ring` (0: every position, at its own row).
+    /// The ring holds the window and a batch's new positions, and is a multiple of 64 (the
+    /// tensor kernel's chunk), so no chunk runs over its end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_ring(
+        &self,
+        half_cache: bool,
+        q: CuDevicePtr,
+        keys: CuDevicePtr,
+        values: CuDevicePtr,
+        out: CuDevicePtr,
+        pos: CuDevicePtr,
+        window: usize,
+        ring: usize,
+        heads: usize,
+        tokens: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        group: usize,
+        scale: f32,
+    ) -> Result<()> {
         assert!(
             head_dim <= 512 && head_dim.is_multiple_of(4),
             "head size {head_dim}"
+        );
+        // The kernels take the window in the argument's low 16 bits and the ring in its high.
+        assert!(
+            window < 1 << 16 && ring < 1 << 15 && ring.is_multiple_of(64),
+            "window {window}, ring {ring}"
+        );
+        assert!(
+            ring == 0 || ring >= window + tokens,
+            "a ring of {ring} for {tokens} tokens"
         );
         let args = [
             Arg::Ptr(q),
@@ -1397,7 +1506,7 @@ impl Gpu {
             Arg::Ptr(values),
             Arg::Ptr(out),
             Arg::Ptr(pos),
-            Arg::I32(window as i32),
+            Arg::I32((window | ring << 16) as i32),
             Arg::I32(head_dim as i32),
             Arg::I32(kv_dim as i32),
             Arg::I32(group as i32),
@@ -1860,6 +1969,10 @@ impl Gpu {
             _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
         };
         let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
+        let (kernels, tc_tokens) = match &self.kernels.matmul_tc_wide {
+            Some(wide) if tokens >= WIDE_TOKENS => (wide, TC_WIDE),
+            _ => (kernels, tc_tokens),
+        };
         let grid = (
             (rows as u32).div_ceil(tc_rows),
             (tokens as u32).div_ceil(tc_tokens),
@@ -1939,6 +2052,9 @@ pub struct QkvPrep {
     pub eps: f32,
     /// The cache holds f16 (8-bit mode), not f32.
     pub half_cache: bool,
+    /// The cache keeps the last `ring` positions only (see [`Gpu::attention_ring`]); 0 for
+    /// every position.
+    pub ring: usize,
 }
 
 /// What [`Gpu::delta_net`] works on (see the CUDA backend's `DeltaNet`).

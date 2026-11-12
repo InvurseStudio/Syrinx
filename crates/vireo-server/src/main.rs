@@ -26,6 +26,7 @@
 mod attach;
 mod calc;
 mod chat;
+mod draft;
 mod files;
 mod http;
 mod json;
@@ -59,6 +60,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
                     [--changes declared|scored|offered] [--skills on|off]
+                    [--draft <small-model.gguf>] [--draft-tokens <n>]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -75,7 +77,11 @@ the user always allows are kept in approvals.txt in that folder.
 
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
 and --with-app (stop when the app does: when its end of standard input closes), and
-reads the address from the \"Listening on\" line.";
+reads the address from the \"Listening on\" line.
+
+--draft has a small model of the same family and vocabulary guess the next tokens (Gemma
+4 E2B for 31B), --draft-tokens at a time (2 by default), for the model to check in one
+pass: every token is still the model's own pick. Gemma 4 only.";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -98,6 +104,9 @@ struct Options {
     /// Skills picked by scoring and written in as a `use_skill` call (`--skills on`, the
     /// default), or none (`off`).
     skills: bool,
+    /// A draft model to guess tokens with (`--draft`), and how many a round.
+    draft: Option<String>,
+    draft_tokens: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -131,6 +140,8 @@ fn main() -> ExitCode {
     let mut heal = true;
     let mut changes = Changes::Declared;
     let mut use_skills = true;
+    let mut draft = None;
+    let mut draft_tokens = draft::DEFAULT_GUESSES;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -195,6 +206,18 @@ fn main() -> ExitCode {
                 };
                 i += 1;
             }
+            "--draft" if value.is_some() => {
+                draft = value.cloned();
+                i += 1;
+            }
+            "--draft-tokens"
+                if value
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .is_some_and(|n| (1..=16).contains(&n)) =>
+            {
+                draft_tokens = value.unwrap().parse().unwrap();
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -218,6 +241,8 @@ fn main() -> ExitCode {
         scored_groups,
         changes,
         skills: use_skills,
+        draft,
+        draft_tokens,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -926,7 +951,9 @@ impl Model {
     fn empty(&self, s: &mut Session) -> Result<(), String> {
         match (self, s) {
             (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
-            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(0),
+            (Model::Gemma4(_), Session::Gemma4(s)) => {
+                s.truncate(0);
+            }
             (Model::Qwen35(m), Session::Qwen35(s)) => m.reset(s).map_err(|e| e.to_string())?,
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1003,7 +1030,14 @@ impl Model {
             }
             match (self, &mut kept.session) {
                 (Model::Llama(_), Session::Llama(s)) => s.truncate(len),
-                (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(len),
+                // A few tokens back: well inside what the session keeps.
+                (Model::Gemma4(_), Session::Gemma4(s)) => {
+                    if s.truncate(len) != len {
+                        return Err(
+                            "The chat's cache couldn't go back to before the choices.".into()
+                        );
+                    }
+                }
                 (Model::Qwen35(m), Session::Qwen35(s)) => {
                     m.restore(s, kept.scratch.as_ref().unwrap()).map_err(e)?
                 }
@@ -1030,10 +1064,12 @@ impl Model {
                 s.truncate(shared);
                 shared
             }
+            // Back to the shared start, or to the beginning when the sliding-window
+            // layers no longer hold the window before it.
             (Model::Gemma4(_), Session::Gemma4(s)) => {
-                s.truncate(shared);
-                kept.history_end = kept.history_end.min(shared);
-                shared
+                let kept_len = s.truncate(shared);
+                kept.history_end = kept.history_end.min(kept_len);
+                kept_len
             }
             // A DeltaNet state can't be cut back: go on from the end, if every token
             // there is wanted, else from the last history's end, else from empty.
@@ -1074,6 +1110,25 @@ impl Model {
         let logits = self.read(&mut kept.session, ids)?;
         kept.tokens.extend_from_slice(ids);
         Ok(logits)
+    }
+
+    /// Takes the session back to `kept.tokens`, dropping what was read past them (a
+    /// draft's guesses): a few tokens, well inside what the session keeps.
+    fn rewind(&self, kept: &mut Kept) -> Result<(), String> {
+        let len = kept.tokens.len();
+        let ok = match (self, &mut kept.session) {
+            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(len) == len,
+            (Model::Llama(_), Session::Llama(s)) => {
+                s.truncate(len);
+                true
+            }
+            _ => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err("The chat's cache couldn't go back to before the draft's guesses.".into())
+        }
     }
 
     /// How many of `ids` `continue_with` would keep from the session in use.
@@ -1155,7 +1210,9 @@ impl Model {
     fn clear(&self, kept: &mut Kept) -> Result<(), String> {
         match (self, &mut kept.session) {
             (Model::Llama(_), Session::Llama(s)) => s.truncate(0),
-            (Model::Gemma4(_), Session::Gemma4(s)) => s.truncate(0),
+            (Model::Gemma4(_), Session::Gemma4(s)) => {
+                s.truncate(0);
+            }
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 m.reset(s).map_err(|e| e.to_string())?;
                 kept.checkpoint = None;
@@ -1291,6 +1348,37 @@ fn engine(
             return;
         }
     };
+    let mut drafter = match &options().draft {
+        Some(draft_path) if family == Family::Gemma4 => {
+            let started = Instant::now();
+            match draft::Drafter::load(
+                draft_path,
+                &tokenizer,
+                precision,
+                context,
+                options().draft_tokens,
+            ) {
+                Ok(d) => {
+                    eprintln!(
+                        "Drafting with {}, {} tokens a round (loaded in {:.1?}).",
+                        d.name,
+                        d.guesses,
+                        started.elapsed()
+                    );
+                    Some(d)
+                }
+                Err(e) => {
+                    let _ = ready.send(Err(e));
+                    return;
+                }
+            }
+        }
+        Some(_) => {
+            let _ = ready.send(Err("--draft works with Gemma 4 models only.".into()));
+            return;
+        }
+        None => None,
+    };
     let _ = ready.send(Ok(ModelInfo {
         model: name,
         runtime: format!("Vireo engine ({gpu_name}, {mode})"),
@@ -1355,6 +1443,7 @@ fn engine(
             context,
             seed,
             &job,
+            drafter.as_mut(),
         ) {
             // Whatever the session held is unknown now: the next reply starts afresh.
             kept = None;
@@ -1443,6 +1532,7 @@ fn reply(
     context: usize,
     seed: u64,
     job: &Job,
+    mut drafter: Option<&mut draft::Drafter>,
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
@@ -1540,6 +1630,9 @@ fn reply(
         switch_chat(model, kept, store, &ids, context)?;
     }
     let (mut logits, reused) = model.continue_with(kept, &ids, mark)?;
+    if let Some(d) = drafter.as_deref_mut() {
+        d.sync(&kept.tokens)?;
+    }
     let prompt_seconds = started.elapsed().as_secs_f64();
 
     let settings = family.sampling().with(job.generation.as_ref());
@@ -1564,6 +1657,14 @@ fn reply(
     // that start a call are taken away from it.
     let mut may_call = !offered.is_empty();
     let mut brace_tokens: Option<Vec<u32>> = None;
+    // Drafted tokens the model has read past `kept.tokens`, each with its logits after.
+    let mut ahead: std::collections::VecDeque<(u32, Vec<f32>)> = Default::default();
+    // With a draft: the last token picked, in `kept.tokens` but not read yet. It's read
+    // with the next round's guesses, in the same pass, rather than on its own.
+    let mut unread: Option<u32> = None;
+    if let Some(d) = drafter.as_deref_mut() {
+        d.start_reply();
+    }
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
     // longer list of tools, ended its turn on the result three times in 39 cases,
@@ -1571,6 +1672,39 @@ fn reply(
     let mut answer_due = !skill_ids.is_empty();
     let mut end_tokens: Option<Vec<u32>> = None;
     while generated.len() + call_tokens < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        let room = (max_tokens - generated.len() - call_tokens)
+            .min(context.saturating_sub(kept.tokens.len() + 64));
+        // Out of guesses: a new round (after the unread token, if there's one), read by
+        // the model in one pass with it.
+        if ahead.is_empty() {
+            match drafter.as_deref_mut() {
+                Some(d) if room > 1 => {
+                    let guesses = d.guess(&kept.tokens, d.guesses.min(room - 1))?;
+                    let first = usize::from(unread.is_some());
+                    let batch: Vec<u32> = unread
+                        .take()
+                        .into_iter()
+                        .chain(guesses.iter().copied())
+                        .collect();
+                    let rows = model.read_all(&mut kept.session, &batch)?;
+                    let vocab = rows.len() / batch.len();
+                    if first == 1 {
+                        logits.copy_from_slice(&rows[..vocab]);
+                    }
+                    ahead.extend(guesses.iter().enumerate().map(|(i, &g)| {
+                        (
+                            g,
+                            rows[(first + i) * vocab..(first + i + 1) * vocab].to_vec(),
+                        )
+                    }));
+                }
+                _ => {
+                    if let Some(u) = unread.take() {
+                        model.next(&mut kept.session, u, &mut logits)?;
+                    }
+                }
+            }
+        }
         if !may_call && !offered.is_empty() {
             if let Some(t) = start_token {
                 logits[t as usize] = f32::NEG_INFINITY;
@@ -1619,6 +1753,13 @@ fn reply(
             b.first() == Some(&b'{')
         };
         let opens_call = may_call && (by_token || by_brace);
+        // The guess is taken when it's the token picked, for plain text; otherwise the
+        // model goes back to before the guesses.
+        let guessed = !opens_call && ahead.front().is_some_and(|(g, _)| *g == next);
+        if !guessed && !ahead.is_empty() {
+            ahead.clear();
+            model.rewind(kept)?;
+        }
         if opens_call {
             flush_text(job, &mut pending);
             if by_token {
@@ -1708,13 +1849,30 @@ fn reply(
                 }
             }
         }
-        model.next(&mut kept.session, next, &mut logits)?;
+        if guessed {
+            logits = ahead.pop_front().unwrap().1;
+            if let Some(d) = drafter.as_deref_mut() {
+                d.taken += 1;
+            }
+        } else if drafter.is_some() {
+            unread = Some(next);
+        } else {
+            model.next(&mut kept.session, next, &mut logits)?;
+        }
         kept.tokens.push(next);
+    }
+    // Guesses read past the end of the reply (it ended, or was stopped): not the chat's.
+    // Nor a last token never read: the next turn reads it with its prompt.
+    if !ahead.is_empty() {
+        model.rewind(kept)?;
+    }
+    if unread.is_some() {
+        kept.tokens.pop();
     }
     flush_text(job, &mut pending);
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}.",
+        "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}{}.",
         ids.len(),
         ids.len() - reused,
         (ids.len() - reused) as f64 / prompt_seconds.max(1e-9),
@@ -1724,7 +1882,14 @@ fn reply(
             ", stopped"
         } else {
             ""
-        }
+        },
+        drafter.as_deref().map_or(String::new(), |d| format!(
+            ", {} of {} guesses taken ({:.0}%, {:.2}s guessing)",
+            d.taken,
+            d.guessed,
+            100.0 * d.taken as f64 / d.guessed.max(1) as f64,
+            d.seconds
+        ))
     );
     let _ = job.out.send(Out::Done {
         tokens: generated.len() + call_tokens,
