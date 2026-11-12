@@ -43,11 +43,24 @@ pub enum Schema {
     Number,
     Boolean,
     Null,
-    /// A list of `items`, at most `max_items` of them.
+    /// A list of `items`, at most `max_items` of them, as JSON writes it (`[a, b]`).
     Array {
         items: Box<Schema>,
         max_items: Option<usize>,
     },
+    /// A list in other punctuation: Gemma 4's `[a,b]`, or an object with keys of its own
+    /// (`{` and `}`, each item a key and its value). `open` and `close` are single ASCII
+    /// bytes, and no item may start with `close`.
+    List {
+        items: Box<Schema>,
+        max_items: Option<usize>,
+        open: u8,
+        separator: String,
+        close: u8,
+    },
+    /// One of these values, told apart by their first byte (a string's quote, a number's
+    /// digit, `t`/`f`/`n`): no two may start with the same byte.
+    AnyOf(Vec<Schema>),
     /// These bytes exactly (not a JSON value: for the text around one).
     Literal(String),
     /// These one after another.
@@ -260,7 +273,10 @@ enum Node {
         /// The choice after an item: another, or the end; and the end alone (at `max`).
         more: u32,
         last: u32,
+        open: u8,
+        close: u8,
     },
+    Any(Vec<u32>),
     Seq(Vec<u32>),
 }
 
@@ -322,19 +338,17 @@ impl Grammar {
                 options.scored = true;
                 self.push(Node::Choice(options))
             }
-            Schema::Array { items, max_items } => {
-                let item = self.add(items);
-                let more = self.choice(vec![
-                    (b", ".to_vec(), Then::NextItem),
-                    (b"]".to_vec(), Then::CloseArray),
-                ]);
-                let last = self.choice(vec![(b"]".to_vec(), Then::CloseArray)]);
-                self.push(Node::Arr {
-                    item,
-                    max: max_items.map_or(u16::MAX, |m| m.min(u16::MAX as usize) as u16),
-                    more,
-                    last,
-                })
+            Schema::Array { items, max_items } => self.list(items, *max_items, b'[', ", ", b']'),
+            Schema::List {
+                items,
+                max_items,
+                open,
+                separator,
+                close,
+            } => self.list(items, *max_items, *open, separator, *close),
+            Schema::AnyOf(options) => {
+                let options = options.iter().map(|o| self.add(o)).collect();
+                self.push(Node::Any(options))
             }
             Schema::Object(props) => self.record(props, &RecordStyle::json()),
             Schema::Record { fields, style } => self.record(fields, style),
@@ -362,6 +376,24 @@ impl Grammar {
                 })
             }
         }
+    }
+
+    fn list(&mut self, items: &Schema, max_items: Option<usize>, open: u8, separator: &str, close: u8) -> u32 {
+        assert!(open.is_ascii() && close.is_ascii(), "a list's brackets must be ASCII");
+        let item = self.add(items);
+        let more = self.choice(vec![
+            (separator.as_bytes().to_vec(), Then::NextItem),
+            (vec![close], Then::CloseArray),
+        ]);
+        let last = self.choice(vec![(vec![close], Then::CloseArray)]);
+        self.push(Node::Arr {
+            item,
+            max: max_items.map_or(u16::MAX, |m| m.min(u16::MAX as usize) as u16),
+            more,
+            last,
+            open,
+            close,
+        })
     }
 
     /// An object (any punctuation): its opening text, then its keys and values.
@@ -466,6 +498,10 @@ enum Frame {
         items: u16,
         open: bool,
     },
+    /// One of several values, before its first byte picks which.
+    Any {
+        node: u32,
+    },
     Seq {
         node: u32,
         next: u16,
@@ -505,6 +541,7 @@ impl Frame {
                 items: 0,
                 open: false,
             },
+            Node::Any(_) => Frame::Any { node },
             Node::Seq(_) => Frame::Seq { node, next: 0 },
         }
     }
@@ -851,18 +888,35 @@ impl<'g> Matcher<'g> {
                         return false;
                     }
                 }
+                Frame::Any { node } => {
+                    let Node::Any(options) = &g.nodes[node as usize] else {
+                        unreachable!()
+                    };
+                    // The first option this byte starts is the value (they start apart).
+                    self.stack.pop();
+                    for &option in options {
+                        let mut t = *self;
+                        if t.stack.push(Frame::new(g, option)) && t.step(b) {
+                            *self = t;
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 Frame::Arr { node, items, open } => {
                     let Node::Arr {
                         item,
                         max,
                         more,
                         last,
+                        open: open_byte,
+                        close,
                     } = g.nodes[node as usize]
                     else {
                         unreachable!()
                     };
                     if !open {
-                        if b != b'[' {
+                        if b != open_byte {
                             return false;
                         }
                         *top = Frame::Arr {
@@ -873,8 +927,8 @@ impl<'g> Matcher<'g> {
                         return true;
                     }
                     if items == 0 {
-                        // Just past "[": the end, or the first item.
-                        if b == b']' {
+                        // Just past the opening: the end, or the first item.
+                        if b == close {
                             self.stack.pop();
                             return true;
                         }
