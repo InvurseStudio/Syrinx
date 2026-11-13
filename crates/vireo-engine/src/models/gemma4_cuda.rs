@@ -16,6 +16,10 @@ use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{Buffer, CuDevicePtr, Gpu, Graph, Q8, QkvPrep};
 
+/// Google's draft model for Gemma 4, run on the main model's state.
+#[path = "gemma4_assistant.rs"]
+pub mod assistant;
+
 struct Layer {
     attn_norm: Buffer,
     q: GpuMatrix,
@@ -99,6 +103,8 @@ pub struct Gemma4Cuda<'a> {
     rope_factors: Option<Buffer>,
     output_norm: Buffer,
     layers: Vec<Layer>,
+    /// A draft model to guess with (`load_assistant`).
+    assistant: Option<assistant::Assistant>,
 }
 
 /// One conversation's state on the GPU. Use it only with the model that made it.
@@ -149,9 +155,21 @@ pub struct Gemma4CudaSession {
     /// wanted (`graph_slot`), each recorded the first time such a batch is read (CUDA).
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     few_graphs: Vec<Option<Graph>>,
+    /// The positions whose final states (after the final norm) the last read left in
+    /// `h`'s rows, from row 0: `hidden_rows` of them from `hidden_from`. The draft model
+    /// starts from the last position's.
+    hidden_from: usize,
+    hidden_rows: usize,
+    /// Room for the draft model (`use_mtp`).
+    assistant: Option<assistant::Room>,
 }
 
 impl Gemma4CudaSession {
+    /// Whether it has room to draft with a draft model ([`Gemma4Cuda::use_mtp`]).
+    pub fn keeps_mtp(&self) -> bool {
+        self.assistant.is_some()
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -221,6 +239,7 @@ impl Gemma4CudaSession {
     pub fn import(&mut self, saved: &SavedState, upto: usize) -> Result<()> {
         load_state(saved, upto, &self.cache_buffers(), self.capacity, &[])?;
         self.len = upto;
+        self.hidden_rows = 0;
         self.high = upto;
         // A windowed layer brought only its window: nothing before `upto` can be rewound to.
         let trimmed = self.windows.iter().flatten().any(|w| upto > *w);
@@ -390,6 +409,7 @@ impl<'a> Gemma4Cuda<'a> {
             rope_factors,
             output_norm: up(output_norm)?,
             layers,
+            assistant: None,
             config: c,
             gpu,
         })
@@ -514,6 +534,9 @@ impl<'a> Gemma4Cuda<'a> {
             half_cache: self.precision == Precision::Int8,
             graph: None,
             few_graphs: Vec::new(),
+            hidden_from: 0,
+            hidden_rows: 0,
+            assistant: None,
         })
     }
 
@@ -987,6 +1010,7 @@ impl<'a> Gemma4Cuda<'a> {
             s.graph = Some(graph);
         }
         s.graph.as_ref().unwrap().launch().map_err(gpu_error)?;
+        (s.hidden_from, s.hidden_rows) = (s.len, self.final_rows(1));
         s.len += 1;
         if !want_logits {
             return Ok(None);
@@ -1062,6 +1086,11 @@ impl<'a> Gemma4Cuda<'a> {
             if !replayed {
                 self.queue_batch(s, t, wanted)?;
             }
+            (s.hidden_from, s.hidden_rows) = match wanted {
+                // The last token's in row 0.
+                Logits::Last => (s.len + t - 1, self.final_rows(1)),
+                _ => (s.len, self.final_rows(t)),
+            };
             s.len += t;
             match wanted {
                 Logits::All => self.logits_into(s, 0, t, b * batch * vocab)?,
@@ -1073,6 +1102,16 @@ impl<'a> Gemma4Cuda<'a> {
             Logits::None => None,
             _ => Some(&s.logits),
         })
+    }
+
+    /// How many of a batch's `t` rows of `h` hold final states after a read: all of them,
+    /// unless some layers share keys and values (they ran for one token, or none).
+    fn final_rows(&self, t: usize) -> usize {
+        if self.config.first_shared_layer >= self.config.layers {
+            t
+        } else {
+            0
+        }
     }
 
     /// Queues the layers for the `t` tokens in `s.x`, for the logits `wanted`: every

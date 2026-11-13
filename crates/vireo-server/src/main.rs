@@ -52,7 +52,7 @@ use json::Value;
 use sample::Sampler;
 use vireo_engine::cuda::Gpu;
 use vireo_engine::grammar::{Grammar, TokenTrie};
-use vireo_engine::models::gemma4_cuda::Gemma4Cuda;
+use vireo_engine::models::gemma4_cuda::{Gemma4Cuda, assistant as gemma4_assistant};
 use vireo_engine::models::llama_cuda::LlamaCuda;
 use vireo_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
 use vireo_engine::models::{Logits, Precision, SavedState};
@@ -91,7 +91,9 @@ pass: every token is still the model's own pick. Gemma 4 only. Without one, --lo
 guesses up to <n> tokens a round from the chat itself (what followed the last few
 tokens where they appeared before; 3 by default, 0 for none), checked the same way.
 Gemma 4, and Qwen 3.5 on the Mac. A Qwen model with its own multi-token-prediction
-layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac).
+layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac), and a
+Gemma 4 with Google's draft model (gemma-4-31B-it-assistant, safetensors) beside it or in
+the Mac app's DraftModels folder with that, or with --draft's folder.
 
 --thinking is what a request gets when it doesn't say (\"thinking\": true or false): off by
 default. On, Gemma 4 and Qwen think before they answer and after each tool's result (at
@@ -1051,7 +1053,16 @@ struct Picker {
     used: u64,
 }
 
-/// Guesses a round from Qwen's multi-token-prediction layer. On Qwen 3.8 27B the first is
+/// Whether `--draft` names Google's draft model for Gemma 4 (a folder, or a .safetensors
+/// file) rather than a small model to draft with (a GGUF file).
+fn is_assistant(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    p.is_dir() || p.extension().is_some_and(|e| e == "safetensors")
+}
+
+/// Guesses a round from Qwen's multi-token-prediction layer, or Gemma 4's draft model
+/// (Google's for 31B: the first right 74% of the time, 1.72 of 3 taken a round,
+/// `vireo-engine`'s `tests/gemma_assistant.rs`). On Qwen 3.8 27B the first is
 /// right 86% of the time, the first two 64% and all three 43% (`tests/mtp.rs`). While
 /// checking 4 tokens cost 1.8 times one, 2 a round beat 3; with the 8-token tile it costs
 /// 1.24 times one (46.7 ms one token, 57.7 four: `tests/check_speed.rs`), and through the
@@ -1278,23 +1289,31 @@ impl Model {
     }
 
     /// The session chats run in: on a Qwen model with a multi-token-prediction layer
-    /// (and `--mtp on`), one that keeps the layer's cache up, to draft with.
+    /// (and `--mtp on`), one that keeps the layer's cache up, to draft with; on a Gemma 4
+    /// with its draft model loaded, one with room for it.
     fn chat_session(&self, capacity: usize) -> Result<Session, String> {
         let mut session = self.session(capacity)?;
-        if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut session)
-            && options().mtp
-            && m.has_mtp()
-        {
-            m.use_mtp(s).map_err(|e| e.to_string())?;
+        match (self, &mut session) {
+            (Model::Qwen35(m), Session::Qwen35(s)) if options().mtp && m.has_mtp() => {
+                m.use_mtp(s).map_err(|e| e.to_string())?;
+            }
+            (Model::Gemma4(m), Session::Gemma4(s)) if m.has_mtp() => {
+                m.use_mtp(s).map_err(|e| e.to_string())?;
+            }
+            _ => {}
         }
         Ok(session)
     }
 
-    /// Up to `k` guesses from Qwen's multi-token-prediction layer at the tokens after
-    /// `first` (picked, not read yet); none for a session that doesn't keep it.
+    /// Up to `k` guesses from Qwen's multi-token-prediction layer, or Gemma 4's draft
+    /// model, at the tokens after `first` (picked, not read yet); none for a session that
+    /// doesn't keep it.
     fn mtp_draft(&self, kept: &mut Kept, first: u32, k: usize) -> Result<Vec<u32>, String> {
         match (self, &mut kept.session) {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
+                m.mtp_draft(s, first, k).map_err(|e| e.to_string())
+            }
+            (Model::Gemma4(m), Session::Gemma4(s)) => {
                 m.mtp_draft(s, first, k).map_err(|e| e.to_string())
             }
             _ => Ok(Vec::new()),
@@ -1632,10 +1651,36 @@ fn engine(
             }
             // Muse Glimmer runs on Gemma 4's model code (`Config::muse`).
             Family::Gemma4 | Family::Muse => {
-                Model::Gemma4(Gemma4Cuda::load(file, gpu).map_err(e).map(|mut m| {
-                    m.set_precision(precision);
-                    m
-                })?)
+                let mut m = Gemma4Cuda::load(file, gpu).map_err(e)?;
+                m.set_precision(precision);
+                // Google's draft model for it: --draft's folder or .safetensors, else one
+                // Vireo keeps beside the model or in the app's DraftModels (--mtp on).
+                let given = options().draft.as_deref().filter(|d| is_assistant(d));
+                let found = match (&options().draft, family) {
+                    (None, Family::Gemma4) if options().mtp => {
+                        gemma4_assistant::find(std::path::Path::new(path))
+                    }
+                    _ => None,
+                };
+                if let Some(draft) = given.map(std::path::PathBuf::from).or(found) {
+                    let started = Instant::now();
+                    match m.load_assistant(&draft) {
+                        Ok(()) => eprintln!(
+                            "Drafting with {}, Google's draft model, {MTP_GUESSES} tokens a round (loaded in {:.1?}).",
+                            draft.display(),
+                            started.elapsed()
+                        ),
+                        // One given must work; one found is only a speed-up.
+                        Err(err) if given.is_some() => {
+                            return Err(format!("Couldn't load the draft model {}: {err}", draft.display()));
+                        }
+                        Err(err) => eprintln!(
+                            "Not drafting with {} ({err}).",
+                            draft.display()
+                        ),
+                    }
+                }
+                Model::Gemma4(m)
             }
         };
         Ok((model, tokenizer, family, gpu_name))
@@ -1705,6 +1750,8 @@ fn engine(
         }
     };
     let mut drafter = match &options().draft {
+        // Google's draft model, loaded with the model.
+        Some(draft_path) if is_assistant(draft_path) => None,
         Some(draft_path) if family == Family::Gemma4 => {
             let started = Instant::now();
             match draft::Drafter::load(
@@ -2298,7 +2345,11 @@ fn reply(
     // Qwen with its multi-token-prediction layer kept up: guesses from that, not the chat.
     let mtp = drafter.is_none()
         && can_go_back
-        && matches!(&kept.session, Session::Qwen35(s) if s.keeps_mtp());
+        && match &kept.session {
+            Session::Qwen35(s) => s.keeps_mtp(),
+            Session::Gemma4(s) => s.keeps_mtp(),
+            _ => false,
+        };
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
     let mut lookup = (drafter.is_none() && !mtp && options().lookup > 0 && can_go_back)
         .then(|| draft::Lookup::new(options().lookup));
