@@ -138,6 +138,32 @@ models, thinking off and on, and the gauntlet (`tools/aurelia_run.py`, which now
   app's Info.plist; a build without them (`swift run`) offers no calendar tools. The first
   real use asks for the Mac's permission. A test script's runs are dry.
 
+## Working rules and Gemma's several calls (the Mac, 2026-11-13, after the second run)
+
+In answer to `docs/dev/test-gauntlet/runs/Aurelia-Proto-Run-2026-11-13-Gemma4-31B-notes.md`
+(17 pass / 12 partial / 3 fail by hand, thinking on): the format and sampling already
+matched Google's template; the gap was the instructions. **Unit tests only (server 105);
+not run on a model.** To check: a few eval cases on Gemma 31B, thinking off and on (e.g.
+`--cases two-files,three-steps,read-and-add,office-invoices,office-policy,calc-tip,injection,no-tool`),
+the small models too, then the gauntlet against the 13 November run.
+
+- **The preamble** (`tools::PREAMBLE`) is 0.9's "How to work" (`server/api_server.py`'s
+  `SYSTEM_PROMPT`): files first, every file and row, read the policy, finish its steps and
+  give totals, `calculate` for every sum, result first then what the user must know, pending
+  not approved, no card numbers, approvals. `tools::family_notes`: Gemma gets 0.9's
+  several-calls rule and tool-call note; Qwen its tool-call note and the short-reply line
+  (no several-calls rule: the server runs its calls one at a time). Every eval prompt reads it.
+- **Gemma's several calls in one step:** after each call the server reads `<tool_call|>` and
+  looks at the model's next token: another `<|tool_call>` is written as the next call, up
+  to 8 together (`MAX_TOGETHER`); otherwise the results follow, one `<|tool_response>`
+  each, then the thought. A record's step has `"then": true` when the next call followed
+  it at once, so the history writes them back the same way (`chat::with_calls`).
+- **Thinking off, Gemma's turn opens with the empty thought** (`<|channel>thought\n<channel|>`),
+  as its GGUF template and Google's July 2026 one do.
+- **Thinking limits:** a thought is 2,000 tokens, or 400 after a step that only made
+  changes (0.9's routine step) or once a reply has thought 8,000; before, past 8,000 the
+  model stopped thinking between steps altogether.
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as

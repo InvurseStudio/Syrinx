@@ -2028,10 +2028,14 @@ fn reply(
     let debug_prompt = std::env::var_os("VIREO_DEBUG_PROMPT").is_some();
     let system_turn = |tools: &[tools::Tool], known: usize| -> (Option<String>, String) {
         // With tools, the system prompt opens with what they're for.
+        let preamble = || match tools::family_notes(family) {
+            Some(notes) => format!("{}\n\n{notes}", tools::PREAMBLE),
+            None => tools::PREAMBLE.to_string(),
+        };
         let system = match (tools.is_empty(), job.system.as_deref().map(str::trim)) {
             (true, s) => s.filter(|s| !s.is_empty()).map(str::to_string),
-            (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
-            (false, _) => Some(tools::PREAMBLE.to_string()),
+            (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", preamble())),
+            (false, _) => Some(preamble()),
         };
         // What the user asked to be remembered, after the rest (the Mac's order).
         let system = match (system, memory::instructions_for(&facts[..known])) {
@@ -2226,6 +2230,9 @@ fn reply(
     // whether Gemma's own label ("thought") is still to come at its start, to leave out.
     let mut in_thought = thinking_on && (family == Family::Qwen35 || !skill_ids.is_empty());
     let mut thought_tokens = 0usize;
+    // The most this thought may take: `THOUGHT_TOKENS`, or `SHORT_THOUGHT_TOKENS` after a
+    // change was made or once the reply's thoughts have had their share.
+    let mut thought_cap = THOUGHT_TOKENS;
     let mut label = false;
     if in_thought {
         shown.tag(job, THINK_OPEN, true);
@@ -2397,20 +2404,13 @@ fn reply(
                 logits[t as usize] = f32::NEG_INFINITY;
             }
         }
-        // No new thought once thoughts have taken their share of the reply.
-        if let Some((open, _)) = think
-            && !in_thought
-            && thought >= REPLY_THOUGHT_TOKENS
-        {
-            logits[open as usize] = f32::NEG_INFINITY;
-        }
         let mut next = sampler.pick(&logits, &generated);
         // A thought ends with its closing token, here even when the model would end its
         // turn inside it, or has thought as long as one thought may: its answer is still
         // to come.
         if in_thought
             && let Some((_, close)) = think
-            && (tokenizer.is_end_of_generation(next) || thought_tokens >= THOUGHT_TOKENS)
+            && (tokenizer.is_end_of_generation(next) || thought_tokens >= thought_cap)
         {
             next = close;
         }
@@ -2510,73 +2510,144 @@ fn reply(
             }
             let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
-            calls += 1;
             // The call as it was written, from its start token (Muse's from its recipient).
             let written_call = if by_token && family != Family::Muse {
                 format!("{}{text}", start.token)
             } else {
                 text.clone()
             };
-            let args = call.args_json();
-            let written = call_started.elapsed();
-            let _ = job.out.send(Out::Event(format!(
-                "{{\"type\":\"tool_call\",\"tool\":{},\"args\":{args}}}",
-                json::string(&call.tool)
-            )));
-            // The same call again, with the same arguments, would get the same answer: a
-            // small model can loop on one. It isn't run again. The first time, the model may
-            // still call another tool (Qwen 3.5 4B repeated a sum in the test gauntlet, then had
-            // no way left to fill the template it was asked to); the second, it must answer.
-            let repeated = last_call.as_ref() == Some(&call);
-            if repeated {
-                repeats += 1;
-            }
-            let result = if repeated && repeats >= 2 {
-                "This is the same call as the last one, and its result is above. Answer the user from it now."
-                    .to_string()
-            } else if repeated {
-                "This is the same call as the last one, and its result is above. Go on from it: call the next tool the task needs, or answer."
-                    .to_string()
-            } else {
-                match run_tool(&call, &offered, job) {
-                    Some(r) => r,
-                    None => break, // stopped while the app ran it
+            let mut group = vec![(call, written_call, call_started.elapsed())];
+            // Gemma 4 may write several calls in one step, one after another, before any
+            // result (its template's form for them): after each call's end, its next
+            // token says whether another follows. Otherwise it would write the results'
+            // start, which is the server's to write.
+            let close = (family == Family::Gemma4)
+                .then(|| tokenizer.encode(tools::GEMMA_CALL_CLOSE, false, true));
+            if let Some(close) = &close {
+                logits = model.feed(kept, close)?;
+                call_tokens += close.len();
+                while may_call && calls + group.len() < MAX_CALLS && group.len() < MAX_TOGETHER {
+                    let peek = sampler.pick(&logits, &generated);
+                    if Some(peek) != start_token {
+                        break;
+                    }
+                    let started = Instant::now();
+                    model.next(&mut kept.session, peek, &mut logits)?;
+                    kept.tokens.push(peek);
+                    call_tokens += 1;
+                    let text = write_call(
+                        model,
+                        kept,
+                        tokenizer,
+                        trie,
+                        grammar,
+                        &mut logits,
+                        &mut call_tokens,
+                        context,
+                    )?;
+                    let call = tools::parse_call(family, &text, &callable)
+                        .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
+                    group.push((call, format!("{}{text}", start.token), started.elapsed()));
+                    logits = model.feed(kept, close)?;
+                    call_tokens += close.len();
                 }
-            };
-            if repeats >= 2 || calls == MAX_CALLS {
-                may_call = false;
             }
-            last_call = Some(call.clone());
-            eprintln!(
-                "Tool: {} {args} (written in {:.0} ms), {} characters back.",
-                call.tool,
-                written.as_secs_f64() * 1000.0,
-                result.len()
-            );
-            let _ = job.out.send(Out::Event(format!(
-                "{{\"type\":\"tool_result\",\"tool\":{},\"result\":{}}}",
-                json::string(&call.tool),
-                json::string(&preview(&result))
-            )));
-            let mut read = shaped(&chat::plain(&result), tools::result_limit(&call, MAX_RESULT));
-            if calls == MAX_CALLS {
-                // Told so, the model answers from what it has; left to find its calls
-                // taken away, Gemma 4 31B ended a reply with nothing said (2026-11-12).
-                read.push_str(LAST_CALL_NOTE);
+            // A thought after the results, as the template opens one: a short one after
+            // changes only (a file saved, an event made: 0.9's routine step) or once the
+            // reply's thoughts have had their share, so a long task still thinks between
+            // its steps.
+            let thinks_next = thinking_on;
+            let routine = group
+                .iter()
+                .all(|(c, _, _)| offered.iter().any(|t| t.name == c.tool && t.asks.is_some()));
+            let together = group.len();
+            let mut ids = Vec::new();
+            let mut stopped = false;
+            for (i, (call, written_call, written)) in group.into_iter().enumerate() {
+                let last = i + 1 == together;
+                calls += 1;
+                let args = call.args_json();
+                let _ = job.out.send(Out::Event(format!(
+                    "{{\"type\":\"tool_call\",\"tool\":{},\"args\":{args}}}",
+                    json::string(&call.tool)
+                )));
+                // The same call again, with the same arguments, would get the same answer: a
+                // small model can loop on one. It isn't run again. The first time, the model
+                // may still call another tool (Qwen 3.5 4B repeated a sum in the test
+                // gauntlet, then had no way left to fill the template it was asked to); the
+                // second, it must answer.
+                let repeated = last_call.as_ref() == Some(&call);
+                if repeated {
+                    repeats += 1;
+                }
+                let result = if repeated && repeats >= 2 {
+                    "This is the same call as the last one, and its result is above. Answer the user from it now."
+                        .to_string()
+                } else if repeated {
+                    "This is the same call as the last one, and its result is above. Go on from it: call the next tool the task needs, or answer."
+                        .to_string()
+                } else {
+                    match run_tool(&call, &offered, job) {
+                        Some(r) => r,
+                        None => {
+                            stopped = true; // stopped while the app ran it
+                            break;
+                        }
+                    }
+                };
+                if repeats >= 2 || calls == MAX_CALLS {
+                    may_call = false;
+                }
+                last_call = Some(call.clone());
+                eprintln!(
+                    "Tool: {} {args} (written in {:.0} ms{}), {} characters back.",
+                    call.tool,
+                    written.as_secs_f64() * 1000.0,
+                    if together > 1 {
+                        format!(", {} of {together} together", i + 1)
+                    } else {
+                        String::new()
+                    },
+                    result.len()
+                );
+                let _ = job.out.send(Out::Event(format!(
+                    "{{\"type\":\"tool_result\",\"tool\":{},\"result\":{}}}",
+                    json::string(&call.tool),
+                    json::string(&preview(&result))
+                )));
+                let mut read = shaped(
+                    &chat::plain(&result),
+                    tools::result_limit(&call, MAX_RESULT),
+                );
+                if calls == MAX_CALLS {
+                    // Told so, the model answers from what it has; left to find its calls
+                    // taken away, Gemma 4 31B ended a reply with nothing said (2026-11-12).
+                    read.push_str(LAST_CALL_NOTE);
+                }
+                let (before, body, after) =
+                    tools::after_call(family, &call.tool, &read, thinks_next && last);
+                // The call's end was read already (Gemma's, to see whether another follows).
+                let before = match close {
+                    Some(_) => before
+                        .strip_prefix(tools::GEMMA_CALL_CLOSE)
+                        .unwrap_or(&before)
+                        .to_string(),
+                    None => before,
+                };
+                steps.push(chat::Step {
+                    at: shown.said.trim_start().len(),
+                    tool: call.tool.clone(),
+                    call: written_call,
+                    result: read,
+                    then: !last,
+                });
+                ids.extend(tokenizer.encode(&before, false, true));
+                ids.extend(tokenizer.encode(&body, false, false));
+                ids.extend(tokenizer.encode(&after, false, true));
             }
-            // A thought after the result, as the templates open one, while thoughts have
-            // any of their share of the reply left.
-            let thinks_next = thinking_on && thought < REPLY_THOUGHT_TOKENS;
-            let (before, body, after) = tools::after_call(family, &call.tool, &read, thinks_next);
-            steps.push(chat::Step {
-                at: shown.said.trim_start().len(),
-                tool: call.tool.clone(),
-                call: written_call,
-                result: read,
-            });
-            let mut ids = tokenizer.encode(&before, false, true);
-            ids.extend(tokenizer.encode(&body, false, false));
-            ids.extend(tokenizer.encode(&after, false, true));
+            if stopped {
+                break;
+            }
             if kept.tokens.len() + ids.len() + 64 > context {
                 return Err("The tool's result doesn't fit in this chat's context.".into());
             }
@@ -2586,6 +2657,11 @@ fn reply(
             if thinks_next {
                 in_thought = true;
                 thought_tokens = 0;
+                thought_cap = if routine || thought >= REPLY_THOUGHT_TOKENS {
+                    SHORT_THOUGHT_TOKENS
+                } else {
+                    THOUGHT_TOKENS
+                };
                 label = false;
                 shown.tag(job, THINK_OPEN, true);
             }
@@ -2601,6 +2677,11 @@ fn reply(
             thought += 1;
             in_thought = true;
             thought_tokens = 0;
+            thought_cap = if thought >= REPLY_THOUGHT_TOKENS {
+                SHORT_THOUGHT_TOKENS
+            } else {
+                THOUGHT_TOKENS
+            };
             label = family == Family::Gemma4;
             shown.tag(job, THINK_OPEN, true);
         } else if closes_thought {
@@ -2949,13 +3030,19 @@ fn debug_calls() -> bool {
 /// The most tool calls one reply makes: enough for a task over several files (read a
 /// guide, six invoices and a register, work out the sums, write the rows).
 const MAX_CALLS: usize = 30;
+/// The most calls Gemma 4 may write together in one step.
+const MAX_TOGETHER: usize = 8;
 /// What the last call's result ends with.
 const LAST_CALL_NOTE: &str = "\n\n[That was the last tool call this reply can make. Answer now from what you have, and say plainly what is still to do.]";
-/// The most tokens one thought may take (thinking on; the Mac server's budget), and all
-/// of a reply's thoughts together. Past the first the thought is closed for the model;
-/// past the second it's given no more.
+/// The most tokens one thought may take (thinking on; the Mac server's budget), and the
+/// share of a reply's thoughts past which each later one is short. Past its cap a thought
+/// is closed for the model. Before 2026-11-13 thoughts stopped altogether past 8,000, and
+/// a long task went on without thinking between its steps.
 const THOUGHT_TOKENS: usize = 2000;
 const REPLY_THOUGHT_TOKENS: usize = 8000;
+/// A short thought: after a change (0.9's 400-token thought after a routine step), and
+/// once a reply's thoughts have had their share.
+const SHORT_THOUGHT_TOKENS: usize = 400;
 /// A thought's start and end as the app is told of them (`thinking` events, with the
 /// thought's text between as their `content`): it shows a thought as the model's
 /// reasoning, apart from the answer.
