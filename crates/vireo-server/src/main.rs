@@ -1709,6 +1709,7 @@ fn engine(
             format!("{path} isn't a Llama, Qwen 3.5, Gemma 4 or Muse Glimmer model")
         })?;
         let tokenizer = Tokenizer::from_gguf(file).map_err(|e| e.to_string())?;
+        chat::follow_template(file.get_str("tokenizer.chat_template"));
         let gpu = Gpu::open().map_err(|e| format!("No GPU for the engine: {e}"))?;
         let gpu_name = gpu.info.name.clone();
         let e = |e: vireo_engine::models::Error| e.to_string();
