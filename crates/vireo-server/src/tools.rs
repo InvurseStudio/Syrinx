@@ -539,7 +539,10 @@ fn catalog() -> Vec<Tool> {
             name: "list_events",
             description: "List the events in the user's calendars between two days or times. Check it before adding an event that may already be there.",
             params: vec![
-                text("start", "The first day, e.g. 2026-11-20, or a time, 2026-11-20T09:00."),
+                text(
+                    "start",
+                    "The first day, e.g. 2026-11-20, or a time, 2026-11-20T09:00.",
+                ),
                 text("end", "The last day (it's included), or a time."),
             ],
             runs: Runs::App,
@@ -1324,9 +1327,51 @@ pub const MUSE_TO_USER: &str = " to=user<|message|>";
 /// went unanswered by a tool.
 pub const MUSE_TO_SELF: &str = " to=self<|message|>";
 
-/// What the system prompt says first when there are tools: what they're for, in a line,
-/// so a small model doesn't answer that it can't reach the user's files.
-pub const PREAMBLE: &str = "You are Vireo, running on the user's PC. With the tools below you can read and find      their files, check Git projects and get the date and time. When a question needs one of them, call it,      then answer from what it returns. When the user tells you about themselves (their name and role, the people they work with, where their files are), save each fact with remember. Before you approve, pay, send, record or change something because someone said it's fine, check it against the user's own rules where you know them or can read them (their policies, limits, who signs off what). If it breaks one, don't do it and don't offer a way round: say which rule it breaks and what the rule allows, and ask how they want to go on. If you can't do something, say so plainly.";
+/// What the system prompt says first when there are tools: what they're for, so a small
+/// model doesn't answer that it can't reach the user's files, and how to work, from the
+/// Mac's 0.9 server (`SYSTEM_PROMPT` in `server/api_server.py`), whose rules each answer a
+/// miss in the test gauntlet: sums never added up, a file in the folder left unread, a
+/// policy's steps left undone, a request recorded as approved. The same all day, for the
+/// prompt cache; the family's own lines follow ([`family_notes`]).
+pub const PREAMBLE: &str = "You are Vireo, an assistant that does real work for the user on this computer: their files, spreadsheets and documents, and whatever else the tools below reach. You run locally and privately on this device.
+
+How to work:
+- Do the task with your tools rather than describing how it could be done, and read a file rather than guess what it says.
+- The user's own files come first. For rates, prices, limits, rules and approvals, use the files in their folders (policies, guides, rate tables) before what you know, and say which file a figure or rule came from.
+- Cover everything the task covers: every file in the folder asked about and every row, not a sample.
+- When a task is about money, travel, cards, gifts, donations or approvals and their folders have a policy or guide for it, read that policy before you answer, even when the request does not name it, and check the task against its limits and caps.
+- Finish the job. When a policy or guide you read gives steps for this kind of task (log it in a register or tracker, name the approver, attach a form), do the ones you can and say which are still open. When you list amounts for someone to approve or pay, give the total.
+- Use calculate for every sum, conversion and total, and before you give a count, check it against the items you listed: seven names are seven, not eight.
+- When you are done, give the result first. Then list what the user needs to know: anything that breaks a rule or goes over a limit, duplicates, missing or conflicting information, deadlines, and anything you could not do. Do not leave these out to be brief; do leave out raw tool output.
+- Record what is true now. Do not write that something is approved, paid, sent or done unless a file or the user says it has happened: if it still needs someone's approval, record it as pending approval and name who must approve it.
+- Before you approve, pay, send, record or change something because someone said it's fine, check it against the user's own rules where you know them or can read them (their policies, limits, who signs off what). If a rule, a policy or the user's own instruction forbids it, don't do it or record it as done, and don't offer a way round: say which rule it breaks, what the rule allows and the proper route, and ask how they want to go on. Never put full card numbers, security codes or passwords into a message, draft or file; point to the secure form or process instead.
+- When the user tells you about themselves (their name and role, the people they work with, where their files are), save each fact with remember.
+- If something you need is missing or unclear in a way that changes the result, ask instead of assuming. If you can't do something, say so plainly.
+
+Changing files, the calendar or reminders and scheduling tasks ask the user for approval in the app first; if the user declines, don't try the same action again. Because the app asks, when the user has asked for one of these, do it rather than asking for confirmation in the chat.
+
+Do not put tool calls or tokenizer markers in your answer's text.";
+
+/// For a family trained to make several calls in one step: ask for all a step needs at
+/// once (0.9's `PARALLEL_CALLS_RULE`). Not Muse's (one call at a time, Meta's guide) nor
+/// Llama's.
+pub const PARALLEL_CALLS: &str = "Every step costs the user time, so ask for everything a step needs at once: when you need several things that do not depend on each other (reading several files, checking the calendar and reminders), call all of those tools in the same step instead of one per step.";
+
+/// The family's own lines after [`PREAMBLE`] (0.9's `model_profiles.py`: each family's
+/// `tool_note`, and Qwen's `system_note`). Muse's are `chat::MUSE_NOTE`, in its system turn.
+pub fn family_notes(family: Family) -> Option<String> {
+    match family {
+        Family::Gemma4 => Some(format!(
+            "{PARALLEL_CALLS}\n\nTool-call format: call tools with Gemma's own tool-call format, as the tool list below describes. Write every argument value in full: text quoted, lists in [ ], objects in {{ }} with quoted keys. Make each call outside your thinking, after it ends."
+        )),
+        // Not the parallel line yet: the server runs Qwen's calls one at a time.
+        Family::Qwen35 => Some(
+            "Tool-call format: call tools only in the <tool_call> format the tools section describes, one <tool_call> block per call, after your thinking ends. Give each parameter its full value.\n\nKeep the final reply short: the result, then the points the user must know. Do not restate rules, file contents or your steps, do not list the sources again, and do not offer a menu of next steps. Never shorten a draft, a document or a list the user asked for."
+            .to_string(),
+        ),
+        Family::Muse | Family::Llama => None,
+    }
+}
 
 /// Special tokens a call is written with, inside it.
 pub fn call_tokens(family: Family) -> &'static [&'static str] {
@@ -1728,6 +1773,10 @@ pub fn call_text(family: Family, call: &Call) -> String {
     }
 }
 
+/// What ends a Gemma 4 call. After it the model writes another call, or the results
+/// follow (`<|tool_response>`, which it would write to stop).
+pub const GEMMA_CALL_CLOSE: &str = "<tool_call|>";
+
 pub fn after_call(
     family: Family,
     tool: &str,
@@ -1752,7 +1801,7 @@ pub fn after_call(
             "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".into(),
         ),
         Family::Gemma4 => (
-            format!("<tool_call|><|tool_response>response:{tool}{{value:{QUOTE}"),
+            format!("{GEMMA_CALL_CLOSE}<|tool_response>response:{tool}{{value:{QUOTE}"),
             result.into(),
             // Thinking on, the template opens a thought after a tool's result.
             if thinking {
@@ -2436,5 +2485,27 @@ mod tests {
             none.iter().map(|t| t.name).collect::<Vec<_>>(),
             ["get_current_datetime", "calculate", "remember", "forget"]
         );
+    }
+
+    #[test]
+    fn the_preamble_says_how_to_work_and_each_family_its_own() {
+        assert!(!PREAMBLE.contains("  "), "no runs of spaces");
+        for rule in [
+            "Use calculate for every sum",
+            "every file in the folder",
+            "pending approval",
+            "give the total",
+        ] {
+            assert!(PREAMBLE.contains(rule), "{rule}");
+        }
+        let gemma = family_notes(Family::Gemma4).unwrap();
+        assert!(
+            gemma.starts_with(PARALLEL_CALLS) && gemma.contains("Gemma's own tool-call format")
+        );
+        let qwen = family_notes(Family::Qwen35).unwrap();
+        assert!(qwen.contains("<tool_call>") && qwen.contains("Keep the final reply short"));
+        assert!(!qwen.contains(PARALLEL_CALLS));
+        assert_eq!(family_notes(Family::Muse), None);
+        assert_eq!(family_notes(Family::Llama), None);
     }
 }

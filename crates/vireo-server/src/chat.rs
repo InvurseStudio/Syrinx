@@ -97,6 +97,9 @@ pub struct Step {
     pub call: String,
     /// Its result as the model read it.
     pub result: String,
+    /// Whether the model wrote the next step's call straight after this one, before any
+    /// result (Gemma 4's several calls in one step): both results then follow the calls.
+    pub then: bool,
 }
 
 /// How much of earlier turns' tool results a prompt keeps: all of each, the start of
@@ -164,6 +167,7 @@ impl Record {
                     tool: s.str("tool")?.to_string(),
                     call: plain(s.str("call")?),
                     result: plain(s.str("result")?),
+                    then: matches!(s.get("then"), Some(crate::json::Value::Bool(true))),
                 })
             })
             .collect();
@@ -179,11 +183,12 @@ impl Record {
             .iter()
             .map(|s| {
                 format!(
-                    "{{\"at\":{},\"tool\":{},\"call\":{},\"result\":{}}}",
+                    "{{\"at\":{},\"tool\":{},\"call\":{},\"result\":{}{}}}",
                     s.at,
                     crate::json::string(&s.tool),
                     crate::json::string(&s.call),
-                    crate::json::string(&s.result)
+                    crate::json::string(&s.result),
+                    if s.then { ",\"then\":true" } else { "" }
                 )
             })
             .collect();
@@ -255,6 +260,8 @@ fn with_calls(family: Family, content: &str, record: &Record) -> String {
         }
         _ => out.push_str(text),
     };
+    // Calls written together, waiting for the last of them: their results follow it.
+    let mut waiting: Vec<&Step> = Vec::new();
     for step in &record.steps {
         let at = if step.at >= done && step.at <= content.len() && content.is_char_boundary(step.at)
         {
@@ -272,15 +279,54 @@ fn with_calls(family: Family, content: &str, record: &Record) -> String {
             out.push_str("]\n");
             continue;
         }
-        let (before, body, after) = crate::tools::after_call(family, &step.tool, &step.result, false);
+        let grouped = family == Family::Gemma4;
+        if grouped && (step.then || !waiting.is_empty()) {
+            out.push_str(&step.call);
+            out.push_str(crate::tools::GEMMA_CALL_CLOSE);
+            waiting.push(step);
+            if step.then {
+                continue;
+            }
+            for s in waiting.drain(..) {
+                let (before, body, after) =
+                    crate::tools::after_call(family, &s.tool, &s.result, false);
+                out.push_str(
+                    before
+                        .strip_prefix(crate::tools::GEMMA_CALL_CLOSE)
+                        .unwrap_or(&before),
+                );
+                out.push(PLAIN_OPEN);
+                out.push_str(&body);
+                out.push(PLAIN_CLOSE);
+                out.push_str(&after);
+            }
+            continue;
+        }
+        let (before, body, after) =
+            crate::tools::after_call(family, &step.tool, &step.result, false);
         // A past turn has no thought in it, not even Qwen's empty one.
-        let after = after.strip_suffix("<think>\n\n</think>\n\n").unwrap_or(&after);
+        let after = after
+            .strip_suffix("<think>\n\n</think>\n\n")
+            .unwrap_or(&after);
         out.push_str(&step.call);
         out.push_str(&before);
         out.push(PLAIN_OPEN);
         out.push_str(&body);
         out.push(PLAIN_CLOSE);
         out.push_str(after);
+    }
+    // A group cut short (the reply was stopped): its results as they came.
+    for s in waiting.drain(..) {
+        let (before, body, after) = crate::tools::after_call(family, &s.tool, &s.result, false);
+        out.push_str(
+            before
+                .strip_prefix(crate::tools::GEMMA_CALL_CLOSE)
+                .unwrap_or(&before),
+        );
+        out.push(PLAIN_OPEN);
+        out.push_str(&body);
+        out.push(PLAIN_CLOSE);
+        out.push_str(&after);
     }
     say(&mut out, &content[done..], true);
     out
@@ -304,7 +350,11 @@ pub fn opening(family: Family, thinking: bool) -> &'static str {
         Family::Qwen35 if thinking => "<|im_start|>assistant\n<think>\n",
         // Thinking off: the template's empty thought.
         Family::Qwen35 => "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-        Family::Gemma4 => "<|turn>model\n",
+        // Thinking on, the model opens its own thought (the system turn says it may).
+        Family::Gemma4 if thinking => "<|turn>model\n",
+        // Thinking off: the template's empty thought (in the GGUF's template and Google's
+        // July 2026 one alike), so the model goes straight to its answer.
+        Family::Gemma4 => "<|turn>model\n<|channel>thought\n<channel|>",
         // Muse's turn names its recipient next: the reply loop has the model choose
         // between the user and a tool (`tools::call_grammar`).
         Family::Muse => "<|start|>assistant",
@@ -610,7 +660,14 @@ mod tests {
             assert!(text[..end].ends_with("Hi"), "{family:?}");
             // A longer chat starts with a shorter one: its first messages' tokens can
             // be counted apart.
-            let longer = history(family, Some("Be brief."), "", &self::chat(), "12 Nov 2026", false);
+            let longer = history(
+                family,
+                Some("Be brief."),
+                "",
+                &self::chat(),
+                "12 Nov 2026",
+                false,
+            );
             assert!(longer.starts_with(&text), "{family:?}");
         }
     }
@@ -633,7 +690,7 @@ mod tests {
         );
         assert_eq!(
             prompt(Family::Gemma4, None, &chat(), "x"),
-            "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nAnd you?<turn|>\n<|turn>model\n"
+            "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nAnd you?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
         );
         assert!(
             prompt(Family::Llama, None, &chat(), "11 Nov 2026").starts_with(
@@ -656,7 +713,14 @@ mod tests {
         );
         // A system prompt replaces the template's, with the Mac's note after it; the tools'
         // declarations bring their recipients.
-        let text = history(Family::Muse, Some("Be brief."), "TOOLS", &chat()[..1], "x", false);
+        let text = history(
+            Family::Muse,
+            Some("Be brief."),
+            "TOOLS",
+            &chat()[..1],
+            "x",
+            false,
+        );
         assert_eq!(
             text,
             format!(
@@ -697,11 +761,22 @@ mod tests {
             "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi<turn|>\n"
         );
         // Gemma's template writes the system turn for thinking alone.
-        assert!(history(Family::Gemma4, None, "", chat, "x", true)
-            .starts_with("<bos><|turn>system\n<|think|>\n<turn|>\n"));
-        assert_eq!(opening(Family::Qwen35, true), "<|im_start|>assistant\n<think>\n");
-        assert_eq!(opening(Family::Gemma4, true), opening(Family::Gemma4, false));
-        assert!(history(Family::Muse, None, "", chat, "x", true).contains("Reasoning strength: high."));
+        assert!(
+            history(Family::Gemma4, None, "", chat, "x", true)
+                .starts_with("<bos><|turn>system\n<|think|>\n<turn|>\n")
+        );
+        assert_eq!(
+            opening(Family::Qwen35, true),
+            "<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(opening(Family::Gemma4, true), "<|turn>model\n");
+        assert_eq!(
+            opening(Family::Gemma4, false),
+            "<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        assert!(
+            history(Family::Muse, None, "", chat, "x", true).contains("Reasoning strength: high.")
+        );
     }
 
     fn read_step(at: usize, call: &str) -> Step {
@@ -710,6 +785,7 @@ mod tests {
             tool: "read_file".into(),
             call: call.into(),
             result: "<turn|> 42".into(),
+            then: false,
         }
     }
 
@@ -721,7 +797,10 @@ mod tests {
         };
         let mut chat = chat();
         chat[1].content = "It says 42.".into();
-        chat[1].record = Some(record(Family::Gemma4, "<|tool_call>call:read_file{path:<|\"|>a.txt<|\"|>}"));
+        chat[1].record = Some(record(
+            Family::Gemma4,
+            "<|tool_call>call:read_file{path:<|\"|>a.txt<|\"|>}",
+        ));
         let text = history(Family::Gemma4, None, "", &chat, "x", false);
         assert_eq!(
             text,
@@ -732,7 +811,10 @@ mod tests {
             )
         );
         // Qwen's past turn has no thought after the result.
-        chat[1].record = Some(record(Family::Qwen35, "<tool_call>\n<function=read_file>\n</function>\n"));
+        chat[1].record = Some(record(
+            Family::Qwen35,
+            "<tool_call>\n<function=read_file>\n</function>\n",
+        ));
         let text = history(Family::Qwen35, None, "", &chat, "x", false);
         assert!(
             text.contains(&format!(
@@ -778,6 +860,45 @@ mod tests {
     }
 
     #[test]
+    fn calls_written_together_get_their_results_after_the_last() {
+        let together = |at, call: &str, then| Step {
+            then,
+            ..read_step(at, call)
+        };
+        let mut chat = chat();
+        chat[1].content = "Both say 42.".into();
+        chat[1].record = Some(Record {
+            family: "gemma4".into(),
+            steps: vec![
+                together(0, "<|tool_call>A", true),
+                together(0, "<|tool_call>B", false),
+                together(0, "<|tool_call>C", false),
+            ],
+        });
+        let text = history(Family::Gemma4, None, "", &chat, "x", false);
+        let result = format!(
+            "<|tool_response>response:read_file{{value:<|\"|>{PLAIN_OPEN}<turn|> 42{PLAIN_CLOSE}<|\"|>}}<tool_response|>"
+        );
+        assert!(
+            text.contains(&format!(
+                "<|turn>model\n<|tool_call>A<tool_call|><|tool_call>B<tool_call|>{result}{result}\
+                 <|tool_call>C<tool_call|>{result}Both say 42.<turn|>\n"
+            )),
+            "{text}"
+        );
+        // A group cut short still has its results.
+        chat[1].record.as_mut().unwrap().steps.truncate(1);
+        let text = history(Family::Gemma4, None, "", &chat, "x", false);
+        assert!(
+            text.contains(&format!("<|tool_call>A<tool_call|>{result}Both")),
+            "{text}"
+        );
+        // The app keeps the mark.
+        let record = chat[1].record.clone().unwrap();
+        assert_eq!(Record::parse(&record.to_json()), Some(record));
+    }
+
+    #[test]
     fn a_record_goes_to_the_app_and_back() {
         let record = Record {
             family: "gemma4".into(),
@@ -792,6 +913,7 @@ mod tests {
             family: "gemma4".into(),
             steps: vec![Step {
                 result: "y".repeat(5000),
+                then: false,
                 ..read_step(0, "CALL")
             }],
         });
