@@ -201,6 +201,11 @@ impl<'a> Gemma4Cuda<'a> {
                 "Muse Glimmer on CUDA (its attention gate's kernel is Metal's only so far)".into(),
             ));
         }
+        if c.experts.is_some() {
+            return Err(Error::Unsupported(
+                "Gemma 4's mixture-of-experts models (26B-A4B) on the GPU".into(),
+            ));
+        }
         let (dim, pl) = (c.dim, c.per_layer_dim);
         let upload = |m: Matrix| GpuMatrix::upload(&gpu, m);
         let up = |v: Vec<f32>| gpu.upload_f32(&v).map_err(gpu_error);
