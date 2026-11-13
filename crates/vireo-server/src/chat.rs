@@ -16,6 +16,23 @@ pub enum Family {
 }
 
 impl Family {
+    /// The family's name in a reply's record of its tool calls ([`Record::family`]).
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Llama => "llama",
+            Family::Qwen35 => "qwen35",
+            Family::Gemma4 => "gemma4",
+            Family::Muse => "muse",
+        }
+    }
+
+    /// Whether the family thinks in a part of the reply set apart from its answer, which
+    /// a request can turn on (`thinking`): Gemma 4's thought channel, Qwen's `<think>`.
+    /// (Muse always reasons, to itself; thinking raises its strength.)
+    pub fn thinks_aloud(self) -> bool {
+        matches!(self, Family::Gemma4 | Family::Qwen35)
+    }
+
     pub fn of(architecture: Option<&str>) -> Option<Self> {
         match architecture? {
             "llama" => Some(Family::Llama),
@@ -52,25 +69,239 @@ impl Family {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// A reply's tool calls and what they returned, as the app kept them from the reply
+    /// (`turn_record`) and sent them back: written into the history where they were made,
+    /// so a later turn still has what an earlier one read.
+    pub record: Option<Record>,
+}
+
+/// The tool calls of one reply (see [`Message::record`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Record {
+    /// The family whose form `call` is written in ([`Family::name`]). A chat that goes on
+    /// with a model of another family gets its results as plain notes instead.
+    pub family: String,
+    pub steps: Vec<Step>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Step {
+    /// Where in the reply's text (thinking left out, trimmed) the call was made, in bytes.
+    pub at: usize,
+    pub tool: String,
+    /// The call as the model wrote it, from its start token.
+    pub call: String,
+    /// Its result as the model read it.
+    pub result: String,
+}
+
+/// How much of earlier turns' tool results a prompt keeps: all of each, the start of
+/// each, or none (the reply's text alone, as before 2026-11-13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Results {
+    Whole,
+    Short,
+    Left,
+}
+
+/// The most of a result kept at [`Results::Short`], in characters.
+const SHORT_RESULT: usize = 1200;
+
+impl Message {
+    pub fn new(role: &str, content: impl Into<String>) -> Self {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            record: None,
+        }
+    }
+
+    /// Its size in the prompt, in bytes, near enough: its text and its tools' results.
+    pub fn bytes(&self) -> usize {
+        self.content.len()
+            + self.record.as_ref().map_or(0, |r| {
+                r.steps.iter().map(|s| s.call.len() + s.result.len()).sum()
+            })
+    }
+
+    /// The message with this much of its tools' results.
+    pub fn with_results(&self, keep: Results) -> Message {
+        let mut m = self.clone();
+        match keep {
+            Results::Whole => {}
+            Results::Left => m.record = None,
+            Results::Short => {
+                for step in m.record.iter_mut().flat_map(|r| r.steps.iter_mut()) {
+                    let chars = step.result.chars().count();
+                    if chars > SHORT_RESULT {
+                        let kept: String = step.result.chars().take(SHORT_RESULT).collect();
+                        step.result = format!(
+                            "{kept}\n[... {} more characters no longer kept: call the tool again for them]",
+                            chars - SHORT_RESULT
+                        );
+                    }
+                }
+            }
+        }
+        m
+    }
+}
+
+impl Record {
+    /// A record as the app holds it: the JSON `to_json` wrote. `None` if it isn't one.
+    pub fn parse(text: &str) -> Option<Record> {
+        let v = crate::json::parse(text).ok()?;
+        let steps: Vec<Step> = v
+            .array("steps")
+            .iter()
+            .filter_map(|s| {
+                Some(Step {
+                    at: s.num("at").unwrap_or(0.0).max(0.0) as usize,
+                    tool: s.str("tool")?.to_string(),
+                    call: plain(s.str("call")?),
+                    result: plain(s.str("result")?),
+                })
+            })
+            .collect();
+        (!steps.is_empty()).then(|| Record {
+            family: v.str("family").unwrap_or("").to_string(),
+            steps,
+        })
+    }
+
+    pub fn to_json(&self) -> String {
+        let steps: Vec<String> = self
+            .steps
+            .iter()
+            .map(|s| {
+                format!(
+                    "{{\"at\":{},\"tool\":{},\"call\":{},\"result\":{}}}",
+                    s.at,
+                    crate::json::string(&s.tool),
+                    crate::json::string(&s.call),
+                    crate::json::string(&s.result)
+                )
+            })
+            .collect();
+        format!(
+            "{{\"family\":{},\"steps\":[{}]}}",
+            crate::json::string(&self.family),
+            steps.join(",")
+        )
+    }
+}
+
+/// Marks around a stretch of a prompt that's read as plain text, so nothing in it can pass
+/// for a special token: a tool's result written back into the history ([`encode`]). They
+/// are private-use characters, taken out of everything that comes from outside ([`plain`]).
+pub const PLAIN_OPEN: char = '\u{E000}';
+pub const PLAIN_CLOSE: char = '\u{E001}';
+
+/// Text without the marks [`encode`] reads.
+pub fn plain(text: &str) -> String {
+    if text.contains([PLAIN_OPEN, PLAIN_CLOSE]) {
+        text.replace([PLAIN_OPEN, PLAIN_CLOSE], "")
+    } else {
+        text.to_string()
+    }
+}
+
+/// A prompt's tokens: special tokens read as such, but for the stretches between
+/// [`PLAIN_OPEN`] and [`PLAIN_CLOSE`], which are read as plain text (as a tool's result is
+/// when the reply that called it reads it, so the chat's cache matches token for token).
+pub fn encode(tokenizer: &vireo_engine::Tokenizer, text: &str) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(PLAIN_OPEN) {
+        if open > 0 {
+            ids.extend(tokenizer.encode(&rest[..open], false, true));
+        }
+        let after = &rest[open + PLAIN_OPEN.len_utf8()..];
+        let close = after.find(PLAIN_CLOSE).unwrap_or(after.len());
+        if close > 0 {
+            ids.extend(tokenizer.encode(&after[..close], false, false));
+        }
+        rest = after.get(close + PLAIN_CLOSE.len_utf8()..).unwrap_or("");
+    }
+    if !rest.is_empty() {
+        ids.extend(tokenizer.encode(rest, false, true));
+    }
+    ids
+}
+
+/// A reply's text with its tool calls and their results where they were made, as the
+/// family's template writes a turn that called tools: what follows the turn's opening, up
+/// to its closing. (Muse's from just after `<|start|>assistant`: each message names its
+/// recipient.) For a record from another family, the results as plain notes.
+fn with_calls(family: Family, content: &str, record: &Record) -> String {
+    let same = record.family == family.name();
+    let mut out = String::new();
+    let mut done = 0;
+    let say = |out: &mut String, text: &str, last: bool| match family {
+        // Muse's text is a message to the user; one with a call after it ends in <|eom|>.
+        Family::Muse if same => {
+            if last {
+                out.push_str(" to=user<|message|>");
+                out.push_str(text);
+            } else if !text.trim().is_empty() {
+                out.push_str(" to=user<|message|>");
+                out.push_str(text);
+                out.push_str("<|eom|><|start|>assistant");
+            }
+        }
+        _ => out.push_str(text),
+    };
+    for step in &record.steps {
+        let at = if step.at >= done && step.at <= content.len() && content.is_char_boundary(step.at)
+        {
+            step.at
+        } else {
+            done
+        };
+        say(&mut out, &content[done..at], false);
+        done = at;
+        if !same {
+            out.push_str(&format!("\n[{} returned:\n", step.tool));
+            out.push(PLAIN_OPEN);
+            out.push_str(&step.result);
+            out.push(PLAIN_CLOSE);
+            out.push_str("]\n");
+            continue;
+        }
+        let (before, body, after) = crate::tools::after_call(family, &step.tool, &step.result, false);
+        // A past turn has no thought in it, not even Qwen's empty one.
+        let after = after.strip_suffix("<think>\n\n</think>\n\n").unwrap_or(&after);
+        out.push_str(&step.call);
+        out.push_str(&before);
+        out.push(PLAIN_OPEN);
+        out.push_str(&body);
+        out.push(PLAIN_CLOSE);
+        out.push_str(after);
+    }
+    say(&mut out, &content[done..], true);
+    out
 }
 
 /// The prompt for `messages` (oldest first) with the turn for the model's reply opened.
 /// Special tokens are written as text, for `encode(.., parse_special: true)`.
 #[cfg(test)]
 pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today: &str) -> String {
-    history(family, system, "", messages, today) + opening(family)
+    history(family, system, "", messages, today, false) + opening(family, false)
 }
 
 /// The turn for the model's reply, opened: what `prompt` adds after `history`. It
 /// starts with a special token on every family, so the two can be tokenized apart.
 /// The next turn's prompt writes the reply differently (Qwen's empty thought isn't
 /// kept), so a chat's prompts can share their history and nothing after it.
-pub fn opening(family: Family) -> &'static str {
+pub fn opening(family: Family, thinking: bool) -> &'static str {
     match family {
         Family::Llama => "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        // Thinking on: the thought is opened for the model, as the template opens it.
+        Family::Qwen35 if thinking => "<|im_start|>assistant\n<think>\n",
         // Thinking off: the template's empty thought.
         Family::Qwen35 => "<|im_start|>assistant\n<think>\n\n</think>\n\n",
         Family::Gemma4 => "<|turn>model\n",
@@ -105,7 +336,7 @@ pub fn cut_points(messages: &[Message], step: usize) -> Vec<usize> {
             cuts.push(i);
             k = before / step + 1;
         }
-        before += m.content.len();
+        before += m.bytes();
     }
     cuts
 }
@@ -115,13 +346,17 @@ pub fn cut_points(messages: &[Message], step: usize) -> Vec<usize> {
 pub fn answer_opening(family: Family) -> &'static str {
     match family {
         Family::Muse => "<|start|>assistant to=user<|message|>",
-        other => opening(other),
+        other => opening(other, false),
     }
 }
 
-/// Muse thinks to itself in a message `to=self`; thinking off, it isn't offered one, and
-/// its template's switch is set as the Mac's server sets it for thinking off.
+/// Muse thinks to itself in a message `to=self`; its template's switch is set as the
+/// Mac's server sets it: low for thinking off, high for thinking on.
 pub const MUSE_REASONING: &str = "Reasoning strength: low.";
+pub const MUSE_REASONING_ON: &str = "Reasoning strength: high.";
+
+/// What Gemma 4's template opens its system turn with when thinking is on.
+const GEMMA_THINK: &str = "<|think|>\n";
 
 /// What the Mac's server adds to a system prompt of Vireo's for Muse (model_profiles.py's
 /// `system_note`): the knowledge cutoff its own default system turn gives, and a line for
@@ -130,13 +365,16 @@ pub const MUSE_NOTE: &str = "Knowledge cutoff: January 4, 2026.\n\nKeep the fina
 
 /// The system prompt, the tools' declarations (`tools::declarations`, or "" for none) and
 /// `messages`, without the reply's turn. The declarations go where each template puts
-/// them, in the system turn, so a chat's prompts all start the same way.
+/// them, in the system turn, so a chat's prompts all start the same way. `thinking` is
+/// the request's: Gemma 4's template says so in the system turn, Muse's sets its strength.
+/// Read it with [`encode`]: a reply's kept tool results are marked as plain text.
 pub fn history(
     family: Family,
     system: Option<&str>,
     tools: &str,
     messages: &[Message],
     today: &str,
+    thinking: bool,
 ) -> String {
     let system = system.map(str::trim).filter(|s| !s.is_empty());
     let mut out = String::new();
@@ -156,7 +394,7 @@ pub fn history(
                 out.push_str("<|start_header_id|>");
                 out.push_str(&m.role);
                 out.push_str("<|end_header_id|>\n\n");
-                out.push_str(m.content.trim());
+                out.push_str(&said(family, m));
                 out.push_str("<|eot_id|>");
             }
         }
@@ -178,14 +416,17 @@ pub fn history(
                 out.push_str("<|im_start|>");
                 out.push_str(&m.role);
                 out.push('\n');
-                out.push_str(m.content.trim());
+                out.push_str(&said(family, m));
                 out.push_str("<|im_end|>\n");
             }
         }
         Family::Gemma4 => {
             out.push_str("<bos>");
-            if system.is_some() || !tools.is_empty() {
+            if system.is_some() || !tools.is_empty() || thinking {
                 out.push_str("<|turn>system\n");
+                if thinking {
+                    out.push_str(GEMMA_THINK);
+                }
                 out.push_str(system.unwrap_or(""));
                 out.push_str(tools);
                 out.push_str("<turn|>\n");
@@ -199,7 +440,7 @@ pub fn history(
                 out.push_str("<|turn>");
                 out.push_str(role);
                 out.push('\n');
-                out.push_str(m.content.trim());
+                out.push_str(&said(family, m));
                 out.push_str("<turn|>\n");
             }
         }
@@ -221,7 +462,11 @@ pub fn history(
                 }
             }
             out.push_str("\n\n");
-            out.push_str(MUSE_REASONING);
+            out.push_str(if thinking {
+                MUSE_REASONING_ON
+            } else {
+                MUSE_REASONING
+            });
             out.push_str("\n\n");
             if tools.is_empty() {
                 out.push_str("# Valid recipients: \"self\", \"user\".");
@@ -231,17 +476,34 @@ pub fn history(
             }
             out.push_str("<|eot|>");
             for m in messages {
-                if m.role == "assistant" {
-                    out.push_str("<|start|>assistant to=user<|message|>");
-                } else {
-                    out.push_str("<|start|>user<|message|>");
+                match (&m.record, m.role == "assistant") {
+                    (Some(record), true) if record.family == family.name() => {
+                        out.push_str("<|start|>assistant");
+                        out.push_str(&with_calls(family, m.content.trim(), record));
+                    }
+                    (_, true) => {
+                        out.push_str("<|start|>assistant to=user<|message|>");
+                        out.push_str(&said(family, m));
+                    }
+                    (_, false) => {
+                        out.push_str("<|start|>user<|message|>");
+                        out.push_str(m.content.trim());
+                    }
                 }
-                out.push_str(m.content.trim());
                 out.push_str("<|eot|>");
             }
         }
     }
     out
+}
+
+/// A message's text as its turn holds it: trimmed, and a reply that called tools with its
+/// calls and their results ([`with_calls`]).
+fn said(family: Family, m: &Message) -> String {
+    match &m.record {
+        Some(record) if m.role == "assistant" => with_calls(family, m.content.trim(), record),
+        _ => m.content.trim().to_string(),
+    }
 }
 
 /// "2026-11-12" (the Muse template's `strftime_now('%Y-%m-%d')`) from `today`'s
@@ -304,10 +566,7 @@ mod tests {
     use super::*;
 
     fn said(role: &str, bytes: usize) -> Message {
-        Message {
-            role: role.into(),
-            content: "x".repeat(bytes),
-        }
+        Message::new(role, "x".repeat(bytes))
     }
 
     #[test]
@@ -345,31 +604,22 @@ mod tests {
         for family in [Family::Llama, Family::Qwen35, Family::Gemma4, Family::Muse] {
             let mut chat = chat();
             chat.truncate(1);
-            let text = history(family, Some("Be brief."), "", &chat, "12 Nov 2026");
+            let text = history(family, Some("Be brief."), "", &chat, "12 Nov 2026", false);
             let end = text.len() - closing(family).len();
             assert_eq!(&text[end..], closing(family), "{family:?}");
             assert!(text[..end].ends_with("Hi"), "{family:?}");
             // A longer chat starts with a shorter one: its first messages' tokens can
             // be counted apart.
-            let longer = history(family, Some("Be brief."), "", &self::chat(), "12 Nov 2026");
+            let longer = history(family, Some("Be brief."), "", &self::chat(), "12 Nov 2026", false);
             assert!(longer.starts_with(&text), "{family:?}");
         }
     }
 
     fn chat() -> Vec<Message> {
         vec![
-            Message {
-                role: "user".into(),
-                content: "Hi".into(),
-            },
-            Message {
-                role: "assistant".into(),
-                content: "Hello!".into(),
-            },
-            Message {
-                role: "user".into(),
-                content: " And you? ".into(),
-            },
+            Message::new("user", "Hi"),
+            Message::new("assistant", "Hello!"),
+            Message::new("user", " And you? "),
         ]
     }
 
@@ -406,7 +656,7 @@ mod tests {
         );
         // A system prompt replaces the template's, with the Mac's note after it; the tools'
         // declarations bring their recipients.
-        let text = history(Family::Muse, Some("Be brief."), "TOOLS", &chat()[..1], "x");
+        let text = history(Family::Muse, Some("Be brief."), "TOOLS", &chat()[..1], "x", false);
         assert_eq!(
             text,
             format!(
@@ -418,7 +668,7 @@ mod tests {
             answer_opening(Family::Muse),
             "<|start|>assistant to=user<|message|>"
         );
-        assert_eq!(answer_opening(Family::Gemma4), opening(Family::Gemma4));
+        assert_eq!(answer_opening(Family::Gemma4), opening(Family::Gemma4, false));
         assert_eq!(Family::of(Some("muse-glimmer")), Some(Family::Muse));
         assert_eq!(iso_date("05 Jan 2027"), "2027-01-05");
     }
@@ -437,5 +687,119 @@ mod tests {
     fn dates_like_strftime() {
         let t = today();
         assert_eq!(t.len(), 11, "{t}");
+    }
+
+    #[test]
+    fn thinking_is_switched_on_as_each_template_does() {
+        let chat = &chat()[..1];
+        assert_eq!(
+            history(Family::Gemma4, Some("Be brief."), "", chat, "x", true),
+            "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi<turn|>\n"
+        );
+        // Gemma's template writes the system turn for thinking alone.
+        assert!(history(Family::Gemma4, None, "", chat, "x", true)
+            .starts_with("<bos><|turn>system\n<|think|>\n<turn|>\n"));
+        assert_eq!(opening(Family::Qwen35, true), "<|im_start|>assistant\n<think>\n");
+        assert_eq!(opening(Family::Gemma4, true), opening(Family::Gemma4, false));
+        assert!(history(Family::Muse, None, "", chat, "x", true).contains("Reasoning strength: high."));
+    }
+
+    fn read_step(at: usize, call: &str) -> Step {
+        Step {
+            at,
+            tool: "read_file".into(),
+            call: call.into(),
+            result: "<turn|> 42".into(),
+        }
+    }
+
+    #[test]
+    fn a_replys_tool_results_are_written_back_where_they_were() {
+        let record = |family: Family, call: &str| Record {
+            family: family.name().into(),
+            steps: vec![read_step(0, call)],
+        };
+        let mut chat = chat();
+        chat[1].content = "It says 42.".into();
+        chat[1].record = Some(record(Family::Gemma4, "<|tool_call>call:read_file{path:<|\"|>a.txt<|\"|>}"));
+        let text = history(Family::Gemma4, None, "", &chat, "x", false);
+        assert_eq!(
+            text,
+            format!(
+                "<bos><|turn>user\nHi<turn|>\n<|turn>model\n<|tool_call>call:read_file{{path:<|\"|>a.txt<|\"|>}}\
+                 <tool_call|><|tool_response>response:read_file{{value:<|\"|>{PLAIN_OPEN}<turn|> 42{PLAIN_CLOSE}<|\"|>}}\
+                 <tool_response|>It says 42.<turn|>\n<|turn>user\nAnd you?<turn|>\n"
+            )
+        );
+        // Qwen's past turn has no thought after the result.
+        chat[1].record = Some(record(Family::Qwen35, "<tool_call>\n<function=read_file>\n</function>\n"));
+        let text = history(Family::Qwen35, None, "", &chat, "x", false);
+        assert!(
+            text.contains(&format!(
+                "<|im_start|>assistant\n<tool_call>\n<function=read_file>\n</function>\n</tool_call><|im_end|>\n\
+                 <|im_start|>user\n<tool_response>\n{PLAIN_OPEN}<turn|> 42{PLAIN_CLOSE}\n</tool_response><|im_end|>\n\
+                 <|im_start|>assistant\nIt says 42.<|im_end|>\n"
+            )),
+            "{text}"
+        );
+        // Muse names each message's recipient.
+        chat[1].record = Some(record(Family::Muse, " to=read_file<|message|>CALL"));
+        let text = history(Family::Muse, None, "", &chat, "x", false);
+        assert!(
+            text.contains(&format!(
+                "<|start|>assistant to=read_file<|message|>CALL<|eot|><|start|>tool read_file<|message|>\
+                 <tool_output name=\"read_file\">\n{PLAIN_OPEN}<turn|> 42{PLAIN_CLOSE}\n</tool_output><|eot|>\
+                 <|start|>assistant to=user<|message|>It says 42.<|eot|>"
+            )),
+            "{text}"
+        );
+        // Another family's record: the result as a note, no call in a form it never wrote.
+        let text = history(Family::Gemma4, None, "", &chat, "x", false);
+        assert!(
+            text.contains(&format!(
+                "<|turn>model\n\n[read_file returned:\n{PLAIN_OPEN}<turn|> 42{PLAIN_CLOSE}]\nIt says 42.<turn|>"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_call_goes_back_where_the_reply_made_it() {
+        let mut m = Message::new("assistant", "One moment. Done.");
+        m.record = Some(Record {
+            family: "gemma4".into(),
+            steps: vec![read_step(11, "CALL"), read_step(999, "LATER")],
+        });
+        let text = super::said(Family::Gemma4, &m);
+        assert!(text.starts_with("One moment.CALL<tool_call|>"), "{text}");
+        // A place past the text (the app cut it short): straight after the last one.
+        assert!(text.ends_with("<tool_response|> Done."), "{text}");
+        assert!(text.contains("<tool_response|>LATER<tool_call|>"), "{text}");
+    }
+
+    #[test]
+    fn a_record_goes_to_the_app_and_back() {
+        let record = Record {
+            family: "gemma4".into(),
+            steps: vec![read_step(3, "call \"x\"\n")],
+        };
+        assert_eq!(Record::parse(&record.to_json()), Some(record.clone()));
+        assert_eq!(Record::parse("{\"steps\":[]}"), None);
+        assert_eq!(Record::parse("nonsense"), None);
+        // Kept short, and left out.
+        let mut m = Message::new("assistant", "Yes.");
+        m.record = Some(Record {
+            family: "gemma4".into(),
+            steps: vec![Step {
+                result: "y".repeat(5000),
+                ..read_step(0, "CALL")
+            }],
+        });
+        assert_eq!(m.bytes(), 4 + 4 + 5000);
+        let short = m.with_results(Results::Short);
+        let kept = &short.record.as_ref().unwrap().steps[0].result;
+        assert!(kept.starts_with(&"y".repeat(SHORT_RESULT)) && kept.contains("3800 more characters"));
+        assert_eq!(m.with_results(Results::Left).record, None);
+        assert_eq!(plain(&format!("a{PLAIN_OPEN}b{PLAIN_CLOSE}")), "ab");
     }
 }

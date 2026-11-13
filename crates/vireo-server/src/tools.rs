@@ -13,6 +13,11 @@
 //! the Mac's server asks for it (`confirm_required`, answered at `/api/agent/confirm`);
 //! those run only in an app that runs them for now, since `files.rs` doesn't make changes
 //! yet.
+//!
+//! Some tools lean on the app besides: the calendar's are the app's alone (the Mac app,
+//! which holds the permission); `schedule_task` is offered to an app that runs the tasks
+//! this server keeps (`tasks.rs`); and `search_chats` runs here for an app whose chats
+//! are on this machine (`chats.rs`). The app says which in `clientTools`.
 
 use vireo_engine::grammar::{Property, RecordStyle, Schema, json_string};
 
@@ -66,6 +71,10 @@ pub enum Group {
     Time,
     /// Arithmetic (`calculate`).
     Numbers,
+    /// The user's calendar and reminders, which the app reaches (the Mac's EventKit).
+    Calendar,
+    /// Tasks Vireo runs later on its own (`schedule_task`).
+    Tasks,
 }
 
 /// The question that picks a request's groups (`--tools-shown scored`), each answer's
@@ -209,7 +218,7 @@ impl Tool {
     /// (Remembering asks for approval too, but a request that tells something about the
     /// user is no request to change a file.)
     pub fn changes_files(&self) -> bool {
-        self.asks.is_some() && self.group != Group::Memory
+        self.asks.is_some() && self.group == Group::Files
     }
 }
 
@@ -220,10 +229,10 @@ fn catalog() -> Vec<Tool> {
     vec![
         Tool {
             name: "read_file",
-            description: "Read a text file, PDF, or Word, Excel or PowerPoint document on this PC.",
+            description: "Read a text file, PDF, or Word, Excel or PowerPoint document on this PC. To read several files, give all their paths in one call, one a line, rather than a call for each.",
             params: vec![text(
                 "path",
-                "The file's path: a full path, or one relative to the home folder (Documents/report.pdf). Don't make one up.",
+                "The file's path: a full path, or one relative to the home folder (Documents/report.pdf). Several files: one path a line. Don't make one up.",
             )],
             runs: Runs::App,
             group: Group::Files,
@@ -288,7 +297,7 @@ fn catalog() -> Vec<Tool> {
         },
         Tool {
             name: "calculate",
-            description: "Work out arithmetic exactly. Use it for every total, sum, difference, percentage or average instead of doing the maths yourself, e.g. \"412.50 + 129.30 + 400\" or \"sum([12.40, 8.99, 31.00]) * 1.13\". Dollar signs, thousands commas and % are fine.",
+            description: "Work out arithmetic exactly. Use it for every total, sum, difference, percentage or average instead of doing the maths yourself, e.g. \"412.50 + 129.30 + 400\" or \"sum([12.40, 8.99, 31.00]) * 1.13\". Dollar signs, thousands commas and % are fine. Work out everything you need in one call, one expression a line, rather than a call for each.",
             params: vec![text(
                 "expression",
                 "Numbers with + - * / % ** and brackets, or round, abs, min, max, sum. For several results, one expression a line.",
@@ -523,6 +532,85 @@ fn catalog() -> Vec<Tool> {
                 rememberable: false,
             }),
         },
+        // The user's calendar and reminders: the app's, where it has them (the Mac app,
+        // through EventKit, which holds the permission). Every argument is asked for, with
+        // "" for none, as the rest of the catalog has no optional ones yet.
+        Tool {
+            name: "list_events",
+            description: "List the events in the user's calendars between two days or times. Check it before adding an event that may already be there.",
+            params: vec![
+                text("start", "The first day, e.g. 2026-11-20, or a time, 2026-11-20T09:00."),
+                text("end", "The last day (it's included), or a time."),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: None,
+        },
+        Tool {
+            name: "create_event",
+            description: "Add an event to the user's calendar. Times are this computer's local time: for something in another time zone, work out the local time here and say the time there in the notes. One event a call. Asks the user for approval.",
+            params: vec![
+                text("title", "The event's title."),
+                text(
+                    "start",
+                    "When it starts, e.g. 2026-11-26T18:00, or 2026-11-26 for an all-day event. Always with the year.",
+                ),
+                text(
+                    "end",
+                    "When it ends, in the same form. For a one-day all-day event, the same day as start.",
+                ),
+                text(
+                    "notes",
+                    "What's worth keeping with it (the place, an amount, who it's with), or \"\" for nothing.",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: Some(Ask {
+                label: "Add calendar events",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "create_reminder",
+            description: "Add a reminder to the user's Reminders. One reminder a call. Asks the user for approval.",
+            params: vec![
+                text("title", "What to be reminded of."),
+                text(
+                    "due",
+                    "When it's due, e.g. 2026-11-25 or 2026-11-25T09:00 (local time, with the year), or \"\" for no date.",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: Some(Ask {
+                label: "Add reminders",
+                rememberable: true,
+            }),
+        },
+        // A task Vireo runs later on its own, in a chat of its own: this server keeps it
+        // and says when it's due, and the app runs it (it lists `run_tasks` when it does).
+        Tool {
+            name: "schedule_task",
+            description: "Set up a task you run on your own later, in a new chat each time: at a time of day (\"every weekday at 8:00, list what's due\"), once at a date and time, whenever a new file lands in a folder (\"when an invoice arrives in Downloads/Invoices, file it\"), or whenever the task's own link is opened by another app or a website. Use it when the user asks for something to happen later, regularly, or whenever something arrives; it does not do the work now. Asks the user for approval.",
+            params: vec![
+                text("name", "A short name, e.g. \"Morning summary\"."),
+                text(
+                    "prompt",
+                    "What to do each time, written as a full instruction to yourself, with every path, rule and file it needs: the run won't see this chat.",
+                ),
+                text(
+                    "when",
+                    "One of: \"daily 08:00\"; days and a time, \"weekdays 08:00\" or \"mon,thu 16:30\"; \"once 2026-11-20T14:00\"; \"folder \" and the folder's path, to run when new files land in it; or \"link\", to run when the task's link is opened (the result gives the link).",
+                ),
+            ],
+            runs: Runs::Server,
+            group: Group::Tasks,
+            asks: Some(Ask {
+                label: "Set up tasks",
+                rememberable: false,
+            }),
+        },
     ]
 }
 
@@ -566,6 +654,28 @@ pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
             let verb = if exists(&path) { "Replace" } else { "Create" };
             format!("{verb} the slide deck {path}")
         }
+        "create_event" => format!("Add \u{201c}{}\u{201d} to the calendar, {}", arg("title"), {
+            let (start, end) = (arg("start"), arg("end"));
+            if end.is_empty() || end == start {
+                start
+            } else {
+                format!("{start} to {end}")
+            }
+        }),
+        "create_reminder" => {
+            let due = arg("due");
+            if due.is_empty() {
+                format!("Add the reminder \u{201c}{}\u{201d}", arg("title"))
+            } else {
+                format!("Add the reminder \u{201c}{}\u{201d}, due {due}", arg("title"))
+            }
+        }
+        "schedule_task" => format!(
+            "Set up the task \u{201c}{}\u{201d}: {}",
+            arg("name"),
+            crate::tasks::When::parse(&arg("when"))
+                .map_or_else(|_| arg("when"), |w| w.described())
+        ),
         "remember" => format!("Remember: {}", arg("fact")),
         "forget" => format!("Forget: {}", arg("fact")),
         other => format!("Run {other}"),
@@ -597,6 +707,14 @@ const SERVER_CHANGE_TOOLS: [&str; 8] = [
     "create_pptx",
 ];
 
+/// What an app lists in `clientTools` besides the tools it runs, for what it does that
+/// this server's own tools lean on. Not tools the model sees.
+/// The app runs the tasks this server says are due (it asks at `/api/tasks/due`).
+pub const RUNS_TASKS: &str = "run_tasks";
+/// The app keeps its chats in the prototype's folder on this machine, where this server
+/// can search them (`chats.rs`): the Mac app.
+pub const CHATS_HERE: &str = "chats_here";
+
 /// Every tool's name, offered or not.
 pub fn all_names() -> Vec<&'static str> {
     catalog().iter().map(|t| t.name).collect()
@@ -610,6 +728,15 @@ pub fn offered(client_tools: &[String], files_here: bool) -> Vec<Tool> {
     catalog()
         .into_iter()
         .filter_map(|mut t| {
+            let lists = |name: &str| client_tools.iter().any(|c| c == name);
+            // A task needs an app that runs it when it's due.
+            if t.name == "schedule_task" && !lists(RUNS_TASKS) {
+                return None;
+            }
+            if t.name == "search_chats" && !lists(t.name) && lists(CHATS_HERE) {
+                t.runs = Runs::Server;
+                return Some(t);
+            }
             if t.runs == Runs::App && !client_tools.iter().any(|c| c == t.name) {
                 let here = SERVER_FILE_TOOLS.contains(&t.name)
                     || (cfg!(target_os = "macos") && SERVER_CHANGE_TOOLS.contains(&t.name));
@@ -1199,7 +1326,7 @@ pub const MUSE_TO_SELF: &str = " to=self<|message|>";
 
 /// What the system prompt says first when there are tools: what they're for, in a line,
 /// so a small model doesn't answer that it can't reach the user's files.
-pub const PREAMBLE: &str = "You are Vireo, running on the user's PC. With the tools below you can read and find      their files, check Git projects and get the date and time. When a question needs one of them, call it,      then answer from what it returns. When the user tells you about themselves (their name and role, the people they work with, where their files are), save each fact with remember.";
+pub const PREAMBLE: &str = "You are Vireo, running on the user's PC. With the tools below you can read and find      their files, check Git projects and get the date and time. When a question needs one of them, call it,      then answer from what it returns. When the user tells you about themselves (their name and role, the people they work with, where their files are), save each fact with remember. Before you approve, pay, send, record or change something because someone said it's fine, check it against the user's own rules where you know them or can read them (their policies, limits, who signs off what). If it breaks one, don't do it and don't offer a way round: say which rule it breaks and what the rule allows, and ask how they want to go on. If you can't do something, say so plainly.";
 
 /// Special tokens a call is written with, inside it.
 pub fn call_tokens(family: Family) -> &'static [&'static str] {
@@ -1601,12 +1728,23 @@ pub fn call_text(family: Family, call: &Call) -> String {
     }
 }
 
-pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, String) {
+pub fn after_call(
+    family: Family,
+    tool: &str,
+    result: &str,
+    thinking: bool,
+) -> (String, String, String) {
     match family {
         Family::Qwen35 => (
             "</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n".into(),
             result.into(),
-            "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
+            // The turn that follows opens as `chat::opening` does: a thought to write, or
+            // the empty one.
+            if thinking {
+                "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n".into()
+            } else {
+                "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into()
+            },
         ),
         Family::Llama => (
             "<|eot_id|><|start_header_id|>ipython<|end_header_id|>\n\n".into(),
@@ -1616,7 +1754,12 @@ pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, 
         Family::Gemma4 => (
             format!("<tool_call|><|tool_response>response:{tool}{{value:{QUOTE}"),
             result.into(),
-            format!("{QUOTE}}}<tool_response|>"),
+            // Thinking on, the template opens a thought after a tool's result.
+            if thinking {
+                format!("{QUOTE}}}<tool_response|><|channel>thought\n")
+            } else {
+                format!("{QUOTE}}}<tool_response|>")
+            },
         ),
         // The template ends a call's message with <|eot|> when the tool's turn follows,
         // and the assistant's next message names its recipient again.
@@ -1633,13 +1776,87 @@ pub fn after_call(family: Family, tool: &str, result: &str) -> (String, String, 
 /// Runs one of the server's own tools, with the files the chat may reach, if any.
 pub fn run_here(call: &Call, files: Option<&Files>) -> Result<String, String> {
     match (call.tool.as_str(), files) {
+        // Several files in one call: each read as its own.
+        ("read_file", Some(files)) if several_paths(call).is_some() => {
+            let paths = several_paths(call).unwrap_or_default();
+            Ok(read_several(&paths, |path| files.run(&read_one(path))))
+        }
         ("get_current_datetime", _) => Ok(now()),
         ("calculate", _) => crate::calc::calculate_many(call.text("expression").unwrap_or("")),
         ("remember", _) => crate::memory::remember(call.text("fact").unwrap_or("")),
         ("forget", _) => crate::memory::forget(call.text("fact").unwrap_or("")),
+        ("search_chats", _) => crate::chats::search(call.text("query").unwrap_or(""), None),
         (_, Some(files)) => files.run(call),
         (other, None) => Err(format!("{other} isn't one of this server's tools")),
     }
+}
+
+/// The most files one `read_file` call reads.
+pub const MAX_FILES_A_CALL: usize = 10;
+
+/// The paths of a `read_file` call that names several, one a line; `None` for one.
+pub fn several_paths(call: &Call) -> Option<Vec<String>> {
+    if call.tool != "read_file" {
+        return None;
+    }
+    let paths: Vec<String> = call
+        .text("path")?
+        .lines()
+        .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    (paths.len() > 1).then_some(paths)
+}
+
+/// A `read_file` call for one path.
+pub fn read_one(path: &str) -> Call {
+    Call {
+        tool: "read_file".into(),
+        args: vec![("path".into(), Arg::Text(path.into()))],
+    }
+}
+
+/// How much of a tool's result the model reads, in characters: `one` for a call that
+/// reads one thing, and for several files up to three times that between them.
+pub fn result_limit(call: &Call, one: usize) -> usize {
+    several_paths(call).map_or(one, |paths| one * paths.len().min(3))
+}
+
+/// Several files read by `read` in one result, each under its path, sharing what one
+/// result may hold (`result_limit`): a file too long for its share is cut, and says so.
+pub fn read_several(paths: &[String], read: impl Fn(&str) -> Result<String, String>) -> String {
+    const ONE: usize = 8000;
+    let read_now = &paths[..paths.len().min(MAX_FILES_A_CALL)];
+    let share = (ONE * read_now.len().min(3) / read_now.len()).saturating_sub(120);
+    let mut out = String::new();
+    for path in read_now {
+        let text = read(path).unwrap_or_else(|e| format!("Error: {e}"));
+        let chars = text.chars().count();
+        out.push_str(&format!("=== {path} ===\n"));
+        if chars > share {
+            out.extend(text.chars().take(share));
+            out.push_str(&format!(
+                "\n[... {} more characters not shown: read this file on its own for the rest]",
+                chars - share
+            ));
+        } else {
+            out.push_str(text.trim_end());
+        }
+        out.push_str("\n\n");
+    }
+    if paths.len() > read_now.len() {
+        out.push_str(&format!(
+            "[Only the first {MAX_FILES_A_CALL} files were read. Call read_file again for: {}]",
+            paths[read_now.len()..].join(", ")
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// "Friday, November 13, 2026": today, for a request's note of the date.
+pub fn today_line() -> String {
+    let now = now();
+    now.rsplit_once(", ").map_or(now.clone(), |(date, _)| date.to_string())
 }
 
 /// "Wednesday, November 11, 2026, 1:05 PM (local time)", as the Mac's server says it.
@@ -1683,7 +1900,7 @@ fn now() -> String {
 
 /// (year, month, day, weekday from Sunday, hour, minute), local.
 #[cfg(windows)]
-fn local_time() -> (u16, u16, u16, u16, u16, u16) {
+pub fn local_time() -> (u16, u16, u16, u16, u16, u16) {
     #[repr(C)]
     #[derive(Default)]
     struct SystemTime {
@@ -1706,7 +1923,7 @@ fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 
 /// The Mac's local time, from `localtime_r` (the user's time zone, as the app shows it).
 #[cfg(target_os = "macos")]
-fn local_time() -> (u16, u16, u16, u16, u16, u16) {
+pub fn local_time() -> (u16, u16, u16, u16, u16, u16) {
     #[repr(C)]
     struct Tm {
         sec: i32,
@@ -1751,7 +1968,7 @@ fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn local_time() -> (u16, u16, u16, u16, u16, u16) {
+pub fn local_time() -> (u16, u16, u16, u16, u16, u16) {
     // UTC, from the system clock.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2079,7 +2296,7 @@ mod tests {
 
     #[test]
     fn muses_results_come_back_as_its_template_writes_them() {
-        let (before, body, after) = after_call(Family::Muse, "read_file", "hello");
+        let (before, body, after) = after_call(Family::Muse, "read_file", "hello", false);
         assert_eq!(
             before,
             "<|eot|><|start|>tool read_file<|message|><tool_output name=\"read_file\">\n"
@@ -2090,7 +2307,7 @@ mod tests {
             after,
             format!(
                 "\n</tool_output><|eot|>{}",
-                crate::chat::opening(Family::Muse)
+                crate::chat::opening(Family::Muse, false)
             )
         );
     }
