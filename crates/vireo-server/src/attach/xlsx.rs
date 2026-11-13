@@ -196,18 +196,18 @@ impl Sheet {
 
 /// A piece of XML: a tag opened (its name without a namespace prefix, its attributes,
 /// and whether it closes itself), a tag closed, or the text between tags.
-enum Piece<'a> {
+pub(super) enum Piece<'a> {
     Open(&'a str, &'a str, bool),
     Close(&'a str),
     Text(&'a str),
 }
 
-struct Pieces<'a> {
+pub(super) struct Pieces<'a> {
     rest: &'a str,
 }
 
 impl<'a> Pieces<'a> {
-    fn new(xml: &'a str) -> Self {
+    pub(super) fn new(xml: &'a str) -> Self {
         Self { rest: xml }
     }
 }
@@ -255,7 +255,7 @@ impl<'a> Iterator for Pieces<'a> {
 }
 
 /// An attribute's value in a tag's attributes (` r="A1" t="s"`), still escaped.
-fn attribute<'t>(attrs: &'t str, key: &str) -> Option<&'t str> {
+pub(super) fn attribute<'t>(attrs: &'t str, key: &str) -> Option<&'t str> {
     let mut from = 0;
     while let Some(found) = attrs[from..].find(key) {
         let at = from + found;
@@ -272,7 +272,7 @@ fn attribute<'t>(attrs: &'t str, key: &str) -> Option<&'t str> {
     None
 }
 
-fn unescaped(text: &str) -> String {
+pub(super) fn unescaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     unescape_into(&mut out, text);
     out
@@ -525,7 +525,7 @@ pub fn column_name(mut column: u32) -> String {
 }
 
 /// The column of a cell reference ("AB12" is 28).
-fn column_of(reference: &str) -> Option<u32> {
+pub(super) fn column_of(reference: &str) -> Option<u32> {
     let mut column = 0u32;
     for c in reference.chars().take_while(char::is_ascii_alphabetic) {
         column = column.checked_mul(26)? + (c.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
