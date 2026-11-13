@@ -113,8 +113,8 @@ struct Options {
     /// Skills picked by scoring and written in as a `use_skill` call (`--skills on`, the
     /// default), or none (`off`).
     skills: bool,
-    /// With more than two skills, one question about them all first and only the two
-    /// likeliest asked about one by one (`--skill-shortlist on`, the default); `off` asks
+    /// With more than two skills, one question about them all first (each skill's name
+    /// scored as its answer) and only the two likeliest asked about one by one (`--skill-shortlist on`, the default); `off` asks
     /// about every skill, as before 2026-11-12. Measured then (PLAN.md).
     skill_shortlist: bool,
     /// A draft model to guess tokens with (`--draft`), and how many a round.
@@ -2517,7 +2517,8 @@ fn pick_skill(
             content: skills::shortlist_question(&skills, request),
         };
         let text = chat::history(family, None, "", &[question], &chat::today())
-            + chat::answer_opening(family);
+            + chat::answer_opening(family)
+            + skills::SHORTLIST_LEAD;
         let ids = tokenizer.encode(&text, false, true);
         shortlist_ids = Some(ids);
     }
@@ -2525,8 +2526,8 @@ fn pick_skill(
         let logits = model.ask(kept, &ids)?;
         let mut ranked: Vec<(f32, usize)> = (0..skills.len().min(skills::SHORTLISTED))
             .map(|i| {
-                let letter = format!(" {}", skills::shortlist_letter(i));
-                let id = tokenizer.encode(&letter, false, false)[0];
+                // The first token of the skill's name, as the next word.
+                let id = tokenizer.encode(&format!(" {}", skills[i].name), false, false)[0];
                 (logits[id as usize], i)
             })
             .collect();
