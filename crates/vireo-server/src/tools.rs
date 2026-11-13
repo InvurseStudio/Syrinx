@@ -81,8 +81,28 @@ pub const GROUP_CHOICES: [(&str, Option<Group>); 5] = [
 /// The question, with worked examples (small models sort far better from examples than
 /// from a description), ending where the answer's letter goes. The examples are worded
 /// apart from the eval's cases.
-pub fn group_question(request: &str) -> String {
+/// The most of a request a scoring question holds, in characters: its start and its end.
+const SCORED_START: usize = 300;
+const SCORED_END: usize = 300;
+
+/// A request as the server's own questions about it hold it (which tools it needs,
+/// whether it asks for a change, whether a skill fits): on one line, and a long one as
+/// its start and its end with the middle left out. What a request asks for is said at
+/// one end or the other, and what's pasted in between would be read once for every
+/// question (and, past the questions' limit, would push the question's own end out).
+pub fn for_scoring(request: &str) -> String {
     let request = request.trim().replace('\n', " ");
+    let count = request.chars().count();
+    if count <= SCORED_START + SCORED_END {
+        return request;
+    }
+    let start: String = request.chars().take(SCORED_START).collect();
+    let end: String = request.chars().skip(count - SCORED_END).collect();
+    format!("{} ... {}", start.trim_end(), end.trim_start())
+}
+
+pub fn group_question(request: &str) -> String {
+    let request = for_scoring(request);
     format!(
         "Sort each request to an assistant on a PC by what answering it needs.\n\
          A = files or folders on the PC (reading, listing, finding, checking or changing one)\n\
@@ -106,7 +126,7 @@ pub fn group_question(request: &str) -> String {
 /// files, with worked examples (worded apart from the eval's cases), ending where the
 /// answer goes: " yes" or " no".
 pub fn change_question(request: &str) -> String {
-    let request = request.trim().replace('\n', " ");
+    let request = for_scoring(request);
     format!(
         "Does each request to an assistant on a PC ask it to create, change, rename, move or \
          delete a file or folder? Reading, finding, explaining, suggesting or writing an answer \
@@ -1737,6 +1757,24 @@ fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_request_is_scored_by_its_start_and_end() {
+        let short = "Read notes.txt\nand sum it up.";
+        assert_eq!(for_scoring(short), "Read notes.txt and sum it up.");
+        let exact = "x".repeat(600);
+        assert_eq!(for_scoring(&exact), exact);
+        let long = format!("Here are my notes. {} Save them to notes.md.", "word ".repeat(400));
+        let scored = for_scoring(&long);
+        assert!(scored.starts_with("Here are my notes."));
+        assert!(scored.ends_with("Save them to notes.md."));
+        assert!(scored.contains(" ... "));
+        assert!(scored.chars().count() <= 605);
+        assert!(change_question(&long).ends_with("Save them to notes.md.\nChanges:"));
+        // Characters, not bytes: nothing is cut inside one.
+        let wide = "é".repeat(700);
+        assert_eq!(for_scoring(&wide).chars().filter(|c| *c == 'é').count(), 600);
+    }
     use vireo_engine::grammar::Grammar;
 
     fn written(family: Family, text: &str) -> Option<Call> {
