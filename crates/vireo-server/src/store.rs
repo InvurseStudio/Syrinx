@@ -23,8 +23,21 @@ use vireo_engine::models::SavedState;
 
 const MAGIC: &[u8; 8] = b"VIREOKV1";
 
-/// What the saved chats may take on disk, per model.
+/// What the saved chats may take on disk, per model, at least.
 pub const DISK_BUDGET: u64 = 4 << 30;
+/// A large model's budget is room for this many chats of the whole context...
+const FULL_CHATS: u64 = 4;
+/// ...up to this much.
+const MOST_DISK: u64 = 32 << 30;
+
+/// The disk budget for a model whose chat of the whole context takes `full_chat` bytes in
+/// the GPU's cache (about what it takes saved): 4 GB for the small models, and for a
+/// large one room for four full chats. On Gemma 4 31B a 26K-token chat saves as 2.9 GB,
+/// and two 11.5K-token chats took 3.6 of the 4 GB (`evals/long-run`): going back to the
+/// second of two long chats would have read it all again.
+pub fn budget_for(full_chat: u64) -> u64 {
+    DISK_BUDGET.max(FULL_CHATS.saturating_mul(full_chat)).min(MOST_DISK)
+}
 /// How many saved states stay in memory too (the newest; on top of the one in use).
 const IN_MEMORY: usize = 2;
 
@@ -395,6 +408,13 @@ mod tests {
         drop(s);
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_large_models_budget_holds_four_full_chats() {
+        assert_eq!(budget_for(400 << 20), 4 << 30); // a small model: the least
+        assert_eq!(budget_for(4400 << 20), 4 * (4400 << 20)); // Gemma 4 31B at 32K
+        assert_eq!(budget_for(30 << 30), 32 << 30); // never more than the most
     }
 
     #[test]

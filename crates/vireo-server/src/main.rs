@@ -1667,10 +1667,16 @@ fn engine(
     let mut store = chat_cache.map(|dir| {
         let key = store::model_key(std::path::Path::new(path), mode);
         let dir = dir.unwrap_or_else(|| store::default_dir(&key));
-        let s = store::Store::open(dir, store::DISK_BUDGET);
-        if !s.entries().is_empty() {
-            eprintln!("{} saved chats.", s.entries().len());
-        }
+        let full_chat = kept
+            .as_ref()
+            .map_or(0, |k| model.cache_bytes_per_position(&k.session) * context);
+        let budget = store::budget_for(full_chat as u64);
+        let s = store::Store::open(dir, budget);
+        eprintln!(
+            "{} saved chats; they may take up to {:.0} GB on disk.",
+            s.entries().len(),
+            budget as f64 / (1u64 << 30) as f64
+        );
         s
     });
     let mut seed = random_u64();
