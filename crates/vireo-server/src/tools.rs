@@ -586,12 +586,15 @@ const SERVER_FILE_TOOLS: [&str; 7] = [
 
 /// The changes `files.rs` makes itself on the Mac, where the app runs no tools (on Windows
 /// the app makes them, with its undo journal).
-const SERVER_CHANGE_TOOLS: [&str; 5] = [
+const SERVER_CHANGE_TOOLS: [&str; 8] = [
     "write_file",
     "rename_file",
     "move_file",
     "delete_file",
     "write_spreadsheet",
+    "create_docx",
+    "fill_docx_template",
+    "create_pptx",
 ];
 
 /// Every tool's name, offered or not.
@@ -2183,7 +2186,15 @@ mod tests {
             "read_spreadsheet",
         ];
         if cfg!(target_os = "macos") {
-            expected.extend(["write_spreadsheet", "write_file", "rename_file", "move_file"]);
+            expected.extend([
+                "create_docx",
+                "write_spreadsheet",
+                "fill_docx_template",
+                "create_pptx",
+                "write_file",
+                "rename_file",
+                "move_file",
+            ]);
         }
         expected.extend(["remember", "forget"]);
         if cfg!(target_os = "macos") {
