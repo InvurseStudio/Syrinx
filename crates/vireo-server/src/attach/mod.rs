@@ -14,8 +14,11 @@
 //! message it came with on later turns too.
 
 pub mod docx;
+pub mod docx_write;
 pub mod inflate;
+pub mod markdown;
 pub mod pdf;
+pub mod pptx_write;
 pub mod xlsx;
 pub mod xlsx_write;
 
