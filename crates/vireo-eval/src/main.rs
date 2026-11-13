@@ -359,6 +359,17 @@ impl Server {
                 std::env::temp_dir()
                     .join(format!("vireo-eval-memory-{}.txt", std::process::id())),
             )
+            // Only the built-in skills, not the ones on this machine: the cases must score
+            // the same wherever they run. (`INVURSE_SKILLS_DIR` set by hand is kept.)
+            .env(
+                "INVURSE_SKILLS_DIR",
+                std::env::var_os("INVURSE_SKILLS_DIR").unwrap_or_else(|| {
+                    let empty = std::env::temp_dir()
+                        .join(format!("vireo-eval-skills-{}", std::process::id()));
+                    let _ = std::fs::create_dir_all(&empty);
+                    empty.into_os_string()
+                }),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
