@@ -30,6 +30,18 @@ impl<'a> Matrix<'a> {
         &self.data[r * n..(r + 1) * n]
     }
 
+    /// `count` rows from row `first` on, as a matrix of their own (one expert's rows in a
+    /// mixture-of-experts tensor, which holds every expert's matrix one after another).
+    pub fn rows_from(&self, first: usize, count: usize) -> Matrix<'a> {
+        let n = self.row_bytes();
+        Matrix {
+            kind: self.kind,
+            rows: count,
+            cols: self.cols,
+            data: &self.data[first * n..(first + count) * n],
+        }
+    }
+
     /// Row `r` as f32s (an embedding lookup).
     pub fn decode_row(&self, r: usize, out: &mut [f32]) {
         quant::dequantize_row(self.kind, self.row(r), &mut out[..self.cols]);
