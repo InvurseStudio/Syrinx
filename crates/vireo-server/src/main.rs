@@ -1744,6 +1744,10 @@ struct Prompt {
 /// once in that many tokens, not at every turn.
 const CUT_BYTES_PER_TOKEN: usize = 4;
 
+/// The share of the context (one part in this many) left free for the request and a
+/// skill's instructions when a long chat's start is chosen from its history alone.
+const REQUEST_ROOM: usize = 8;
+
 /// How many facts back a chat's instructions may stop at for its cache to be kept: the
 /// facts remembered while it's cached, before it's read again with all of them.
 const OLDER_FACTS: usize = 8;
@@ -1943,7 +1947,19 @@ fn reply(
             ids.extend(tokenizer.encode(&rest, false, true));
             ids.extend_from_slice(&opening);
             ids.extend_from_slice(&skill_ids);
-            if ids.len() + max_tokens <= context || first + 1 >= job.messages.len() {
+            // A start is settled on what came before the request, with room left for a
+            // request and a skill's instructions (`REQUEST_ROOM`): that only grows, so
+            // once a chat has moved to a later start it never goes back to an earlier one
+            // on a turn that happens to be shorter (a short question after a long one, or
+            // no skill after a skill), which would swap its cache out and in again.
+            let last = job.messages.len() - 1;
+            let settled = first >= last || {
+                let before =
+                    chat::history(family, system.as_deref(), &declared, &job.messages[first..last], &today);
+                tokenizer.encode(&before, false, true).len() + max_tokens + context / REQUEST_ROOM
+                    <= context
+            };
+            if (settled && ids.len() + max_tokens <= context) || first >= last {
                 break Prompt {
                     ids,
                     mark,
