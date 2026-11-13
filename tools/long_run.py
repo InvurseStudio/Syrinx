@@ -287,11 +287,45 @@ class Llama:
         self.log.close()
 
 
+def steps_for(args, with_extras):
+    """The run's steps in order; with the engine's extras, the remember turn too."""
+    steps = plan(args.turns, args.seed)
+    if with_extras and args.remember_at:
+        steps.insert(args.remember_at - 1, {
+            "kind": "remember", "expect": None,
+            "text": "Please remember that my manager is Dana Whitfield and that I work from the Graz office.",
+        })
+    return steps
+
+
+SIDE_CHAT = ["Different topic: give me three names for a bakery, one line.",
+             "Pick the best one and say why in one sentence."]
+
+
+def export_script(args):
+    side = {int(t) for t in args.side_chats.split(",") if t}
+    steps = []
+    for n, step in enumerate(steps_for(args, True), 1):
+        steps.append({"prompt": step["text"], "title": step["kind"],
+                      **({"expect": [step["expect"]]} if step["expect"] else {})})
+        if n in side:
+            steps += [{"prompt": text, "title": "side chat", "chat": f"side chat after {n}"}
+                      for text in SIDE_CHAT]
+    out = Path(args.export_script)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"name": f"Long run, {args.turns} rounds", "systemPrompt": SYSTEM,
+                               "steps": steps}, indent=1))
+    print(f"{len(steps)} steps written to {out}.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--engine", choices=["vireo", "llama"], required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--engine", choices=["vireo", "llama"])
+    parser.add_argument("--model")
+    parser.add_argument("--out")
+    parser.add_argument("--export-script", metavar="FILE",
+                        help="write the chat as a test script for the prototype app "
+                             "(Test > Run Test Script, or --run-script) and stop")
     parser.add_argument("--turns", type=int, default=56, help="notes and recall rounds (default 56)")
     parser.add_argument("--context", type=int, default=0, help="tokens (default: the server's own)")
     parser.add_argument("--max-tokens", type=int, default=200)
@@ -301,6 +335,11 @@ def main():
     parser.add_argument("--keep", action="store_true", help="keep the server's temporary folder")
     parser.add_argument("extra", nargs="*", help="more arguments for the server, after --")
     args = parser.parse_args()
+    if args.export_script:
+        export_script(args)
+        return
+    if not (args.engine and args.model and args.out):
+        parser.error("--engine, --model and --out are needed (or --export-script)")
 
     server = (Vireo if args.engine == "vireo" else Llama)(
         args.model, args.context, args.max_tokens, args.extra)
@@ -308,12 +347,7 @@ def main():
     rows, messages = [], []
     started = time.time()
     try:
-        steps = plan(args.turns, args.seed)
-        if args.engine == "vireo" and args.remember_at:
-            steps.insert(args.remember_at - 1, {
-                "kind": "remember", "expect": None,
-                "text": "Please remember that my manager is Dana Whitfield and that I work from the Graz office.",
-            })
+        steps = steps_for(args, args.engine == "vireo")
         for n, step in enumerate(steps, 1):
             messages.append({"role": "user", "content": step["text"]})
             row = server.ask(messages)
@@ -334,10 +368,10 @@ def main():
             )
             if n in side:
                 # Another chat, two turns, then back to the long one on the next turn.
-                other = [{"role": "user", "content": "Different topic: give me three names for a bakery, one line."}]
+                other = [{"role": "user", "content": SIDE_CHAT[0]}]
                 a = server.ask(other)
                 other += [{"role": "assistant", "content": a["reply"]},
-                          {"role": "user", "content": "Pick the best one and say why in one sentence."}]
+                          {"role": "user", "content": SIDE_CHAT[1]}]
                 b = server.ask(other)
                 time.sleep(2)  # the save is written on a thread of its own
                 rows.append({"turn": n, "kind": "side-chat", "first_word_s": a["first_word_s"],

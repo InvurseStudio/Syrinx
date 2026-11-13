@@ -33,7 +33,22 @@ const SKIPPED_FOLDERS: [&str; 4] = ["node_modules", "venv", "__pycache__", "site
 /// Read with the Mac's document readers rather than as text.
 const RICH_TEXT_EXTENSIONS: [&str; 5] = ["docx", "doc", "rtf", "rtfd", "odt"];
 /// Documents these tools can't read yet.
-const UNREAD_DOCUMENTS: [&str; 6] = ["xlsx", "xlsm", "pptx", "pages", "numbers", "key"];
+const UNREAD_DOCUMENTS: [&str; 5] = ["xls", "pptx", "pages", "numbers", "key"];
+/// Excel workbooks, read by `attach::xlsx`.
+const WORKBOOKS: [&str; 2] = ["xlsx", "xlsm"];
+
+/// Opens the workbook at `file` (`size` bytes).
+fn workbook(file: &str, size: u64) -> Result<crate::attach::xlsx::Workbook, String> {
+    let name = file_name(file);
+    if size > crate::attach::xlsx::MAX_FILE {
+        return Err(format!(
+            "{name} is too large to read ({} MB). The most is 30 MB.",
+            size >> 20
+        ));
+    }
+    let data = fs::read(file).map_err(|_| format!("Couldn't read {file}."))?;
+    crate::attach::xlsx::open(&data).map_err(|e| format!("Couldn't read {name}: {e}"))
+}
 
 /// The machine's path separator.
 #[cfg(windows)]
@@ -111,6 +126,7 @@ impl Files {
         match call.tool.as_str() {
             "read_file" => self.read_file(&arg(call, "path")?),
             "list_directory" => self.list_directory(&arg(call, "path")?, int_arg(call, "depth")),
+            "read_spreadsheet" => self.read_spreadsheet(&arg(call, "path")?),
             "file_exists" => self.file_exists(&arg(call, "path")?),
             "search_files" => self.search_files(
                 &arg(call, "pattern")?,
@@ -219,9 +235,12 @@ impl Files {
         if RICH_TEXT_EXTENSIONS.contains(&ext.as_str()) {
             return documents::rich_text(&file).ok_or(format!("Couldn't read {name}."));
         }
+        if WORKBOOKS.contains(&ext.as_str()) {
+            return Ok(workbook(&file, meta.len())?.describe());
+        }
         if UNREAD_DOCUMENTS.contains(&ext.as_str()) {
             return Err(format!(
-                "{name} is a document this {MACHINE}'s tools can't read yet. read_file can read text files, PDFs and Word documents."
+                "{name} is a document this {MACHINE}'s tools can't read yet. read_file can read text files, PDFs, Word documents and Excel workbooks."
             ));
         }
         let size = meta.len();
@@ -234,13 +253,32 @@ impl Files {
         let data = fs::read(&file).map_err(|_| format!("Couldn't read {file}."))?;
         let text = String::from_utf8(data).map_err(|_| {
             format!(
-                "{name} is not a text file. read_file can read text files, PDFs and Word documents."
+                "{name} is not a text file. read_file can read text files, PDFs, Word documents and Excel workbooks."
             )
         })?;
         Ok(text
             .strip_prefix('\u{FEFF}')
             .map(str::to_string)
             .unwrap_or(text))
+    }
+
+    /// An Excel workbook's sheet names and the cells of its first sheet.
+    fn read_spreadsheet(&self, path: &str) -> Result<String, String> {
+        let file = self.resolve(path)?;
+        let Ok(meta) = fs::metadata(&file) else {
+            return Err(format!("File not found: {file}"));
+        };
+        let name = file_name(&file);
+        let ext = Path::new(&file)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if meta.is_dir() || !WORKBOOKS.contains(&ext.as_str()) {
+            return Err(format!(
+                "{name} isn't an Excel workbook (.xlsx). Use read_file for other files."
+            ));
+        }
+        Ok(workbook(&file, meta.len())?.read())
     }
 
     /// A folder's contents, and with `depth` 2 or 3 the folders inside it, indented.
@@ -1063,7 +1101,7 @@ mod tests {
     #[test]
     fn documents_it_cant_read_say_so() {
         let h = home();
-        make(&h, "Documents/budget.xlsx", "PK");
+        make(&h, "Documents/budget.pptx", "PK");
         make(&h, "Documents/photo.bin", "");
         fs::write(
             format!("{}/Documents/photo.bin", h.0),
@@ -1071,12 +1109,17 @@ mod tests {
         )
         .unwrap();
         let t = tools(&h, Access::Home);
-        let xlsx = failure(&t, "read_file", &[("path", "Documents/budget.xlsx")]);
-        assert!(xlsx.contains("can't read yet"), "{xlsx}");
+        let deck = failure(&t, "read_file", &[("path", "Documents/budget.pptx")]);
+        assert!(deck.contains("can't read yet"), "{deck}");
+        make(&h, "Documents/broken.xlsx", "PK");
+        let broken = failure(&t, "read_file", &[("path", "Documents/broken.xlsx")]);
+        assert!(broken.starts_with("Couldn't read broken.xlsx:"), "{broken}");
+        let notes = failure(&t, "read_spreadsheet", &[("path", "Documents/budget.pptx")]);
+        assert!(notes.contains("isn't an Excel workbook"), "{notes}");
         let binary = failure(&t, "read_file", &[("path", "Documents/photo.bin")]);
         assert_eq!(
             binary,
-            "photo.bin is not a text file. read_file can read text files, PDFs and Word documents."
+            "photo.bin is not a text file. read_file can read text files, PDFs, Word documents and Excel workbooks."
         );
     }
 
