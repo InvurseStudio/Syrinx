@@ -115,8 +115,14 @@ pub fn forget(fact: &str) -> Result<String, String> {
 }
 
 /// The lines for a chat's instructions, or `None` when nothing is remembered.
+#[cfg(test)]
 pub fn instructions() -> Option<String> {
-    let facts = all();
+    instructions_for(&all())
+}
+
+/// The lines for a chat's instructions for `facts` (the first few of `all`, for a chat
+/// that began when only those were remembered), or `None` for none.
+pub fn instructions_for(facts: &[String]) -> Option<String> {
     (!facts.is_empty()).then(|| {
         format!(
             "{NOTE}\n{}",
@@ -127,6 +133,23 @@ pub fn instructions() -> Option<String> {
                 .join("\n")
         )
     })
+}
+
+/// What a request ends with for `facts` remembered after its chat began (its instructions
+/// keep the facts they started with, so the chat's cached start stays as it was), or ""
+/// for none. It opens with a blank line and ends without one.
+pub fn since(facts: &[String]) -> String {
+    if facts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n(Remembered since this chat began, as background about the user:\n{})",
+        facts
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 #[cfg(test)]
@@ -153,6 +176,22 @@ mod tests {
         assert!(forget("the weather").unwrap_err().contains("- Her manager is Rafael Ortiz."));
         assert_eq!(forget("Rafael Ortiz is her manager").unwrap(), "Forgot: Her manager is Rafael Ortiz.");
         assert_eq!(all(), ["Maya is the Communications Coordinator."]);
+        // A chat that began with the first fact keeps it in its instructions, and is
+        // told the rest at the end of its request.
+        remember("Her files are in Documents/Comms.").unwrap();
+        let facts = all();
+        assert_eq!(instructions_for(&facts), instructions());
+        assert!(
+            instructions()
+                .unwrap()
+                .starts_with(&instructions_for(&facts[..1]).unwrap())
+        );
+        assert_eq!(instructions_for(&facts[..0]), None);
+        assert_eq!(since(&facts[2..]), "");
+        assert_eq!(
+            since(&facts[1..]),
+            "\n\n(Remembered since this chat began, as background about the user:\n- Her files are in Documents/Comms.)"
+        );
         let _ = std::fs::remove_file(&file);
     }
 }
