@@ -55,6 +55,12 @@ struct ExpertLayer {
     post_norm: Buffer,
 }
 
+/// From this many tokens a batch's experts are run grouped by expert (`Gpu::moe_matmul`).
+/// Measured on Gemma 4 26B-A4B (M5 Max), grouped against a slot at a time: 56 tokens 254
+/// against 240 ms, 103 tokens 273 against 312, 393 tokens 388 against 759.
+#[cfg(target_os = "macos")]
+const MOE_GROUPED_FROM: usize = 80;
+
 /// A session's room for a batch's experts.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct ExpertBuffers {
@@ -67,6 +73,10 @@ struct ExpertBuffers {
     out: Buffer,
     /// A token's experts' outputs added up.
     sum: Buffer,
+    /// A batch's slots in order of their expert, and that order cut into tiles
+    /// (`Gpu::moe_group`).
+    order: Buffer,
+    tiles: Buffer,
 }
 
 /// The per-layer inputs (E2B, E4B): their embedding, projection and the projection's norm.
@@ -482,6 +492,11 @@ impl<'a> Gemma4Cuda<'a> {
                     gate_up: f32s(batch * x.used * 2 * x.width)?,
                     out: f32s(batch * x.used * c.dim)?,
                     sum: f32s(batch * c.dim)?,
+                    order: f32s(batch * x.used)?,
+                    #[cfg(target_os = "macos")]
+                    tiles: f32s(3 * Gpu::moe_tiles(batch * x.used, x.count))?,
+                    #[cfg(not(target_os = "macos"))]
+                    tiles: f32s(1)?,
                 }),
                 None => None,
             },
@@ -716,37 +731,84 @@ impl<'a> Gemma4Cuda<'a> {
                 // own way), the activation, then its down rows.
                 g.rms_norm_rows(s.x.ptr(), m.pre_norm.ptr(), s.h.ptr(), t, dim, eps)
                     .map_err(e)?;
-                g.moe_matvec(
-                    m.gate_up.kind,
-                    m.gate_up.data.ptr(),
-                    s.h.ptr(),
-                    b.gate_up.ptr(),
-                    2 * x.width,
-                    dim,
-                    b.idx.ptr(),
-                    x.used,
-                    dim,
-                    false,
-                    2 * x.width,
-                    slots,
-                )
-                .map_err(e)?;
+                // A batch: its slots grouped by expert, so each expert's matrices are read
+                // once for the tokens that chose it (a token at a time read 8 × 5.3 MB a
+                // token a layer, and reading was memory-bound). A few tokens: each slot's
+                // own product, the weights read as for one token.
+                let grouped = t >= MOE_GROUPED_FROM;
+                if grouped {
+                    g.moe_group(b.idx.ptr(), b.order.ptr(), b.tiles.ptr(), slots, x.count)
+                        .map_err(e)?;
+                    g.moe_matmul(
+                        m.gate_up.kind,
+                        m.gate_up.data.ptr(),
+                        s.h.ptr(),
+                        b.gate_up.ptr(),
+                        2 * x.width,
+                        dim,
+                        b.order.ptr(),
+                        b.tiles.ptr(),
+                        x.used,
+                        dim,
+                        false,
+                        2 * x.width,
+                        slots,
+                        x.count,
+                    )
+                    .map_err(e)?;
+                } else {
+                    g.moe_matvec(
+                        m.gate_up.kind,
+                        m.gate_up.data.ptr(),
+                        s.h.ptr(),
+                        b.gate_up.ptr(),
+                        2 * x.width,
+                        dim,
+                        b.idx.ptr(),
+                        x.used,
+                        dim,
+                        false,
+                        2 * x.width,
+                        slots,
+                    )
+                    .map_err(e)?;
+                }
                 g.moe_geglu(b.gate_up.ptr(), x.width, slots).map_err(e)?;
-                g.moe_matvec(
-                    m.down.kind,
-                    m.down.data.ptr(),
-                    b.gate_up.ptr(),
-                    b.out.ptr(),
-                    dim,
-                    x.width,
-                    b.idx.ptr(),
-                    x.used,
-                    2 * x.width,
-                    true,
-                    dim,
-                    slots,
-                )
-                .map_err(e)?;
+                if grouped {
+                    g.moe_matmul(
+                        m.down.kind,
+                        m.down.data.ptr(),
+                        b.gate_up.ptr(),
+                        b.out.ptr(),
+                        dim,
+                        x.width,
+                        b.order.ptr(),
+                        b.tiles.ptr(),
+                        x.used,
+                        2 * x.width,
+                        true,
+                        dim,
+                        slots,
+                        x.count,
+                    )
+                    .map_err(e)?;
+                } else {
+                    g.moe_matvec(
+                        m.down.kind,
+                        m.down.data.ptr(),
+                        b.gate_up.ptr(),
+                        b.out.ptr(),
+                        dim,
+                        x.width,
+                        b.idx.ptr(),
+                        x.used,
+                        2 * x.width,
+                        true,
+                        dim,
+                        slots,
+                    )
+                    .map_err(e)?;
+                }
                 g.moe_sum(b.sum.ptr(), b.out.ptr(), b.share.ptr(), x.used, dim, t)
                     .map_err(e)?;
                 g.rms_norm_rows(b.sum.ptr(), m.post_norm.ptr(), b.sum.ptr(), t, dim, eps)
