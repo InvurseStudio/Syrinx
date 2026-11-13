@@ -164,6 +164,27 @@ the small models too, then the gauntlet against the 13 November run.
   changes (0.9's routine step) or once a reply has thought 8,000; before, past 8,000 the
   model stopped thinking between steps altogether.
 
+## Google's draft model for Gemma 4 31B (the Mac, 2026-11-13)
+
+`gemma-4-31B-it-assistant` (Google's, safetensors bf16, 926 MB; the one 0.9 drafts with)
+runs on the engine: `vireo-engine/src/models/gemma4_assistant.rs`, a child of
+`gemma4_cuda.rs`. Four small layers with no keys or values of their own: they read the
+main model's (its last sliding and last global layer's), from its final state for the last
+position read and the token just picked. Weights rounded to Q8_0 on load (about 1 s).
+
+- **Measured on the M5 Max** (`tests/gemma_assistant.rs`, both ignored, need
+  `VIREO_GEMMA_MODEL`): first guess right 74%, 1.72 of 3 taken a round, 4.3 ms to guess 3;
+  writing greedy the same text as one token at a time, 19-20 → 31-32 tokens/s (1.6-1.7×;
+  2, 3 or 4 guesses a round about the same, 3 kept). The E2B draft model managed 23.
+- **The server** loads it with the model when it finds one (`assistant::find`: beside the
+  GGUF, or `~/Library/Application Support/InvurseChat/DraftModels/<name>-assistant-bf16`)
+  and `--mtp on` (the default), or from `--draft <folder or .safetensors>`. It drafts as
+  Qwen's layer does (`mtp_draft`, `MTP_GUESSES`). The prototype app doesn't download it
+  yet: on a Mac without 0.9's draft models it runs without.
+- **Not yet:** a run through the app and the gauntlet with it; CUDA (the code is the
+  shared GPU path, never run there); the 26B-A4B's and E2B/E4B's draft models (the E2B/E4B
+  ones have a centroid head, `use_ordered_embeddings`, not built).
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as
