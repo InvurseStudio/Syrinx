@@ -81,6 +81,11 @@ impl<'a> Zip<'a> {
         Ok(Self { data, entries })
     }
 
+    /// Every file's name, in the ZIP's order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.0.as_str())
+    }
+
     /// The file called `name`, unpacked and checked; None if there's none.
     pub fn read(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
         let Some(&(_, method, crc, packed, size, offset)) =
@@ -117,6 +122,53 @@ impl<'a> Zip<'a> {
         }
         Ok(Some(bytes))
     }
+}
+
+/// A ZIP of the files as they are, not compressed: what Vireo writes an Office file as
+/// (Word, Excel and the rest read it like any other).
+pub fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in files {
+        let offset = out.len() as u32;
+        let crc = inflate::crc32(data);
+        let header = |sig: u32, central_entry: bool| {
+            let mut h = Vec::new();
+            h.extend_from_slice(&sig.to_le_bytes());
+            if central_entry {
+                h.extend_from_slice(&20u16.to_le_bytes()); // made by
+            }
+            h.extend_from_slice(&20u16.to_le_bytes()); // needed
+            h.extend_from_slice(&0u16.to_le_bytes()); // flags
+            h.extend_from_slice(&0u16.to_le_bytes()); // stored
+            h.extend_from_slice(&0u32.to_le_bytes()); // time, date
+            h.extend_from_slice(&crc.to_le_bytes());
+            h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes()); // extra
+            if central_entry {
+                h.extend_from_slice(&[0; 6]); // comment, disk, internal attributes
+                h.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+                h.extend_from_slice(&offset.to_le_bytes());
+            }
+            h.extend_from_slice(name.as_bytes());
+            h
+        };
+        out.extend(header(0x0403_4b50, false));
+        out.extend_from_slice(data);
+        central.extend(header(0x0201_4b50, true));
+    }
+    let at = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
 }
 
 // ---- The document's XML ----------------------------------------------------------------
@@ -280,51 +332,7 @@ pub fn unescape_into(out: &mut String, text: &str) {
 pub mod tests {
     use super::*;
 
-    /// A ZIP of stored files, as a test .docx.
-    pub fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut central = Vec::new();
-        for (name, data) in files {
-            let offset = out.len() as u32;
-            let crc = inflate::crc32(data);
-            let header = |sig: u32, central_entry: bool| {
-                let mut h = Vec::new();
-                h.extend_from_slice(&sig.to_le_bytes());
-                if central_entry {
-                    h.extend_from_slice(&20u16.to_le_bytes()); // made by
-                }
-                h.extend_from_slice(&20u16.to_le_bytes()); // needed
-                h.extend_from_slice(&0u16.to_le_bytes()); // flags
-                h.extend_from_slice(&0u16.to_le_bytes()); // stored
-                h.extend_from_slice(&0u32.to_le_bytes()); // time, date
-                h.extend_from_slice(&crc.to_le_bytes());
-                h.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                h.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                h.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                h.extend_from_slice(&0u16.to_le_bytes()); // extra
-                if central_entry {
-                    h.extend_from_slice(&[0; 6]); // comment, disk, internal attributes
-                    h.extend_from_slice(&0u32.to_le_bytes()); // external attributes
-                    h.extend_from_slice(&offset.to_le_bytes());
-                }
-                h.extend_from_slice(name.as_bytes());
-                h
-            };
-            out.extend(header(0x0403_4b50, false));
-            out.extend_from_slice(data);
-            central.extend(header(0x0201_4b50, true));
-        }
-        let at = out.len() as u32;
-        out.extend_from_slice(&central);
-        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-        out.extend_from_slice(&[0; 4]);
-        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
-        out.extend_from_slice(&at.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out
-    }
+    pub use super::stored_zip;
 
     #[test]
     fn reads_a_word_file_from_textutil() {

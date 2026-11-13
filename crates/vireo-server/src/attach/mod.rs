@@ -17,6 +17,7 @@ pub mod docx;
 pub mod inflate;
 pub mod pdf;
 pub mod xlsx;
+pub mod xlsx_write;
 
 use std::path::PathBuf;
 

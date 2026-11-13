@@ -2883,7 +2883,13 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
                 return Some(format!("Error: {why}"));
             }
         }
-        match approve(call, ask, job) {
+        // The same check for a change the server makes itself.
+        if tool.runs == tools::Runs::Server
+            && let Err(why) = tools::check_here(call, job.files.as_ref())
+        {
+            return Some(format!("Error: {why}"));
+        }
+        match approve(call, ask, tool.runs == tools::Runs::Server, job) {
             Some(Ok(())) => {}
             Some(Err(why)) => return Some(format!("Error: {why}")),
             None => return None,
@@ -2937,7 +2943,12 @@ fn ask_app(tool: &str, args_json: &str, job: &Job) -> Option<Result<String, Stri
 /// Asks the user to approve a change (`confirm_required`, as the Mac's server sends it)
 /// and waits for the answer at `/api/agent/confirm`, unless they always allow this kind.
 /// `Err` says, for the model, why it won't happen; `None` if the reply was stopped.
-fn approve(call: &tools::Call, ask: tools::Ask, job: &Job) -> Option<Result<(), String>> {
+fn approve(
+    call: &tools::Call,
+    ask: tools::Ask,
+    here: bool,
+    job: &Job,
+) -> Option<Result<(), String>> {
     if ask.rememberable && job.approvals.always.lock().unwrap().contains(&call.tool) {
         eprintln!("Approved without asking (always allowed): {}", call.tool);
         return Some(Ok(()));
@@ -2946,6 +2957,12 @@ fn approve(call: &tools::Call, ask: tools::Ask, job: &Job) -> Option<Result<(), 
     let (tx, rx) = channel();
     job.approvals.waiting.lock().unwrap().insert(id.clone(), tx);
     let preview = tools::approval_preview(call, |p| on_this_pc(p).exists());
+    // A file the server deletes itself goes to this Mac's Trash, not an app's Recycle Bin.
+    let preview = if here && cfg!(target_os = "macos") {
+        preview.replace("to the Recycle Bin", "to the Trash")
+    } else {
+        preview
+    };
     let remember = if ask.rememberable {
         format!(",\"rememberLabel\":{}", json::string(&ask.remember_label()))
     } else {
