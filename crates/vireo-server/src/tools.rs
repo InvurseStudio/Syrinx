@@ -574,8 +574,9 @@ pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
 
 /// The app's tools that `files.rs` can run on the server instead, for an app that doesn't
 /// run them (the Mac app).
-const SERVER_FILE_TOOLS: [&str; 6] = [
+const SERVER_FILE_TOOLS: [&str; 7] = [
     "read_file",
+    "read_spreadsheet",
     "list_directory",
     "search_files",
     "file_exists",
@@ -2160,6 +2161,7 @@ mod tests {
                 "git_diff",
                 "get_current_datetime",
                 "calculate",
+                "read_spreadsheet",
                 "remember",
                 "forget"
             ]
