@@ -3,9 +3,10 @@
 //! prompt.
 //!
 //! Read here: plain text and Markdown (and code, CSV, JSON... anything that is text), PDF
-//! (`pdf.rs`) and Word .docx (`docx.rs`, a ZIP of XML, unpacked by `inflate.rs`). Images
+//! (`pdf.rs`), Word .docx (`docx.rs`, a ZIP of XML, unpacked by `inflate.rs`) and Excel
+//! .xlsx (`xlsx.rs`, the same kind of ZIP). Images
 //! are refused with a reason the app shows, since the engine has no vision yet; so are
-//! formats not read yet (Excel, PowerPoint, iWork, old .doc).
+//! formats not read yet (PowerPoint, iWork, old .doc and .xls).
 //!
 //! Each upload is kept in `<data>/uploads/` as `<id>-<name>` with its text in `<id>.txt`.
 //! The app shows the attachment by its path, `/uploads/<id>-<name>`, and sends that path
@@ -15,6 +16,7 @@
 pub mod docx;
 pub mod inflate;
 pub mod pdf;
+pub mod xlsx;
 
 use std::path::PathBuf;
 
@@ -158,7 +160,7 @@ fn is_image(ext: &str, b: &[u8]) -> bool {
 fn not_read_yet(ext: &str) -> Option<&'static str> {
     Some(match ext {
         "doc" => "old Word (.doc)",
-        "xlsx" | "xlsm" | "xls" => "Excel",
+        "xls" => "old Excel (.xls)",
         "pptx" | "ppt" => "PowerPoint",
         "pages" => "Pages",
         "numbers" => "Numbers",
@@ -187,6 +189,11 @@ pub fn extract(name: &str, bytes: &[u8]) -> Result<Extracted, Failure> {
         ));
     } else if matches!(ext.as_str(), "docx" | "dotx" | "docm") {
         ("docx", docx::text(bytes).map_err(|e| fail(422, e))?)
+    } else if matches!(ext.as_str(), "xlsx" | "xlsm") {
+        (
+            "xlsx",
+            xlsx::open(bytes).map_err(|e| fail(422, e))?.describe(),
+        )
     } else if let Some(what) = not_read_yet(&ext) {
         return Err(fail(
             415,
@@ -695,9 +702,12 @@ mod tests {
                 .contains(".bin file isn't text"),
             "{reply:?}"
         );
-        let (status, reply, _) = send("sheet.xlsx", b"PK\x03\x04", "xlsx");
+        let (status, reply, _) = send("sheet.xls", b"\xD0\xCF\x11\xE0", "xls");
         assert_eq!(status, 415);
         assert!(reply.str("detail").unwrap().contains("Excel"));
+        // A broken workbook is refused as one that can't be read, not as an unknown kind.
+        let (status, _, _) = send("sheet.xlsx", b"PK\x03\x04", "xlsx");
+        assert_eq!(status, 422);
         let big = vec![b'a'; MAX_FILE + 1];
         let (status, reply, _) = send("big.txt", &big, "big");
         assert_eq!(status, 413);

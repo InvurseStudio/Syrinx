@@ -293,6 +293,46 @@ pub const CONTROLS: [&str; 2] = [
 
 /// The question that scores whether one skill fits a request, with worked examples (of
 /// made-up skills, so none is favoured), ending where " yes" or " no" goes.
+/// How many skills one shortlist question can hold: a letter each, after A for none.
+pub const SHORTLISTED: usize = 25;
+/// The most of a skill's description its line in the shortlist question holds, in
+/// characters: the question has to fit a picker's session.
+const SHORTLIST_DESCRIPTION: usize = 200;
+
+/// One question about every skill at once, to find the few worth asking about one by one
+/// (`fit_question`): the skills listed a letter each, then the request. The list comes
+/// first, so it's read once and kept, and each request after it costs one short read
+/// however many skills there are; a yes-or-no question a skill cost a read each (0.3 s a
+/// skill on Gemma 4 31B, every turn). The answer's letters are scored, not written.
+pub fn shortlist_question(skills: &[Skill], request: &str) -> String {
+    let request = crate::tools::for_scoring(request);
+    let mut text = String::from(
+        "A skill is saved instructions for one kind of task. Which skill fits the request? \
+         One fits when the request asks for the kind of task it describes; most requests fit \
+         none.\n\nA = none of these\n",
+    );
+    for (i, skill) in skills.iter().take(SHORTLISTED).enumerate() {
+        text.push_str(&format!(
+            "{} = {}: {}\n",
+            shortlist_letter(i),
+            skill.name,
+            skill
+                .description
+                .replace('\n', " ")
+                .chars()
+                .take(SHORTLIST_DESCRIPTION)
+                .collect::<String>()
+        ));
+    }
+    text.push_str(&format!("\nRequest: {request}\nFits:"));
+    text
+}
+
+/// The letter of skill `i` in the shortlist question (B for the first).
+pub fn shortlist_letter(i: usize) -> char {
+    (b'B' + i as u8) as char
+}
+
 pub fn fit_question(skill: &Skill, request: &str) -> String {
     // The skill comes before the request. The other way round, every skill's question
     // about a request would start the same and the request be read once, not once a
@@ -336,6 +376,27 @@ pub const START: &str = "Do the task now, following these steps: start with step
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shortlist_question_lists_each_skill_by_letter() {
+        let skill = |name: &str, description: &str| Skill {
+            name: name.into(),
+            description: description.into(),
+            instructions: String::new(),
+            built_in: true,
+        };
+        let skills = [
+            skill("analyze-data", "Answer a question from a spreadsheet."),
+            skill("write-memo", &"long ".repeat(100)),
+        ];
+        let q = shortlist_question(&skills, "What's the total in budget.xlsx?");
+        assert!(q.contains("\nA = none of these\nB = analyze-data: Answer a question from a spreadsheet.\nC = write-memo: long long"));
+        assert!(q.ends_with("\n\nRequest: What's the total in budget.xlsx?\nFits:"));
+        let c_line = q.lines().find(|l| l.starts_with("C = ")).unwrap();
+        assert!(c_line.chars().count() <= 220);
+        assert_eq!(shortlist_letter(0), 'B');
+        assert_eq!(shortlist_letter(24), 'Z');
+    }
 
     fn skill(name: &str, instructions: &str) -> Skill {
         Skill {
