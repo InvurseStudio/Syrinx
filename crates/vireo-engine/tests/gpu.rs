@@ -2102,6 +2102,29 @@ fn gemma4_26b_a4b_on_the_gpu_matches_the_cpu() {
         }
     }
     close(&single, "token by token");
+    // A longer batch, whose experts run grouped by expert, against the same tokens one
+    // at a time (each slot's own product, checked against the CPU above).
+    let long = long_text(&tokenizer, false);
+    let long = &long[..long.len().min(200)];
+    assert!(long.len() >= 64);
+    let mut session = model.session(256).unwrap();
+    let grouped = model
+        .forward_batch(&mut session, long, Logits::Last)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let mut session = model.session(256).unwrap();
+    let mut one_by_one = Vec::new();
+    for (i, &id) in long.iter().enumerate() {
+        if let Some(l) = model.forward(&mut session, id, i + 1 == long.len()).unwrap() {
+            one_by_one = l.to_vec();
+        }
+    }
+    let (mut a, mut b) = (grouped.clone(), one_by_one);
+    cpu::softmax(&mut a);
+    cpu::softmax(&mut b);
+    let worst = a.iter().zip(&b).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(worst < 5e-4, "grouped by expert: a probability is {worst} from one at a time");
     // 8-bit activations round along the way: the same next token.
     model.set_precision(Precision::Int8);
     let mut session = model.session(32).unwrap();

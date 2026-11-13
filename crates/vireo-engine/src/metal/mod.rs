@@ -124,7 +124,8 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         n if n.starts_with("matvec") || n.starts_with("matmul") => &[2],
         "rms_norm" => &[2],
         "moe_pick" => &[2, 3],
-        n if n.starts_with("moe_matvec") => &[2],
+        n if n.starts_with("moe_matvec") || n.starts_with("moe_matmul") => &[2],
+        "moe_group" => &[1, 2],
         "moe_geglu" | "moe_sum" => &[0],
         "residual_norm" => &[0, 5],
         "qkv_prep" => &[4, 9, 10, 23],
@@ -702,6 +703,9 @@ struct Kernels {
     moe_matvec_q6_k: Pso,
     moe_geglu: Pso,
     moe_sum: Pso,
+    /// A batch's slots put in order of their expert, and the product a tile of them.
+    moe_group: Pso,
+    moe_matmul: [Pso; 7],
     residual_norm: Pso,
     qkv_prep: Pso,
     sigmoid_mul: Pso,
@@ -816,6 +820,8 @@ const FIRST_COMMIT: usize = 16;
 
 /// The number of threads the matrix-vector kernels use per threadgroup: 4 SIMD groups.
 const ROWS_PER_BLOCK: u32 = 4;
+/// The slots in a tile of `moe_matmul` (SG_TOKENS in vireo.metal).
+const MOE_TILE_SLOTS: usize = 32;
 /// The matrix-matrix kernel's tile (matmul_sg): rows of weights by tokens.
 const TILE_ROWS: u32 = 64;
 const TILE_TOKENS: u32 = 32;
@@ -1039,6 +1045,8 @@ impl Gpu {
             moe_matvec_q6_k: pipeline("moe_matvec_q6_k")?,
             moe_geglu: pipeline("moe_geglu")?,
             moe_sum: pipeline("moe_sum")?,
+            moe_group: pipeline("moe_group")?,
+            moe_matmul: per_kind("moe_matmul")?,
             residual_norm: pipeline("residual_norm")?,
             qkv_prep: pipeline("qkv_prep")?,
             sigmoid_mul: pipeline("sigmoid_mul")?,
@@ -1703,6 +1711,76 @@ impl Gpu {
         // A SIMD group takes 2 rows (MV_ROWS), ROWS_PER_BLOCK groups a threadgroup.
         let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK * 2);
         self.run(kernel, (grid, slots as u32), ROWS_PER_BLOCK * 32, &args)
+    }
+
+    /// How many tiles `moe_group` may cut `slots` slots of `experts` experts into: the
+    /// full ones, and a part-filled one an expert.
+    pub fn moe_tiles(slots: usize, experts: usize) -> usize {
+        slots / MOE_TILE_SLOTS + experts
+    }
+
+    /// A batch's `slots` slots sorted by their expert into `order` (an i32 each), and cut
+    /// into `tiles` (three i32s each, `moe_tiles` of them) for `moe_matmul`.
+    pub fn moe_group(
+        &self,
+        idx: CuDevicePtr,
+        order: CuDevicePtr,
+        tiles: CuDevicePtr,
+        slots: usize,
+        experts: usize,
+    ) -> Result<()> {
+        assert!(experts <= 512, "moe_group holds up to 512 experts");
+        let args = [
+            Arg::Ptr(idx),
+            Arg::Ptr(order),
+            Arg::Ptr(tiles),
+            Arg::I32(slots as i32),
+            Arg::I32(experts as i32),
+            Arg::I32(Self::moe_tiles(slots, experts) as i32),
+            Arg::I32(MOE_TILE_SLOTS as i32),
+        ];
+        self.run(&self.kernels.moe_group, (1, 1), 1, &args)
+    }
+
+    /// `moe_matvec` for a batch grouped by `moe_group`: each expert's matrix is read once
+    /// for all the slots that chose it. Any weight type the prompt kernels read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_matmul(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        order: CuDevicePtr,
+        tiles: CuDevicePtr,
+        used: usize,
+        x_stride: usize,
+        x_per_slot: bool,
+        y_stride: usize,
+        slots: usize,
+        experts: usize,
+    ) -> Result<()> {
+        let kernel = &self.kernels.moe_matmul[Self::kind_index(kind)?];
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(order),
+            Arg::Ptr(tiles),
+            Arg::I32(used as i32),
+            Arg::I32(x_stride as i32),
+            Arg::I32(i32::from(x_per_slot)),
+            Arg::I32(y_stride as i32),
+        ];
+        let grid = (
+            (rows as u32).div_ceil(TILE_ROWS),
+            Self::moe_tiles(slots, experts) as u32,
+        );
+        self.run(kernel, grid, 128, &args)
     }
 
     /// Each slot's 2 × `width` numbers (its gate products, then its up products) into its
