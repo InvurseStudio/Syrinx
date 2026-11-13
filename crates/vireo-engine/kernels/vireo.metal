@@ -1197,6 +1197,119 @@ template [[host_name("matmul_q4_k")]] kernel void matmul<K_Q4_K>(ARGS, KP);
 template [[host_name("matmul_q5_k")]] kernel void matmul<K_Q5_K>(ARGS, KP);
 template [[host_name("matmul_q6_k")]] kernel void matmul<K_Q6_K>(ARGS, KP);
 
+// A batch's slots of a mixture of experts (see moe_pick), put in order of their expert
+// so each expert's matrix is read once for all the tokens that chose it, not once a
+// token: `order` is the slots sorted by expert, and `tiles` cuts that order into runs of
+// up to `tile_slots` slots of one expert, three numbers a tile (the expert, where its run
+// starts in `order`, how many slots; 0 for a tile not used). One thread.
+#define MOE_MAX_EXPERTS 512
+kernel void moe_group(ARGS, KP) {
+    device const int* idx = ARG_PTR(const int, 0);
+    device int* order = ARG_PTR(int, 1);
+    device int* tiles = ARG_PTR(int, 2);
+    const int slots = ARG_INT(3), experts = ARG_INT(4), max_tiles = ARG_INT(5), tile_slots = ARG_INT(6);
+    if (tid != 0 || gid.x != 0) return;
+    int start[MOE_MAX_EXPERTS + 1];
+    for (int e = 0; e <= experts; e++) start[e] = 0;
+    for (int s = 0; s < slots; s++) start[idx[s] + 1]++;
+    for (int e = 0; e < experts; e++) start[e + 1] += start[e];
+    int n = 0;
+    for (int e = 0; e < experts; e++) {
+        for (int first = start[e]; first < start[e + 1] && n < max_tiles; first += tile_slots) {
+            tiles[3 * n] = e;
+            tiles[3 * n + 1] = first;
+            tiles[3 * n + 2] = min(tile_slots, start[e + 1] - first);
+            n++;
+        }
+    }
+    for (; n < max_tiles; n++) tiles[3 * n + 2] = 0;
+    // Each expert's slots in turn (start[e] moves along its run as they're placed).
+    for (int s = 0; s < slots; s++) order[start[idx[s]]++] = s;
+}
+
+// `matmul_sg` for one tile of moe_group's: its expert's rows × its slots, the tile a
+// threadgroup row (gid.y), on the SIMD-group matrix units. The slots' inputs are gathered
+// through `order` and their products stored each to its own slot, as moe_matvec does.
+// (As `matmul`, 128 rows × 64 slots in scalar f32, it ran at a seventh of this: 8.6 ms a
+// layer's gate and up rows for 1,024 tokens on the M5 Max.) Arguments: w, x, y, rows (an
+// expert's), cols, order, tiles, used, x_stride, x_per_slot, y_stride.
+template <int KIND>
+kernel void moe_matmul(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]]) {
+    const int rows = ARG_INT(3), cols = ARG_INT(4);
+    device const int* order = ARG_PTR(const int, 5);
+    device const int* tile = ARG_PTR(const int, 6) + 3 * gid.y;
+    const int used = ARG_INT(7), x_stride = ARG_INT(8), x_per_slot = ARG_INT(9), y_stride = ARG_INT(10);
+    const int tokens = tile[2];
+    if (tokens == 0) return;
+    const ulong row_bytes = mm_row_bytes<KIND>(cols);
+    device const u8* w = ARG_PTR(const u8, 0) + (ulong)tile[0] * (ulong)rows * row_bytes;
+    device const float* x = ARG_PTR(const float, 1);
+    device float* y = ARG_PTR(float, 2);
+    device const int* slots = order + tile[1];
+    constexpr int SA = SG_K + SG_PAD, SB = SG_K + SG_PAD;
+    threadgroup float sa[SG_ROWS * SA];
+    threadgroup float sb[SG_TOKENS * SB];
+    threadgroup float cs[SG_TOKENS * SG_ROWS];
+    const int row0 = gid.x * SG_ROWS;
+    const int lr = tid >> 1, lk = (tid & 1) * 16;
+    const int lt = tid >> 2, lx = (tid & 3) * 8;
+    const bool row_live = row0 + lr < rows, tok_live = lt < tokens;
+    device const u8* wrow = w + (ulong)(row0 + lr) * row_bytes;
+    device const float* xrow = x;
+    if (tok_live) {
+        const int slot = slots[lt];
+        xrow = x + (ulong)(x_per_slot ? slot : slot / used) * x_stride;
+    }
+    const int sr = (sg & 1) * 32, st = (sg >> 1) * 16;
+    simdgroup_float8x8 acc[4][2];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < cols; k0 += SG_K) {
+        float v[8];
+        for (int part = 0; part < 2; part++) {
+            if (row_live) {
+                decode8<KIND>(wrow, cols / 32, k0 + lk + part * 8, v);
+            } else {
+                for (int i = 0; i < 8; i++) v[i] = 0.0f;
+            }
+            for (int i = 0; i < 8; i++) sa[lr * SA + lk + part * 8 + i] = v[i];
+        }
+        if (tok_live) {
+            const float4 a = f4(xrow + k0 + lx), b = f4(xrow + k0 + lx + 4);
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx]) = a;
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx + 4]) = b;
+        } else {
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx]) = float4(0.0f);
+            *reinterpret_cast<threadgroup float4*>(&sb[lt * SB + lx + 4]) = float4(0.0f);
+        }
+        BARRIER;
+        for (int kk = 0; kk < SG_K; kk += 8) {
+            simdgroup_float8x8 a[4], b[2];
+            for (int i = 0; i < 4; i++) simdgroup_load(a[i], &sa[(sr + 8 * i) * SA + kk], SA);
+            for (int j = 0; j < 2; j++) simdgroup_load(b[j], &sb[(st + 8 * j) * SB + kk], SB, ulong2(0, 0), true);
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 2; j++) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        BARRIER;
+    }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++)
+            simdgroup_store(acc[i][j], &cs[(st + 8 * j) * SG_ROWS + sr + 8 * i], SG_ROWS, ulong2(0, 0), true);
+    BARRIER;
+    for (int e = tid; e < SG_ROWS * SG_TOKENS; e += tpg.x) {
+        const int t = e / SG_ROWS, r = e % SG_ROWS;
+        if (t < tokens && row0 + r < rows) y[(ulong)slots[t] * y_stride + row0 + r] = cs[e];
+    }
+}
+template [[host_name("moe_matmul_f32")]] kernel void moe_matmul<K_F32>(ARGS, KP, uint);
+template [[host_name("moe_matmul_f16")]] kernel void moe_matmul<K_F16>(ARGS, KP, uint);
+template [[host_name("moe_matmul_q4_0")]] kernel void moe_matmul<K_Q4_0>(ARGS, KP, uint);
+template [[host_name("moe_matmul_q8_0")]] kernel void moe_matmul<K_Q8_0>(ARGS, KP, uint);
+template [[host_name("moe_matmul_q4_k")]] kernel void moe_matmul<K_Q4_K>(ARGS, KP, uint);
+template [[host_name("moe_matmul_q5_k")]] kernel void moe_matmul<K_Q5_K>(ARGS, KP, uint);
+template [[host_name("moe_matmul_q6_k")]] kernel void moe_matmul<K_Q6_K>(ARGS, KP, uint);
+
 // ---- Norms, RoPE and the residual stream ---------------------------------------------
 
 kernel void rms_norm(ARGS, KP) {
