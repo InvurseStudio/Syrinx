@@ -123,6 +123,9 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
     Some(match name {
         n if n.starts_with("matvec") || n.starts_with("matmul") => &[2],
         "rms_norm" => &[2],
+        "moe_pick" => &[2, 3],
+        n if n.starts_with("moe_matvec") => &[2],
+        "moe_geglu" | "moe_sum" => &[0],
         "residual_norm" => &[0, 5],
         "qkv_prep" => &[4, 9, 10, 23],
         n if n.starts_with("attention_part") => &[3],
@@ -692,6 +695,13 @@ struct Kernels {
     /// The same with 8- to 192-token tiles, for short batches (SMALL_TILES).
     matmul_tc_small: Option<[[Pso; 7]; 6]>,
     rms_norm: Pso,
+    /// A mixture of experts' kernels: its pick, its products for Q8_0 and Q6_K matrices,
+    /// its activation and its sum.
+    moe_pick: Pso,
+    moe_matvec_q8_0: Pso,
+    moe_matvec_q6_k: Pso,
+    moe_geglu: Pso,
+    moe_sum: Pso,
     residual_norm: Pso,
     qkv_prep: Pso,
     sigmoid_mul: Pso,
@@ -1024,6 +1034,11 @@ impl Gpu {
                 None
             },
             rms_norm: pipeline("rms_norm")?,
+            moe_pick: pipeline("moe_pick")?,
+            moe_matvec_q8_0: pipeline("moe_matvec_q8_0")?,
+            moe_matvec_q6_k: pipeline("moe_matvec_q6_k")?,
+            moe_geglu: pipeline("moe_geglu")?,
+            moe_sum: pipeline("moe_sum")?,
             residual_norm: pipeline("residual_norm")?,
             qkv_prep: pipeline("qkv_prep")?,
             sigmoid_mul: pipeline("sigmoid_mul")?,
@@ -1619,6 +1634,113 @@ impl Gpu {
 
     /// RMSNorm of each of `rows` rows of `n` numbers; `weight` is the same for every row,
     /// or 0 for none. In place is fine.
+    /// Whether a mixture of experts' matrices of this type have a kernel (`moe_matvec`).
+    pub fn supports_experts(kind: TensorType) -> bool {
+        matches!(kind, TensorType::Q8_0 | TensorType::Q6_K)
+    }
+
+    /// For each of `tokens` rows of `experts` scores: the `used` highest into `idx`, and
+    /// their shares (a softmax over them, times each expert's `scale`) into `share`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_pick(
+        &self,
+        scores: CuDevicePtr,
+        scale: CuDevicePtr,
+        idx: CuDevicePtr,
+        share: CuDevicePtr,
+        experts: usize,
+        used: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(scores),
+            Arg::Ptr(scale),
+            Arg::Ptr(idx),
+            Arg::Ptr(share),
+            Arg::I32(experts as i32),
+            Arg::I32(used as i32),
+        ];
+        self.run(&self.kernels.moe_pick, (tokens as u32, 1), 1, &args)
+    }
+
+    /// `y = W_e x` for each of `slots` slots (a token's turn with one of its `used`
+    /// experts): `w` holds every expert's `rows` × `cols` matrix one after another, and
+    /// `idx` each slot's expert. `x` is the token's (or, with `x_per_slot`, the slot's
+    /// own), `x_stride` numbers apart; `y` the slot's, `y_stride` apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_matvec(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        idx: CuDevicePtr,
+        used: usize,
+        x_stride: usize,
+        x_per_slot: bool,
+        y_stride: usize,
+        slots: usize,
+    ) -> Result<()> {
+        let kernel = match kind {
+            TensorType::Q8_0 => &self.kernels.moe_matvec_q8_0,
+            TensorType::Q6_K => &self.kernels.moe_matvec_q6_k,
+            other => return Err(Error::Unsupported(other)),
+        };
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(idx),
+            Arg::I32(used as i32),
+            Arg::I32(x_stride as i32),
+            Arg::I32(i32::from(x_per_slot)),
+            Arg::I32(y_stride as i32),
+        ];
+        // A SIMD group takes 2 rows (MV_ROWS), ROWS_PER_BLOCK groups a threadgroup.
+        let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK * 2);
+        self.run(kernel, (grid, slots as u32), ROWS_PER_BLOCK * 32, &args)
+    }
+
+    /// Each slot's 2 × `width` numbers (its gate products, then its up products) into its
+    /// activation, GELU(gate) × up, in the first `width`.
+    pub fn moe_geglu(&self, y: CuDevicePtr, width: usize, slots: usize) -> Result<()> {
+        let total = width * slots;
+        self.run_per_number(
+            &self.kernels.moe_geglu,
+            total,
+            &[Arg::Ptr(y), Arg::I32(width as i32), Arg::I32(total as i32)],
+        )
+    }
+
+    /// `out` = each token's slots' `n` numbers, added up with their shares.
+    pub fn moe_sum(
+        &self,
+        out: CuDevicePtr,
+        parts: CuDevicePtr,
+        share: CuDevicePtr,
+        used: usize,
+        n: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let total = n * tokens;
+        self.run_per_number(
+            &self.kernels.moe_sum,
+            total,
+            &[
+                Arg::Ptr(out),
+                Arg::Ptr(parts),
+                Arg::Ptr(share),
+                Arg::I32(used as i32),
+                Arg::I32(n as i32),
+                Arg::I32(total as i32),
+            ],
+        )
+    }
+
     pub fn rms_norm_rows(
         &self,
         x: CuDevicePtr,

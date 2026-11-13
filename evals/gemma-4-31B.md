@@ -15,7 +15,7 @@ The engine was written on Gemma 4 E2B and E4B. The 31B differs in three ways:
   already; the GPU path refused it.
 
 All three are handled now, in the CPU reference (`gemma4.rs`) and the GPU path
-(`gemma4_cuda.rs`). Gemma 4 26B-A4B (mixture of experts) runs on the CPU reference path since 2026-11-12 (checked against llama.cpp, `tests/real_models.rs`); the GPU still refuses it.
+(`gemma4_cuda.rs`). Gemma 4 26B-A4B (mixture of experts) runs on the CPU reference path and on Metal since 2026-11-12 (checked against llama.cpp and against each other, `tests/real_models.rs` and `tests/gpu.rs`; all 43 eval cases, `evals/gemma-4-26B-A4B.json`); CUDA still refuses it.
 
 ## Tuning
 
