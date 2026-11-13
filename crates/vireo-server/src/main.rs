@@ -26,6 +26,7 @@
 mod attach;
 mod calc;
 mod chat;
+mod chats;
 mod draft;
 mod files;
 mod http;
@@ -34,6 +35,7 @@ mod memory;
 mod sample;
 mod skills;
 mod store;
+mod tasks;
 mod tools;
 
 use std::collections::HashMap;
@@ -63,7 +65,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--changes declared|scored|offered] [--skills on|off]
                     [--skill-shortlist on|off]
                     [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
-                    [--mtp on|off]
+                    [--mtp on|off] [--thinking on|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -89,7 +91,12 @@ pass: every token is still the model's own pick. Gemma 4 only. Without one, --lo
 guesses up to <n> tokens a round from the chat itself (what followed the last few
 tokens where they appeared before; 3 by default, 0 for none), checked the same way.
 Gemma 4, and Qwen 3.5 on the Mac. A Qwen model with its own multi-token-prediction
-layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac).";
+layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac).
+
+--thinking is what a request gets when it doesn't say (\"thinking\": true or false): off by
+default. On, Gemma 4 and Qwen think before they answer and after each tool's result (at
+most 2,000 tokens a thought), sent to the app as \"thinking\" events apart from the
+answer, and Muse reasons at high strength.";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -126,6 +133,8 @@ struct Options {
     /// Qwen's multi-token-prediction layer as the draft, where the model has one
     /// (`--mtp on`, the default; `off` for none).
     mtp: bool,
+    /// Thinking for a request that doesn't say (`--thinking on`; off by default).
+    thinking: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -164,6 +173,7 @@ fn main() -> ExitCode {
     let mut draft_tokens = draft::DEFAULT_GUESSES;
     let mut lookup = draft::DEFAULT_LOOKUP;
     let mut mtp = true;
+    let mut thinking = false;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -256,6 +266,10 @@ fn main() -> ExitCode {
                 mtp = value.map(String::as_str) == Some("on");
                 i += 1;
             }
+            "--thinking" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                thinking = value.map(String::as_str) == Some("on");
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -284,6 +298,7 @@ fn main() -> ExitCode {
         draft_tokens,
         lookup,
         mtp,
+        thinking,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -323,6 +338,7 @@ fn main() -> ExitCode {
     let port = listener.local_addr().map_or(port, |a| a.port());
     let mut pairing = Pairing::load();
     pairing.app_token = app_token;
+    tasks::set_port(port);
     println!();
     println!("Vireo server: {} on {}", info.model, info.runtime);
     println!("Listening on http://127.0.0.1:{port}");
@@ -534,6 +550,21 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         );
     }
 
+    // A link task's link, opened by another app on this computer: its token is its key.
+    if let Some(token) = path.strip_prefix("/api/tasks/link/")
+        && matches!(method, "GET" | "POST")
+    {
+        let sent = String::from_utf8_lossy(&request.body);
+        return match tasks::open_link(token, &sent) {
+            Some(name) => http::respond(
+                &mut stream,
+                200,
+                &format!("{{\"ok\":true,\"task\":{}}}", json::string(&name)),
+            ),
+            None => http::respond(&mut stream, 404, &error("No task has that link.")),
+        };
+    }
+
     let device = shared
         .pairing
         .lock()
@@ -633,6 +664,41 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             None => http::respond(&mut stream, 404, &error("That attachment isn't kept here.")),
         },
         ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
+        // Tasks (`tasks.rs`): the app lists them, and asks which are due to run.
+        ("GET", "/api/tasks") => http::respond(&mut stream, 200, &tasks::list_json()),
+        ("GET", "/api/tasks/due") => http::respond(&mut stream, 200, &tasks::due_json()),
+        ("POST", "/api/tasks") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            match tasks::add_from_json(&body) {
+                Ok(task) => http::respond(&mut stream, 200, &task),
+                Err(why) => http::respond(&mut stream, 400, &error(&why)),
+            }
+        }
+        ("POST", p) if p.starts_with("/api/tasks/") && p.ends_with("/run") => {
+            let id = &p["/api/tasks/".len()..p.len() - "/run".len()];
+            if tasks::run_now(id) {
+                http::respond(&mut stream, 200, "{\"ok\":true}");
+            } else {
+                http::respond(&mut stream, 404, &error("No such task."));
+            }
+        }
+        ("POST", p) if p.starts_with("/api/tasks/") && p.ends_with("/enabled") => {
+            let id = &p["/api/tasks/".len()..p.len() - "/enabled".len()];
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            let enabled = matches!(body.get("enabled"), Some(Value::Bool(true)));
+            if tasks::set_enabled(id, enabled) {
+                http::respond(&mut stream, 200, "{\"ok\":true}");
+            } else {
+                http::respond(&mut stream, 404, &error("No such task."));
+            }
+        }
+        ("DELETE", p) if p.starts_with("/api/tasks/") => {
+            if tasks::delete(&p["/api/tasks/".len()..]) {
+                http::respond(&mut stream, 200, "{\"ok\":true}");
+            } else {
+                http::respond(&mut stream, 404, &error("No such task."));
+            }
+        }
         ("POST", "/api/agent/client-tool-result") => {
             let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
             let Some(id) = body.str("id") else {
@@ -711,14 +777,13 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
                         None => gone.push((messages.len(), path.to_string())),
                     }
                 }
-                messages.push(Message {
-                    role: "user".into(),
-                    content: content.to_string(),
-                });
+                messages.push(Message::new("user", chat::plain(content)));
             }
             "assistant" => messages.push(Message {
                 role: "assistant".into(),
-                content: chat::without_thinking(content),
+                content: chat::without_thinking(&chat::plain(content)),
+                // What the reply's tools returned, as the app kept it (`turn_record`).
+                record: m.str("record").and_then(chat::Record::parse),
             }),
             _ => {}
         }
@@ -753,7 +818,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         })
         .collect();
     // The files the chat may reach on this Mac, for the PC tools the app doesn't run.
-    let folders = body
+    let folders: Vec<String> = body
         .array("folders")
         .iter()
         .filter_map(|f| match f {
@@ -761,8 +826,12 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
             _ => None,
         })
         .collect();
-    let files =
-        files::Access::from_request(body.str("access"), folders).map(files::Files::for_user);
+    let files = files::Access::from_request(body.str("access"), folders.clone())
+        .map(files::Files::for_user);
+    let thinking = match body.get("thinking") {
+        Some(Value::Bool(on)) => *on,
+        _ => options().thinking,
+    };
     // `"tools": false`: a plain chat, no tools offered at all (the server's own too).
     let no_tools = matches!(body.get("tools"), Some(Value::Bool(false)));
     let job = Job {
@@ -774,6 +843,10 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         out,
         client_tools,
         files,
+        access: body.str("access").unwrap_or("").to_string(),
+        folders,
+        chat_id: body.str("chatId").map(str::to_string),
+        thinking,
         no_tools,
         tool_results: shared.tool_results.clone(),
         approvals: shared.approvals.clone(),
@@ -823,7 +896,7 @@ fn add_documents(
     // About three bytes of text a token, kept on the safe side.
     let context = shared.info.context;
     let room = context.saturating_sub(max_tokens.min(context / 2) + 2048) * 3;
-    let others: usize = messages.iter().map(|m| m.content.len()).sum();
+    let others: usize = messages.iter().map(Message::bytes).sum();
     let mut budget = room.saturating_sub(others);
     for (i, name, text) in documents.iter().rev() {
         let message = &mut messages[*i];
@@ -880,6 +953,7 @@ fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, st
 
 // ---- The engine ------------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)] // one at a time, taken off the channel at once
 enum Work {
     Reply(Job),
     /// Save the chat in use, then say so.
@@ -898,6 +972,15 @@ struct Job {
     /// What the chat may reach on this Mac (its `access`, and `folders`), for the PC tools
     /// the server runs itself; `None` for none.
     files: Option<files::Files>,
+    /// The request's `access` and `folders` as sent: what a task set up in this chat may
+    /// reach when it runs.
+    access: String,
+    folders: Vec<String>,
+    /// The chat's id in the app, which a search of earlier chats leaves out.
+    chat_id: Option<String>,
+    /// Whether the model thinks before it answers (the request's `thinking`, else
+    /// `--thinking`).
+    thinking: bool,
     /// No tools at all (the request's `"tools": false`).
     no_tools: bool,
     tool_results: ToolWaits,
@@ -1844,6 +1927,17 @@ fn reply(
 ) -> Result<(), String> {
     let today = chat::today();
     let max_tokens = job.max_tokens.min(context / 2);
+    // Thinking, where the request asks for it and the model has the tokens that open and
+    // close a thought: Gemma 4's thought channel, Qwen's <think>.
+    let think = (job.thinking && family.thinks_aloud())
+        .then_some(match family {
+            Family::Qwen35 => ("<think>", "</think>"),
+            _ => ("<|channel>", "<channel|>"),
+        })
+        .and_then(|(open, close)| Some((tokenizer.token_id(open)?, tokenizer.token_id(close)?)));
+    let thinking_on = think.is_some();
+    // What the prompt says of it (Muse's is its reasoning strength).
+    let prompt_thinking = thinking_on || (job.thinking && family == Family::Muse);
     let mut offered = if job.no_tools {
         Vec::new()
     } else {
@@ -1886,7 +1980,7 @@ fn reply(
             args: vec![("name".into(), tools::Arg::Text(skill.name.clone()))],
         };
         let result = skills::instructions(&skill);
-        let (before, body, after) = tools::after_call(family, "use_skill", &result);
+        let (before, body, after) = tools::after_call(family, "use_skill", &result, thinking_on);
         skill_ids = tokenizer.encode(&tools::call_text(family, &call), false, true);
         skill_ids.extend(tokenizer.encode(&before, false, true));
         skill_ids.extend(tokenizer.encode(&body, false, false));
@@ -1908,8 +2002,29 @@ fn reply(
     // callable now), and its instructions keep the facts they began with, the newer
     // ones told at the end of the request.
     let facts = memory::all();
-    let opening = tokenizer.encode(chat::opening(family), false, true);
+    // A skill written in comes before any thought: the turn opens without one, and the
+    // thought follows the skill's instructions, as it follows any tool's result.
+    let opens_thinking = thinking_on && skill_ids.is_empty();
+    let opening = tokenizer.encode(chat::opening(family, opens_thinking), false, true);
     let cuts = chat::cut_points(&job.messages, context / CUT_STEP * CUT_BYTES_PER_TOKEN);
+    // Earlier replies' tool results (`chat::Record`) are kept whole while the chat fits;
+    // then only the start of each; then not at all, before the chat's start moves on.
+    let views: Vec<Vec<Message>> = if job.messages.iter().any(|m| m.record.is_some()) {
+        [chat::Results::Whole, chat::Results::Short, chat::Results::Left]
+            .iter()
+            .map(|&keep| job.messages.iter().map(|m| m.with_results(keep)).collect())
+            .collect()
+    } else {
+        vec![job.messages.clone()]
+    };
+    // With tools, a request ends with today's date (Llama's template gives it): a memo
+    // was dated from the model's training otherwise. After the history, so the chat's
+    // cache is the same from one day to the next.
+    let dated = if !offered.is_empty() && family != Family::Llama {
+        format!("\n\n(Today is {}.)", tools::today_line())
+    } else {
+        String::new()
+    };
     let debug_prompt = std::env::var_os("VIREO_DEBUG_PROMPT").is_some();
     let system_turn = |tools: &[tools::Tool], known: usize| -> (Option<String>, String) {
         // With tools, the system prompt opens with what they're for.
@@ -1927,15 +2042,20 @@ fn reply(
     };
     let build = |tools: &[tools::Tool], known: usize| -> Prompt {
         let (system, declared) = system_turn(tools, known);
-        let note = memory::since(&facts[known..]);
+        let note = format!("{}{dated}", memory::since(&facts[known..]));
         // The chat's latest messages that fit with room for the reply: all of them, else
-        // from the first of `cuts` that fits, else from the first message that does.
-        let mut starts = std::iter::once(0).chain(cuts.iter().copied());
+        // from the first of `cuts` that fits, else from the first message that does. At
+        // each start, with as much of earlier tool results as fits (`views`).
+        let mut starts = std::iter::once(0)
+            .chain(cuts.iter().copied())
+            .flat_map(|start| (0..views.len()).map(move |view| (start, view)));
         let mut first = 0;
+        let mut view;
         loop {
             match starts.next() {
-                Some(start) => first = start,
+                Some((start, results)) => (first, view) = (start, results),
                 None => {
+                    view = views.len() - 1;
                     first += 1;
                     while first < job.messages.len() && job.messages[first].role != "user" {
                         first += 1;
@@ -1943,12 +2063,14 @@ fn reply(
                     first = first.min(job.messages.len() - 1);
                 }
             }
+            let messages = &views[view];
             let text = chat::history(
                 family,
                 system.as_deref(),
                 &declared,
-                &job.messages[first..],
+                &messages[first..],
                 &today,
+                prompt_thinking,
             );
             // The note goes at the end of the request, read apart from the history
             // before it: the next turn's prompt is the same up to there (Qwen's
@@ -1960,9 +2082,12 @@ fn reply(
                 (&text[..end], format!("{note}{}", &text[end..]))
             };
             if debug_prompt {
-                eprintln!("[prompt] {history}{rest}{}", chat::opening(family));
+                eprintln!(
+                    "[prompt] {history}{rest}{}",
+                    chat::opening(family, opens_thinking)
+                );
             }
-            let mut ids = tokenizer.encode(history, false, true);
+            let mut ids = chat::encode(tokenizer, history);
             let mark = ids.len();
             ids.extend(tokenizer.encode(&rest, false, true));
             ids.extend_from_slice(&opening);
@@ -1974,9 +2099,15 @@ fn reply(
             // no skill after a skill), which would swap its cache out and in again.
             let last = job.messages.len() - 1;
             let settled = first >= last || {
-                let before =
-                    chat::history(family, system.as_deref(), &declared, &job.messages[first..last], &today);
-                tokenizer.encode(&before, false, true).len() + max_tokens + context / REQUEST_ROOM
+                let before = chat::history(
+                    family,
+                    system.as_deref(),
+                    &declared,
+                    &messages[first..last],
+                    &today,
+                    prompt_thinking,
+                );
+                chat::encode(tokenizer, &before).len() + max_tokens + context / REQUEST_ROOM
                     <= context
             };
             if (settled && ids.len() + max_tokens <= context) || first >= last {
@@ -2010,8 +2141,9 @@ fn reply(
                 &p.declared,
                 &job.messages[p.first..p.first + 1],
                 &today,
+                prompt_thinking,
             );
-            let head = tokenizer.encode(&head, false, true).len();
+            let head = chat::encode(tokenizer, &head).len();
             caches.iter().any(|c| shared_start(c, &p.ids) >= head)
         };
         if !cached(&prompt) {
@@ -2022,8 +2154,15 @@ fn reply(
                     let Some(tools) = tools else { continue };
                     // Cheaply first: is any cache's system turn written this way?
                     let (system, declared) = system_turn(tools, known);
-                    let turn = chat::history(family, system.as_deref(), &declared, &[], &today);
-                    let turn = tokenizer.encode(&turn, false, true);
+                    let turn = chat::history(
+                        family,
+                        system.as_deref(),
+                        &declared,
+                        &[],
+                        &today,
+                        prompt_thinking,
+                    );
+                    let turn = chat::encode(tokenizer, &turn);
                     if !caches.iter().any(|c| c.starts_with(&turn)) {
                         continue;
                     }
@@ -2069,14 +2208,30 @@ fn reply(
 
     let settings = family.sampling().with(job.generation.as_ref());
     let mut sampler = Sampler::new(settings, seed);
-    // Gemma 4's thinking channel, should it open one with thinking off: left out.
-    let channel = (
-        tokenizer.token_id("<|channel>"),
-        tokenizer.token_id("<channel|>"),
-    );
+    // Gemma 4's thinking channel, for a thought it opens with thinking off (with it on,
+    // `think` has these tokens).
+    let channel = if thinking_on {
+        (None, None)
+    } else {
+        (
+            tokenizer.token_id("<|channel>"),
+            tokenizer.token_id("<channel|>"),
+        )
+    };
     let mut in_channel = false;
     let mut generated: Vec<u32> = Vec::new();
-    let mut pending = Vec::new();
+    let mut shown = Shown::default();
+    // Thinking on: whether the model is in a thought now (Qwen's turn opens in one; so
+    // does the turn after a skill's instructions), the tokens this thought has taken, and
+    // whether Gemma's own label ("thought") is still to come at its start, to leave out.
+    let mut in_thought = thinking_on && (family == Family::Qwen35 || !skill_ids.is_empty());
+    let mut thought_tokens = 0usize;
+    let mut label = false;
+    if in_thought {
+        shown.tag(job, THINK_OPEN, true);
+    }
+    // The reply's tool calls and their results, for the app to keep (`chat::Record`).
+    let mut steps: Vec<chat::Step> = Vec::new();
     let started = Instant::now();
     // Tool calls: the grammar they're written under, and how one starts.
     let grammar = Grammar::new(&tools::call_grammar(family, &callable));
@@ -2091,6 +2246,11 @@ fn reply(
     // Muse writing to itself, and the tokens it has so far this reply.
     let mut thinking = false;
     let mut thought = 0usize;
+    let muse_thought_tokens = if job.thinking {
+        MUSE_THOUGHT_TOKENS * 2
+    } else {
+        MUSE_THOUGHT_TOKENS
+    };
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
     let mut last_call: Option<tools::Call> = None;
@@ -2145,11 +2305,16 @@ fn reply(
     // `max_tokens` is the model's own writing; calls have their own limits (`MAX_CALLS`,
     // `MAX_CALL_TOKENS`), so a task of many calls still has room to answer.
     while generated.len() < max_tokens && !job.stop.load(Ordering::Relaxed) {
+        // Thoughts and tools' results aren't counted in `max_tokens`: the context's end
+        // is the limit for them.
+        if kept.tokens.len() + 8 >= context {
+            break;
+        }
         // Muse names each message's recipient first. With no call to make, the user: the
         // model writes to them from here. Otherwise the call's grammar has it choose (the
         // user is one of its options), below.
         let muse_turn = family == Family::Muse && turn_start;
-        let may_think = thought < MUSE_THOUGHT_TOKENS;
+        let may_think = thought < muse_thought_tokens;
         if muse_turn && !may_call && !may_think {
             let ids = tokenizer.encode(tools::MUSE_TO_USER, false, true);
             if kept.tokens.len() + ids.len() + 64 > context {
@@ -2232,11 +2397,27 @@ fn reply(
                 logits[t as usize] = f32::NEG_INFINITY;
             }
         }
+        // No new thought once thoughts have taken their share of the reply.
+        if let Some((open, _)) = think
+            && !in_thought
+            && thought >= REPLY_THOUGHT_TOKENS
+        {
+            logits[open as usize] = f32::NEG_INFINITY;
+        }
         let mut next = sampler.pick(&logits, &generated);
+        // A thought ends with its closing token, here even when the model would end its
+        // turn inside it, or has thought as long as one thought may: its answer is still
+        // to come.
+        if in_thought
+            && let Some((_, close)) = think
+            && (tokenizer.is_end_of_generation(next) || thought_tokens >= THOUGHT_TOKENS)
+        {
+            next = close;
+        }
         // Muse's reasoning ends its message with <|eom|>, here even when it would end its
         // turn, or runs out of room: its answer is still to come.
         if thinking
-            && (tokenizer.is_end_of_generation(next) || thought >= MUSE_THOUGHT_TOKENS)
+            && (tokenizer.is_end_of_generation(next) || thought >= muse_thought_tokens)
             && let Some(eom) = start_token
         {
             next = eom;
@@ -2244,7 +2425,13 @@ fn reply(
         if tokenizer.is_end_of_generation(next) && !muse_turn {
             break;
         }
-        if !muse_turn && !thinking {
+        // A thought isn't the answer that's due, shown (thinking on) or left out (Gemma's
+        // channel with thinking off): a reply that thought and then ended said nothing.
+        let of_a_thought = in_thought
+            || in_channel
+            || think.is_some_and(|(open, _)| next == open)
+            || (channel.0.is_some() && Some(next) == channel.0);
+        if !muse_turn && !thinking && !of_a_thought {
             answer_due = false;
         }
         if debug_calls() && turn_start {
@@ -2276,7 +2463,12 @@ fn reply(
             model.rewind(kept)?;
         }
         if opens_call {
-            flush_text(job, &mut pending);
+            if in_thought {
+                in_thought = false;
+                shown.tag(job, THINK_CLOSE, false);
+            } else {
+                shown.flush(job, true);
+            }
             if by_token {
                 // The call's own start token is the model's; Llama's brace is the grammar's.
                 model.next(&mut kept.session, next, &mut logits)?;
@@ -2284,7 +2476,7 @@ fn reply(
                 call_tokens += 1;
                 if family == Family::Muse {
                     // Muse's <|eom|>: another message follows, its recipient chosen at its start.
-                    let ids = tokenizer.encode(chat::opening(family), false, true);
+                    let ids = tokenizer.encode(chat::opening(family, false), false, true);
                     logits = model.feed(kept, &ids)?;
                     call_tokens += ids.len();
                     turn_start = true;
@@ -2319,6 +2511,12 @@ fn reply(
             let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
             calls += 1;
+            // The call as it was written, from its start token (Muse's from its recipient).
+            let written_call = if by_token && family != Family::Muse {
+                format!("{}{text}", start.token)
+            } else {
+                text.clone()
+            };
             let args = call.args_json();
             let written = call_started.elapsed();
             let _ = job.out.send(Out::Event(format!(
@@ -2360,7 +2558,22 @@ fn reply(
                 json::string(&call.tool),
                 json::string(&preview(&result))
             )));
-            let (before, body, after) = tools::after_call(family, &call.tool, &shaped(&result));
+            let mut read = shaped(&chat::plain(&result), tools::result_limit(&call, MAX_RESULT));
+            if calls == MAX_CALLS {
+                // Told so, the model answers from what it has; left to find its calls
+                // taken away, Gemma 4 31B ended a reply with nothing said (2026-11-12).
+                read.push_str(LAST_CALL_NOTE);
+            }
+            // A thought after the result, as the templates open one, while thoughts have
+            // any of their share of the reply left.
+            let thinks_next = thinking_on && thought < REPLY_THOUGHT_TOKENS;
+            let (before, body, after) = tools::after_call(family, &call.tool, &read, thinks_next);
+            steps.push(chat::Step {
+                at: shown.said.trim_start().len(),
+                tool: call.tool.clone(),
+                call: written_call,
+                result: read,
+            });
             let mut ids = tokenizer.encode(&before, false, true);
             ids.extend(tokenizer.encode(&body, false, false));
             ids.extend(tokenizer.encode(&after, false, true));
@@ -2370,32 +2583,51 @@ fn reply(
             logits = model.feed(kept, &ids)?;
             turn_start = true;
             answer_due = true;
+            if thinks_next {
+                in_thought = true;
+                thought_tokens = 0;
+                label = false;
+                shown.tag(job, THINK_OPEN, true);
+            }
             continue;
         }
         turn_start = false;
-        if thinking {
-            thought += 1;
-        } else {
-            generated.push(next);
-        }
+        let opens_thought = !in_thought && think.is_some_and(|(open, _)| next == open);
+        let closes_thought = in_thought && think.is_some_and(|(_, close)| next == close);
         if thinking {
             // Muse's reasoning: the model's, not the reply's.
-        } else if Some(next) == channel.0 {
-            in_channel = true;
-        } else if Some(next) == channel.1 {
-            in_channel = false;
-        } else if !in_channel {
-            tokenizer.token_bytes(next, false, &mut pending);
-            // Whole characters only: a character's bytes can span tokens.
-            let whole = match std::str::from_utf8(&pending) {
-                Ok(_) => pending.len(),
-                Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(_) => pending.len(),
-            };
-            if whole > 0 {
-                let text = String::from_utf8_lossy(&pending[..whole]).into_owned();
-                pending.drain(..whole);
-                if job.out.send(Out::Text(text)).is_err() {
+            thought += 1;
+        } else if opens_thought {
+            thought += 1;
+            in_thought = true;
+            thought_tokens = 0;
+            label = family == Family::Gemma4;
+            shown.tag(job, THINK_OPEN, true);
+        } else if closes_thought {
+            thought += 1;
+            in_thought = false;
+            shown.tag(job, THINK_CLOSE, false);
+        } else if in_thought {
+            // Sent as it comes, as the model's reasoning.
+            thought += 1;
+            thought_tokens += 1;
+            tokenizer.token_bytes(next, false, &mut shown.pending);
+            if label {
+                label = shown.drop_label(GEMMA_THOUGHT_LABEL);
+            }
+            if !label && !shown.send(job, false) {
+                break;
+            }
+        } else {
+            generated.push(next);
+            // Gemma 4's thinking channel, should it open one with thinking off: left out.
+            if channel.0.is_some() && Some(next) == channel.0 {
+                in_channel = true;
+            } else if channel.1.is_some() && Some(next) == channel.1 {
+                in_channel = false;
+            } else if !in_channel {
+                tokenizer.token_bytes(next, false, &mut shown.pending);
+                if !shown.send(job, true) {
                     break;
                 }
             }
@@ -2426,7 +2658,21 @@ fn reply(
     if unread.is_some() {
         kept.tokens.pop();
     }
-    flush_text(job, &mut pending);
+    if in_thought {
+        shown.tag(job, THINK_CLOSE, false);
+    } else {
+        shown.flush(job, true);
+    }
+    if !steps.is_empty() {
+        let record = chat::Record {
+            family: family.name().into(),
+            steps,
+        };
+        let _ = job.out.send(Out::Event(format!(
+            "{{\"type\":\"turn_record\",\"record\":{}}}",
+            json::string(&record.to_json())
+        )));
+    }
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
         "Reply: {} prompt tokens ({reused} kept, {} read in {prompt_seconds:.2}s, {:.0}/s), {} tokens in {seconds:.2}s ({:.1}/s), {calls} tool calls{}{}{}.",
@@ -2518,11 +2764,8 @@ fn pick_skill(
     // (A list too long for a picker's session is left out, and every skill asked about.)
     let mut shortlist_ids = None;
     if options().skill_shortlist && skills.len() > SKILLS_ASKED {
-        let question = Message {
-            role: "user".into(),
-            content: skills::shortlist_question(&skills, request),
-        };
-        let text = chat::history(family, None, "", &[question], &chat::today())
+        let question = Message::new("user", skills::shortlist_question(&skills, request));
+        let text = chat::history(family, None, "", &[question], &chat::today(), false)
             + chat::answer_opening(family)
             + skills::SHORTLIST_LEAD;
         let ids = tokenizer.encode(&text, false, true);
@@ -2594,11 +2837,8 @@ fn yes_share(
     question: &str,
     lead: &str,
 ) -> Result<f64, String> {
-    let question = Message {
-        role: "user".into(),
-        content: question.to_string(),
-    };
-    let text = chat::history(family, None, "", &[question], &chat::today())
+    let question = Message::new("user", question);
+    let text = chat::history(family, None, "", &[question], &chat::today(), false)
         + chat::answer_opening(family)
         + lead;
     let ids = tokenizer.encode(&text, false, true);
@@ -2644,12 +2884,9 @@ fn pick_groups(
     request: &str,
 ) -> Result<Vec<tools::Group>, String> {
     const GROUP_SHARE: f64 = 0.15;
-    let question = Message {
-        role: "user".into(),
-        content: tools::group_question(request),
-    };
+    let question = Message::new("user", tools::group_question(request));
     // The answer opens with the examples' "Needs:", so its next token is the letter.
-    let text = chat::history(family, None, "", &[question], &chat::today())
+    let text = chat::history(family, None, "", &[question], &chat::today(), false)
         + chat::answer_opening(family)
         + "Needs:";
     let ids = tokenizer.encode(&text, false, true);
@@ -2711,7 +2948,21 @@ fn debug_calls() -> bool {
 
 /// The most tool calls one reply makes: enough for a task over several files (read a
 /// guide, six invoices and a register, work out the sums, write the rows).
-const MAX_CALLS: usize = 20;
+const MAX_CALLS: usize = 30;
+/// What the last call's result ends with.
+const LAST_CALL_NOTE: &str = "\n\n[That was the last tool call this reply can make. Answer now from what you have, and say plainly what is still to do.]";
+/// The most tokens one thought may take (thinking on; the Mac server's budget), and all
+/// of a reply's thoughts together. Past the first the thought is closed for the model;
+/// past the second it's given no more.
+const THOUGHT_TOKENS: usize = 2000;
+const REPLY_THOUGHT_TOKENS: usize = 8000;
+/// A thought's start and end as the app is told of them (`thinking` events, with the
+/// thought's text between as their `content`): it shows a thought as the model's
+/// reasoning, apart from the answer.
+const THINK_OPEN: &str = "\"start\"";
+const THINK_CLOSE: &str = "\"done\"";
+/// What Gemma 4 opens a thought of its own with.
+const GEMMA_THOUGHT_LABEL: &[u8] = b"thought\n";
 /// The most tokens Muse may reason in, a reply (at "Reasoning strength: low"). Past it
 /// its reasoning message is ended for it and it answers or calls without more.
 const MUSE_THOUGHT_TOKENS: usize = 2048;
@@ -2720,13 +2971,75 @@ const MAX_CALL_TOKENS: usize = 4096;
 /// The most of a tool's result the model reads, in characters (about 2,000 tokens).
 const MAX_RESULT: usize = 8000;
 
-/// Sends the text held back so far (only whole characters are sent as they come).
-fn flush_text(job: &Job, pending: &mut Vec<u8>) {
-    if !pending.is_empty() {
+/// A reply's text on its way to the app: what's held back (only whole characters are
+/// sent as they come: a character's bytes can span tokens), and the answer sent so far,
+/// which is where a tool call is said to have been made (`chat::Step::at`).
+#[derive(Default)]
+struct Shown {
+    pending: Vec<u8>,
+    /// The answer's text so far, thoughts left out.
+    said: String,
+}
+
+impl Shown {
+    /// The answer's text goes as the reply's content; a thought's as `thinking` events,
+    /// which an app shows apart from the answer (or not at all).
+    fn out(&mut self, job: &Job, text: String, answer: bool) -> bool {
+        if answer {
+            self.said.push_str(&text);
+            job.out.send(Out::Text(text)).is_ok()
+        } else {
+            job.out
+                .send(Out::Event(format!(
+                    "{{\"type\":\"thinking\",\"content\":{}}}",
+                    json::string(&text)
+                )))
+                .is_ok()
+        }
+    }
+
+    /// Sends the whole characters held back. `false` once nobody is reading.
+    fn send(&mut self, job: &Job, answer: bool) -> bool {
+        let whole = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => self.pending.len(),
+        };
+        if whole == 0 {
+            return true;
+        }
+        let text = String::from_utf8_lossy(&self.pending[..whole]).into_owned();
+        self.pending.drain(..whole);
+        self.out(job, text, answer)
+    }
+
+    /// Sends all that's held back.
+    fn flush(&mut self, job: &Job, answer: bool) {
+        if !self.pending.is_empty() {
+            let text = String::from_utf8_lossy(&self.pending).into_owned();
+            self.pending.clear();
+            self.out(job, text, answer);
+        }
+    }
+
+    /// Says a thought has started or ended (`mark`), after what's held back (`answer`:
+    /// whether that was the answer's, as before a thought starts, or the thought's).
+    fn tag(&mut self, job: &Job, mark: &str, answer: bool) {
+        self.flush(job, answer);
         let _ = job
             .out
-            .send(Out::Text(String::from_utf8_lossy(pending).into_owned()));
-        pending.clear();
+            .send(Out::Event(format!("{{\"type\":\"thinking\",{mark}:true}}")));
+    }
+
+    /// Takes `label` off the start of what's held back. Whether it may still be coming
+    /// (what's held is only its start so far).
+    fn drop_label(&mut self, label: &[u8]) -> bool {
+        if self.pending.starts_with(label) {
+            self.pending.drain(..label.len());
+            false
+        } else {
+            label.starts_with(&self.pending)
+        }
     }
 }
 
@@ -2883,6 +3196,12 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
                 return Some(format!("Error: {why}"));
             }
         }
+        // A task's schedule is read before anyone is asked to approve it.
+        if call.tool == "schedule_task"
+            && let Err(why) = tasks::When::parse(call.text("when").unwrap_or(""))
+        {
+            return Some(format!("Error: {why}"));
+        }
         // The same check for a change the server makes itself.
         if tool.runs == tools::Runs::Server
             && let Err(why) = tools::check_here(call, job.files.as_ref())
@@ -2896,7 +3215,32 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         }
     }
     let result = match tool.runs {
+        tools::Runs::Server if call.tool == "search_chats" => {
+            chats::search(call.text("query").unwrap_or(""), job.chat_id.as_deref())
+        }
+        tools::Runs::Server if call.tool == "schedule_task" => schedule(call, job),
         tools::Runs::Server => tools::run_here(call, job.files.as_ref()),
+        // Several files in one call: the app is asked for each.
+        tools::Runs::App if tools::several_paths(call).is_some() => {
+            let paths = tools::several_paths(call).unwrap_or_default();
+            let stopped = std::cell::Cell::new(false);
+            let text = tools::read_several(&paths, |path| {
+                if stopped.get() {
+                    return Err("stopped".into());
+                }
+                match ask_app("read_file", &tools::read_one(path).args_json(), job) {
+                    Some(result) => result,
+                    None => {
+                        stopped.set(true);
+                        Err("stopped".into())
+                    }
+                }
+            });
+            if stopped.get() {
+                return None;
+            }
+            Ok(text)
+        }
         // The app answers create_docx with the file's path alone; the server words it.
         tools::Runs::App if call.tool == "create_docx" => {
             ask_app(&call.tool, &call.args_json(), job)?
@@ -2905,6 +3249,29 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         tools::Runs::App => ask_app(&call.tool, &call.args_json(), job)?,
     };
     Some(result.unwrap_or_else(|e| format!("Error: {e}")))
+}
+
+/// Sets up the task a `schedule_task` call asks for (`tasks.rs`), with what this chat may
+/// reach: a folder to watch must be one of them.
+fn schedule(call: &tools::Call, job: &Job) -> Result<String, String> {
+    let mut when = tasks::When::parse(call.text("when").unwrap_or(""))?;
+    if let tasks::When::Folder { path } = &mut when {
+        let files = job
+            .files
+            .as_ref()
+            .ok_or("This chat can't reach the user's files, so it can't watch a folder.")?;
+        *path = files.resolve(path)?;
+        if std::path::Path::new(path.as_str()).is_file() {
+            return Err(format!("{path} is a file, not a folder."));
+        }
+    }
+    tasks::add(
+        call.text("name").unwrap_or(""),
+        call.text("prompt").unwrap_or(""),
+        when,
+        &job.access,
+        &job.folders,
+    )
 }
 
 /// What the app runs, not a tool the model sees: whether a change could be made, without
@@ -3036,18 +3403,15 @@ fn on_this_pc(path: &str) -> PathBuf {
     }
 }
 
-/// A tool's result as the model reads it: at most `MAX_RESULT` characters, saying how much
-/// was left out.
-fn shaped(result: &str) -> String {
+/// A tool's result as the model reads it: at most `limit` characters (`MAX_RESULT`, or
+/// more for a call that read several files), saying how much was left out.
+fn shaped(result: &str, limit: usize) -> String {
     let chars = result.chars().count();
-    if chars <= MAX_RESULT {
+    if chars <= limit {
         return result.to_string();
     }
-    let kept: String = result.chars().take(MAX_RESULT).collect();
-    format!(
-        "{kept}\n[... {} more characters not shown]",
-        chars - MAX_RESULT
-    )
+    let kept: String = result.chars().take(limit).collect();
+    format!("{kept}\n[... {} more characters not shown]", chars - limit)
 }
 
 /// A result's first few hundred characters, for the step the app shows.
