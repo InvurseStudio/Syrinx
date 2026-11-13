@@ -34,6 +34,7 @@ mod json;
 mod memory;
 mod sample;
 mod skills;
+mod stats;
 mod store;
 mod tasks;
 mod tools;
@@ -368,6 +369,7 @@ fn main() -> ExitCode {
         let shared = shared.clone();
         std::thread::spawn(move || prune_uploads(&shared));
     }
+    stats::start();
     for stream in listener.incoming().flatten() {
         let shared = shared.clone();
         std::thread::spawn(move || serve(stream, &shared));
@@ -535,6 +537,7 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
         let mut pairing = shared.pairing.lock().unwrap();
         if body.str("code") != Some(pairing.code.as_str()) {
+            stats::refuse(&peer(&stream), "Wrong pairing code");
             return http::respond(
                 &mut stream,
                 400,
@@ -584,6 +587,14 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         return http::respond(&mut stream, 200, &body);
     }
     if device.is_none() {
+        stats::refuse(
+            &peer(&stream),
+            if request.bearer.is_some() {
+                "Unknown token"
+            } else {
+                "Not paired"
+            },
+        );
         return http::respond(
             &mut stream,
             401,
@@ -665,7 +676,24 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             Some((bytes, media_type)) => http::respond_with(&mut stream, 200, media_type, &bytes),
             None => http::respond(&mut stream, 404, &error("That attachment isn't kept here.")),
         },
-        ("POST", "/api/chat/completions") => completion(stream, shared, &request.body),
+        ("GET", "/api/stats") => {
+            let i = &shared.info;
+            http::respond(
+                &mut stream,
+                200,
+                &stats::json(&i.model, &i.runtime, i.context),
+            );
+        }
+        ("POST", "/api/chat/completions") => {
+            let app = request.bearer.is_some()
+                && shared.pairing.lock().unwrap().app_token == request.bearer;
+            let source = stats::Source::of(
+                app,
+                device.as_deref().unwrap_or(""),
+                request.user_agent.as_deref(),
+            );
+            completion(stream, shared, &request.body, source)
+        }
         // Tasks (`tasks.rs`): the app lists them, and asks which are due to run.
         ("GET", "/api/tasks") => http::respond(&mut stream, 200, &tasks::list_json()),
         ("GET", "/api/tasks/due") => http::respond(&mut stream, 200, &tasks::due_json()),
@@ -754,7 +782,7 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
 }
 
 /// One reply, streamed as the app reads them: the run, the text as it comes, then done.
-fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
+fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8], source: stats::Source) {
     let body = match json::parse(&String::from_utf8_lossy(body)) {
         Ok(v) => v,
         Err(e) => return http::respond(&mut stream, 400, &error(&format!("Bad request: {e}"))),
@@ -853,12 +881,29 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8]) {
         tool_results: shared.tool_results.clone(),
         approvals: shared.approvals.clone(),
     };
+    let counted = stats::begin(source);
+    let asked = Instant::now();
     if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
         shared.runs.lock().unwrap().remove(&run_id);
+        stats::finish(
+            counted,
+            stats::Outcome {
+                status: "error",
+                ..Default::default()
+            },
+        );
         return http::respond(&mut stream, 500, &error("The engine has stopped."));
     }
-    stream_reply(&mut stream, &run_id, &events, &stop);
+    let outcome = stream_reply(&mut stream, &run_id, &events, &stop, asked);
     shared.runs.lock().unwrap().remove(&run_id);
+    stats::finish(counted, outcome);
+}
+
+/// The address a request came from, for a refused one.
+fn peer(stream: &TcpStream) -> String {
+    stream
+        .peer_addr()
+        .map_or_else(|_| "unknown".into(), |a| a.ip().to_string())
 }
 
 /// Writes the attached documents into their messages. The last message's comes from
@@ -919,10 +964,19 @@ fn prune_uploads(shared: &Shared) {
     }
 }
 
-fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, stop: &AtomicBool) {
+/// Streams the reply, and says how it went (for `stats`): `asked` is when the request came.
+fn stream_reply(
+    stream: &mut TcpStream,
+    run_id: &str,
+    events: &Receiver<Out>,
+    stop: &AtomicBool,
+    asked: Instant,
+) -> stats::Outcome {
+    let mut outcome = stats::Outcome::default();
     if http::start_events(stream).is_err() {
         stop.store(true, Ordering::Relaxed);
-        return;
+        outcome.status = "cancelled";
+        return outcome;
     }
     let mut send = |data: &str| {
         if http::event(stream, data).is_err() {
@@ -934,10 +988,17 @@ fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, st
         json::string(run_id)
     ));
     for event in events {
+        if matches!(event, Out::Text(_) | Out::Event(_)) && outcome.first_token_seconds.is_none() {
+            outcome.first_token_seconds = Some(asked.elapsed().as_secs_f64());
+        }
         match event {
             Out::Text(text) => send(&format!("{{\"content\":{}}}", json::string(&text))),
             Out::Event(event) => send(&event),
+            Out::Usage(usage) => outcome.usage = Some(usage),
             Out::Done { tokens, seconds } => {
+                outcome.status = "ok";
+                outcome.completion_tokens = tokens;
+                outcome.generation_seconds = Some(seconds);
                 let tps = if seconds > 0.0 {
                     tokens as f64 / seconds
                 } else {
@@ -947,10 +1008,21 @@ fn stream_reply(stream: &mut TcpStream, run_id: &str, events: &Receiver<Out>, st
                     "{{\"done\":true,\"tokens\":{tokens},\"duration\":\"{seconds:.2}\",\"tokensPerSecond\":\"{tps:.2}\"}}"
                 ));
             }
-            Out::Error(e) => send(&format!("{{\"error\":{}}}", json::string(&e))),
+            Out::Error(e) => {
+                outcome.status = "error";
+                send(&format!("{{\"error\":{}}}", json::string(&e)))
+            }
         }
     }
     send("[DONE]");
+    if outcome.status.is_empty() || (outcome.status == "ok" && stop.load(Ordering::Relaxed)) {
+        outcome.status = if stop.load(Ordering::Relaxed) {
+            "cancelled"
+        } else {
+            "error"
+        };
+    }
+    outcome
 }
 
 // ---- The engine ------------------------------------------------------------------------
@@ -993,6 +1065,8 @@ enum Out {
     Text(String),
     /// An event as it's sent: a tool call, a request for the app to run one, its result.
     Event(String),
+    /// What the reply read and how (for `stats`), just before `Done`; not sent on.
+    Usage(stats::Usage),
     Done {
         tokens: usize,
         seconds: f64,
@@ -2846,6 +2920,20 @@ fn reply(
             )))
             .unwrap_or_default()
     );
+    let (guessed, taken) = match (drafter.as_deref(), lookup.as_ref()) {
+        (Some(d), _) => (d.guessed, d.taken),
+        (None, Some(l)) => (l.guessed, l.taken),
+        _ => mtp_stats,
+    };
+    let _ = job.out.send(Out::Usage(stats::Usage {
+        prompt_tokens: ids.len(),
+        cached_tokens: reused,
+        prefill_seconds: prompt_seconds,
+        context_tokens: kept.tokens.len(),
+        tool_calls: calls,
+        guessed,
+        taken,
+    }));
     let _ = job.out.send(Out::Done {
         tokens: generated.len() + call_tokens + thought,
         seconds,
