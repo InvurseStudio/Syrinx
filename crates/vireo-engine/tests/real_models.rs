@@ -362,3 +362,64 @@ What is the capital of France? Answer in one sentence.<turn|>
         "The capital of France is Paris."
     );
 }
+
+/// Gemma 4 26B-A4B (mixture of experts) against llama.cpp b12228: llama-server on the
+/// CPU, f32 cache, on an F32 copy of unsloth's UD-Q6_K file (101 GB, made with
+/// llama-quantize). The top token is within 0.15 points; the dense 31B, checked the same
+/// way, is within 0.03, and E2B within 0.0002, so some of this is a difference the large
+/// models share. An expert's rows read up-first instead give " a" 24.9%, and the router's
+/// scale without 1/sqrt(dim) a perplexity in the hundreds of thousands. The file is in
+/// the Vireo app's model folder, or where `VIREO_GEMMA_26B` says.
+#[test]
+fn gemma4_26b_a4b_forward_pass_matches_llama_cpp() {
+    let path = std::env::var_os("VIREO_GEMMA_26B").map(PathBuf::from).or_else(|| {
+        std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h).join(
+                "Library/Application Support/InvurseChat/models/unsloth/\
+                 gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf",
+            )
+        })
+    });
+    let Some(path) = path.filter(|p| p.exists()) else {
+        eprintln!("skipped: the Gemma 4 26B-A4B file isn't on this machine");
+        return;
+    };
+    let file = GgufFile::open(&path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+    let model = Gemma4::load(&file, Pool::with_all_cores()).unwrap();
+    assert_eq!(
+        model.config.experts,
+        Some(vireo_engine::models::gemma4::Experts {
+            count: 128,
+            used: 8,
+            width: 704
+        })
+    );
+    let ids = tokenizer.encode(
+        "The weather report for the coming week says that on Monday we should expect",
+        true,
+        true,
+    );
+    assert_eq!(ids.len(), 15);
+    let mut session = model.session(32);
+    let mut probs = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        if let Some(l) = model.forward(&mut session, id, i + 1 == ids.len()) {
+            probs = l.to_vec();
+        }
+    }
+    cpu::softmax(&mut probs);
+    // llama.cpp: "-" 74.1497%, " own" 11.4948%, " to" 9.9130%, "/" 0.4453%.
+    for (id, percent) in [
+        (236772, 74.1497),
+        (1852, 11.4948),
+        (531, 9.9130),
+        (236786, 0.4453),
+    ] {
+        let ours = probs[id] as f64 * 100.0;
+        assert!(
+            (ours - percent).abs() < 0.2,
+            "token {id}: {ours:.4}% vs llama.cpp's {percent}%"
+        );
+    }
+}

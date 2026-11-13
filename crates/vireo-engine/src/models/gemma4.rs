@@ -1,5 +1,5 @@
-//! Gemma 4 (the dense ones: E2B, E4B, 31B): the forward pass, on the CPU reference
-//! backend. Follows llama.cpp's `gemma4.cpp` graph.
+//! Gemma 4 (E2B, E4B, 31B, and the mixture-of-experts 26B-A4B): the forward pass, on the
+//! CPU reference backend. Follows llama.cpp's `gemma4.cpp` graph.
 //!
 //! Each token's input:
 //!
@@ -22,9 +22,22 @@
 //! x = (f + RMSNorm(proj · (GELU(inp_gate f) × PLI[layer])) × post_norm) × layer_output_scale
 //! ```
 //!
+//! A mixture-of-experts layer (26B-A4B: 128 experts, 8 used, beside a dense network)
+//! replaces the `down(...)` in `f` with two parts, each normed, added:
+//!
+//! ```text
+//! dense   = RMSNorm(down(GELU(gate a') × up a')) × post_ffw_norm_1
+//! scores  = ffn_gate_inp · (RMSNorm(a) × ffn_gate_inp.scale / sqrt(dim))      one per expert
+//! shares  = softmax over the `used` highest scores
+//! experts = RMSNorm(Σ share_e × scale_e × down_e(GELU(gate_e a'') × up_e a'')) × post_ffw_norm_2
+//!           a'' = RMSNorm(a) × pre_ffw_norm_2;  gate_e, up_e: the two halves of expert e's
+//!           rows in ffn_gate_up_exps;  scale_e: ffn_down_exps.scale
+//! f = a + RMSNorm(dense + experts) × post_ffw_norm
+//! ```
+//!
 //! and the logits are `30 × tanh(token_embd · (RMSNorm(x) × output_norm) / 30)`.
 
-use super::{Error, Result, matrix, required, vector};
+use super::{Error, Result, matrices, matrix, required, vector};
 use crate::GgufFile;
 use crate::cpu::{self, Matrix, Pool};
 use crate::gguf::Value;
@@ -65,6 +78,18 @@ pub struct Config {
     pub muse: bool,
     /// The logits' multiplier before the softcap (Muse: `logit_scale`; Gemma 1).
     pub logit_scale: f32,
+    /// A mixture-of-experts model's experts (26B-A4B); `None` for the dense models.
+    pub experts: Option<Experts>,
+}
+
+/// A mixture-of-experts model's settings: every layer has `count` small feed-forward
+/// networks `width` wide beside its dense one, and each token goes through the `used`
+/// of them its router scores highest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Experts {
+    pub count: usize,
+    pub used: usize,
+    pub width: usize,
 }
 
 impl Config {
@@ -109,11 +134,21 @@ impl Config {
                 "per-layer settings don't have one entry per layer".into(),
             ));
         }
-        if file.tensor("blk.0.ffn_gate_inp.weight").is_some() {
-            return Err(Error::Unsupported(
-                "Gemma 4's mixture-of-experts models (26B-A4B)".into(),
-            ));
-        }
+        let experts = if file.tensor("blk.0.ffn_gate_inp.weight").is_some() {
+            let e = Experts {
+                count: required(file, "expert_count")?,
+                used: required(file, "expert_used_count")?,
+                width: required(file, "expert_feed_forward_length")?,
+            };
+            if e.used == 0 || e.used > e.count || e.width == 0 {
+                return Err(Error::Invalid(
+                    "the mixture-of-experts settings don't fit each other".into(),
+                ));
+            }
+            Some(e)
+        } else {
+            None
+        };
         let shared = file.arch_u64("attention.shared_kv_layers").unwrap_or(0) as usize;
         let vocab = file
             .get("tokenizer.ggml.tokens")
@@ -152,6 +187,7 @@ impl Config {
             softcap: file.arch_f64("final_logit_softcapping").map(|v| v as f32),
             muse,
             logit_scale: file.arch_f64("logit_scale").map_or(1.0, |v| v as f32),
+            experts,
         };
         if c.kv_heads
             .iter()
@@ -214,7 +250,27 @@ struct Layer<'a> {
     post_ffw_norm: Vec<f32>,
     /// The per-layer input's gate, projection and norm (models with them).
     per_layer: Option<(Matrix<'a>, Matrix<'a>, Vec<f32>)>,
+    /// The layer's experts (a mixture-of-experts model).
+    experts: Option<ExpertLayer<'a>>,
     output_scale: f32,
+}
+
+/// A layer's experts and the router that picks among them.
+struct ExpertLayer<'a> {
+    /// The router: a score per expert from the layer's input, RMS-normed and times
+    /// `router_weight` (the file's `ffn_gate_inp.scale` over sqrt(dim)).
+    router: Matrix<'a>,
+    router_weight: Vec<f32>,
+    /// Every expert's gate and up matrices, an expert's `2 × width` rows after the last's
+    /// (the gate's rows, then the up's), and every expert's down matrix likewise.
+    gate_up: Matrix<'a>,
+    down: Matrix<'a>,
+    /// Each expert's multiplier on its share (`ffn_down_exps.scale`).
+    scale: Vec<f32>,
+    /// The norm on the experts' input, on the dense network's output and on the experts'.
+    pre_norm: Vec<f32>,
+    dense_post_norm: Vec<f32>,
+    post_norm: Vec<f32>,
 }
 
 /// The per-layer inputs' embedding, projection and its norm (E2B, E4B).
@@ -314,6 +370,31 @@ impl<'a> Gemma4<'a> {
                 up: matrix(file, &name("ffn_up"), dim, c.ffn_dims[i])?,
                 down: matrix(file, &name("ffn_down"), c.ffn_dims[i], dim)?,
                 post_ffw_norm: vector(file, &name("post_ffw_norm"), dim)?,
+                experts: match c.experts {
+                    Some(e) => {
+                        let root = (dim as f32).sqrt();
+                        Some(ExpertLayer {
+                            router: matrix(file, &name("ffn_gate_inp"), dim, e.count)?,
+                            router_weight: vector(file, &format!("blk.{i}.ffn_gate_inp.scale"), dim)?
+                                .iter()
+                                .map(|s| s / root)
+                                .collect(),
+                            gate_up: matrices(
+                                file,
+                                &name("ffn_gate_up_exps"),
+                                dim,
+                                2 * e.width,
+                                e.count,
+                            )?,
+                            down: matrices(file, &name("ffn_down_exps"), e.width, dim, e.count)?,
+                            scale: vector(file, &format!("blk.{i}.ffn_down_exps.scale"), e.count)?,
+                            pre_norm: vector(file, &name("pre_ffw_norm_2"), dim)?,
+                            dense_post_norm: vector(file, &name("post_ffw_norm_1"), dim)?,
+                            post_norm: vector(file, &name("post_ffw_norm_2"), dim)?,
+                        })
+                    }
+                    None => None,
+                },
                 per_layer: if pl > 0 {
                     Some((
                         matrix(file, &name("inp_gate"), dim, pl)?,
@@ -525,6 +606,39 @@ impl<'a> Gemma4<'a> {
                 *g = self.gelu(*g) * u;
             }
             cpu::matvec(pool, &layer.down, &s.gate[..f], &mut s.projected);
+            if let (Some(m), Some(e)) = (&layer.experts, c.experts) {
+                // The dense network's output, normed, plus the experts': the router
+                // scores every expert from the layer's input, the `used` highest share
+                // the token by a softmax over their scores (times each one's scale).
+                let mut dense = vec![0.0; c.dim];
+                cpu::rms_norm(&s.projected, &m.dense_post_norm, eps, &mut dense);
+                cpu::rms_norm(&s.x, &m.router_weight, eps, &mut s.h);
+                let mut scores = vec![0.0; e.count];
+                cpu::matvec(pool, &m.router, &s.h, &mut scores);
+                let mut picked: Vec<usize> = (0..e.count).collect();
+                picked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+                picked.truncate(e.used);
+                let mut shares: Vec<f32> = picked.iter().map(|&i| scores[i]).collect();
+                cpu::softmax(&mut shares);
+                cpu::rms_norm(&s.x, &m.pre_norm, eps, &mut s.h);
+                let w = e.width;
+                let mut gate_up = vec![0.0; 2 * w];
+                let mut out = vec![0.0; c.dim];
+                let mut sum = vec![0.0; c.dim];
+                for (&i, &share) in picked.iter().zip(&shares) {
+                    cpu::matvec(pool, &m.gate_up.rows_from(i * 2 * w, 2 * w), &s.h, &mut gate_up);
+                    let act: Vec<f32> = (0..w)
+                        .map(|j| self.gelu(gate_up[j]) * gate_up[w + j])
+                        .collect();
+                    cpu::matvec(pool, &m.down.rows_from(i * c.dim, c.dim), &act, &mut out);
+                    let share = share * m.scale[i];
+                    for (s, &o) in sum.iter_mut().zip(&out) {
+                        *s += share * o;
+                    }
+                }
+                cpu::rms_norm(&sum, &m.post_norm, eps, &mut s.projected);
+                add(&mut s.projected, &dense);
+            }
             cpu::rms_norm(&s.projected, &layer.post_ffw_norm, eps, &mut s.h);
             add(&mut s.x, &s.h);
 

@@ -135,6 +135,40 @@ fn matrix<'a>(file: &'a GgufFile, name: &str, cols: usize, rows: usize) -> Resul
     })
 }
 
+/// `count` weight matrices of `rows` × `cols` in one tensor, one after another (GGUF
+/// dimensions `[cols, rows, count]`: a mixture-of-experts layer's experts), as one matrix
+/// of `rows × count` rows. Expert `e` is rows `e × rows` on (`Matrix::rows_from`).
+fn matrices<'a>(
+    file: &'a GgufFile,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    count: usize,
+) -> Result<Matrix<'a>> {
+    let t = file
+        .tensor(name)
+        .ok_or_else(|| Error::Missing(format!("tensor {name}")))?;
+    if t.dims != [cols as u64, rows as u64, count as u64] {
+        return Err(Error::Invalid(format!(
+            "{name} is {:?}, but the settings make it [{cols}, {rows}, {count}]",
+            t.dims
+        )));
+    }
+    let kind = t.kind.filter(|&k| quant::supports(k)).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "{name}'s type (GGUF type {}) on the CPU",
+            t.type_id
+        ))
+    })?;
+    let data = file.tensor_data(t).expect("a known type has data");
+    Ok(Matrix {
+        kind,
+        rows: rows * count,
+        cols,
+        data,
+    })
+}
+
 /// A 1-D tensor of `len` numbers (norm weights and the like), decoded to f32.
 fn vector(file: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
     let m = matrix_1d(file, name, len)?;
