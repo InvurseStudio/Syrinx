@@ -74,7 +74,8 @@ in chat-cache (or
 --chat-cache's folder; off for none), so going back to a chat reads only what's new.
 
 The tools that change files are offered when one scored question says the request asks
-for a change (--changes), and each waits for the user's approval in the app. The kinds
+for a change (--changes), and stay declared in that chat from then on (its cache is read
+again once, not at every such turn). Each waits for the user's approval in the app. The kinds
 the user always allows are kept in approvals.txt in that folder.
 
 The app starts it itself with --port 0, --token (a token it accepts without pairing)
@@ -102,7 +103,8 @@ struct Options {
     scored_groups: bool,
     /// When the tools that change files are there (`--changes`): `declared` (the
     /// default), declared and callable only when scoring says the request asks for a
-    /// change; `scored`, declared always but callable only then (the prompt stays the
+    /// change, and from then on declared for the rest of that chat (callable only when
+    /// asked for, as `scored`), so the chat's cached start changes once at most; `scored`, declared always but callable only then (the prompt stays the
     /// same, but the longer tool list cost small models on other requests, and a model
     /// kept from a change it wanted called another tool); `offered`, always. Measured
     /// 2026-11-11 (PLAN.md).
@@ -1725,6 +1727,27 @@ fn stash(model: &Model, kept: &Kept, store: &mut store::Store) {
     }
 }
 
+/// A reply's prompt, written one of the ways `reply` may write it.
+struct Prompt {
+    ids: Vec<u32>,
+    /// Where the history ends in `ids`: what the next turn's prompt starts with.
+    mark: usize,
+    /// The first of the chat's messages in it (later than 0 for a chat too long to fit).
+    first: usize,
+    /// Its system prompt and tool declarations.
+    system: Option<String>,
+    declared: String,
+}
+
+/// A chat too long for the context starts a third of the context further on each time
+/// (`chat::cut_points`, in bytes: about this many a token), so it reads everything again
+/// once in that many tokens, not at every turn.
+const CUT_BYTES_PER_TOKEN: usize = 4;
+
+/// How many facts back a chat's instructions may stop at for its cache to be kept: the
+/// facts remembered while it's cached, before it's read again with all of them.
+const OLDER_FACTS: usize = 8;
+
 /// The fewest tokens worth saving a chat's cache for: a shorter chat reads again in a
 /// few tenths of a second, about what loading it takes, and its file would still be
 /// megabytes (Qwen's DeltaNet state alone is 18 MB on the 0.8B).
@@ -1812,6 +1835,9 @@ fn reply(
     // The tools a call may name: all those offered, less the ones that change files
     // when the request doesn't ask for a change.
     let mut callable = offered.clone();
+    // `declared`, and this request doesn't ask for a change: the tools offered with the
+    // ones that change files still among them, for a chat whose cache declares them.
+    let mut with_changes: Option<Vec<tools::Tool>> = None;
     if options().changes != Changes::Offered
         && offered.iter().any(|t| t.changes_files())
         && let Some(request) = job.messages.last()
@@ -1819,6 +1845,7 @@ fn reply(
     {
         callable.retain(|t| !t.changes_files());
         if options().changes == Changes::Declared {
+            with_changes = Some(offered.clone());
             offered.retain(|t| !t.changes_files());
         }
     }
@@ -1850,45 +1877,144 @@ fn reply(
         )));
         eprintln!("Skill: {} ({} tokens)", skill.name, skill_ids.len());
     }
-    let declared = tools::declarations(family, &offered);
-    // With tools, the system prompt opens with what they're for.
-    let system = match (offered.is_empty(), job.system.as_deref().map(str::trim)) {
-        (true, s) => s.filter(|s| !s.is_empty()).map(str::to_string),
-        (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
-        (false, _) => Some(tools::PREAMBLE.to_string()),
-    };
-    // What the user asked to be remembered, after the rest (the Mac's order).
-    let system = match (system, memory::instructions()) {
-        (Some(s), Some(m)) => Some(format!("{s}\n\n{m}")),
-        (s, m) => s.or(m),
-    };
-    // The chat's latest messages that fit with room for the reply.
-    let mut first = 0;
+    // The prompt. A chat's cache holds its start as it was first written, and two things
+    // would change that start from one turn to the next: the tools that change files
+    // (declared only when asked for) and a fact remembered since. So a chat whose cache
+    // was written another way keeps that way: those tools stay declared (though not
+    // callable now), and its instructions keep the facts they began with, the newer
+    // ones told at the end of the request.
+    let facts = memory::all();
     let opening = tokenizer.encode(chat::opening(family), false, true);
-    let (ids, mark) = loop {
-        let text = chat::history(
-            family,
-            system.as_deref(),
-            &declared,
-            &job.messages[first..],
-            &today,
-        );
-        if std::env::var_os("VIREO_DEBUG_PROMPT").is_some() {
-            eprintln!("[prompt] {text}{}", chat::opening(family));
-        }
-        let mut ids = tokenizer.encode(&text, false, true);
-        let mark = ids.len();
-        ids.extend_from_slice(&opening);
-        ids.extend_from_slice(&skill_ids);
-        if ids.len() + max_tokens <= context || first + 1 >= job.messages.len() {
-            break (ids, mark);
-        }
-        first += 1;
-        while first < job.messages.len() && job.messages[first].role != "user" {
-            first += 1;
-        }
-        first = first.min(job.messages.len() - 1);
+    let cuts = chat::cut_points(&job.messages, context / 3 * CUT_BYTES_PER_TOKEN);
+    let debug_prompt = std::env::var_os("VIREO_DEBUG_PROMPT").is_some();
+    let system_turn = |tools: &[tools::Tool], known: usize| -> (Option<String>, String) {
+        // With tools, the system prompt opens with what they're for.
+        let system = match (tools.is_empty(), job.system.as_deref().map(str::trim)) {
+            (true, s) => s.filter(|s| !s.is_empty()).map(str::to_string),
+            (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", tools::PREAMBLE)),
+            (false, _) => Some(tools::PREAMBLE.to_string()),
+        };
+        // What the user asked to be remembered, after the rest (the Mac's order).
+        let system = match (system, memory::instructions_for(&facts[..known])) {
+            (Some(s), Some(m)) => Some(format!("{s}\n\n{m}")),
+            (s, m) => s.or(m),
+        };
+        (system, tools::declarations(family, tools))
     };
+    let build = |tools: &[tools::Tool], known: usize| -> Prompt {
+        let (system, declared) = system_turn(tools, known);
+        let note = memory::since(&facts[known..]);
+        // The chat's latest messages that fit with room for the reply: all of them, else
+        // from the first of `cuts` that fits, else from the first message that does.
+        let mut starts = std::iter::once(0).chain(cuts.iter().copied());
+        let mut first = 0;
+        loop {
+            match starts.next() {
+                Some(start) => first = start,
+                None => {
+                    first += 1;
+                    while first < job.messages.len() && job.messages[first].role != "user" {
+                        first += 1;
+                    }
+                    first = first.min(job.messages.len() - 1);
+                }
+            }
+            let text = chat::history(
+                family,
+                system.as_deref(),
+                &declared,
+                &job.messages[first..],
+                &today,
+            );
+            // The note goes at the end of the request, read apart from the history
+            // before it: the next turn's prompt is the same up to there (Qwen's
+            // DeltaNet is saved at `mark`, and must be wanted whole).
+            let end = text.len() - chat::closing(family).len();
+            let (history, rest) = if note.is_empty() {
+                (text.as_str(), String::new())
+            } else {
+                (&text[..end], format!("{note}{}", &text[end..]))
+            };
+            if debug_prompt {
+                eprintln!("[prompt] {history}{rest}{}", chat::opening(family));
+            }
+            let mut ids = tokenizer.encode(history, false, true);
+            let mark = ids.len();
+            ids.extend(tokenizer.encode(&rest, false, true));
+            ids.extend_from_slice(&opening);
+            ids.extend_from_slice(&skill_ids);
+            if ids.len() + max_tokens <= context || first + 1 >= job.messages.len() {
+                break Prompt {
+                    ids,
+                    mark,
+                    first,
+                    system,
+                    declared,
+                };
+            }
+        }
+    };
+    let mut prompt = build(&offered, facts.len());
+    let mut keep_changes = false;
+    if job.messages.len() - prompt.first > 1 && (with_changes.is_some() || !facts.is_empty()) {
+        let caches: Vec<&[u32]> = std::iter::once(kept.tokens.as_slice())
+            .chain(
+                store
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(|s| s.entries().iter().map(|e| e.tokens.as_slice())),
+            )
+            .collect();
+        // Whether a cached chat starts as `p` does through its first message at least
+        // (another chat with the same system turn doesn't count).
+        let cached = |p: &Prompt| {
+            let head = chat::history(
+                family,
+                p.system.as_deref(),
+                &p.declared,
+                &job.messages[p.first..p.first + 1],
+                &today,
+            );
+            let head = tokenizer.encode(&head, false, true).len();
+            caches.iter().any(|c| shared_start(c, &p.ids) >= head)
+        };
+        if !cached(&prompt) {
+            let oldest = facts.len().saturating_sub(OLDER_FACTS);
+            'ways: for known in (oldest..=facts.len()).rev() {
+                let plain = (known < facts.len()).then_some(offered.as_slice());
+                for (tools, changes) in [(plain, false), (with_changes.as_deref(), true)] {
+                    let Some(tools) = tools else { continue };
+                    // Cheaply first: is any cache's system turn written this way?
+                    let (system, declared) = system_turn(tools, known);
+                    let turn = chat::history(family, system.as_deref(), &declared, &[], &today);
+                    let turn = tokenizer.encode(&turn, false, true);
+                    if !caches.iter().any(|c| c.starts_with(&turn)) {
+                        continue;
+                    }
+                    let other = build(tools, known);
+                    if job.messages.len() - other.first > 1 && cached(&other) {
+                        eprintln!(
+                            "Prompt as the chat's cache has it: {}{} of {} facts in its instructions.",
+                            if changes {
+                                "the tools that change files declared, "
+                            } else {
+                                ""
+                            },
+                            known,
+                            facts.len()
+                        );
+                        prompt = other;
+                        keep_changes = changes;
+                        break 'ways;
+                    }
+                }
+            }
+        }
+    }
+    if keep_changes && let Some(tools) = with_changes {
+        offered = tools;
+    }
+    let Prompt { ids, mark, .. } = prompt;
     if ids.len() + max_tokens > context {
         return Err(format!(
             "The message is {} tokens, too long for this server's {context}-token chats.",

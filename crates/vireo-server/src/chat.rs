@@ -80,6 +80,36 @@ pub fn opening(family: Family) -> &'static str {
     }
 }
 
+/// What ends a message in `history`: its last message's text stops this far from the
+/// end, which is where a note for this turn only can go (`memory::since`).
+pub fn closing(family: Family) -> &'static str {
+    match family {
+        Family::Llama => "<|eot_id|>",
+        Family::Qwen35 => "<|im_end|>\n",
+        Family::Gemma4 => "<turn|>\n",
+        Family::Muse => "<|eot|>",
+    }
+}
+
+/// Where a chat too long for the context may start instead of at its first message:
+/// each a user's message, the first one with `step` bytes of messages before it, then
+/// with twice that, and so on. They depend only on the messages before them, so a chat
+/// keeps the same start (and its cache) turn after turn, until it has grown by about a
+/// step and moves on to the next.
+pub fn cut_points(messages: &[Message], step: usize) -> Vec<usize> {
+    let step = step.max(1);
+    let mut cuts = Vec::new();
+    let (mut before, mut k) = (0usize, 1usize);
+    for (i, m) in messages.iter().enumerate() {
+        if m.role == "user" && before >= k * step {
+            cuts.push(i);
+            k = before / step + 1;
+        }
+        before += m.content.len();
+    }
+    cuts
+}
+
 /// The reply's turn opened for a plain answer (for a question the server asks the model
 /// itself): `opening`, with Muse's recipient the user.
 pub fn answer_opening(family: Family) -> &'static str {
@@ -272,6 +302,59 @@ pub fn today() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn said(role: &str, bytes: usize) -> Message {
+        Message {
+            role: role.into(),
+            content: "x".repeat(bytes),
+        }
+    }
+
+    #[test]
+    fn a_long_chat_starts_at_the_same_message_as_it_grows() {
+        // 60 bytes a turn, a step of 100: a cut at the first user message with 100
+        // bytes before it, the next with 200, and so on.
+        let mut chat = Vec::new();
+        for _ in 0..6 {
+            chat.push(said("user", 20));
+            chat.push(said("assistant", 40));
+        }
+        chat.push(said("user", 20));
+        assert_eq!(cut_points(&chat, 100), [4, 8, 10]);
+        // Two turns on, the earlier ones are where they were, and there's one more.
+        for _ in 0..2 {
+            chat.push(said("assistant", 40));
+            chat.push(said("user", 20));
+        }
+        assert_eq!(cut_points(&chat, 100), [4, 8, 10, 14]);
+        // One long message passes several steps: one cut after it, not one for each.
+        let chat = [
+            said("user", 350),
+            said("assistant", 10),
+            said("user", 5),
+            said("assistant", 60),
+            said("user", 5),
+        ];
+        assert_eq!(cut_points(&chat, 100), [2, 4]);
+        assert!(cut_points(&chat[..1], 100).is_empty());
+        assert!(cut_points(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn every_history_ends_with_its_closing() {
+        for family in [Family::Llama, Family::Qwen35, Family::Gemma4, Family::Muse] {
+            let mut chat = chat();
+            chat.truncate(1);
+            let text = history(family, Some("Be brief."), "", &chat, "12 Nov 2026");
+            let end = text.len() - closing(family).len();
+            assert_eq!(&text[end..], closing(family), "{family:?}");
+            assert!(text[..end].ends_with("Hi"), "{family:?}");
+            // A longer chat starts with a shorter one: its first messages' tokens can
+            // be counted apart.
+            let longer = history(family, Some("Be brief."), "", &self::chat(), "12 Nov 2026");
+            assert!(longer.starts_with(&text), "{family:?}");
+        }
+    }
 
     fn chat() -> Vec<Message> {
         vec![
