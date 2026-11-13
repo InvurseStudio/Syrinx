@@ -61,6 +61,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--token <token>] [--with-app] [--chat-cache <folder>|off]
                     [--score-choices on|off] [--tools-shown all|scored] [--heal on|off]
                     [--changes declared|scored|offered] [--skills on|off]
+                    [--skill-shortlist on|off]
                     [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
                     [--mtp on|off]
 
@@ -112,6 +113,10 @@ struct Options {
     /// Skills picked by scoring and written in as a `use_skill` call (`--skills on`, the
     /// default), or none (`off`).
     skills: bool,
+    /// With more than two skills, one question about them all first and only the two
+    /// likeliest asked about one by one (`--skill-shortlist on`, the default); `off` asks
+    /// about every skill, as before 2026-11-12. Measured then (PLAN.md).
+    skill_shortlist: bool,
     /// A draft model to guess tokens with (`--draft`), and how many a round.
     draft: Option<String>,
     draft_tokens: usize,
@@ -154,6 +159,7 @@ fn main() -> ExitCode {
     let mut heal = true;
     let mut changes = Changes::Declared;
     let mut use_skills = true;
+    let mut skill_shortlist = true;
     let mut draft = None;
     let mut draft_tokens = draft::DEFAULT_GUESSES;
     let mut lookup = draft::DEFAULT_LOOKUP;
@@ -207,6 +213,10 @@ fn main() -> ExitCode {
             }
             "--skills" if matches!(value.map(String::as_str), Some("on" | "off")) => {
                 use_skills = value.unwrap() == "on";
+                i += 1;
+            }
+            "--skill-shortlist" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                skill_shortlist = value.unwrap() == "on";
                 i += 1;
             }
             "--score-choices" if matches!(value.map(String::as_str), Some("on" | "off")) => {
@@ -269,6 +279,7 @@ fn main() -> ExitCode {
         scored_groups,
         changes,
         skills: use_skills,
+        skill_shortlist,
         draft,
         draft_tokens,
         lookup,
@@ -967,7 +978,7 @@ const MTP_GUESSES: usize = 3;
 
 /// The most picker sessions kept: the change question, the skill questions and the group
 /// question each start their own way.
-const PICKERS: usize = 3;
+const PICKERS: usize = 4;
 /// The most tokens a picker session reads at once. Its questions are a few hundred tokens,
 /// mostly shared with the last one, and a session's buffers grow with its batch: at 1,024
 /// Qwen 3.5 9B's are 0.4 GB a session, and three pickers on top of the chat's left an 8 GB
@@ -2477,6 +2488,9 @@ fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
 /// for requests that fit no skill (`skills::CONTROLS`, scored once per skill while this
 /// model runs). A model whose yes means nothing (Qwen 3.5 0.8B said yes to nearly every skill
 /// for every request) so picks none, as before skills, instead of a wrong one.
+/// How many skills are asked about one by one, after the shortlist question.
+const SKILLS_ASKED: usize = 2;
+
 fn pick_skill(
     model: &Model,
     kept: &mut Kept,
@@ -2492,8 +2506,46 @@ fn pick_skill(
     if let Some(skill) = skills::named(request, &skills) {
         return Ok(Some(skill.clone()));
     }
+    // With more than a couple of skills, one question about them all first: only the
+    // likeliest are then asked about one by one, so a turn's cost doesn't grow with the
+    // skills. A skill is still taken only on its own question's yes, as before.
+    // (A list too long for a picker's session is left out, and every skill asked about.)
+    let mut shortlist_ids = None;
+    if options().skill_shortlist && skills.len() > SKILLS_ASKED {
+        let question = Message {
+            role: "user".into(),
+            content: skills::shortlist_question(&skills, request),
+        };
+        let text = chat::history(family, None, "", &[question], &chat::today())
+            + chat::answer_opening(family);
+        let ids = tokenizer.encode(&text, false, true);
+        shortlist_ids = Some(ids);
+    }
+    let asked: Vec<usize> = if let Some(ids) = shortlist_ids.filter(|ids| ids.len() <= 1000) {
+        let logits = model.ask(kept, &ids)?;
+        let mut ranked: Vec<(f32, usize)> = (0..skills.len().min(skills::SHORTLISTED))
+            .map(|i| {
+                let letter = format!(" {}", skills::shortlist_letter(i));
+                let id = tokenizer.encode(&letter, false, false)[0];
+                (logits[id as usize], i)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if debug_calls() {
+            let names: Vec<&str> = ranked
+                .iter()
+                .take(SKILLS_ASKED)
+                .map(|&(_, i)| skills[i].name.as_str())
+                .collect();
+            eprintln!("[calls] skills shortlisted: {}", names.join(", "));
+        }
+        ranked.iter().take(SKILLS_ASKED).map(|&(_, i)| i).collect()
+    } else {
+        (0..skills.len()).collect()
+    };
     let mut best: Option<(f64, usize)> = None;
-    for (i, skill) in skills.iter().enumerate() {
+    for i in asked {
+        let skill = &skills[i];
         let question = skills::fit_question(skill, request);
         let share = yes_share(model, kept, tokenizer, family, &question, "Fits:")?;
         let mut control: f64 = 0.0;
