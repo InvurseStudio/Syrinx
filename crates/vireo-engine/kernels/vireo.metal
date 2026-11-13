@@ -2389,6 +2389,144 @@ template [[host_name("attention_flash2_512")]] kernel void attention_flash2<512,
 
 // ---- Element-wise steps --------------------------------------------------------------
 
+// ---- A mixture of experts (Gemma 4 26B-A4B) ------------------------------------------
+//
+// Each token goes through the `used` experts its router scores highest. A slot is one
+// token's turn with one expert (slot = token × used + k), and `idx[slot]` is the expert:
+// the experts' matrices lie one after another in `w`, `rows` rows each.
+
+// The `used` highest of a token's `experts` scores (the lowest index on a tie), and each
+// one's share: a softmax over those scores, times the expert's own scale. One threadgroup
+// a token.
+kernel void moe_pick(ARGS, KP) {
+    device const float* scores = ARG_PTR(const float, 0);
+    device const float* scale = ARG_PTR(const float, 1);
+    device int* idx = ARG_PTR(int, 2);
+    device float* share = ARG_PTR(float, 3);
+    const int experts = ARG_INT(4), used = ARG_INT(5);
+    if (tid != 0) return;
+    device const float* s = scores + (ulong)gid.x * experts;
+    device int* ix = idx + (ulong)gid.x * used;
+    device float* sh = share + (ulong)gid.x * used;
+    for (int k = 0; k < used; k++) {
+        int best = -1;
+        float value = 0.0f;
+        for (int e = 0; e < experts; e++) {
+            bool taken = false;
+            for (int j = 0; j < k; j++) taken = taken || ix[j] == e;
+            if (!taken && (best < 0 || s[e] > value)) {
+                best = e;
+                value = s[e];
+            }
+        }
+        ix[k] = best;
+        sh[k] = value;
+    }
+    const float top = sh[0];
+    float total = 0.0f;
+    for (int k = 0; k < used; k++) {
+        sh[k] = exp(sh[k] - top);
+        total += sh[k];
+    }
+    for (int k = 0; k < used; k++) sh[k] = sh[k] / total * scale[ix[k]];
+}
+
+// y = W_e x for a slot's expert e, a threadgroup row (gid.y) a slot: the matrix-vector
+// kernels above, with the matrix found through `idx`. `x` is the token's (`x_per_slot`
+// 0) or the slot's own (1), `x_stride` numbers apart; `y` is the slot's, `y_stride` apart.
+#define MOE_ARGS(ROW_BYTES)                                                             \
+    const int rows = ARG_INT(3), cols = ARG_INT(4);                                     \
+    device const int* idx = ARG_PTR(const int, 5);                                      \
+    const int used = ARG_INT(6), x_stride = ARG_INT(7), x_per_slot = ARG_INT(8);        \
+    const int y_stride = ARG_INT(9);                                                    \
+    const int slot = gid.y;                                                             \
+    const ulong row_bytes = (ROW_BYTES);                                                \
+    device const u8* w = ARG_PTR(const u8, 0) + (ulong)idx[slot] * (ulong)rows * row_bytes; \
+    device const float* x = ARG_PTR(const float, 1) + (ulong)(x_per_slot ? slot : slot / used) * x_stride; \
+    device float* y = ARG_PTR(float, 2) + (ulong)slot * y_stride;
+
+kernel void moe_matvec_q8_0(ARGS, KP) {
+    MOE_ARGS((ulong)(ARG_INT(4) / 32) * 34)
+    MATVEC_ROWS
+    const int blocks = cols / 32;
+    const int sub = lane >> 3, j = (lane & 7) * 4;
+    for (int b = sub; b < blocks; b += 4) {
+        const float4 xv = f4(x + b * 32 + j);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * 34;
+            const u32 q = u32_at2(block + 2 + j);
+            const float dot = small_int((q & 0xFF) ^ 0x80, 128.0f) * xv.x +
+                              small_int(((q >> 8) & 0xFF) ^ 0x80, 128.0f) * xv.y +
+                              small_int(((q >> 16) & 0xFF) ^ 0x80, 128.0f) * xv.z +
+                              small_int((q >> 24) ^ 0x80, 128.0f) * xv.w;
+            sum[r] += half_at(block) * dot;
+        }
+    }
+    MATVEC_STORE
+}
+
+kernel void moe_matvec_q6_k(ARGS, KP) {
+    MOE_ARGS((ulong)(ARG_INT(4) / 256) * Q6K_BYTES)
+    MATVEC_ROWS
+    const int blocks = cols / 256;
+    const int sub = lane >> 4, hf = (lane & 15) >> 3, l = (lane & 7) * 4;
+    for (int b = sub; b < blocks; b += 2) {
+        device const float* xb = x + b * 256 + hf * 128 + l;
+        float4 xv[4];
+        for (int k = 0; k < 4; k++) xv[k] = f4(xb + k * 32);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
+            const float d = half_at(block + 208);
+            const u32 ql0 = u32_at4(block + hf * 64 + l), ql1 = u32_at4(block + hf * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + hf * 32 + l);
+            device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + l / 16);
+            float bsum = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const u32 low = ((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4);
+                const float q0 = small_int((low & 0xF) | (((qh >> (2 * k)) & 3) << 4), 32.0f);
+                const float q1 = small_int(((low >> 8) & 0xF) | (((qh >> (8 + 2 * k)) & 3) << 4), 32.0f);
+                const float q2 = small_int(((low >> 16) & 0xF) | (((qh >> (16 + 2 * k)) & 3) << 4), 32.0f);
+                const float q3 = small_int(((low >> 24) & 0xF) | (((qh >> (24 + 2 * k)) & 3) << 4), 32.0f);
+                bsum += (float)sc[2 * k] * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
+            }
+            sum[r] += d * bsum;
+        }
+    }
+    MATVEC_STORE
+}
+
+// A slot's 2 × width numbers are its expert's gate rows' products, then its up rows':
+// the first half becomes GELU(gate) × up, the expert's activation.
+kernel void moe_geglu(ARGS, KP) {
+    device float* y = ARG_PTR(float, 0);
+    const int width = ARG_INT(1), total = ARG_INT(2);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= total) return;
+    device float* slot = y + (ulong)(i / width) * (2 * width);
+    const int j = i % width;
+    const float x = slot[j];
+    slot[j] = 0.5f * x * (1.0f + tanh(0.7978846f * x * (1.0f + 0.044715f * x * x))) * slot[width + j];
+}
+
+// out[token] = Σ over the token's slots of share × the slot's `n` numbers.
+kernel void moe_sum(ARGS, KP) {
+    device float* out = ARG_PTR(float, 0);
+    device const float* parts = ARG_PTR(const float, 1);
+    device const float* share = ARG_PTR(const float, 2);
+    const int used = ARG_INT(3), n = ARG_INT(4), total = ARG_INT(5);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= total) return;
+    const int token = i / n, j = i % n;
+    float sum = 0.0f;
+    for (int k = 0; k < used; k++) {
+        const ulong slot = (ulong)token * used + k;
+        sum += share[slot] * parts[slot * n + j];
+    }
+    out[i] = sum;
+}
+
 #define PER_NUMBER const int i = gid.x * tpg.x + tid;
 
 kernel void swiglu(ARGS, KP) {

@@ -9,7 +9,9 @@ use super::gpu::{
     GpuMatrix, Input, LogitsBuffer, Positions, gpu_error, load_state, q8_room, record, row,
     save_state,
 };
-use super::{DEFAULT_BATCH, Error, Logits, Precision, Result, SavedState, matrix, vector};
+use super::{
+    DEFAULT_BATCH, Error, Logits, Precision, Result, SavedState, matrices, matrix, vector,
+};
 use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{Buffer, CuDevicePtr, Gpu, Graph, Q8, QkvPrep};
@@ -33,6 +35,38 @@ struct Layer {
     output_scale: f32,
     /// Muse Glimmer: the gate on each head's output, sigmoid(attn_gate h).
     attn_gate: Option<GpuMatrix>,
+    /// The layer's experts (a mixture-of-experts model; the Mac only so far).
+    experts: Option<ExpertLayer>,
+}
+
+/// A layer's experts and their router (`gemma4.rs` has the arithmetic).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct ExpertLayer {
+    router: GpuMatrix,
+    /// The file's `ffn_gate_inp.scale` over sqrt(dim): the router's input is the layer's,
+    /// RMS-normed, times this.
+    router_weight: Buffer,
+    /// Every expert's gate and up rows (2 × width an expert), and every expert's down rows.
+    gate_up: GpuMatrix,
+    down: GpuMatrix,
+    scale: Buffer,
+    pre_norm: Buffer,
+    dense_post_norm: Buffer,
+    post_norm: Buffer,
+}
+
+/// A session's room for a batch's experts.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct ExpertBuffers {
+    /// A token's score for each expert, then its chosen experts and their shares.
+    scores: Buffer,
+    idx: Buffer,
+    share: Buffer,
+    /// A slot's gate and up products (its activation, after), and its down product.
+    gate_up: Buffer,
+    out: Buffer,
+    /// A token's experts' outputs added up.
+    sum: Buffer,
 }
 
 /// The per-layer inputs (E2B, E4B): their embedding, projection and the projection's norm.
@@ -92,6 +126,8 @@ pub struct Gemma4CudaSession {
     gate: Buffer,
     up: Buffer,
     small: Buffer,
+    /// Room for a batch's experts (a mixture-of-experts model).
+    experts: Option<ExpertBuffers>,
     logits_gpu: LogitsBuffer,
     logits: Vec<f32>,
     /// The batch's activations in 8 bits, unless the model is exact.
@@ -201,9 +237,11 @@ impl<'a> Gemma4Cuda<'a> {
                 "Muse Glimmer on CUDA (its attention gate's kernel is Metal's only so far)".into(),
             ));
         }
-        if c.experts.is_some() {
+        if c.experts.is_some() && !cfg!(target_os = "macos") {
             return Err(Error::Unsupported(
-                "Gemma 4's mixture-of-experts models (26B-A4B) on the GPU".into(),
+                "Gemma 4's mixture-of-experts models (26B-A4B) on CUDA (the experts' kernels \
+                 are Metal's only so far)"
+                    .into(),
             ));
         }
         let (dim, pl) = (c.dim, c.per_layer_dim);
@@ -251,6 +289,36 @@ impl<'a> Gemma4Cuda<'a> {
                     None
                 },
                 output_scale: vector(file, &name("layer_output_scale"), 1).map_or(1.0, |v| v[0]),
+                experts: match c.experts {
+                    Some(x) => {
+                        let root = (dim as f32).sqrt();
+                        let gate_up = matrices(file, &name("ffn_gate_up_exps"), dim, 2 * x.width, x.count)?;
+                        let down = matrices(file, &name("ffn_down_exps"), x.width, dim, x.count)?;
+                        #[cfg(target_os = "macos")]
+                        for m in [&gate_up, &down] {
+                            if !Gpu::supports_experts(m.kind) {
+                                return Err(Error::Unsupported(format!(
+                                    "experts stored as {:?} on the GPU (Q6_K and Q8_0 are)",
+                                    m.kind
+                                )));
+                            }
+                        }
+                        Some(ExpertLayer {
+                            router: upload(matrix(file, &name("ffn_gate_inp"), dim, x.count)?)?,
+                            router_weight: up(vector(file, &format!("blk.{i}.ffn_gate_inp.scale"), dim)?
+                                .iter()
+                                .map(|s| s / root)
+                                .collect())?,
+                            gate_up: upload(gate_up)?,
+                            down: upload(down)?,
+                            scale: up(vector(file, &format!("blk.{i}.ffn_down_exps.scale"), x.count)?)?,
+                            pre_norm: up(vector(file, &name("pre_ffw_norm_2"), dim)?)?,
+                            dense_post_norm: up(vector(file, &name("post_ffw_norm_1"), dim)?)?,
+                            post_norm: up(vector(file, &name("post_ffw_norm_2"), dim)?)?,
+                        })
+                    }
+                    None => None,
+                },
                 attn_gate: if c.muse {
                     Some(upload(matrix(
                         file,
@@ -406,6 +474,17 @@ impl<'a> Gemma4Cuda<'a> {
             gate: f32s(batch * widest_ffn)?,
             up: f32s(batch * widest_ffn)?,
             small: f32s(batch * c.per_layer_dim)?,
+            experts: match c.experts {
+                Some(x) => Some(ExpertBuffers {
+                    scores: f32s(batch * x.count)?,
+                    idx: f32s(batch * x.used)?,
+                    share: f32s(batch * x.used)?,
+                    gate_up: f32s(batch * x.used * 2 * x.width)?,
+                    out: f32s(batch * x.used * c.dim)?,
+                    sum: f32s(batch * c.dim)?,
+                }),
+                None => None,
+            },
             logits_gpu: LogitsBuffer::new(&self.gpu, c.vocab)?,
             logits: vec![0.0; c.vocab],
             q8: q8_room(
@@ -613,6 +692,76 @@ impl<'a> Gemma4Cuda<'a> {
                 &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
                 s.projected.ptr(),
             )?;
+            // A mixture of experts: the dense network's output, normed, plus the experts'.
+            #[cfg(target_os = "macos")]
+            if let (Some(m), Some(x), Some(b)) = (&layer.experts, c.experts, &s.experts) {
+                let slots = t * x.used;
+                // The router scores every expert from the layer's input; the highest share
+                // the token.
+                g.rms_norm_rows(s.x.ptr(), m.router_weight.ptr(), s.h.ptr(), t, dim, eps)
+                    .map_err(e)?;
+                m.router
+                    .mul(&Input::new(g, s.h.ptr(), t, None), b.scores.ptr())?;
+                g.moe_pick(
+                    b.scores.ptr(),
+                    m.scale.ptr(),
+                    b.idx.ptr(),
+                    b.share.ptr(),
+                    x.count,
+                    x.used,
+                    t,
+                )
+                .map_err(e)?;
+                // Each chosen expert: its gate and up rows on the layer's input (normed its
+                // own way), the activation, then its down rows.
+                g.rms_norm_rows(s.x.ptr(), m.pre_norm.ptr(), s.h.ptr(), t, dim, eps)
+                    .map_err(e)?;
+                g.moe_matvec(
+                    m.gate_up.kind,
+                    m.gate_up.data.ptr(),
+                    s.h.ptr(),
+                    b.gate_up.ptr(),
+                    2 * x.width,
+                    dim,
+                    b.idx.ptr(),
+                    x.used,
+                    dim,
+                    false,
+                    2 * x.width,
+                    slots,
+                )
+                .map_err(e)?;
+                g.moe_geglu(b.gate_up.ptr(), x.width, slots).map_err(e)?;
+                g.moe_matvec(
+                    m.down.kind,
+                    m.down.data.ptr(),
+                    b.gate_up.ptr(),
+                    b.out.ptr(),
+                    dim,
+                    x.width,
+                    b.idx.ptr(),
+                    x.used,
+                    2 * x.width,
+                    true,
+                    dim,
+                    slots,
+                )
+                .map_err(e)?;
+                g.moe_sum(b.sum.ptr(), b.out.ptr(), b.share.ptr(), x.used, dim, t)
+                    .map_err(e)?;
+                g.rms_norm_rows(b.sum.ptr(), m.post_norm.ptr(), b.sum.ptr(), t, dim, eps)
+                    .map_err(e)?;
+                g.rms_norm_rows(
+                    s.projected.ptr(),
+                    m.dense_post_norm.ptr(),
+                    s.projected.ptr(),
+                    t,
+                    dim,
+                    eps,
+                )
+                .map_err(e)?;
+                g.add(s.projected.ptr(), b.sum.ptr(), t * dim).map_err(e)?;
+            }
             let next = match self.layers.get(l + 1) {
                 Some(next) => &next.attn_norm,
                 None => &self.output_norm,
