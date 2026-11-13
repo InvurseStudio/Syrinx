@@ -584,6 +584,16 @@ const SERVER_FILE_TOOLS: [&str; 7] = [
     "git_diff",
 ];
 
+/// The changes `files.rs` makes itself on the Mac, where the app runs no tools (on Windows
+/// the app makes them, with its undo journal).
+const SERVER_CHANGE_TOOLS: [&str; 5] = [
+    "write_file",
+    "rename_file",
+    "move_file",
+    "delete_file",
+    "write_spreadsheet",
+];
+
 /// Every tool's name, offered or not.
 pub fn all_names() -> Vec<&'static str> {
     catalog().iter().map(|t| t.name).collect()
@@ -598,14 +608,24 @@ pub fn offered(client_tools: &[String], files_here: bool) -> Vec<Tool> {
         .into_iter()
         .filter_map(|mut t| {
             if t.runs == Runs::App && !client_tools.iter().any(|c| c == t.name) {
-                if !files_here || t.asks.is_some() || !SERVER_FILE_TOOLS.contains(&t.name) {
+                let here = SERVER_FILE_TOOLS.contains(&t.name)
+                    || (cfg!(target_os = "macos") && SERVER_CHANGE_TOOLS.contains(&t.name));
+                if !files_here || !here {
                     return None;
                 }
                 t.runs = Runs::Server;
+                if t.name == "delete_file" {
+                    t.description = "Delete a file on this Mac (it goes to the Trash). Asks the user for approval.";
+                }
             }
             Some(t)
         })
         .collect()
+}
+
+/// Whether a change the server would make itself could be made now (`Files::check`).
+pub fn check_here(call: &Call, files: Option<&Files>) -> Result<(), String> {
+    files.map_or(Ok(()), |f| f.check(call))
 }
 
 /// The capability list `/api/capabilities` answers with (the app's Settings count them).
@@ -2148,28 +2168,37 @@ mod tests {
         assert_eq!(runs(&app, "read_file"), Some(Runs::App));
         assert_eq!(runs(&app, "list_directory"), None);
         // With access and no client tools (the Mac app), the server runs what files.rs
-        // has: not the changes, nor the app's document and project tools.
+        // has: on the Mac the four changes too, but not the app's document and project
+        // tools.
         let here = offered(&[], true);
+        let mut expected = vec![
+            "read_file",
+            "list_directory",
+            "search_files",
+            "file_exists",
+            "git_status",
+            "git_diff",
+            "get_current_datetime",
+            "calculate",
+            "read_spreadsheet",
+        ];
+        if cfg!(target_os = "macos") {
+            expected.extend(["write_spreadsheet", "write_file", "rename_file", "move_file"]);
+        }
+        expected.extend(["remember", "forget"]);
+        if cfg!(target_os = "macos") {
+            expected.push("delete_file");
+        }
+        assert_eq!(here.iter().map(|t| t.name).collect::<Vec<_>>(), expected);
+        assert!(here.iter().all(|t| t.runs == Runs::Server));
         assert_eq!(
-            here.iter().map(|t| t.name).collect::<Vec<_>>(),
-            [
-                "read_file",
-                "list_directory",
-                "search_files",
-                "file_exists",
-                "git_status",
-                "git_diff",
-                "get_current_datetime",
-                "calculate",
-                "read_spreadsheet",
-                "remember",
-                "forget"
-            ]
+            here.iter().any(|t| t.changes_files()),
+            cfg!(target_os = "macos")
         );
-        assert!(
-            here.iter()
-                .all(|t| t.runs == Runs::Server && !t.changes_files())
-        );
+        if cfg!(target_os = "macos") {
+            let delete = here.iter().find(|t| t.name == "delete_file").unwrap();
+            assert!(delete.description.contains("Trash"));
+        }
         // An app that runs a change tool is still asked to, with access or without.
         let both = offered(&["write_file".into()], true);
         assert_eq!(runs(&both, "write_file"), Some(Runs::App));

@@ -1667,10 +1667,16 @@ fn engine(
     let mut store = chat_cache.map(|dir| {
         let key = store::model_key(std::path::Path::new(path), mode);
         let dir = dir.unwrap_or_else(|| store::default_dir(&key));
-        let s = store::Store::open(dir, store::DISK_BUDGET);
-        if !s.entries().is_empty() {
-            eprintln!("{} saved chats.", s.entries().len());
-        }
+        let full_chat = kept
+            .as_ref()
+            .map_or(0, |k| model.cache_bytes_per_position(&k.session) * context);
+        let budget = store::budget_for(full_chat as u64);
+        let s = store::Store::open(dir, budget);
+        eprintln!(
+            "{} saved chats; they may take up to {:.0} GB on disk.",
+            s.entries().len(),
+            budget as f64 / (1u64 << 30) as f64
+        );
         s
     });
     let mut seed = random_u64();
@@ -2877,7 +2883,13 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
                 return Some(format!("Error: {why}"));
             }
         }
-        match approve(call, ask, job) {
+        // The same check for a change the server makes itself.
+        if tool.runs == tools::Runs::Server
+            && let Err(why) = tools::check_here(call, job.files.as_ref())
+        {
+            return Some(format!("Error: {why}"));
+        }
+        match approve(call, ask, tool.runs == tools::Runs::Server, job) {
             Some(Ok(())) => {}
             Some(Err(why)) => return Some(format!("Error: {why}")),
             None => return None,
@@ -2931,7 +2943,12 @@ fn ask_app(tool: &str, args_json: &str, job: &Job) -> Option<Result<String, Stri
 /// Asks the user to approve a change (`confirm_required`, as the Mac's server sends it)
 /// and waits for the answer at `/api/agent/confirm`, unless they always allow this kind.
 /// `Err` says, for the model, why it won't happen; `None` if the reply was stopped.
-fn approve(call: &tools::Call, ask: tools::Ask, job: &Job) -> Option<Result<(), String>> {
+fn approve(
+    call: &tools::Call,
+    ask: tools::Ask,
+    here: bool,
+    job: &Job,
+) -> Option<Result<(), String>> {
     if ask.rememberable && job.approvals.always.lock().unwrap().contains(&call.tool) {
         eprintln!("Approved without asking (always allowed): {}", call.tool);
         return Some(Ok(()));
@@ -2940,6 +2957,12 @@ fn approve(call: &tools::Call, ask: tools::Ask, job: &Job) -> Option<Result<(), 
     let (tx, rx) = channel();
     job.approvals.waiting.lock().unwrap().insert(id.clone(), tx);
     let preview = tools::approval_preview(call, |p| on_this_pc(p).exists());
+    // A file the server deletes itself goes to this Mac's Trash, not an app's Recycle Bin.
+    let preview = if here && cfg!(target_os = "macos") {
+        preview.replace("to the Recycle Bin", "to the Trash")
+    } else {
+        preview
+    };
     let remember = if ask.rememberable {
         format!(",\"rememberLabel\":{}", json::string(&ask.remember_label()))
     } else {
