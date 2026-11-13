@@ -1741,8 +1741,11 @@ struct Prompt {
 
 /// A chat too long for the context starts a third of the context further on each time
 /// (`chat::cut_points`, in bytes: about this many a token), so it reads everything again
-/// once in that many tokens, not at every turn.
+/// once in that many tokens, not at every turn. A quarter at a time was tried on a
+/// 64-turn chat (Gemma 4 31B, `evals/long-run`): 25 s more reading, and the same early
+/// notes forgotten.
 const CUT_BYTES_PER_TOKEN: usize = 4;
+const CUT_STEP: usize = 3;
 
 /// The share of the context (one part in this many) left free for the request and a
 /// skill's instructions when a long chat's start is chosen from its history alone.
@@ -1889,7 +1892,7 @@ fn reply(
     // ones told at the end of the request.
     let facts = memory::all();
     let opening = tokenizer.encode(chat::opening(family), false, true);
-    let cuts = chat::cut_points(&job.messages, context / 3 * CUT_BYTES_PER_TOKEN);
+    let cuts = chat::cut_points(&job.messages, context / CUT_STEP * CUT_BYTES_PER_TOKEN);
     let debug_prompt = std::env::var_os("VIREO_DEBUG_PROMPT").is_some();
     let system_turn = |tools: &[tools::Tool], known: usize| -> (Option<String>, String) {
         // With tools, the system prompt opens with what they're for.
