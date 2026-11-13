@@ -51,12 +51,21 @@ Windows but for three that tip between the two GPUs. The steps, for the next tim
 - **Tools that change files:** `write_file`, `rename_file`, `move_file`, `delete_file`.
   Each asks the user first (`confirm_required`, answered at `/api/agent/confirm`), after
   the app checks the change can be made (`check_change`). Offered only when one scored
-  question says the request asks for a change. **App-run only for now:** `files.rs` doesn't
+  question says the request asks for a change; once a chat's cache declares them they
+  stay declared in that chat (callable only when asked for), so its cache is read again
+  once, not at every such turn (2026-11-12). **App-run only for now:** `files.rs` doesn't
   make changes, so the Mac app doesn't get them yet (to-do 1).
 - **Skills:** SKILL.md files, the Mac's ten built-in ones plus the user's. A skill is
   offered when this machine has the first tool it names (`summarize-document`,
   `translate-document`, `code-review` today), picked by its slash command or by scoring,
   and written into the reply as a `use_skill` call and its result.
+- **A chat's cache kept (2026-11-12, PLAN.md Progress):** besides the change tools
+  above, a chat too long for the context starts at a fixed cut (`chat::cut_points`) and
+  reads everything again once in about a third of the context, not every turn; and a
+  fact remembered mid-chat is told at the end of the request (`memory::since`) while the
+  chat's instructions keep the facts they began with. Checked with scripted chats and
+  14 eval cases on Gemma 4 E2B and Qwen 3.5 4B on the Mac. **On Windows:** run the eval
+  (shared code). **Not measured:** the large models.
 - **Attachments:** `POST /api/upload` reads text, Markdown, PDF and Word in Rust (`attach/`).
 
 ## Eval on Windows after the merge
