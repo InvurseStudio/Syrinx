@@ -4,6 +4,7 @@
 //! `server/model_profiles.py`.
 
 use crate::sample::Settings;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
@@ -332,6 +333,26 @@ fn with_calls(family: Family, content: &str, record: &Record) -> String {
     out
 }
 
+/// Whether a Gemma 4's turn opens with the empty thought when thinking is off: set from
+/// the model's chat template when it's loaded (`follow_template`).
+static GEMMA_EMPTY_THOUGHT: AtomicBool = AtomicBool::new(true);
+
+/// Follows the loaded model's chat template on the one thing it decides here: whether a
+/// Gemma 4's turn, thinking off, opens with the empty thought. Gemma 4 31B's template
+/// writes it; E2B's and E4B's open the turn with `<|turn>model\n` alone, and with the
+/// empty thought written for them they wrote their reasoning as the reply (Windows eval,
+/// 2026-11-13: E4B 39 -> 35 of 43, twice the tokens). No template: the empty thought.
+pub fn follow_template(template: Option<&str>) {
+    GEMMA_EMPTY_THOUGHT.store(template.is_none_or(writes_empty_thought), Ordering::Relaxed);
+}
+
+/// Whether a chat template writes Gemma's empty thought (`<|channel>thought` then
+/// `<channel|>`, with the newline between as Jinja's `\n` or as itself).
+fn writes_empty_thought(template: &str) -> bool {
+    template.contains("<|channel>thought\\n<channel|>")
+        || template.contains("<|channel>thought\n<channel|>")
+}
+
 /// The prompt for `messages` (oldest first) with the turn for the model's reply opened.
 /// Special tokens are written as text, for `encode(.., parse_special: true)`.
 #[cfg(test)]
@@ -345,6 +366,11 @@ pub fn prompt(family: Family, system: Option<&str>, messages: &[Message], today:
 /// kept), so a chat's prompts can share their history and nothing after it.
 pub fn opening(family: Family, thinking: bool) -> &'static str {
     match family {
+        // Thinking off, for a Gemma whose template opens its turn with no thought
+        // (Gemma 4 E2B and E4B): the turn as the template opens it.
+        Family::Gemma4 if !thinking && !GEMMA_EMPTY_THOUGHT.load(Ordering::Relaxed) => {
+            "<|turn>model\n"
+        }
         Family::Llama => "<|start_header_id|>assistant<|end_header_id|>\n\n",
         // Thinking on: the thought is opened for the model, as the template opens it.
         Family::Qwen35 if thinking => "<|im_start|>assistant\n<think>\n",
@@ -777,6 +803,18 @@ mod tests {
         assert!(
             history(Family::Muse, None, "", chat, "x", true).contains("Reasoning strength: high.")
         );
+    }
+
+    #[test]
+    fn a_gemma_template_decides_the_empty_thought() {
+        // 31B's: the generation prompt writes the empty thought.
+        assert!(writes_empty_thought(
+            "{{- '<|turn>model\\n' -}}{%- if not enable_thinking -%}{{- '<|channel>thought\\n<channel|>' -}}"
+        ));
+        // E2B's and E4B's: the turn alone, a thought only after a tool's response.
+        assert!(!writes_empty_thought(
+            "{{- '<|turn>model\\n' -}}{%- elif ns.prev_message_type == 'tool_response' and enable_thinking -%}{{- '<|channel>thought\\n' -}}"
+        ));
     }
 
     fn read_step(at: usize, call: &str) -> Step {
