@@ -2024,3 +2024,91 @@ fn short_batch_tiles_match_the_64_token_tile() {
         }
     }
 }
+
+/// Gemma 4 26B-A4B (a mixture of experts) on the GPU against the CPU reference, in exact
+/// mode: a prompt read as one batch, then token by token, must give the CPU's
+/// probabilities, and 8-bit mode the same next token. The Mac only (the experts' kernels
+/// are Metal's); skipped without the file, which is in the Vireo app's model folder or
+/// where `VIREO_GEMMA_26B` says.
+#[test]
+#[cfg(target_os = "macos")]
+fn gemma4_26b_a4b_on_the_gpu_matches_the_cpu() {
+    use vireo_engine::models::gemma4::Gemma4;
+    let path = std::env::var_os("VIREO_GEMMA_26B").map(PathBuf::from).or_else(|| {
+        std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h).join(
+                "Library/Application Support/InvurseChat/models/unsloth/\
+                 gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf",
+            )
+        })
+    });
+    let Some(path) = path.filter(|p| p.exists()) else {
+        eprintln!("skipped: the Gemma 4 26B-A4B file isn't on this machine");
+        return;
+    };
+    let Some(gpu) = open_gpu() else { return };
+    let file = GgufFile::open(&path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&file).unwrap();
+    let ids = tokenizer.encode(
+        "The weather report for the coming week says that on Monday we should expect",
+        true,
+        true,
+    );
+
+    let reference = Gemma4::load(&file, Pool::with_all_cores()).unwrap();
+    let mut cpu_session = reference.session(32);
+    let mut expected = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        if let Some(l) = reference.forward(&mut cpu_session, id, i + 1 == ids.len()) {
+            expected = l.to_vec();
+        }
+    }
+    let next = (0..expected.len())
+        .max_by(|&a, &b| expected[a].total_cmp(&expected[b]))
+        .unwrap();
+    cpu::softmax(&mut expected);
+
+    let mut model = Gemma4Cuda::load(&file, gpu).unwrap();
+    let top = |logits: &[f32]| {
+        (0..logits.len())
+            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+            .unwrap()
+    };
+    let close = |logits: &[f32], how: &str| {
+        let mut probs = logits.to_vec();
+        cpu::softmax(&mut probs);
+        let worst = probs
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 2e-4, "{how}: a probability is {worst} from the CPU's");
+    };
+    model.set_precision(Precision::Exact);
+    // The whole prompt as one batch.
+    let mut session = model.session(32).unwrap();
+    let batch = model
+        .forward_batch(&mut session, &ids, Logits::Last)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    close(&batch, "one batch");
+    // Token by token.
+    let mut session = model.session(32).unwrap();
+    let mut single = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        if let Some(l) = model.forward(&mut session, id, i + 1 == ids.len()).unwrap() {
+            single = l.to_vec();
+        }
+    }
+    close(&single, "token by token");
+    // 8-bit activations round along the way: the same next token.
+    model.set_precision(Precision::Int8);
+    let mut session = model.session(32).unwrap();
+    let rounded = model
+        .forward_batch(&mut session, &ids, Logits::Last)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    assert_eq!(top(&rounded), next);
+}
