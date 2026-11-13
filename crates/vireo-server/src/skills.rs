@@ -294,8 +294,11 @@ pub const CONTROLS: [&str; 2] = [
 /// The question that scores whether one skill fits a request, with worked examples (of
 /// made-up skills, so none is favoured), ending where " yes" or " no" goes.
 pub fn fit_question(skill: &Skill, request: &str) -> String {
-    let request = request.trim().replace('\n', " ");
-    let request: String = request.chars().take(600).collect();
+    // The skill comes before the request. The other way round, every skill's question
+    // about a request would start the same and the request be read once, not once a
+    // skill (~0.3 s each on Gemma 4 31B); tried 2026-11-12, and Gemma 4 E4B then took a
+    // skill for a plain question about a file (`skill-none`), so it stays this way.
+    let request = crate::tools::for_scoring(request);
     format!(
         "A skill is saved instructions for one kind of task. Does each skill fit its request? It \
          fits when the request asks for the kind of task the skill describes.\n\n\
