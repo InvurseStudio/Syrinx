@@ -173,6 +173,21 @@ impl Files {
             "rename_file" => self.rename_file(&arg(call, "path")?, &arg(call, "new_name")?),
             "move_file" => self.move_file(&arg(call, "source")?, &arg(call, "destination")?),
             "delete_file" => self.delete_file(&arg(call, "path")?),
+            "create_docx" => self.create_docx(
+                &arg(call, "path")?,
+                &optional_arg(call, "title").unwrap_or_default(),
+                &arg(call, "content")?,
+            ),
+            "fill_docx_template" => self.fill_docx_template(
+                &arg(call, "template")?,
+                &arg(call, "path")?,
+                call.json("values").or_else(|| call.text("values")).unwrap_or(""),
+            ),
+            "create_pptx" => self.create_pptx(
+                &arg(call, "path")?,
+                &optional_arg(call, "title").unwrap_or_default(),
+                call.json("slides").or_else(|| call.text("slides")).unwrap_or(""),
+            ),
             "write_spreadsheet" => self.write_spreadsheet(
                 &arg(call, "path")?,
                 &optional_arg(call, "start_cell").unwrap_or_default(),
@@ -193,7 +208,12 @@ impl Files {
     pub fn check(&self, call: &Call) -> Result<(), String> {
         match call.tool.as_str() {
             "write_file" => self.writable(&arg(call, "path")?).map(|_| ()),
-            "write_spreadsheet" => self.workbook_target(&arg(call, "path")?).map(|_| ()),
+            "write_spreadsheet" => self.office_target(&arg(call, "path")?, ".xlsx").map(|_| ()),
+            "create_docx" => self.office_target(&arg(call, "path")?, ".docx").map(|_| ()),
+            "create_pptx" => self.office_target(&arg(call, "path")?, ".pptx").map(|_| ()),
+            "fill_docx_template" => self
+                .template_and_target(&arg(call, "template")?, &arg(call, "path")?)
+                .map(|_| ()),
             "delete_file" => self.deletable(&arg(call, "path")?).map(|_| ()),
             "rename_file" => self
                 .rename_target(&arg(call, "path")?, &arg(call, "new_name")?)
@@ -280,11 +300,11 @@ impl Files {
         Ok(())
     }
 
-    /// The workbook a path names: ".xlsx" added when it's left off.
-    fn workbook_target(&self, path: &str) -> Result<String, String> {
+    /// The Office file a path names: its extension added when it's left off.
+    fn office_target(&self, path: &str, extension: &str) -> Result<String, String> {
         let mut file = self.resolve(path.trim())?;
-        if !file.to_lowercase().ends_with(".xlsx") {
-            file.push_str(".xlsx");
+        if !file.to_lowercase().ends_with(extension) {
+            file.push_str(extension);
         }
         if is_dir(&file) {
             return Err(format!("{file} is a folder."));
@@ -292,11 +312,107 @@ impl Files {
         Ok(file)
     }
 
+    /// A template that's there, and where its filled copy goes: a file name on its own
+    /// means beside the template, and never over the template itself.
+    fn template_and_target(&self, template: &str, path: &str) -> Result<(String, String), String> {
+        let template = self.resolve(template)?;
+        if !exists(&template) || is_dir(&template) {
+            return Err(format!("File not found: {template}"));
+        }
+        let lower = template.to_lowercase();
+        if !(lower.ends_with(".docx") || lower.ends_with(".dotx")) {
+            return Err(format!(
+                "{} isn't a Word template (.docx or .dotx).",
+                file_name(&template)
+            ));
+        }
+        let target = path.trim();
+        let bare = !target.is_empty() && !target.contains(['/', '\\']) && !target.starts_with('~');
+        let file = if bare {
+            self.office_target(&join(&parent(&template), target), ".docx")?
+        } else {
+            self.office_target(target, ".docx")?
+        };
+        if file.eq_ignore_ascii_case(&template) {
+            return Err(
+                "Save the filled document under a new name, so the template stays as it is.".into(),
+            );
+        }
+        Ok((template, file))
+    }
+
+    /// A Word document from a title and Markdown (`attach::docx_write`).
+    fn create_docx(&self, path: &str, title: &str, content: &str) -> Result<String, String> {
+        let file = self.office_target(path, ".docx")?;
+        self.replace(&file, &crate::attach::docx_write::create(title, content))?;
+        Ok(format!("Word document saved: {file}"))
+    }
+
+    /// A copy of a Word template with its {{placeholders}} filled in.
+    fn fill_docx_template(&self, template: &str, path: &str, values: &str) -> Result<String, String> {
+        use crate::json::Value;
+        const SHAPE: &str = "values must name each placeholder and its text.";
+        let (template, file) = self.template_and_target(template, path)?;
+        let mut parsed = crate::json::parse(values).map_err(|_| SHAPE.to_string())?;
+        if let Value::String(inner) = &parsed {
+            parsed = crate::json::parse(inner).map_err(|_| SHAPE.to_string())?;
+        }
+        let Value::Object(map) = parsed else {
+            return Err(SHAPE.into());
+        };
+        let values: Vec<(String, String)> = map
+            .iter()
+            .map(|(k, v)| {
+                let text = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_json(),
+                };
+                (k.clone(), text)
+            })
+            .collect();
+        let data = fs::read(&template).map_err(|_| format!("Couldn't read {template}."))?;
+        let (bytes, result) = crate::attach::docx_write::fill(&data, &values)
+            .map_err(|e| format!("Couldn't fill {}: {e}", file_name(&template)))?;
+        self.replace(&file, &bytes)?;
+        let mut lines = vec![format!("Document saved successfully: {file}")];
+        if !result.filled.is_empty() {
+            lines.push(format!("Filled: {}.", result.filled.join(", ")));
+        }
+        if !result.left_empty.is_empty() {
+            let names: Vec<String> = result.left_empty.iter().map(|n| format!("{{{{{n}}}}}")).collect();
+            lines.push(format!(
+                "Left as they were, with no value given: {}.",
+                names.join(", ")
+            ));
+        }
+        if !result.not_in_template.is_empty() {
+            lines.push(format!(
+                "Not in the template, so not used: {}.",
+                result.not_in_template.join(", ")
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// A slide deck: a title slide, then a slide per entry (`attach::pptx_write`).
+    fn create_pptx(&self, path: &str, title: &str, slides: &str) -> Result<String, String> {
+        use crate::attach::pptx_write;
+        let file = self.office_target(path, ".pptx")?;
+        let slides = pptx_write::slides_from(slides)?;
+        self.replace(&file, &pptx_write::create(title, &slides))?;
+        let titles: Vec<&str> = slides.iter().map(|s| s.title.as_str()).collect();
+        Ok(format!(
+            "Slide deck saved successfully: {file}\n{} slides: the title slide, then {}.",
+            slides.len() + 1,
+            titles.join(", ")
+        ))
+    }
+
     /// Rows of values into a workbook's first sheet, from a cell or after its last row;
     /// the workbook is made when there's none (`attach::xlsx_write`).
     fn write_spreadsheet(&self, path: &str, start: &str, rows: &str) -> Result<String, String> {
         use crate::attach::xlsx_write;
-        let file = self.workbook_target(path)?;
+        let file = self.office_target(path, ".xlsx")?;
         let start = xlsx_write::Start::parse(start)?;
         let rows = xlsx_write::rows_from(rows)?;
         let existing = if exists(&file) {
@@ -1276,6 +1392,37 @@ mod tests {
         let read = run(&t, "read_spreadsheet", &[("path", "Documents/register.xlsx")]);
         assert!(read.ends_with("1 | Invoice | CAD\n2 | NP-1 | 120.5\n3 | NP-2 | 80"), "{read}");
         assert!(exists(&format!("{home}/.test-trash/register.xlsx")));
+        // Word and PowerPoint: made, and a template filled beside itself.
+        let doc = run(&t, "create_docx", &[("path", "Documents/memo"), ("title", "Memo"), ("content", "To: {{name}}\n\n- one")]);
+        assert_eq!(doc, format!("Word document saved: {home}/Documents/memo.docx"));
+        assert!(run(&t, "read_file", &[("path", "Documents/memo.docx")]).contains("To: {{name}}"));
+        let filled = run(
+            &t,
+            "fill_docx_template",
+            &[("template", "Documents/memo.docx"), ("path", "memo-ada.docx"), ("values", r#"{"Name": "Ada", "extra": 1}"#)],
+        );
+        assert_eq!(
+            filled,
+            format!("Document saved successfully: {home}/Documents/memo-ada.docx\nFilled: name.\nNot in the template, so not used: extra.")
+        );
+        assert!(run(&t, "read_file", &[("path", "Documents/memo-ada.docx")]).contains("To: Ada"));
+        assert_eq!(
+            failure(&t, "fill_docx_template", &[("template", "Documents/memo.docx"), ("path", "memo.docx"), ("values", "{}")]),
+            "Save the filled document under a new name, so the template stays as it is."
+        );
+        assert_eq!(
+            failure(&t, "fill_docx_template", &[("template", "Documents/none.docx"), ("path", "x.docx"), ("values", "{}")]),
+            format!("File not found: {home}/Documents/none.docx")
+        );
+        let deck = run(
+            &t,
+            "create_pptx",
+            &[("path", "Documents/deck.pptx"), ("title", "Forum"), ("slides", r#"[{"title":"Goals","bullets":["One"]},{"title":"Ask"}]"#)],
+        );
+        assert_eq!(
+            deck,
+            format!("Slide deck saved successfully: {home}/Documents/deck.pptx\n3 slides: the title slide, then Goals, Ask.")
+        );
         // Outside what the chat may reach, nothing is changed.
         let chosen = tools(&h, Access::Folders(vec![format!("{home}/Documents/New")]));
         assert!(failure(&chosen, "write_file", &[("path", "Documents/Invoices/x.txt"), ("content", "x")]).contains("outside the folders"));
