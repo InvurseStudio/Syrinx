@@ -310,10 +310,8 @@ pub fn all() -> Vec<Case> {
                         .any(|c| c.tool == "read_file" && c.points_at("path", "project.txt")),
                     "didn't read project.txt",
                 )?;
-                need(
-                    !r.called("get_current_datetime").is_empty(),
-                    "didn't check today's date",
-                )?;
+                // Today's date is in the request now ("(Today is ...)"), so checking it
+                // with the tool is no longer needed.
                 need(
                     r.says(&["passed", "past", "yes", "overdue", "already"]),
                     "didn't say it has passed",

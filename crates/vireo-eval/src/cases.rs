@@ -137,6 +137,17 @@ const WEEKDAYS: [&str; 7] = [
     "Sunday",
 ];
 
+/// Today's weekday as this machine's clock has it in UTC, with the day either side, since
+/// the server says the local date and a time zone can be a day off UTC.
+fn around_today() -> Vec<&'static str> {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400);
+    // 1 January 1970 was a Thursday (WEEKDAYS[3]).
+    let today = (days + 3) % 7;
+    [6, 0, 1].iter().map(|o| WEEKDAYS[((today + o) % 7) as usize]).collect()
+}
+
 /// Every case: the easy ones, the harder ones (`hard_cases.rs`), then the ones that
 /// change files (`change_cases.rs`).
 pub fn all() -> Vec<Case> {
@@ -163,16 +174,22 @@ fn easy() -> Vec<Case> {
             skills: false,
             more: false,
             pc: Pc::default(),
+            // The request ends with "(Today is ...)" (since 2026-11-13), so the model may
+            // answer from it or check with the tool; either way the weekday must be right.
             check: |r| {
-                need(!r.called("get_current_datetime").is_empty(), "didn't check the date")?;
                 r.only(&["get_current_datetime"])?;
-                let today = r
+                let from_tool = r
                     .results
                     .iter()
                     .flat_map(|res| WEEKDAYS.iter().filter(move |d| res.contains(*d)))
-                    .next()
-                    .ok_or("the date tool gave no weekday")?;
-                need(r.says(&[today]), &format!("didn't say {today}"))
+                    .next();
+                match from_tool {
+                    Some(today) => need(r.says(&[today]), &format!("didn't say {today}")),
+                    None => need(
+                        r.says(&around_today()),
+                        "didn't say today's weekday",
+                    ),
+                }
             },
         },
         Case {
