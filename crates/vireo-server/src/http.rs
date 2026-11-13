@@ -11,6 +11,8 @@ pub struct Request {
     pub query: String,
     pub bearer: Option<String>,
     pub content_type: Option<String>,
+    /// Who's asking, as the client says (`stats::Source` tells the app from a script).
+    pub user_agent: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -49,6 +51,7 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, Refusal> {
     let mut chunked = false;
     let mut bearer = None;
     let mut content_type = None;
+    let mut user_agent = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).map_err(bad)? == 0 {
@@ -71,6 +74,8 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, Refusal> {
             bearer = value.strip_prefix("Bearer ").map(|t| t.trim().to_string());
         } else if name.eq_ignore_ascii_case("content-type") {
             content_type = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("user-agent") {
+            user_agent = Some(value.to_string());
         }
     }
     let body = if chunked {
@@ -89,6 +94,7 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, Refusal> {
         query,
         bearer,
         content_type,
+        user_agent,
         body,
     })
 }
