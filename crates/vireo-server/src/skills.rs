@@ -293,28 +293,37 @@ pub const CONTROLS: [&str; 2] = [
 
 /// The question that scores whether one skill fits a request, with worked examples (of
 /// made-up skills, so none is favoured), ending where " yes" or " no" goes.
-/// How many skills one shortlist question can hold: a letter each, after A for none.
+/// How many skills one shortlist question can hold (it has to fit a picker's session).
 pub const SHORTLISTED: usize = 25;
 /// The most of a skill's description its line in the shortlist question holds, in
-/// characters: the question has to fit a picker's session.
+/// characters.
 const SHORTLIST_DESCRIPTION: usize = 200;
 
+/// What the model's answer to the shortlist question starts with, written for it: the
+/// skill's name is scored as what comes next.
+pub const SHORTLIST_LEAD: &str = "Skill:";
+
 /// One question about every skill at once, to find the few worth asking about one by one
-/// (`fit_question`): the skills listed a letter each, then the request. The list comes
-/// first, so it's read once and kept, and each request after it costs one short read
-/// however many skills there are; a yes-or-no question a skill cost a read each (0.3 s a
-/// skill on Gemma 4 31B, every turn). The answer's letters are scored, not written.
+/// (`fit_question`): the skills listed by name, then the request. The list comes first,
+/// so it's read once and kept, and each request after it costs one short read however
+/// many skills there are; a yes-or-no question a skill cost a read each (0.3 s a skill on
+/// Gemma 4 31B, every turn). The answer isn't written: after `SHORTLIST_LEAD`, each
+/// skill's name is scored as the next word.
+///
+/// Names, not letters: with the skills lettered (B = ..., C = ...) the small models
+/// ranked them well enough, but Gemma 4 26B-A4B and 31B put the right skill outside the
+/// first two on two of five skill cases; by name, all three Gemma sizes tried put it first
+/// at 83-99% (2026-11-12).
 pub fn shortlist_question(skills: &[Skill], request: &str) -> String {
     let request = crate::tools::for_scoring(request);
     let mut text = String::from(
-        "A skill is saved instructions for one kind of task. Which skill fits the request? \
-         One fits when the request asks for the kind of task it describes; most requests fit \
-         none.\n\nA = none of these\n",
+        "A skill is saved instructions for one kind of task. Which of these skills fits the \
+         request? One fits when the request asks for the kind of task it describes; most \
+         requests fit none. Answer with the skill's name, or \"none\".\n\n",
     );
-    for (i, skill) in skills.iter().take(SHORTLISTED).enumerate() {
+    for skill in skills.iter().take(SHORTLISTED) {
         text.push_str(&format!(
-            "{} = {}: {}\n",
-            shortlist_letter(i),
+            "- {}: {}\n",
             skill.name,
             skill
                 .description
@@ -324,13 +333,8 @@ pub fn shortlist_question(skills: &[Skill], request: &str) -> String {
                 .collect::<String>()
         ));
     }
-    text.push_str(&format!("\nRequest: {request}\nFits:"));
+    text.push_str(&format!("\nRequest: {request}"));
     text
-}
-
-/// The letter of skill `i` in the shortlist question (B for the first).
-pub fn shortlist_letter(i: usize) -> char {
-    (b'B' + i as u8) as char
 }
 
 pub fn fit_question(skill: &Skill, request: &str) -> String {
@@ -378,7 +382,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_shortlist_question_lists_each_skill_by_letter() {
+    fn the_shortlist_question_lists_each_skill_by_name() {
         let skill = |name: &str, description: &str| Skill {
             name: name.into(),
             description: description.into(),
@@ -390,12 +394,10 @@ mod tests {
             skill("write-memo", &"long ".repeat(100)),
         ];
         let q = shortlist_question(&skills, "What's the total in budget.xlsx?");
-        assert!(q.contains("\nA = none of these\nB = analyze-data: Answer a question from a spreadsheet.\nC = write-memo: long long"));
-        assert!(q.ends_with("\n\nRequest: What's the total in budget.xlsx?\nFits:"));
-        let c_line = q.lines().find(|l| l.starts_with("C = ")).unwrap();
-        assert!(c_line.chars().count() <= 220);
-        assert_eq!(shortlist_letter(0), 'B');
-        assert_eq!(shortlist_letter(24), 'Z');
+        assert!(q.contains("\n\n- analyze-data: Answer a question from a spreadsheet.\n- write-memo: long long"));
+        assert!(q.ends_with("\n\nRequest: What's the total in budget.xlsx?"));
+        let line = q.lines().find(|l| l.starts_with("- write-memo")).unwrap();
+        assert!(line.chars().count() <= 220);
     }
 
     fn skill(name: &str, instructions: &str) -> Skill {
