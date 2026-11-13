@@ -108,6 +108,36 @@ otherwise; `DEFAULT_LOOKUP` and `LONGEST_RUN` now one value for both, the Mac's)
 `tests/check_speed.rs` (runs on both; Qwen goes back through a checkpoint). Run
 `cargo test --release` and a few eval cases there; nothing should measure differently.
 
+## After the gauntlet's first run (the Mac, 2026-11-13)
+
+Built in answer to `docs/dev/test-gauntlet/runs/Aurelia-Proto-Run-2026-11-12-Gemma4-31B-notes.md`
+(PLAN.md's Progress has the detail). **Nothing here has been run on a model**: unit tests
+only (server 103, Mac app 144). Before it's merged: the eval on the small and the large
+models, thinking off and on, and the gauntlet (`tools/aurelia_run.py`, which now plays all
+32 prompts; `--thinking off` for a like-for-like with the 12 November run).
+
+- **Thinking:** a request's `"thinking": true` (else `--thinking`, off by default, so the
+  eval and the Windows app are as they were). The Mac app sends it on unless Settings,
+  Chats says otherwise. Thoughts go to the app as `{"type":"thinking"}` events
+  (`start`, `content`, `done`), never in the reply's text.
+- **A reply's tool results, kept:** the reply ends with a `turn_record` event (a string:
+  JSON with each call as written and its result as read). An app keeps it with the reply
+  and sends it back as that message's `record`; without it a chat is as before. The
+  Windows app doesn't yet.
+- **What every prompt now says differently:** the preamble's lines on the user's rules;
+  `(Today is ...)` at the end of a request with tools; `read_file`'s and `calculate`'s
+  descriptions. The eval's cases will read these.
+- **`clientTools` from the Mac app:** `run_tasks` (it runs due tasks, so `schedule_task`
+  is offered), `chats_here` (its chats are on this machine, so the server searches them),
+  and the calendar tools it may use. An app that lists none gets none of the new tools.
+- **Tasks** are the server's (`tasks.json`; `VIREO_TASKS_FILE` for a test) and run only
+  while an app asks `GET /api/tasks/due` (the Mac app, every 10 s). A link task's link is
+  `POST /api/tasks/link/<token>`, which needs no pairing: the token is the key, and the
+  server listens on this machine only.
+- **Calendar and reminders** need the usage texts `build-test-app.sh` now writes into the
+  app's Info.plist; a build without them (`swift run`) offers no calendar tools. The first
+  real use asks for the Mac's permission. A test script's runs are dry.
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as
