@@ -37,6 +37,30 @@ const UNREAD_DOCUMENTS: [&str; 5] = ["xls", "pptx", "pages", "numbers", "key"];
 /// Excel workbooks, read by `attach::xlsx`.
 const WORKBOOKS: [&str; 2] = ["xlsx", "xlsm"];
 
+/// Where a deleted file goes, as this machine calls it.
+const TRASH: &str = if cfg!(target_os = "macos") {
+    "Trash"
+} else {
+    "Recycle Bin"
+};
+
+fn exists(path: &str) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// The checks a move makes, without moving: nothing is at the destination already (a
+/// change of capitals alone is the same item), and its folder is there.
+fn can_move_to(source: &str, destination: &str) -> Result<(), String> {
+    if !source.eq_ignore_ascii_case(destination) && exists(destination) {
+        return Err(format!("Destination already exists: {destination}"));
+    }
+    let folder = parent(destination);
+    if !is_dir(&folder) {
+        return Err(format!("Folder not found: {folder}"));
+    }
+    Ok(())
+}
+
 /// Opens the workbook at `file` (`size` bytes).
 fn workbook(file: &str, size: u64) -> Result<crate::attach::xlsx::Workbook, String> {
     let name = file_name(file);
@@ -91,6 +115,8 @@ pub struct Files {
     /// The user's folder, where relative paths start.
     home: String,
     access: Access,
+    /// Where deleted and replaced files go instead of the system's Trash (tests).
+    trash_folder: Option<String>,
 }
 
 impl Files {
@@ -102,7 +128,15 @@ impl Files {
         Files {
             home: standardized(home),
             access,
+            trash_folder: None,
         }
+    }
+
+    /// Deleted and replaced files go into `folder`, not the system's Trash.
+    #[cfg(test)]
+    pub fn with_trash(mut self, folder: &str) -> Files {
+        self.trash_folder = Some(standardized(folder));
+        self
     }
 
     /// For the user this server runs as: `HOME`, or on Windows `USERPROFILE`.
@@ -135,7 +169,185 @@ impl Files {
             ),
             "git_status" => self.git_status(&arg(call, "path")?),
             "git_diff" => self.git_diff(&arg(call, "path")?),
+            "write_file" => self.write_file(&arg(call, "path")?, &arg(call, "content")?),
+            "rename_file" => self.rename_file(&arg(call, "path")?, &arg(call, "new_name")?),
+            "move_file" => self.move_file(&arg(call, "source")?, &arg(call, "destination")?),
+            "delete_file" => self.delete_file(&arg(call, "path")?),
+            "write_spreadsheet" => self.write_spreadsheet(
+                &arg(call, "path")?,
+                &optional_arg(call, "start_cell").unwrap_or_default(),
+                call.json("rows").or_else(|| call.text("rows")).unwrap_or(""),
+            ),
             other => Err(format!("{other} can't run on this {MACHINE}.")),
+        }
+    }
+
+    // ---- Changes -------------------------------------------------------------------------
+    //
+    // As the Windows app's PcTools makes them, with the same answers. Nothing is deleted
+    // for good: a deleted file, and the old version of one that's replaced, go to the Trash.
+
+    /// Whether a change could be made now, without making it (the app's `check_change`):
+    /// the server asks before it asks the user to approve one, so nobody approves a change
+    /// to a file that isn't there. `Ok` for a tool that changes no file.
+    pub fn check(&self, call: &Call) -> Result<(), String> {
+        match call.tool.as_str() {
+            "write_file" => self.writable(&arg(call, "path")?).map(|_| ()),
+            "write_spreadsheet" => self.workbook_target(&arg(call, "path")?).map(|_| ()),
+            "delete_file" => self.deletable(&arg(call, "path")?).map(|_| ()),
+            "rename_file" => self
+                .rename_target(&arg(call, "path")?, &arg(call, "new_name")?)
+                .map(|_| ()),
+            "move_file" => self
+                .move_target(&arg(call, "source")?, &arg(call, "destination")?)
+                .map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
+    fn writable(&self, path: &str) -> Result<String, String> {
+        let file = self.resolve(path)?;
+        if is_dir(&file) {
+            return Err(format!("{file} is a folder, not a file."));
+        }
+        Ok(file)
+    }
+
+    fn deletable(&self, path: &str) -> Result<String, String> {
+        let file = self.resolve(path)?;
+        if is_dir(&file) {
+            return Err(format!(
+                "{file} is a folder. delete_file deletes files only."
+            ));
+        }
+        if !exists(&file) {
+            return Err(format!("File not found: {file}"));
+        }
+        Ok(file)
+    }
+
+    /// A rename's source and where it goes, checked.
+    fn rename_target(&self, path: &str, new_name: &str) -> Result<(String, String), String> {
+        let source = self.resolve(path)?;
+        if !exists(&source) {
+            return Err(format!("File not found: {source}"));
+        }
+        let name = new_name.trim();
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            return Err("New name must be a single file or folder name.".into());
+        }
+        let destination = self.resolve(&join(&parent(&source), name))?;
+        can_move_to(&source, &destination)?;
+        Ok((source, destination))
+    }
+
+    fn move_target(&self, source: &str, destination: &str) -> Result<(String, String), String> {
+        let source = self.resolve(source)?;
+        let destination = self.resolve(destination)?;
+        if !exists(&source) {
+            return Err(format!("File not found: {source}"));
+        }
+        can_move_to(&source, &destination)?;
+        Ok((source, destination))
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
+        let file = self.writable(path)?;
+        self.replace(&file, content.as_bytes())?;
+        Ok(format!("File written successfully: {file}"))
+    }
+
+    /// Writes `bytes` as `file`, its folder made if need be. The new file is written
+    /// beside it first, so a failed write leaves the old one whole, and the old one goes
+    /// to the Trash, not away.
+    fn replace(&self, file: &str, bytes: &[u8]) -> Result<(), String> {
+        fs::create_dir_all(parent(file))
+            .map_err(|e| format!("Couldn't make the folder for {file}: {e}"))?;
+        let temp = format!("{file}.vireo-writing");
+        fs::write(&temp, bytes).map_err(|e| format!("Couldn't write {file}: {e}"))?;
+        if exists(file)
+            && let Err(e) = self.to_trash(file)
+        {
+            let _ = fs::remove_file(&temp);
+            return Err(format!(
+                "Couldn't keep the old version of {file} ({e}), so it was left as it is."
+            ));
+        }
+        fs::rename(&temp, file).map_err(|e| format!("Couldn't write {file}: {e}"))?;
+        if fs::read(file).ok().as_deref() != Some(bytes) {
+            return Err(format!("File verification failed after writing: {file}"));
+        }
+        Ok(())
+    }
+
+    /// The workbook a path names: ".xlsx" added when it's left off.
+    fn workbook_target(&self, path: &str) -> Result<String, String> {
+        let mut file = self.resolve(path.trim())?;
+        if !file.to_lowercase().ends_with(".xlsx") {
+            file.push_str(".xlsx");
+        }
+        if is_dir(&file) {
+            return Err(format!("{file} is a folder."));
+        }
+        Ok(file)
+    }
+
+    /// Rows of values into a workbook's first sheet, from a cell or after its last row;
+    /// the workbook is made when there's none (`attach::xlsx_write`).
+    fn write_spreadsheet(&self, path: &str, start: &str, rows: &str) -> Result<String, String> {
+        use crate::attach::xlsx_write;
+        let file = self.workbook_target(path)?;
+        let start = xlsx_write::Start::parse(start)?;
+        let rows = xlsx_write::rows_from(rows)?;
+        let existing = if exists(&file) {
+            Some(fs::read(&file).map_err(|_| format!("Couldn't read {file}."))?)
+        } else {
+            None
+        };
+        let (bytes, message) = xlsx_write::write(&file, existing.as_deref(), start, &rows)?;
+        self.replace(&file, &bytes)?;
+        Ok(message)
+    }
+
+    fn rename_file(&self, path: &str, new_name: &str) -> Result<String, String> {
+        let (source, destination) = self.rename_target(path, new_name)?;
+        fs::rename(&source, &destination)
+            .map_err(|e| format!("Couldn't rename {source}: {e}"))?;
+        Ok(format!(
+            "Renamed successfully: {} -> {}",
+            file_name(&source),
+            file_name(&destination)
+        ))
+    }
+
+    fn move_file(&self, source: &str, destination: &str) -> Result<String, String> {
+        let (source, destination) = self.move_target(source, destination)?;
+        fs::rename(&source, &destination).map_err(|e| format!("Couldn't move {source}: {e}"))?;
+        Ok(format!("Moved successfully: {source} -> {destination}"))
+    }
+
+    fn delete_file(&self, path: &str) -> Result<String, String> {
+        let file = self.deletable(path)?;
+        self.to_trash(&file)
+            .map_err(|e| format!("Couldn't move {file} to the {TRASH}: {e}"))?;
+        Ok(format!("File moved to the {TRASH}: {file}"))
+    }
+
+    /// Moves a file to the Trash (in tests, to their own folder).
+    fn to_trash(&self, file: &str) -> Result<(), String> {
+        match &self.trash_folder {
+            Some(folder) => {
+                fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+                let mut target = join(folder, &file_name(file));
+                let mut n = 1;
+                while exists(&target) {
+                    n += 1;
+                    target = join(folder, &format!("{} {n}", file_name(file)));
+                }
+                fs::rename(file, target).map_err(|e| e.to_string())
+            }
+            None if documents::trash(file) => Ok(()),
+            None => Err(format!("this {MACHINE}'s {TRASH} didn't take it")),
         }
     }
 
@@ -730,11 +942,13 @@ pub fn standardized(path: &str) -> String {
     } else {
         joined
     };
+    // /private/tmp is /tmp, and so on. Whether or not the path itself is there yet: a
+    // file about to be written in a chosen folder must come out inside that folder.
     if let Some(rest) = result.strip_prefix("/private/")
-        && ["var", "tmp", "etc"]
+        && let Some(d) = ["var", "tmp", "etc"]
             .iter()
-            .any(|d| rest == *d || rest.starts_with(&format!("{d}/")))
-        && Path::new(&format!("/{rest}")).exists()
+            .find(|d| rest == **d || rest.starts_with(&format!("{d}/")))
+        && Path::new(&format!("/{d}")).exists()
     {
         return format!("/{rest}");
     }
@@ -883,6 +1097,25 @@ mod documents {
         })
     }
 
+    /// To the user's Trash, as Finder's Move to Trash: it can be put back from there.
+    pub fn trash(path: &str) -> bool {
+        autoreleasepool(|_| {
+            let class = AnyClass::get(c"NSFileManager")?;
+            let url = url(path);
+            unsafe {
+                let manager: Option<Retained<AnyObject>> = msg_send![class, defaultManager];
+                let done: bool = msg_send![
+                    &*manager?,
+                    trashItemAtURL: &*url,
+                    resultingItemURL: std::ptr::null_mut::<*mut AnyObject>(),
+                    error: std::ptr::null_mut::<*mut AnyObject>()
+                ];
+                Some(done)
+            }
+        })
+        .unwrap_or(false)
+    }
+
     pub fn rich_text(path: &str) -> Option<String> {
         autoreleasepool(|_| {
             let url = url(path);
@@ -911,6 +1144,10 @@ mod documents {
     pub fn pdf_text(path: &str) -> Option<String> {
         let bytes = std::fs::read(path).ok()?;
         crate::attach::pdf::text(&bytes).ok()
+    }
+    /// The server makes no changes on this machine: the app does, to its Recycle Bin.
+    pub fn trash(_path: &str) -> bool {
+        false
     }
     pub fn rich_text(path: &str) -> Option<String> {
         if !path.to_lowercase().ends_with(".docx") {
@@ -965,7 +1202,84 @@ mod tests {
     }
 
     fn tools(home: &Home, access: Access) -> Files {
-        Files::new(&home.0, access)
+        Files::new(&home.0, access).with_trash(&format!("{}/.test-trash", home.0))
+    }
+
+    #[test]
+    fn changes_are_checked_made_and_nothing_is_lost() {
+        let h = home();
+        make(&h, "Documents/notes.txt", "old");
+        make(&h, "Documents/Invoices/acme.pdf", "pdf");
+        let t = tools(&h, Access::Home);
+        let home = &t.home;
+        // A new file, its folder made on the way; then replaced, the old text kept.
+        let made = run(&t, "write_file", &[("path", "Documents/New/plan.md"), ("content", "one")]);
+        assert_eq!(made, format!("File written successfully: {home}/Documents/New/plan.md"));
+        run(&t, "write_file", &[("path", "Documents/notes.txt"), ("content", "new")]);
+        assert_eq!(fs::read_to_string(format!("{home}/Documents/notes.txt")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(format!("{home}/.test-trash/notes.txt")).unwrap(), "old");
+        assert_eq!(
+            failure(&t, "write_file", &[("path", "Documents"), ("content", "x")]),
+            format!("{home}/Documents is a folder, not a file.")
+        );
+        // Renaming and moving: the name must be free and the folder there.
+        assert_eq!(
+            run(&t, "rename_file", &[("path", "Documents/notes.txt"), ("new_name", "notes-2026.txt")]),
+            "Renamed successfully: notes.txt -> notes-2026.txt"
+        );
+        assert_eq!(
+            failure(&t, "rename_file", &[("path", "Documents/notes-2026.txt"), ("new_name", "a/b.txt")]),
+            "New name must be a single file or folder name."
+        );
+        assert_eq!(
+            failure(&t, "move_file", &[("source", "Documents/notes-2026.txt"), ("destination", "Documents/Invoices/acme.pdf")]),
+            format!("Destination already exists: {home}/Documents/Invoices/acme.pdf")
+        );
+        assert_eq!(
+            failure(&t, "move_file", &[("source", "Documents/notes-2026.txt"), ("destination", "Documents/Nowhere/n.txt")]),
+            format!("Folder not found: {home}/Documents/Nowhere")
+        );
+        assert_eq!(
+            run(&t, "move_file", &[("source", "Documents/notes-2026.txt"), ("destination", "Documents/Invoices/notes.txt")]),
+            format!("Moved successfully: {home}/Documents/notes-2026.txt -> {home}/Documents/Invoices/notes.txt")
+        );
+        // Deleting: files only, and into the Trash.
+        assert!(failure(&t, "delete_file", &[("path", "Documents/Invoices")]).ends_with("delete_file deletes files only."));
+        assert_eq!(
+            failure(&t, "delete_file", &[("path", "Documents/gone.txt")]),
+            format!("File not found: {home}/Documents/gone.txt")
+        );
+        assert!(run(&t, "delete_file", &[("path", "Documents/Invoices/acme.pdf")]).starts_with("File moved to the "));
+        assert!(!exists(&format!("{home}/Documents/Invoices/acme.pdf")));
+        assert_eq!(fs::read_to_string(format!("{home}/.test-trash/acme.pdf")).unwrap(), "pdf");
+        // The check says what the change itself would, and changes nothing.
+        let wrong = call("delete_file", &[("path", "Documents/gone.txt")]);
+        assert_eq!(t.check(&wrong), Err(format!("File not found: {home}/Documents/gone.txt")));
+        assert_eq!(t.check(&call("write_file", &[("path", "Documents/x.txt"), ("content", "x")])), Ok(()));
+        assert!(!exists(&format!("{home}/Documents/x.txt")));
+        // A workbook: made, added to, and its old version kept.
+        let made = run(
+            &t,
+            "write_spreadsheet",
+            &[("path", "Documents/register"), ("start_cell", "A1"), ("rows", r#"[["Invoice","CAD"],["NP-1",120.5]]"#)],
+        );
+        assert_eq!(
+            made,
+            format!("Spreadsheet written successfully: {home}/Documents/register.xlsx\nWrote 4 cells to Sheet1!A1:B2 in a new workbook.")
+        );
+        let added = run(
+            &t,
+            "write_spreadsheet",
+            &[("path", "Documents/register.xlsx"), ("start_cell", "append"), ("rows", r#"[["NP-2",80]]"#)],
+        );
+        assert!(added.ends_with("Wrote 2 cells to Sheet1!A3:B3."), "{added}");
+        let read = run(&t, "read_spreadsheet", &[("path", "Documents/register.xlsx")]);
+        assert!(read.ends_with("1 | Invoice | CAD\n2 | NP-1 | 120.5\n3 | NP-2 | 80"), "{read}");
+        assert!(exists(&format!("{home}/.test-trash/register.xlsx")));
+        // Outside what the chat may reach, nothing is changed.
+        let chosen = tools(&h, Access::Folders(vec![format!("{home}/Documents/New")]));
+        assert!(failure(&chosen, "write_file", &[("path", "Documents/Invoices/x.txt"), ("content", "x")]).contains("outside the folders"));
+        assert!(failure(&chosen, "move_file", &[("source", "Documents/New/plan.md"), ("destination", "Documents/plan.md")]).contains("outside the folders"));
     }
 
     fn call(tool: &str, args: &[(&str, &str)]) -> Call {
@@ -1369,10 +1683,10 @@ mod tests {
         assert_eq!(
             failure(
                 &tools(&h, Access::Home),
-                "delete_file",
+                "run_tests",
                 &[("path", "Documents/notes.txt")]
             ),
-            "delete_file can't run on this Mac."
+            "run_tests can't run on this Mac."
         );
     }
 

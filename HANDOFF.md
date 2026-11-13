@@ -110,7 +110,7 @@ otherwise; `DEFAULT_LOOKUP` and `LONGEST_RUN` now one value for both, the Mac's)
 
 ## To do, roughly in order
 
-1. **Changes on the Mac:** `files.rs` makes the four changes (to the Trash, with undo as
+1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as
    the Windows app's journal does) and checks them before asking, as `check_change` does
    in the app. Then `tools::offered` can let the server run them, and the six change cases
    apply on the Mac.
