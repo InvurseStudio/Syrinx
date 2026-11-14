@@ -150,6 +150,67 @@ template [[host_name("matmul_tc_wide_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_W
 template [[host_name("matmul_tc_wide_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_WIDE>(ARGS, KP);
 
+// matmul_tc for one tile of moe_group's (vireo.metal): its expert's rows × its slots, the
+// tile a threadgroup row (gid.y). The slots' inputs and products lie in moe_group's order
+// (moe_gather_half), so a tile's are one after another: `x` rows of f16 `x_stride` apart,
+// `y` rows of f32 `y_stride` apart. Arguments: w, x, y, rows (an expert's), cols, tiles,
+// x_stride, y_stride.
+#ifndef MOE_TC_TOKENS
+#define MOE_TC_TOKENS 64
+#endif
+template <int KIND, int TOK, int ROWS = TC_ROWS, int KK = TC_K>
+kernel void moe_matmul_tc(ARGS, KP) {
+    const int rows = ARG_INT(3), cols = ARG_INT(4);
+    device const int* tile = ARG_PTR(const int, 5) + 3 * gid.y;
+    const int x_stride = ARG_INT(6), y_stride = ARG_INT(7);
+    const int tokens = tile[2];
+    if (tokens == 0) return;
+    const ulong row_bytes = mm_row_bytes<KIND>(cols);
+    device const u8* w = ARG_PTR(const u8, 0) + (ulong)tile[0] * (ulong)rows * row_bytes;
+    device half* x = ARG_PTR(half, 1) + (ulong)tile[1] * x_stride;
+    device float* y = ARG_PTR(float, 2) + (ulong)tile[1] * y_stride;
+    threadgroup half sa[ROWS * KK];
+    const int row0 = gid.x * ROWS;
+    constexpr int RUNS = KK / 32, PER = (ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(TOK, ROWS, static_cast<int>(dynamic_extent), false, true, true,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<TC_SG>>
+        mm;
+    auto t_w = tensor(sa, dextents<int32_t, 2>(KK, ROWS));
+    auto t_x = tensor(x, dextents<int32_t, 2>(cols, tokens), array<int, 2>({1, x_stride}));
+    auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x), decltype(t_w), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); i++) acc[i] = 0.0f;
+
+    for (int k0 = 0; k0 < cols; k0 += KK) {
+        for (int part = 0; part < PER; part++) {
+            const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
+            if (lr >= ROWS) break;
+            threadgroup half* dst = sa + lr * KK + lk;
+            if (row0 + lr < rows && k0 + lk < cols) {
+                decode32<KIND>(w + (ulong)(row0 + lr) * row_bytes, cols / 32, k0 + lk, dst);
+            } else {
+                for (int i = 0; i < 32; i++) dst[i] = half(0.0f);
+            }
+        }
+        BARRIER;
+        const int k_len = min(KK, cols - k0);
+        auto tile_w = tensor(sa, dextents<int32_t, 2>(k_len, ROWS), array<int, 2>({1, KK}));
+        auto tile_x = tensor(x + k0, dextents<int32_t, 2>(k_len, tokens), array<int, 2>({1, x_stride}));
+        mm.run(tile_x, tile_w, acc);
+        BARRIER;
+    }
+    auto t_y = tensor(y + row0, dextents<int32_t, 2>(min(ROWS, rows - row0), tokens), array<int, 2>({1, y_stride}));
+    acc.store(t_y);
+}
+template [[host_name("moe_matmul_tc_f32")]] kernel void moe_matmul_tc<K_F32, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_f16")]] kernel void moe_matmul_tc<K_F16, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q4_0")]] kernel void moe_matmul_tc<K_Q4_0, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q8_0")]] kernel void moe_matmul_tc<K_Q8_0, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q4_k")]] kernel void moe_matmul_tc<K_Q4_K, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q5_k")]] kernel void moe_matmul_tc<K_Q5_K, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q6_k")]] kernel void moe_matmul_tc<K_Q6_K, MOE_TC_TOKENS>(ARGS, KP);
 
 // matmul_tc's splits added up, in order: y[i] = parts[0][i] + parts[1][i] + ...
 kernel void sum_parts(ARGS, KP) {
@@ -349,8 +410,15 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
         mm_pv;
     auto tv0 = tensor(values + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
     auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
-    for (uint16_t i = 0; i < co.get_capacity(); i++)
-        if (co.is_valid_element(i)) co[i] = 0.0f;
+    // Each of this thread's numbers of the output: its row, or -1 for one not in use.
+    constexpr int CO_MAX = 64;
+    short co_row[CO_MAX];
+    const int co_n = min((int)co.get_capacity(), CO_MAX);
+    for (int i = 0; i < co_n; i++) {
+        const bool valid = co.is_valid_element(i);
+        co_row[i] = valid ? (short)co.get_multidimensional_index(i)[1] : (short)-1;
+        if (valid) co[i] = 0.0f;
+    }
     float row_max[ROWS], row_sum[ROWS];
     for (int jj = 0; jj < ROWS; jj++) {
         row_max[jj] = -INFINITY;
@@ -397,8 +465,12 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
             if (lane == 0) sr[j] = correction;
         }
         BARRIER;
-        for (uint16_t i = 0; i < co.get_capacity(); i++)
-            if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
+        // Rescaled only where a row's maximum moved: deep in a context most don't.
+        for (int i = 0; i < co_n; i++) {
+            if (co_row[i] < 0) continue;
+            const float fix = sr[co_row[i]];
+            if (fix != 1.0f) co[i] *= fix;
+        }
         auto tv = tensor(values + at_cache, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_pv.run(tp, tv, co);
         BARRIER;

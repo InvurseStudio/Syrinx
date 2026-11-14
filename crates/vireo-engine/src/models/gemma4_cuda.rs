@@ -81,6 +81,10 @@ struct ExpertBuffers {
     /// (`Gpu::moe_group`).
     order: Buffer,
     tiles: Buffer,
+    /// Where each slot went in `order`, and (the default mode, where the GPU has neural
+    /// accelerators) the slots' inputs in that order, in f16 (`Gpu::moe_gather_half`).
+    place: Buffer,
+    sorted: Option<Buffer>,
 }
 
 /// The per-layer inputs (E2B, E4B): their embedding, projection and the projection's norm.
@@ -513,6 +517,22 @@ impl<'a> Gemma4Cuda<'a> {
                     out: f32s(batch * x.used * c.dim)?,
                     sum: f32s(batch * c.dim)?,
                     order: f32s(batch * x.used)?,
+                    place: f32s(batch * x.used)?,
+                    #[cfg(target_os = "macos")]
+                    sorted: if self.precision == Precision::Int8
+                        && batch >= MOE_GROUPED_FROM
+                        && self.gpu.moe_fast(crate::TensorType::F32)
+                    {
+                        Some(
+                            self.gpu
+                                .alloc(batch * x.used * c.dim.max(x.width) * 2)
+                                .map_err(gpu_error)?,
+                        )
+                    } else {
+                        None
+                    },
+                    #[cfg(not(target_os = "macos"))]
+                    sorted: None,
                     #[cfg(target_os = "macos")]
                     tiles: f32s(3 * Gpu::moe_tiles(batch * x.used, x.count))?,
                     #[cfg(not(target_os = "macos"))]
@@ -759,9 +779,50 @@ impl<'a> Gemma4Cuda<'a> {
                 // token a layer, and reading was memory-bound). A few tokens: each slot's
                 // own product, the weights read as for one token.
                 let grouped = t >= MOE_GROUPED_FROM;
+                // On the neural accelerators (the default mode): the slots' inputs and
+                // products in the order of their experts, a tile's one after another.
+                let fast = b
+                    .sorted
+                    .as_ref()
+                    .filter(|_| grouped && g.moe_fast(m.gate_up.kind) && g.moe_fast(m.down.kind));
                 if grouped {
-                    g.moe_group(b.idx.ptr(), b.order.ptr(), b.tiles.ptr(), slots, x.count)
-                        .map_err(e)?;
+                    g.moe_group(
+                        b.idx.ptr(),
+                        b.order.ptr(),
+                        b.tiles.ptr(),
+                        b.place.ptr(),
+                        slots,
+                        x.count,
+                        fast.is_some(),
+                    )
+                    .map_err(e)?;
+                }
+                if let Some(sorted) = fast {
+                    g.moe_gather_half(
+                        s.h.ptr(),
+                        sorted.ptr(),
+                        b.order.ptr(),
+                        x.used,
+                        dim,
+                        dim,
+                        true,
+                        slots,
+                    )
+                    .map_err(e)?;
+                    g.moe_matmul_fast(
+                        m.gate_up.kind,
+                        m.gate_up.data.ptr(),
+                        sorted.ptr(),
+                        b.gate_up.ptr(),
+                        2 * x.width,
+                        dim,
+                        b.tiles.ptr(),
+                        2 * x.width,
+                        slots,
+                        x.count,
+                    )
+                    .map_err(e)?;
+                } else if grouped {
                     g.moe_matmul(
                         m.gate_up.kind,
                         m.gate_up.data.ptr(),
@@ -797,7 +858,32 @@ impl<'a> Gemma4Cuda<'a> {
                     .map_err(e)?;
                 }
                 g.moe_geglu(b.gate_up.ptr(), x.width, slots).map_err(e)?;
-                if grouped {
+                if let Some(sorted) = fast {
+                    g.moe_gather_half(
+                        b.gate_up.ptr(),
+                        sorted.ptr(),
+                        b.order.ptr(),
+                        x.used,
+                        x.width,
+                        2 * x.width,
+                        false,
+                        slots,
+                    )
+                    .map_err(e)?;
+                    g.moe_matmul_fast(
+                        m.down.kind,
+                        m.down.data.ptr(),
+                        sorted.ptr(),
+                        b.out.ptr(),
+                        dim,
+                        x.width,
+                        b.tiles.ptr(),
+                        dim,
+                        slots,
+                        x.count,
+                    )
+                    .map_err(e)?;
+                } else if grouped {
                     g.moe_matmul(
                         m.down.kind,
                         m.down.data.ptr(),
@@ -832,8 +918,16 @@ impl<'a> Gemma4Cuda<'a> {
                     )
                     .map_err(e)?;
                 }
-                g.moe_sum(b.sum.ptr(), b.out.ptr(), b.share.ptr(), x.used, dim, t)
-                    .map_err(e)?;
+                g.moe_sum(
+                    b.sum.ptr(),
+                    b.out.ptr(),
+                    b.share.ptr(),
+                    x.used,
+                    dim,
+                    t,
+                    fast.map(|_| b.place.ptr()),
+                )
+                .map_err(e)?;
                 g.rms_norm_rows(b.sum.ptr(), m.post_norm.ptr(), b.sum.ptr(), t, dim, eps)
                     .map_err(e)?;
                 g.rms_norm_rows(
