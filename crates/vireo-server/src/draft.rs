@@ -66,6 +66,7 @@ impl Drafter {
         let gpu = Gpu::open().map_err(|e| format!("No GPU for the draft model: {e}"))?;
         let mut model = Gemma4Cuda::load(file, gpu).map_err(|e| e.to_string())?;
         model.set_precision(precision);
+        file.release_pages();
         let session = model
             .session(context + guesses + 1)
             .map_err(|e| e.to_string())?;

@@ -2134,4 +2134,19 @@ fn gemma4_26b_a4b_on_the_gpu_matches_the_cpu() {
         .unwrap()
         .to_vec();
     assert_eq!(top(&rounded), next);
+    // The longer batch in the default mode: its experts on the neural accelerators, the
+    // slots in their experts' order (moe_matmul_tc). The same next token as exact mode's.
+    // (Not its probability: on this repeating text the default mode's f16 attention cache
+    // alone moves it from 0.95 to 0.71 by 200 tokens, token by token too, and the experts
+    // in f32 beside it picked another token here. Over ordinary text the two modes'
+    // perplexities are within 2%.)
+    let mut session = model.session(256).unwrap();
+    let fast = model
+        .forward_batch(&mut session, long, Logits::Last)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let likeliest = top(&grouped);
+    let ft = top(&fast);
+    assert_eq!(ft, likeliest);
 }
