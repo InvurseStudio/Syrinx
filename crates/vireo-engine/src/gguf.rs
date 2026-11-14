@@ -466,6 +466,12 @@ impl GgufFile {
         self.map.is_empty()
     }
 
+    /// Gives the file's pages read so far back to the operating system (see
+    /// `Mmap::release`), once the weights are in GPU memory. The file stays readable.
+    pub fn release_pages(&self) {
+        self.map.release();
+    }
+
     /// A tensor's data, straight from the mapped file. `None` for a type we don't know.
     pub fn tensor_data(&self, tensor: &TensorInfo) -> Option<&[u8]> {
         self.header

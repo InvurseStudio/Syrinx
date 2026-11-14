@@ -15,6 +15,8 @@ use std::ptr::NonNull;
 pub struct Mmap {
     ptr: NonNull<u8>,
     len: usize,
+    /// The file, kept open for [`Mmap::release`].
+    file: Option<File>,
 }
 
 // The mapping is read-only and owned by this value alone, so it can be shared and moved
@@ -39,10 +41,26 @@ impl Mmap {
             return Ok(Self {
                 ptr: NonNull::dangling(),
                 len: 0,
+                file: None,
             });
         }
         let ptr = sys::map(&file, len)?;
-        Ok(Self { ptr, len })
+        Ok(Self {
+            ptr,
+            len,
+            file: Some(file),
+        })
+    }
+
+    /// Gives the pages read so far back to the operating system; the bytes stay readable
+    /// and are read from the file again when next used. For after a model's weights are
+    /// copied to the GPU: until then the process holds the file's pages beside the copy,
+    /// twice the model's size. Does nothing on Windows.
+    pub fn release(&self) {
+        if let Some(file) = &self.file {
+            // Failing leaves the mapping as it was, pages and all.
+            let _ = unsafe { sys::release(self.ptr, self.len, file) };
+        }
     }
 }
 
@@ -124,6 +142,12 @@ mod sys {
 
     /// # Safety
     /// `ptr` must be a view returned by `map` and not unmapped yet.
+    pub unsafe fn release(_ptr: NonNull<u8>, _len: usize, _file: &File) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// # Safety
+    /// `ptr` must be a mapping returned by `map` and not unmapped yet.
     pub unsafe fn unmap(ptr: NonNull<u8>, _len: usize) {
         unsafe { UnmapViewOfFile(ptr.as_ptr().cast()) };
     }
@@ -139,6 +163,7 @@ mod sys {
 
     const PROT_READ: c_int = 1;
     const MAP_PRIVATE: c_int = 2;
+    const MAP_FIXED: c_int = 0x10;
 
     // `off_t` is 64 bits on macOS and 64-bit Linux, the only Unix systems Vireo targets.
     unsafe extern "C" {
@@ -159,6 +184,28 @@ mod sys {
             return Err(io::Error::last_os_error());
         }
         NonNull::new(ptr.cast()).ok_or_else(|| io::Error::other("mmap returned a null address"))
+    }
+
+    /// Maps the file again over its own mapping, in one step: the same bytes at the same
+    /// address, none of them resident.
+    ///
+    /// # Safety
+    /// `ptr` and `len` must be a mapping of `file` returned by `map` and not unmapped yet.
+    pub unsafe fn release(ptr: NonNull<u8>, len: usize, file: &File) -> io::Result<()> {
+        let again = unsafe {
+            mmap(
+                ptr.as_ptr().cast(),
+                len,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if again as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// # Safety
@@ -185,6 +232,23 @@ mod tests {
         let map = unsafe { Mmap::open(&path) }.unwrap();
         assert_eq!(&map[..], &contents[..]);
         drop(map); // Windows can't delete a file that's still mapped.
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_the_same_bytes_after_a_release() {
+        let contents: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+        let path = temp_file("release", &contents);
+        let map = unsafe { Mmap::open(&path) }.unwrap();
+        let before = map.as_ptr();
+        assert_eq!(&map[..], &contents[..]);
+        map.release();
+        assert_eq!(map.as_ptr(), before);
+        assert_eq!(&map[..], &contents[..]);
+        map.release();
+        map.release();
+        assert_eq!(&map[..], &contents[..]);
+        drop(map);
         std::fs::remove_file(path).unwrap();
     }
 
