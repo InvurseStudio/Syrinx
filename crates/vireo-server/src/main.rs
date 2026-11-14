@@ -1468,13 +1468,15 @@ impl Model {
 
     /// Reads `ids` (the history, then from `mark` on the reply's opened turn) into the
     /// kept session, starting from the longest start it shares with the tokens already
-    /// there; the last token's logits, and how many tokens were reused. On an error the
-    /// session's contents are unknown: drop it.
+    /// there; the last token's logits, and how many tokens were reused. `head` is where
+    /// the system turn ends in `ids` (0 when not known): what a new chat would share. On
+    /// an error the session's contents are unknown: drop it.
     fn continue_with(
         &self,
         kept: &mut Kept,
         ids: &[u32],
         mark: usize,
+        head: usize,
     ) -> Result<(Vec<f32>, usize), String> {
         let e = |e: vireo_engine::models::Error| e.to_string();
         let shared = shared_start(&kept.tokens, ids);
@@ -1514,10 +1516,16 @@ impl Model {
         let reused = from;
         // Qwen, read from the start again: a checkpoint where this prompt parts from the
         // last (a few tokens early, as the next may part a token sooner), when that's before
-        // the history's end: the system prompt and tools a new chat shares.
+        // the history's end: the system prompt and tools a new chat shares. Read from
+        // empty with nothing to part from (the first chat since the model loaded), one
+        // at the system turn's end, so the second chat doesn't read that turn again.
         let mut from = from;
         if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut kept.session) {
-            let base_at = shared.saturating_sub(8);
+            let base_at = if from == 0 && shared < 64 + 8 {
+                head.saturating_sub(8)
+            } else {
+                shared.saturating_sub(8)
+            };
             if kept.base.is_none() && base_at >= from + 64 && base_at < mark {
                 m.forward_batch(s, &ids[from..base_at], Logits::None)
                     .map_err(e)?;
@@ -1777,6 +1785,8 @@ fn engine(
     } else {
         "8-bit"
     };
+    // The weights are in GPU memory now: let go of the file's pages read on the way.
+    file.release_pages();
     eprintln!("Loaded {name} in {:.1?}.", started.elapsed());
     let trained = file
         .arch_u64("context_length")
@@ -2314,7 +2324,13 @@ fn reply(
     if keep_changes && let Some(tools) = with_changes {
         offered = tools;
     }
-    let Prompt { ids, mark, .. } = prompt;
+    let Prompt {
+        ids,
+        mark,
+        system,
+        declared,
+        ..
+    } = prompt;
     if ids.len() + max_tokens > context {
         return Err(format!(
             "The message is {} tokens, too long for this server's {context}-token chats.",
@@ -2325,7 +2341,21 @@ fn reply(
     if let Some(store) = store {
         switch_chat(model, kept, store, &ids, context)?;
     }
-    let (mut logits, reused) = model.continue_with(kept, &ids, mark)?;
+    // Qwen: where the system turn ends, for a saved start for new chats.
+    let head = if matches!(family, Family::Qwen35) {
+        let turn = chat::history(
+            family,
+            system.as_deref(),
+            &declared,
+            &[],
+            &today,
+            prompt_thinking,
+        );
+        shared_start(&chat::encode(tokenizer, &turn), &ids)
+    } else {
+        0
+    };
+    let (mut logits, reused) = model.continue_with(kept, &ids, mark, head)?;
     if let Some(d) = drafter.as_deref_mut() {
         d.sync(&kept.tokens)?;
     }

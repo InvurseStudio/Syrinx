@@ -125,8 +125,9 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "rms_norm" => &[2],
         "moe_pick" => &[2, 3],
         n if n.starts_with("moe_matvec") || n.starts_with("moe_matmul") => &[2],
-        "moe_group" => &[1, 2],
+        "moe_group" => &[1, 2, 7],
         "moe_geglu" | "moe_sum" => &[0],
+        "moe_gather_half" => &[1],
         "residual_norm" => &[0, 5],
         "qkv_prep" => &[4, 9, 10, 23],
         n if n.starts_with("attention_part") => &[3],
@@ -706,6 +707,9 @@ struct Kernels {
     /// A batch's slots put in order of their expert, and the product a tile of them.
     moe_group: Pso,
     moe_matmul: [Pso; 7],
+    moe_gather_half: Pso,
+    /// `moe_matmul` on the neural accelerators, where the GPU has them.
+    moe_matmul_tc: Option<[Pso; 7]>,
     residual_norm: Pso,
     qkv_prep: Pso,
     sigmoid_mul: Pso,
@@ -822,6 +826,8 @@ const FIRST_COMMIT: usize = 16;
 const ROWS_PER_BLOCK: u32 = 4;
 /// The slots in a tile of `moe_matmul` (SG_TOKENS in vireo.metal).
 const MOE_TILE_SLOTS: usize = 32;
+/// The slots in a tile of `moe_matmul_tc` (MOE_TC_TOKENS in vireo_tensor.metal).
+const MOE_TC_SLOTS: usize = 64;
 /// The matrix-matrix kernel's tile (matmul_sg): rows of weights by tokens.
 const TILE_ROWS: u32 = 64;
 const TILE_TOKENS: u32 = 32;
@@ -933,7 +939,7 @@ impl Gpu {
         // With the tensor kernels where Metal compiles them (it can't before the M5 and A19).
         let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
         let with_tensors = format!(
-            "{SOURCE}\n#define TC_ROWS {tc_rows}\n#define TC_TOKENS {tc_tokens}\n#define TC_WIDE {TC_WIDE}\n#define TC_SG {tc_sg}\n{TENSOR_SOURCE}"
+            "{SOURCE}\n#define TC_ROWS {tc_rows}\n#define TC_TOKENS {tc_tokens}\n#define TC_WIDE {TC_WIDE}\n#define TC_SG {tc_sg}\n#define MOE_TC_TOKENS {MOE_TC_SLOTS}\n{TENSOR_SOURCE}"
         );
         let (library, tensor_ops) = match device
             .newLibraryWithSource_options_error(&NSString::from_str(&with_tensors), Some(&options))
@@ -1047,6 +1053,12 @@ impl Gpu {
             moe_sum: pipeline("moe_sum")?,
             moe_group: pipeline("moe_group")?,
             moe_matmul: per_kind("moe_matmul")?,
+            moe_gather_half: pipeline("moe_gather_half")?,
+            moe_matmul_tc: if tensor_ops {
+                Some(per_kind("moe_matmul_tc")?)
+            } else {
+                None
+            },
             residual_norm: pipeline("residual_norm")?,
             qkv_prep: pipeline("qkv_prep")?,
             sigmoid_mul: pipeline("sigmoid_mul")?,
@@ -1668,7 +1680,8 @@ impl Gpu {
             Arg::I32(experts as i32),
             Arg::I32(used as i32),
         ];
-        self.run(&self.kernels.moe_pick, (tokens as u32, 1), 1, &args)
+        assert!(used <= 32, "moe_pick holds up to 32 picks (MOE_MAX_USED)");
+        self.run(&self.kernels.moe_pick, (tokens as u32, 1), 128, &args)
     }
 
     /// `y = W_e x` for each of `slots` slots (a token's turn with one of its `used`
@@ -1714,32 +1727,124 @@ impl Gpu {
     }
 
     /// How many tiles `moe_group` may cut `slots` slots of `experts` experts into: the
-    /// full ones, and a part-filled one an expert.
+    /// full ones, and a part-filled one an expert. (Counted for the smaller tile, of
+    /// `moe_matmul`: room for either kind.)
     pub fn moe_tiles(slots: usize, experts: usize) -> usize {
         slots / MOE_TILE_SLOTS + experts
     }
 
-    /// A batch's `slots` slots sorted by their expert into `order` (an i32 each), and cut
-    /// into `tiles` (three i32s each, `moe_tiles` of them) for `moe_matmul`.
+    /// Whether a batch's experts can run on the neural accelerators (`moe_matmul_fast`),
+    /// for weights of this type.
+    pub fn moe_fast(&self, kind: TensorType) -> bool {
+        self.kernels.moe_matmul_tc.is_some() && KINDS.contains(&kind)
+    }
+
+    /// The slots in one of `moe_group`'s tiles: for `moe_matmul_fast` or `moe_matmul`.
+    fn moe_tile_slots(fast: bool) -> usize {
+        if fast { MOE_TC_SLOTS } else { MOE_TILE_SLOTS }
+    }
+
+    /// A batch's `slots` slots sorted by their expert into `order` (an i32 each, and
+    /// where each slot went into `place`), and cut into `tiles` (three i32s each,
+    /// `moe_tiles` of them) for `moe_matmul`, or for `moe_matmul_fast` (`fast`).
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_group(
         &self,
         idx: CuDevicePtr,
         order: CuDevicePtr,
         tiles: CuDevicePtr,
+        place: CuDevicePtr,
         slots: usize,
         experts: usize,
+        fast: bool,
     ) -> Result<()> {
         assert!(experts <= 512, "moe_group holds up to 512 experts");
+        let tile = Self::moe_tile_slots(fast);
         let args = [
             Arg::Ptr(idx),
             Arg::Ptr(order),
             Arg::Ptr(tiles),
             Arg::I32(slots as i32),
             Arg::I32(experts as i32),
-            Arg::I32(Self::moe_tiles(slots, experts) as i32),
-            Arg::I32(MOE_TILE_SLOTS as i32),
+            Arg::I32((slots / tile + experts) as i32),
+            Arg::I32(tile as i32),
+            Arg::Ptr(place),
         ];
-        self.run(&self.kernels.moe_group, (1, 1), 1, &args)
+        self.run(&self.kernels.moe_group, (1, 1), 1024, &args)
+    }
+
+    /// The inputs of `moe_matmul_fast` into `out`, `slots` rows of `cols` f16s in
+    /// `moe_group`'s order: each slot's token's row of `x` (`by_token`, a token's `used`
+    /// slots sharing it), or the rows of `x` as they lie (already in that order);
+    /// `x_stride` numbers apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gather_half(
+        &self,
+        x: CuDevicePtr,
+        out: CuDevicePtr,
+        order: CuDevicePtr,
+        used: usize,
+        cols: usize,
+        x_stride: usize,
+        by_token: bool,
+        slots: usize,
+    ) -> Result<()> {
+        assert!(cols.is_multiple_of(4), "rows of {cols} aren't whole fours");
+        let total = slots * cols / 4;
+        self.run_per_number(
+            &self.kernels.moe_gather_half,
+            total,
+            &[
+                Arg::Ptr(x),
+                Arg::Ptr(out),
+                Arg::Ptr(order),
+                Arg::I32(used as i32),
+                Arg::I32(cols as i32),
+                Arg::I32(x_stride as i32),
+                Arg::I32(i32::from(by_token)),
+                Arg::I32(total as i32),
+            ],
+        )
+    }
+
+    /// `moe_matmul` on the neural accelerators (see [`Gpu::moe_fast`]), with the slots'
+    /// inputs and products in `moe_group`'s order: `x` from `moe_gather_half` (rows of
+    /// `cols` f16s), `y` rows of `y_stride` f32s, row for row with `x`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_matmul_fast(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        tiles: CuDevicePtr,
+        y_stride: usize,
+        slots: usize,
+        experts: usize,
+    ) -> Result<()> {
+        let kernels = self
+            .kernels
+            .moe_matmul_tc
+            .as_ref()
+            .expect("checked with moe_fast");
+        let (tc_rows, _, tc_sg) = tensor_tile();
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(tiles),
+            Arg::I32(cols as i32),
+            Arg::I32(y_stride as i32),
+        ];
+        let grid = (
+            (rows as u32).div_ceil(tc_rows),
+            (slots / MOE_TC_SLOTS + experts) as u32,
+        );
+        self.run(&kernels[Self::kind_index(kind)?], grid, 32 * tc_sg, &args)
     }
 
     /// `moe_matvec` for a batch grouped by `moe_group`: each expert's matrix is read once
@@ -1794,7 +1899,9 @@ impl Gpu {
         )
     }
 
-    /// `out` = each token's slots' `n` numbers, added up with their shares.
+    /// `out` = each token's slots' `n` numbers, added up with their shares: `parts` in
+    /// slot order, or with `place` in `moe_group`'s order (each slot's at its place).
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_sum(
         &self,
         out: CuDevicePtr,
@@ -1803,6 +1910,7 @@ impl Gpu {
         used: usize,
         n: usize,
         tokens: usize,
+        place: Option<CuDevicePtr>,
     ) -> Result<()> {
         let total = n * tokens;
         self.run_per_number(
@@ -1815,6 +1923,9 @@ impl Gpu {
                 Arg::I32(used as i32),
                 Arg::I32(n as i32),
                 Arg::I32(total as i32),
+                // Not read without `place`: any address a buffer starts at.
+                Arg::Ptr(place.unwrap_or(share)),
+                Arg::I32(i32::from(place.is_some())),
             ],
         )
     }

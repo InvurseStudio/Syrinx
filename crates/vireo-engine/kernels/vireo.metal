@@ -1201,30 +1201,59 @@ template [[host_name("matmul_q6_k")]] kernel void matmul<K_Q6_K>(ARGS, KP);
 // so each expert's matrix is read once for all the tokens that chose it, not once a
 // token: `order` is the slots sorted by expert, and `tiles` cuts that order into runs of
 // up to `tile_slots` slots of one expert, three numbers a tile (the expert, where its run
-// starts in `order`, how many slots; 0 for a tile not used). One thread.
+// starts in `order`, how many slots; 0 for a tile not used), and `place` is where each
+// slot went in `order`. One threadgroup of at least `experts` threads: a thread takes one
+// expert and one part of the slots (as many parts as the threads allow), counts its
+// expert's slots there, one thread lays out the runs and the tiles, then each places its
+// own, in slot order. (One thread doing all of it took 1.4 ms for 8,192 slots, an eighth
+// of a prompt's GPU time.)
 #define MOE_MAX_EXPERTS 512
+#define MOE_GROUP_THREADS 1024
 kernel void moe_group(ARGS, KP) {
     device const int* idx = ARG_PTR(const int, 0);
     device int* order = ARG_PTR(int, 1);
     device int* tiles = ARG_PTR(int, 2);
     const int slots = ARG_INT(3), experts = ARG_INT(4), max_tiles = ARG_INT(5), tile_slots = ARG_INT(6);
-    if (tid != 0 || gid.x != 0) return;
-    int start[MOE_MAX_EXPERTS + 1];
-    for (int e = 0; e <= experts; e++) start[e] = 0;
-    for (int s = 0; s < slots; s++) start[idx[s] + 1]++;
-    for (int e = 0; e < experts; e++) start[e + 1] += start[e];
-    int n = 0;
-    for (int e = 0; e < experts; e++) {
-        for (int first = start[e]; first < start[e + 1] && n < max_tiles; first += tile_slots) {
-            tiles[3 * n] = e;
-            tiles[3 * n + 1] = first;
-            tiles[3 * n + 2] = min(tile_slots, start[e + 1] - first);
-            n++;
+    device int* place = ARG_PTR(int, 7);
+    if (gid.x != 0) return;
+    // start[e * parts + part]: where expert e's slots of that part begin in `order`.
+    threadgroup int start[MOE_GROUP_THREADS + 1];
+    const int parts = (int)tpg.x / experts;
+    const int e = tid % experts, part = tid / experts;
+    const bool live = part < parts;
+    const int lo = (int)((long)slots * part / parts), hi = (int)((long)slots * (part + 1) / parts);
+    if (live) {
+        int n = 0;
+        for (int s = lo; s < hi; s++) n += idx[s] == e ? 1 : 0;
+        start[e * parts + part + 1] = n;
+    }
+    BARRIER;
+    if (tid == 0) {
+        start[0] = 0;
+        for (int i = 0; i < experts * parts; i++) start[i + 1] += start[i];
+        int n = 0;
+        for (int x = 0; x < experts; x++) {
+            const int end = start[(x + 1) * parts];
+            for (int first = start[x * parts]; first < end && n < max_tiles; first += tile_slots) {
+                tiles[3 * n] = x;
+                tiles[3 * n + 1] = first;
+                tiles[3 * n + 2] = min(tile_slots, end - first);
+                n++;
+            }
+        }
+        for (; n < max_tiles; n++) tiles[3 * n + 2] = 0;
+    }
+    BARRIER;
+    if (live) {
+        int at = start[e * parts + part];
+        for (int s = lo; s < hi; s++) {
+            if (idx[s] == e) {
+                order[at] = s;
+                place[s] = at;
+                at++;
+            }
         }
     }
-    for (; n < max_tiles; n++) tiles[3 * n + 2] = 0;
-    // Each expert's slots in turn (start[e] moves along its run as they're placed).
-    for (int s = 0; s < slots; s++) order[start[idx[s]]++] = s;
 }
 
 // `matmul_sg` for one tile of moe_group's: its expert's rows × its slots, the tile a
@@ -2510,38 +2539,52 @@ template [[host_name("attention_flash2_512")]] kernel void attention_flash2<512,
 
 // The `used` highest of a token's `experts` scores (the lowest index on a tie), and each
 // one's share: a softmax over those scores, times the expert's own scale. One threadgroup
-// a token.
+// a token, its threads sharing out the experts: each finds its experts' places among the
+// scores (how many beat it), and the first `used` places are the picks. (One thread
+// picking them a best at a time took 0.2 ms a token, a third of the GPU's time writing.)
+#define MOE_MAX_USED 32
 kernel void moe_pick(ARGS, KP) {
     device const float* scores = ARG_PTR(const float, 0);
     device const float* scale = ARG_PTR(const float, 1);
     device int* idx = ARG_PTR(int, 2);
     device float* share = ARG_PTR(float, 3);
     const int experts = ARG_INT(4), used = ARG_INT(5);
-    if (tid != 0) return;
+    threadgroup int tix[MOE_MAX_USED];
+    threadgroup float tsh[MOE_MAX_USED];
     device const float* s = scores + (ulong)gid.x * experts;
+    // Scores that can't be ordered (a NaN) would leave places empty: a valid pick first.
+    for (int k = tid; k < used; k += tpg.x) {
+        tix[k] = k;
+        tsh[k] = 0.0f;
+    }
+    BARRIER;
+    for (int e = tid; e < experts; e += tpg.x) {
+        const float v = s[e];
+        int place = 0;
+        for (int j = 0; j < experts; j++) {
+            const float o = s[j];
+            place += (o > v || (o == v && j < e)) ? 1 : 0;
+        }
+        if (place < used) {
+            tix[place] = e;
+            tsh[place] = v;
+        }
+    }
+    BARRIER;
+    if (tid != 0) return;
     device int* ix = idx + (ulong)gid.x * used;
     device float* sh = share + (ulong)gid.x * used;
-    for (int k = 0; k < used; k++) {
-        int best = -1;
-        float value = 0.0f;
-        for (int e = 0; e < experts; e++) {
-            bool taken = false;
-            for (int j = 0; j < k; j++) taken = taken || ix[j] == e;
-            if (!taken && (best < 0 || s[e] > value)) {
-                best = e;
-                value = s[e];
-            }
-        }
-        ix[k] = best;
-        sh[k] = value;
-    }
-    const float top = sh[0];
+    float e[MOE_MAX_USED];
+    const float top = tsh[0];
     float total = 0.0f;
     for (int k = 0; k < used; k++) {
-        sh[k] = exp(sh[k] - top);
-        total += sh[k];
+        e[k] = exp(tsh[k] - top);
+        total += e[k];
     }
-    for (int k = 0; k < used; k++) sh[k] = sh[k] / total * scale[ix[k]];
+    for (int k = 0; k < used; k++) {
+        ix[k] = tix[k];
+        sh[k] = e[k] / total * scale[tix[k]];
+    }
 }
 
 // y = W_e x for a slot's expert e, a threadgroup row (gid.y) a slot: the matrix-vector
@@ -2623,21 +2666,42 @@ kernel void moe_geglu(ARGS, KP) {
     slot[j] = 0.5f * x * (1.0f + tanh(0.7978846f * x * (1.0f + 0.044715f * x * x))) * slot[width + j];
 }
 
-// out[token] = Σ over the token's slots of share × the slot's `n` numbers.
+// out[token] = Σ over the token's slots of share × the slot's `n` numbers: the slots'
+// numbers in slot order, or (`sorted`) in moe_group's order, each slot's at its `place`.
 kernel void moe_sum(ARGS, KP) {
     device float* out = ARG_PTR(float, 0);
     device const float* parts = ARG_PTR(const float, 1);
     device const float* share = ARG_PTR(const float, 2);
     const int used = ARG_INT(3), n = ARG_INT(4), total = ARG_INT(5);
+    device const int* place = ARG_PTR(const int, 6);
+    const int sorted = ARG_INT(7);
     const int i = gid.x * tpg.x + tid;
     if (i >= total) return;
     const int token = i / n, j = i % n;
     float sum = 0.0f;
     for (int k = 0; k < used; k++) {
         const ulong slot = (ulong)token * used + k;
-        sum += share[slot] * parts[slot * n + j];
+        const ulong at = sorted ? (ulong)place[slot] : slot;
+        sum += share[slot] * parts[at * n + j];
     }
     out[i] = sum;
+}
+
+// The slots' inputs in moe_group's order, rounded to f16, for moe_matmul_tc: row `at` of
+// `out` (`cols` numbers) is the input of the slot `order[at]`, its token's row of `x`
+// (`by_token`), or is row `at` of `x` itself (rows already in that order), `x_stride`
+// numbers apart. 4 numbers a thread (`cols` a multiple of 4).
+kernel void moe_gather_half(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device half4* out = ARG_PTR(half4, 1);
+    device const int* order = ARG_PTR(const int, 2);
+    const int used = ARG_INT(3), cols4 = ARG_INT(4) / 4, x_stride = ARG_INT(5), by_token = ARG_INT(6);
+    const int total = ARG_INT(7);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= total) return;
+    const int at = i / cols4, j = i % cols4;
+    const ulong row = by_token ? (ulong)(order[at] / used) : (ulong)at;
+    out[i] = half4(f4(x + row * x_stride + 4 * j));
 }
 
 #define PER_NUMBER const int i = gid.x * tpg.x + tid;
