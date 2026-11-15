@@ -594,6 +594,7 @@ git), for checking our output and speed.
 | 2026-11-13 | After the gauntlet's first run on the prototype, what it found wanting. **Thinking** (a request's `thinking`, else `--thinking`; the Mac app's Settings, Chats, on by default): Gemma 4's system turn opens with `<|think|>` and Qwen's reply with `<think>`, as their templates write them, and a thought is opened after each tool's result; at most 2,000 tokens a thought and 8,000 a reply, closed for the model past that; sent to the app as `thinking` events apart from the answer (Muse reasons at high strength). No check pass: it was off in the 0.9 runs. **Earlier turns' tool results kept**: a reply's calls and results go to the app as a `turn_record`, which it keeps with the reply and sends back; `chat::history` writes them where they were made, in the family's own form, read as plain text (`chat::encode`); whole while the chat fits, then the first 1,200 characters of each, then none, before the chat's start moves on. **Fewer calls**: `read_file` takes several paths, one a line (up to 10, sharing three results' room); `calculate` says to put every sum in one call; 30 calls a reply, and the last one's result says it was the last (a thought no longer counts as the answer that's due, which is how a reply ended with nothing said). **Rules**: the tools' preamble says to check a change someone waved through against the user's own rules and to name the rule; a request with tools ends with today's date. **New on the Mac**: `search_chats` over the app's chat files (`chats.rs`); `list_events`, `create_event`, `create_reminder` run by the app through EventKit (pretended in a test script unless it says `"calendar": "real"`); `schedule_task` (`tasks.rs`: a time of day, once, a folder's new files, a link) kept by the server and run by the app as a chat of its own (`TaskRunner`, Settings, Tasks). `aurelia_run.py` plays all 32 prompts now | Unit tests only: server 103 (thinking and kept results in each family's form, a record to the app and back, task schedules and what is due, chat search), Mac app 144 (reasoning apart from the answer, records saved with a reply, dates read, a dry calendar run). **Not run:** the eval, the gauntlet, or any model at all: every prompt changed (the preamble, the date, two tool descriptions, three more tools declared when the app offers them), so the eval needs running on the small and the large models before this is merged, with thinking on and off. **Not built:** the Windows app's side (it ignores the new events; it would have to keep and send back `record`, and say `run_tasks` to get tasks) |
 | 2026-11-13 | The Mac against mlx-vlm after the 8-model benchmark (`evals/speed/bench-2026-11-13`). **Gemma 4 26B-A4B's experts**: `moe_pick` on a threadgroup (each thread places its experts among the scores; one thread picking a best at a time took 0.2 ms a token, a third of the GPU's time writing), `moe_group` on 1,024 threads (an expert and a part of the slots each; 1.4 → 0.2 ms for 8,192 slots), and a batch's products on the neural accelerators (`moe_matmul_tc`, vireo_tensor.metal): the slots' inputs gathered in their experts' order in f16 (`moe_gather_half`), the products left in that order and added up through `place` (`moe_sum`); the default mode only, exact mode keeps `moe_matmul`. **A model's file let go after loading** (`Mmap::release`, the file mapped again over its own mapping; `GgufFile::release_pages` after the model and a draft model load): its pages no longer sit beside the GPU's copy. **Qwen's first chat** saves its DeltaNet at the system turn's end (`continue_with`'s `head`), so the second chat no longer reads that turn again. **Prompt attention** (`attention_tcg`): the output rescaled only where a row's maximum moved, each thread's rows found once, 8-17% less time at 30K positions (`prompt_attention_speed`), the same numbers. | 26B-A4B (UD-Q6_K, M5 Max, one run through vireo-server, before → after, mlx-vlm 6-bit / llama.cpp b12228): short reply 61 → 95 tok/s (108 / 94); reading 3K 1,730 → 3,160 (4,210 / 2,960), 32K 1,670 → 2,940 (3,040 / 2,010), 96K 1,270 → 1,830 (1,850 / 1,270); writing after 96K 78 (49 / 48); peak memory 53 → 31 GB (34 / 38). Qwen 3.5 9B Q6_K: writing 63-68 (mlx 66-71), reading 3K / 32K / 96K 2,790 / 2,240 / 1,670 (3,180 / 2,520 / 1,890); a new chat's first reply keeps 1,477 of 1,563 tokens (Qwen 3.5 4B). Perplexity, 26B, 6 × 1,024 tokens: 27.44 (27.56 before, exact 28.04). Engine tests (75 + GPU 17, with the 26B's default-mode batch against exact mode's next token), server 110. Writing on the dense models is bound by reading the weights (Qwen 9B: 7.5 GB a token at 70 tok/s). Open: prompts read 10-25% behind mlx-vlm on Qwen and at 3K on the 26B; the 26B's default mode on a repeating text (next token 0.95 exact, 0.71 with the f16 cache alone); E2B and E4B write their reasoning as the answer with thinking off under the agent's system prompt |
 | 2026-11-14 | What the all-Q6 comparison of Nov 13 found (eight models, three engines; HANDOFF.md's item 7). **Tool calls drafted** (`write_call`): where the model is free to write (a path, a sum, a file's text) the token is read with the draft layer's guesses, or the chat's, and each the model would have picked itself under the grammar is taken; where the grammar writes the text or scores a choice it goes on as before. Calls were 70% of the writing in Gemma 4 31B's tool task, a token at a time (54 ms); 95% of the guesses are taken there. The small Qwens, which don't guess from the chat in a reply's text on the Mac, do inside calls (`text_drafts`). **A skill that names a tool that changes files makes those tools callable** (the 31B was kept from `write_file` by the request's own words and read and summed in circles). **The same call again** is caught wherever it was made earlier in the reply, until something is changed, and counted once a round. **A call past its limit** (4,096 tokens; 768 for `calculate`) is taken back (`take_back`) and the model answers without more calls, instead of the reply failing. **Gemma with thinking off** is told so in its system turn (`GEMMA_NO_THINKING`). **Q6_K's blocks on the GPU** are 212 bytes, not 224 (`decode32` reads them as packed words). | One run each through vireo-server (M5 Max, Q6, before → after; mlx-vlm): tool task, Gemma 4 31B 56.2 → 28.5 s (57.9), Qwen 3.8 27B 56.0 → 30.4 (57.7), Muse 66.1 → 50.3 (145), 26B 11.6 → 9.2 (13.1), E4B 14.1 → 7.3 (14.8), Qwen 3.5 4B 9.5 → 6.5 (12.9), 9B 16.0 → 10.9 (18.6); skill task, 31B 113 → 27.1 (60.6) and right, Qwen 27B 59.5 → 28.7 (55.3), Muse 92.1 → 64.8 (193), E4B 15.8 → 7.4 (11.5), Qwen 4B 11.1 → 7.3 (11.5). Scored tasks right of 6: E4B 1 → 6, E2B 0 → 4. Qwen 27B's long tool task 365 s and an error → 209 s and right. Q6_K at 212 bytes: Qwen 3.5 9B writing 63 → 66 tokens/s, perplexity the same to every digit on Qwen 3.5 9B and Gemma 4 E4B, both modes. Server tests 111, engine 75 + GPU 17. Not run: vireo-eval, the gauntlet |
+| 2026-11-15 | Windows, fourth pass (see "Fifteenth round"): Google's draft models for Gemma 4 E2B and E4B on CUDA. Their centroid head (2,048 clusters, the 32 best scored: `gemma4_assistant.rs`'s `Centroids`, on the CPU), 4 query heads of their own, a guess's layers replayed from a graph, guesses stopped where the draft gives under 0.7 (`mtp_draft_sure`; CUDA), and the chat's long runs still taken beside the draft's. `vireo-eval` saves each case's reading, writing and tool times; `tools/reply_speed.py` times four kinds of reply one way against another | Greedy in the engine the same text as one token at a time, 1.25× (E2B) and 1.41× (E4B) as fast; first guess right 63% and 69% with no floor. Through the server against the chat's guesses alone (`--mtp off`), 400-token replies: E2B a list 85 → 105 tokens/s, an explanation 78 → 97, a story 79 → 86, an edited code file 170 → 179; E4B 46 → 66, 46 → 62, 42 → 53, 104 → 109; much the same at the models' own sampling (`evals/speed/windows-2026-11-15/`). The full eval, draft off → on: E2B 34 and 34, E4B 39 and 39, all 43 answers identical on both, writing 76.5 → 85.0 and 46.1 → 53.3 tokens/s (`evals/windows-small-gemma-draft.json`, with each case's speeds). Qwen 3.5 4B 38 for 13 November's 39 on `main` too. Engine 77, GPU 14, server 98, eval 12 tests pass. The GPU was held to ~33 W (a token about twice 12 November's time): ratios, not absolutes. Not compiled on the Mac |
 
 There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
 0.8B, so the 0.8B tests the code the 27B runs.
@@ -1110,6 +1111,79 @@ tokens 10%, of 9-64 8%.
   checkpoints, so the GPU still runs full (at full speed since the pickers shrank).
   Counting them would leave it ~7K tokens, or ~9K and the chat's guesses with fewer
   pickers: a choice, not made here.
+
+**Fifteenth round: Google's draft models for the small Gemmas (2026-11-15):**
+
+The Mac's draft model for Gemma 4 31B (13 November) was "not yet" on CUDA, and not for
+E2B and E4B, whose draft models (`gemma-4-E2B-it-assistant`, `-E4B-`; 158 MB each, four
+layers 256 wide) have a centroid head. Both run now, on this PC (RTX 5060 Laptop, mains,
+Performance scheme, but the GPU held to ~33 W all day: one token of E2B took 10.6 ms
+against 5.5 on 12 November, so compare within a row, not with earlier rounds).
+
+- **The centroid head** (`Gemma4AssistantMaskedEmbedder`): 2,048 clusters of 128 tokens;
+  the draft's final state scores the centroids and only the 32 best clusters' tokens
+  get logits, 4,096 rows of 256 instead of 262,144. On the CPU, from the state read back
+  (1 KB, not 1 MB of logits), the tied embedding kept in cluster order in the PC's
+  memory (134 MB, bf16): 0.11 ms a guess.
+- **Its heads are its own**: 4 query heads over the model's 1 or 2 key-value heads (the
+  loader asked for the model's 8). And after a check (every token's logits) every row of
+  a shared-layer model's states is final, so the next round drafts from the last one
+  kept; the Mac's code gave such models none.
+- **A guess's layers replay a graph** (CUDA): queuing its ~40 kernels took 0.65 of a
+  guess's 0.92 ms; now 0.6 ms a guess, the GPU's work 0.1-0.3.
+- **Guesses only where the draft is sure.** A guess checked costs these models a third
+  of a token, not the tenth `check_speed` shows: a check wants every token's logits, so
+  the 20 layers that share keys and values and the 262,144-row output run for each
+  guess (E2B: one token 10.6 ms, 3.4 more a guess; E4B 19.8 and 5.3; for the last
+  token's logits only, 0.8 and 2.4). The draft knows when it's guessing: of first
+  guesses it gave 0.9 or more, 90% were the model's greedy pick (87% of the model's own
+  probability, what sampling at temperature 1 takes); under 0.7, about one in five. So a
+  round's guesses stop before the first under 0.7 (`mtp_draft_sure`, `MTP_FLOOR`; CUDA
+  only, the Mac's 31B drafts as before). Writing greedy in the engine, 3 guesses a
+  round, any / 0.5 / 0.7 / 0.9: E2B 1.01 / 1.14 / 1.25 / 1.21 times one token at a
+  time, E4B 1.28 / 1.42 / 1.41 / 1.36, the same text every time; 5 or 7 guesses a round
+  were no better.
+- **The chat's guesses too**: with a draft model the server still takes the chat's own
+  where it offers 3 or more (a run of 4 matched), and leaves shorter ones to the draft.
+
+Through the server, 400-token replies, the chat's guesses alone (`--mtp off`, as
+before) → with the draft model, tokens/s (`tools/reply_speed.py`, two rounds, the ways
+taking turns; `evals/speed/windows-2026-11-15/`):
+
+| | A document as a list | A code file with an edit | A new story | An explanation |
+|---|---|---|---|---|
+| Gemma 4 E2B, greedy | 85 → 105 | 170 → 179 | 79 → 86 | 78 → 97 |
+| Gemma 4 E2B, its own sampling | 88 → 109 | 168 → 178 | 76 → 87 | 77 → 97 |
+| Gemma 4 E4B, greedy | 46 → 66 | 104 → 109 | 42 → 53 | 46 → 62 |
+| Gemma 4 E4B, its own sampling | 43 → 64 | 96 → 106 | 43 → 51 | 45 → 61 |
+
+The full eval (43 cases, greedy), the draft model off → on, back to back
+(`evals/windows-small-gemma-draft-off.json`, `-draft.json`): Gemma 4 E2B 34 and 34, E4B
+39 and 39, every answer the same to the letter on both (43 of 43); writing 76.5 → 85.0
+and 46.1 → 53.3 tokens/s (98 → 90 and 162 → 144 s for all 43), guesses taken 1,760 of
+3,760 → 2,784 of 4,813 and 1,656 of 3,284 → 2,718 of 4,294. No case changed against 13
+November's run on the Gemmas or Qwen 3.5 9B (41); Qwen 3.5 4B has 38 for 39
+(`office-invoices`, in a full run only), and has it on `main` without this round too,
+so since the Mac's merge of 13 November or the date, not from here. The same run's
+speeds, as the eval now saves them:
+
+| | Read (tokens, /s; kept) | Wrote (tokens, /s) | A tool call written / run |
+|---|---|---|---|
+| Gemma 4 E2B | 13,998 at 3,544 (87,765 kept) | 6,749 at 85.0 | 322 ms / 0.9 ms |
+| Gemma 4 E4B | 16,397 at 1,310 (87,765) | 6,233 at 53.3 | 584 ms / 0.9 ms |
+| Qwen 3.5 4B | 49,700 at 782 (72,034) | 8,212 at 36.2 | 824 ms / 1.0 ms |
+| Qwen 3.5 9B | 49,630 at 451 (72,034) | 7,916 at 22.4 (no guesses: no memory for its steps) | 1,452 ms / 1.1 ms |
+
+- **The eval saves its speeds** (both machines): each case's prompt tokens, those kept
+  and read, the reading and writing speeds, each tool call's time to write and to run
+  (the server's `Tool:` line now has both), and guesses made and taken, with a total for
+  each model (`speeds`), read from the server's `Reply:` and `Tool:` lines.
+- **Next:** a check that runs the shared layers and the logits only for guesses still
+  in the running (two passes; a wrong first guess now pays for the ones after it); the
+  draft's embedding and head on the GPU, so a round's guesses are one launch; the draft
+  models downloaded by the app (they're found beside the model: `models/` here). Qwen
+  3.5 has no draft model of its own; its gains here are the Mac's shared ones (the
+  system turn's state kept for a second chat).
 
 **Long chats (2026-11-11):** vireo-server's context is now automatic by default: as
 many tokens as the GPU's free memory holds once the model is loaded (leaving 1 GB and a

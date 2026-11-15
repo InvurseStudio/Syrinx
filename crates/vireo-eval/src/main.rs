@@ -175,7 +175,9 @@ fn main() -> ExitCode {
         println!("\n{name}");
         let mut runs = Vec::new();
         for case in &cases {
+            let logged = running.log.lock().unwrap().len();
             let run = ask(running.port, case);
+            let speeds = running.speeds_since(logged);
             let verdict = match (&run.error, (case.check)(&run)) {
                 (Some(e), _) => Err(format!("error: {e}")),
                 (None, _)
@@ -208,7 +210,7 @@ fn main() -> ExitCode {
                     .err()
                     .map_or(String::new(), |why| format!("  ({why})"))
             );
-            runs.push((case.id, verdict, run));
+            runs.push((case.id, verdict, run, speeds));
         }
         let passed = runs.iter().filter(|r| r.1.is_ok()).count();
         let seconds: f64 = runs.iter().map(|r| r.2.seconds).sum();
@@ -242,6 +244,23 @@ fn main() -> ExitCode {
             runs.len(),
             seconds / runs.len().max(1) as f64
         );
+        let mut all = Speeds::default();
+        for r in &runs {
+            all.add(&r.3);
+        }
+        let (call_ms, run_ms) = all.tool_ms();
+        println!(
+            "  read {} tokens at {:.0}/s ({} more kept), wrote {} at {:.1}/s, {} of {} guesses taken; a tool call written in {:.0} ms and run in {:.0} ms on average",
+            all.read_tokens,
+            Speeds::per_second(all.read_tokens, all.read_seconds),
+            all.kept_tokens,
+            all.written_tokens,
+            Speeds::per_second(all.written_tokens, all.write_seconds),
+            all.taken,
+            all.guessed,
+            call_ms / all.tools.len().max(1) as f64,
+            run_ms / all.tools.len().max(1) as f64
+        );
         running.stop();
         report.push((name, runs));
     }
@@ -256,7 +275,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-type Report<'a> = Vec<(String, Vec<(&'a str, Result<(), String>, Run)>)>;
+type Report<'a> = Vec<(String, Vec<(&'a str, Result<(), String>, Run, Speeds)>)>;
 
 fn results_json(report: &Report, server_args: &[String]) -> String {
     let models: Vec<String> = report
@@ -264,14 +283,14 @@ fn results_json(report: &Report, server_args: &[String]) -> String {
         .map(|(name, runs)| {
             let cases: Vec<String> = runs
                 .iter()
-                .map(|(id, verdict, run)| {
+                .map(|(id, verdict, run, speeds)| {
                     let tools: Vec<String> = run
                         .calls
                         .iter()
                         .map(|c| format!("{{\"tool\":{},\"args\":{}}}", json::string(&c.tool), to_json(&c.args)))
                         .collect();
                     format!(
-                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"skillCase\":{},\"moreCase\":{},\"skills\":[{}],\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},\"answer\":{}}}",
+                        "{{\"id\":{},\"hard\":{},\"changes\":{},\"skillCase\":{},\"moreCase\":{},\"skills\":[{}],\"asked\":[{}],\"passed\":{},\"problem\":{},\"calls\":[{}],\"seconds\":{:.2},\"tokens\":{},{},\"answer\":{}}}",
                         json::string(id),
                         run.hard,
                         run.changes,
@@ -284,15 +303,22 @@ fn results_json(report: &Report, server_args: &[String]) -> String {
                         tools.join(","),
                         run.seconds,
                         run.tokens,
+                        speeds.json(true),
                         json::string(&run.answer)
                     )
                 })
                 .collect();
+            let mut all = Speeds::default();
+            for r in runs {
+                all.add(&r.3);
+            }
             format!(
-                "{}:{{\"passed\":{},\"total\":{},\"cases\":[\n    {}\n  ]}}",
+                "{}:{{\"passed\":{},\"total\":{},\"seconds\":{:.2},\"speeds\":{{{}}},\"cases\":[\n    {}\n  ]}}",
                 json::string(name),
                 runs.iter().filter(|r| r.1.is_ok()).count(),
                 runs.len(),
+                runs.iter().map(|r| r.2.seconds).sum::<f64>(),
+                all.json(false),
                 cases.join(",\n    ")
             )
         })
@@ -331,6 +357,138 @@ struct Server {
     child: Child,
     stdin: Option<ChildStdin>,
     port: u16,
+    /// Its log so far, a line each.
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+/// What the server's log says of a case's replies: how much it read and wrote and how
+/// fast ("Reply:" lines), and each tool call's time ("Tool:" lines). Saved with every
+/// case on every machine, so runs can be compared for speed as well as score.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Speeds {
+    /// The prompt's tokens, those kept from the chat's cache, and those read.
+    prompt_tokens: usize,
+    kept_tokens: usize,
+    read_tokens: usize,
+    read_seconds: f64,
+    /// Tokens written (the answer, calls and thoughts) and the time from the prompt's
+    /// end to the reply's, tools' runs included.
+    written_tokens: usize,
+    write_seconds: f64,
+    /// Each call: the tool, the time writing the call and the time the tool ran, ms.
+    tools: Vec<(String, f64, f64)>,
+    /// Guesses checked (a draft model's, the chat's own) and taken.
+    guessed: usize,
+    taken: usize,
+}
+
+impl Speeds {
+    /// From the log lines of one case.
+    fn read(lines: &[String]) -> Self {
+        // The number before `after` in `line` (after the text before it, if given).
+        fn before(line: &str, after: &str) -> Option<f64> {
+            let head = &line[..line.find(after)?];
+            let start = head
+                .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .map_or(0, |i| i + 1);
+            head[start..].parse().ok()
+        }
+        let mut out = Speeds::default();
+        for line in lines {
+            if let Some(rest) = line.strip_prefix("Reply: ") {
+                let n = |after: &str| before(rest, after).unwrap_or(0.0);
+                out.prompt_tokens += n(" prompt tokens") as usize;
+                out.kept_tokens += n(" kept,") as usize;
+                out.read_tokens += n(" read in ") as usize;
+                out.read_seconds += n("s, ");
+                // "), 123 tokens in 4.56s (": after the prompt's part.
+                if let Some(at) = rest.find("/s), ") {
+                    let written = &rest[at + 5..];
+                    out.written_tokens += before(written, " tokens in ").unwrap_or(0.0) as usize;
+                    out.write_seconds += before(written, "s (").unwrap_or(0.0);
+                }
+                let mut guesses = rest;
+                while let Some(at) = guesses.find(" guesses") {
+                    // "12 of 34 guesses".
+                    let head = &guesses[..at];
+                    out.guessed += before(guesses, " guesses").unwrap_or(0.0) as usize;
+                    out.taken += before(head, " of ").unwrap_or(0.0) as usize;
+                    guesses = &guesses[at + 8..];
+                }
+            } else if let Some(rest) = line.strip_prefix("Tool: ") {
+                let name = rest.split(' ').next().unwrap_or("").to_string();
+                // The times follow the arguments: the last "(written in".
+                let times = rest.rfind("(written in ").map_or("", |at| &rest[at..]);
+                out.tools.push((
+                    name,
+                    before(times, " ms").unwrap_or(0.0),
+                    times
+                        .find("run in ")
+                        .and_then(|at| before(&times[at..], " ms"))
+                        .unwrap_or(0.0),
+                ));
+            }
+        }
+        out
+    }
+
+    fn per_second(tokens: usize, seconds: f64) -> f64 {
+        if seconds > 0.0 { tokens as f64 / seconds } else { 0.0 }
+    }
+
+    fn add(&mut self, other: &Speeds) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.kept_tokens += other.kept_tokens;
+        self.read_tokens += other.read_tokens;
+        self.read_seconds += other.read_seconds;
+        self.written_tokens += other.written_tokens;
+        self.write_seconds += other.write_seconds;
+        self.tools.extend(other.tools.iter().cloned());
+        self.guessed += other.guessed;
+        self.taken += other.taken;
+    }
+
+    /// Time writing calls and running tools, ms.
+    fn tool_ms(&self) -> (f64, f64) {
+        self.tools
+            .iter()
+            .fold((0.0, 0.0), |sum, t| (sum.0 + t.1, sum.1 + t.2))
+    }
+
+    /// The fields of a case's (or a model's) JSON object, without braces.
+    fn json(&self, with_calls: bool) -> String {
+        let (call_ms, run_ms) = self.tool_ms();
+        let mut out = format!(
+            "\"promptTokens\":{},\"keptTokens\":{},\"readTokens\":{},\"readSeconds\":{:.3},\"readTokensPerSecond\":{:.0},\"writtenTokens\":{},\"writeSeconds\":{:.3},\"writtenTokensPerSecond\":{:.1},\"toolCalls\":{},\"toolCallWriteMs\":{:.0},\"toolRunMs\":{:.0},\"guessed\":{},\"guessesTaken\":{}",
+            self.prompt_tokens,
+            self.kept_tokens,
+            self.read_tokens,
+            self.read_seconds,
+            Self::per_second(self.read_tokens, self.read_seconds),
+            self.written_tokens,
+            self.write_seconds,
+            Self::per_second(self.written_tokens, self.write_seconds),
+            self.tools.len(),
+            call_ms,
+            run_ms,
+            self.guessed,
+            self.taken
+        );
+        if with_calls {
+            let calls: Vec<String> = self
+                .tools
+                .iter()
+                .map(|(tool, write, run)| {
+                    format!(
+                        "{{\"tool\":{},\"writeMs\":{write:.0},\"runMs\":{run:.0}}}",
+                        json::string(tool)
+                    )
+                })
+                .collect();
+            out += &format!(",\"toolTimes\":[{}]", calls.join(","));
+        }
+        out
+    }
 }
 
 impl Server {
@@ -401,12 +559,37 @@ impl Server {
             }
         }
         match port {
-            Some(port) => Ok(Server { child, stdin, port }),
+            Some(port) => Ok(Server {
+                child,
+                stdin,
+                port,
+                log,
+            }),
             None => {
                 let _ = child.wait();
                 Err(log.lock().unwrap().join("\n"))
             }
         }
+    }
+
+    /// The speeds in the log's lines from line `from` on: a case's, once its reply is
+    /// done. The log comes through a pipe, a moment after the reply's last event.
+    fn speeds_since(&self, from: usize) -> Speeds {
+        for _ in 0..50 {
+            let log = self.log.lock().unwrap();
+            if log[from.min(log.len())..]
+                .iter()
+                .any(|l| l.starts_with("Reply:"))
+            {
+                break;
+            }
+            drop(log);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // A line more may follow the first "Reply:" (a second request's): a moment for it.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let log = self.log.lock().unwrap();
+        Speeds::read(&log[from.min(log.len())..])
     }
 
     fn stop(&mut self) {
@@ -537,4 +720,42 @@ fn ask(port: u16, case: &Case) -> Run {
     run.seconds = started.elapsed().as_secs_f64();
     run.pc = pc;
     run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_cases_speeds_from_the_servers_log() {
+        let lines: Vec<String> = [
+            "[calls] something else",
+            "Tool: read_file {\"path\":\"notes (written in haste).txt\"} (written in 212 ms, run in 3 ms), 1840 characters back.",
+            "Tool: calculate {\"expression\":\"2+2\"} (written in 95 ms, run in 0 ms, 2 of 2 together), 1 characters back.",
+            "Reply: 1563 prompt tokens (1477 kept, 86 read in 0.04s, 2150/s), 120 tokens in 1.50s (80.0/s), 2 tool calls, 30 of 40 guesses from the chat taken (75%), 5 of 10 guesses from the draft model taken (50%).",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let s = Speeds::read(&lines);
+        assert_eq!(
+            (s.prompt_tokens, s.kept_tokens, s.read_tokens, s.written_tokens),
+            (1563, 1477, 86, 120)
+        );
+        assert_eq!((s.read_seconds, s.write_seconds), (0.04, 1.5));
+        assert_eq!((s.guessed, s.taken), (50, 35));
+        assert_eq!(
+            s.tools,
+            vec![
+                ("read_file".to_string(), 212.0, 3.0),
+                ("calculate".to_string(), 95.0, 0.0)
+            ]
+        );
+        assert_eq!(s.tool_ms(), (307.0, 3.0));
+        // An older server's line, without the run time.
+        let old = Speeds::read(&["Tool: list_dir {} (written in 50 ms), 9 characters back.".to_string()]);
+        assert_eq!(old.tools, vec![("list_dir".to_string(), 50.0, 0.0)]);
+        assert!(s.json(true).contains("\"readTokensPerSecond\":2150,"));
+        assert!(s.json(true).contains("\"toolTimes\":[{\"tool\":\"read_file\",\"writeMs\":212,\"runMs\":3}"));
+    }
 }
