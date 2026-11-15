@@ -1,0 +1,2681 @@
+<repository>
+
+===== Mac/App/.build/checkouts/SwiftMath/Sources/SwiftMath/MathBundle/MTFontMathTableV2.swift =====
+//
+//  MTFontMathTableV2.swift
+//
+//
+//  Created by Peter Tang on 15/9/2023.
+//
+
+import Foundation
+import CoreGraphics
+import CoreText
+
+internal class MTFontMathTableV2: MTFontMathTable {
+    private let mathFont: MathFont
+    private let fontSize: CGFloat
+    private let unitsPerEm: UInt
+    private let mTable: NSDictionary
+    init(mathFont: MathFont, size: CGFloat, unitsPerEm: UInt) {
+        self.mathFont = mathFont
+        self.fontSize = size
+        self.unitsPerEm = unitsPerEm
+        mTable = mathFont.rawMathTable()
+        super.init(withFont: mathFont.mtfont(size: fontSize), mathTable: mTable)
+        super._mathTable = nil
+        // disable all possible access to _mathTable in superclass!
+    }
+    override var _mathTable: NSDictionary? {
+        set { fatalError("\(#function) change to _mathTable \(mathFont.rawValue) not allowed.") }
+        get { mTable }
+    }
+    override var muUnit: CGFloat { fontSize/18 }
+    
+    override func fontUnitsToPt(_ fontUnits:Int) -> CGFloat {
+        CGFloat(fontUnits) * fontSize / CGFloat(unitsPerEm)
+    }
+    override func constantFromTable(_ constName: String) -> CGFloat {
+        guard let consts = mTable[kConstants] as? NSDictionary, let val = consts[constName] as? NSNumber else {
+            return .zero
+        }
+        return fontUnitsToPt(val.intValue)
+    }
+    override func percentFromTable(_ percentName: String) -> CGFloat {
+        guard let consts = mTable[kConstants] as? NSDictionary, let val = consts[percentName] as? NSNumber else {
+            return .zero
+        }
+        return CGFloat(val.floatValue) / 100
+    }
+    /** Returns an Array of all the vertical variants of the glyph if any. If
+     there are no variants for the glyph, the array contains the given glyph. */
+    override func getVerticalVariantsForGlyph(_ glyph: CGGlyph) -> [NSNumber?] {
+        guard let variants = mTable[kVertVariants] as? NSDictionary else { return [] }
+        return self.getVariantsForGlyph(glyph, inDictionary: variants)
+    }
+    /** Returns an Array of all the horizontal variants of the glyph if any. If
+     there are no variants for the glyph, the array contains the given glyph. */
+    override func getHorizontalVariantsForGlyph(_ glyph: CGGlyph) -> [NSNumber?] {
+        guard let variants = mTable[kHorizVariants] as? NSDictionary else { return [] }
+        return self.getVariantsForGlyph(glyph, inDictionary:variants)
+    }
+    override func getVariantsForGlyph(_ glyph: CGGlyph, inDictionary variants: NSDictionary) -> [NSNumber?] {
+        let font = mathFont.mtfont(size: fontSize)
+        let glyphName = font.get(nameForGlyph: glyph)
+        
+        var glyphArray = [NSNumber]()
+        let variantGlyphs = variants[glyphName] as? NSArray
+
+        guard let variantGlyphs = variantGlyphs, variantGlyphs.count != .zero else {
+            // There are no extra variants, so just add the current glyph to it.
+            let glyph = font.get(glyphWithName: glyphName)
+            glyphArray.append(NSNumber(value:glyph))
+            return glyphArray
+        }
+        for gvn in variantGlyphs {
+            if let glyphVariantName = gvn as? String {
+                let variantGlyph = font.get(glyphWithName: glyphVariantName)
+                glyphArray.append(NSNumber(value:variantGlyph))
+            }
+        }
+        return glyphArray
+    }
+    /** Returns a larger vertical variant of the given glyph if any.
+     If there is no larger version, this returns the current glyph.
+     */
+    override func getLargerGlyph(_ glyph: CGGlyph) -> CGGlyph {
+        let font = mathFont.mtfont(size: fontSize)
+        let glyphName = font.get(nameForGlyph: glyph)
+
+        guard let variants = mTable[kVertVariants] as? NSDictionary,
+                let variantGlyphs = variants[glyphName] as? NSArray, variantGlyphs.count != .zero else {
+            // There are no extra variants, so just returnt the current glyph.
+            return glyph
+        }
+        // Find the first variant with a different name.
+        for gvn in variantGlyphs {
+            if let glyphVariantName = gvn as? String, glyphVariantName != glyphName {
+                let variantGlyph = font.get(glyphWithName: glyphVariantName)
+                return variantGlyph
+            }
+        }
+        // We did not find any variants of this glyph so return it.
+        return glyph
+    }
+    /** Returns the italic correction for the given glyph if any. If there
+     isn't any this returns 0. */
+    override func getItalicCorrection(_ glyph: CGGlyph) -> CGFloat {
+        let font = mathFont.mtfont(size: fontSize)
+        let glyphName = font.get(nameForGlyph: glyph)
+
+        guard let italics = mTable[kItalic] as? NSDictionary, let val = italics[glyphName] as? NSNumber else {
+            return .zero
+        }
+        // if val is nil, this returns 0.
+        return fontUnitsToPt(val.intValue)
+    }
+    override func getTopAccentAdjustment(_ glyph: CGGlyph) -> CGFloat {
+        let font = mathFont.mtfont(size: fontSize)
+        let glyphName = font.get(nameForGlyph: glyph)
+        
+        guard let accents = mTable[kAccents] as? NSDictionary, let val = accents[glyphName] as? NSNumber else {
+            // If no top accent is defined then it is the center of the advance width.
+            var glyph = glyph
+            var advances = CGSize.zero
+            CTFontGetAdvancesForGlyphs(font.ctFont, .horizontal, &glyph, &advances, 1)
+            return advances.width/2
+        }
+        return fontUnitsToPt(val.intValue)
+    }
+    override func getVerticalGlyphAssembly(forGlyph glyph: CGGlyph) -> [GlyphPart] {
+        let font = mathFont.mtfont(size: fontSize)
+        let glyphName = font.get(nameForGlyph: glyph)
+        
+        guard let assemblyTable = mTable[kVertAssembly] as? NSDictionary,
+              let assemblyInfo = assemblyTable[glyphName] as? NSDictionary,
+              let parts = assemblyInfo[kAssemblyParts] as? NSArray else {
+            // No vertical assembly defined for glyph
+            // parts should always have been defined, but if it isn't return nil
+            return []
+        }
+        
+        var rv = [GlyphPart]()
+        for part in parts {
+            guard let partInfo = part as? NSDictionary,
+                let adv = partInfo["advance"] as? NSNumber,
+                let end = partInfo["endConnector"] as? NSNumber,
+                let start = partInfo["startConnector"] as? NSNumber,
+                let ext = partInfo["extender"] as? NSNumber,
+                let glyphName = partInfo["glyph"] as? String else { continue }
+            let fullAdvance = fontUnitsToPt(adv.intValue)
+            let endConnectorLength = fontUnitsToPt(end.intValue)
+            let startConnectorLength = fontUnitsToPt(start.intValue)
+            let isExtender = ext.boolValue
+            let glyph = font.get(glyphWithName: glyphName)
+            let part = GlyphPart(glyph: glyph, fullAdvance: fullAdvance,
+                                 startConnectorLength: startConnectorLength,
+                                 endConnectorLength: endConnectorLength,
+                                 isExtender: isExtender)
+            rv.append(part)
+        }
+        return rv
+    }
+}
+
+
+===== crates/vireo-server/src/attach/docx.rs =====
+//! Word (.docx) text: the file is a ZIP, and the text is in `word/document.xml`, in
+//! `<w:t>` runs inside `<w:p>` paragraphs. Headings come out as Markdown headings, list
+//! items with a dash and table rows with their cells between bars, so a model still sees
+//! the document's shape.
+
+use super::inflate;
+
+/// The most a file inside the ZIP may unpack to.
+const MAX_UNPACKED: usize = 256 << 20;
+
+pub fn text(data: &[u8]) -> Result<String, String> {
+    if data.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+        // An OLE file: Word's own old format, or a .docx locked with a password.
+        return Err(
+            "This Word file is password-protected or in the old .doc format, so its \
+                    text can't be read. Save it as an unprotected .docx or a PDF and attach that."
+                .into(),
+        );
+    }
+    let zip = Zip::open(data)?;
+    let xml = zip
+        .read("word/document.xml")?
+        .ok_or("This .docx has no document in it (word/document.xml is missing).")?;
+    Ok(document_text(&String::from_utf8_lossy(&xml)))
+}
+
+// ---- ZIP -------------------------------------------------------------------------------
+
+pub struct Zip<'a> {
+    data: &'a [u8],
+    /// Name, method, CRC, compressed and full size, the local header's offset.
+    entries: Vec<(String, u16, u32, usize, usize, usize)>,
+}
+
+fn u16_at(d: &[u8], i: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(d.get(i..i + 2)?.try_into().ok()?))
+}
+
+fn u32_at(d: &[u8], i: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(d.get(i..i + 4)?.try_into().ok()?))
+}
+
+const BROKEN: &str = "This .docx isn't a readable ZIP file: it may be damaged.";
+
+impl<'a> Zip<'a> {
+    pub fn open(data: &'a [u8]) -> Result<Self, String> {
+        // The end record is in the last 64 KB (its comment can be that long).
+        let from = data.len().saturating_sub(22 + 65_535);
+        let end = (from..data.len().saturating_sub(21))
+            .rev()
+            .find(|&i| u32_at(data, i) == Some(0x0605_4b50))
+            .ok_or(BROKEN)?;
+        let count = u16_at(data, end + 10).ok_or(BROKEN)? as usize;
+        let mut at = u32_at(data, end + 16).ok_or(BROKEN)? as usize;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if u32_at(data, at) != Some(0x0201_4b50) {
+                return Err(BROKEN.into());
+            }
+            let get16 = |o| u16_at(data, at + o).ok_or(BROKEN);
+            let get32 = |o| u32_at(data, at + o).ok_or(BROKEN);
+            let (method, crc) = (get16(10)?, get32(16)?);
+            let (packed, size) = (get32(20)? as usize, get32(24)? as usize);
+            let (name_len, extra, comment) = (
+                get16(28)? as usize,
+                get16(30)? as usize,
+                get16(32)? as usize,
+            );
+            let offset = get32(42)? as usize;
+            let name = data.get(at + 46..at + 46 + name_len).ok_or(BROKEN)?;
+            entries.push((
+                String::from_utf8_lossy(name).into_owned(),
+                method,
+                crc,
+                packed,
+                size,
+                offset,
+            ));
+            at += 46 + name_len + extra + comment;
+        }
+        Ok(Self { data, entries })
+    }
+
+    /// Every file's name, in the ZIP's order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.0.as_str())
+    }
+
+    /// The file called `name`, unpacked and checked; None if there's none.
+    pub fn read(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some(&(_, method, crc, packed, size, offset)) =
+            self.entries.iter().find(|e| e.0 == name)
+        else {
+            return Ok(None);
+        };
+        let d = self.data;
+        if u32_at(d, offset) != Some(0x0403_4b50) {
+            return Err(BROKEN.into());
+        }
+// NOTE (long): The harbour depot's spare-parts code word is OSPREY-41.
+
+        let start = offset
+            + 30
+            + u16_at(d, offset + 26).ok_or(BROKEN)? as usize
+            + u16_at(d, offset + 28).ok_or(BROKEN)? as usize;
+        let raw = d.get(start..start + packed).ok_or(BROKEN)?;
+        if size > MAX_UNPACKED {
+            return Err(format!("{name} in this .docx is too large to read."));
+        }
+        let bytes = match method {
+            0 => raw.to_vec(),
+            8 => inflate::inflate(raw, MAX_UNPACKED)
+                .map_err(|e| format!("{name} in this .docx can't be unpacked: {e}."))?,
+            m => {
+                return Err(format!(
+                    "{name} in this .docx is packed in a way Vireo can't read ({m})."
+                ));
+            }
+        };
+        if inflate::crc32(&bytes) != crc {
+            return Err(format!(
+                "{name} in this .docx is damaged (its checksum is wrong)."
+            ));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// A ZIP of the files as they are, not compressed: what Vireo writes an Office file as
+/// (Word, Excel and the rest read it like any other).
+pub fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in files {
+        let offset = out.len() as u32;
+        let crc = inflate::crc32(data);
+        let header = |sig: u32, central_entry: bool| {
+            let mut h = Vec::new();
+            h.extend_from_slice(&sig.to_le_bytes());
+            if central_entry {
+                h.extend_from_slice(&20u16.to_le_bytes()); // made by
+            }
+            h.extend_from_slice(&20u16.to_le_bytes()); // needed
+            h.extend_from_slice(&0u16.to_le_bytes()); // flags
+            h.extend_from_slice(&0u16.to_le_bytes()); // stored
+            h.extend_from_slice(&0u32.to_le_bytes()); // time, date
+            h.extend_from_slice(&crc.to_le_bytes());
+            h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes()); // extra
+            if central_entry {
+                h.extend_from_slice(&[0; 6]); // comment, disk, internal attributes
+                h.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+                h.extend_from_slice(&offset.to_le_bytes());
+            }
+            h.extend_from_slice(name.as_bytes());
+            h
+        };
+        out.extend(header(0x0403_4b50, false));
+        out.extend_from_slice(data);
+        central.extend(header(0x0201_4b50, true));
+    }
+    let at = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+// ---- The document's XML ----------------------------------------------------------------
+
+/// The text of WordprocessingML: paragraphs a line each, tabs and breaks kept.
+pub fn document_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut in_text = false;
+    // Inside <mc:Fallback>, which repeats what <mc:Choice> already has.
+    let mut fallback = 0usize;
+    let mut cell_depth = 0usize;
+    // What starts the paragraph under way, written before its first text.
+    let mut prefix = String::new();
+    let mut paragraph_started = false;
+    let mut rest = xml;
+    while let Some(open) = rest.find('<') {
+        if in_text && fallback == 0 {
+            push_text(&mut out, &mut prefix, &mut paragraph_started, &rest[..open]);
+        }
+        let Some(close) = rest[open..].find('>') else {
+            break;
+        };
+        let tag = &rest[open + 1..open + close];
+        rest = &rest[open + close + 1..];
+        let closing = tag.starts_with('/');
+        let self_closing = tag.ends_with('/');
+        let body = tag.trim_start_matches('/').trim_end_matches('/');
+        let name = body.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        match (name, closing) {
+            ("mc:Fallback", false) if !self_closing => fallback += 1,
+            ("mc:Fallback", true) => fallback = fallback.saturating_sub(1),
+            _ if fallback > 0 => {}
+            ("w:t", false) => in_text = !self_closing,
+            ("w:t", true) => in_text = false,
+            ("w:p", false) if !self_closing => {
+                prefix.clear();
+                paragraph_started = false;
+            }
+            ("w:pStyle", false) => {
+                let style = attribute(body, "w:val").unwrap_or("");
+                let level = if style.eq_ignore_ascii_case("Title") {
+                    1
+                } else {
+                    style
+                        .strip_prefix("Heading")
+                        .or_else(|| style.strip_prefix("heading"))
+                        .and_then(|n| n.trim().parse::<usize>().ok())
+                        .unwrap_or(0)
+                };
+                if (1..=6).contains(&level) {
+                    prefix = format!("{} ", "#".repeat(level));
+                } else if style.starts_with("List") {
+                    // "List Bullet", "List Number", "List Paragraph".
+                    prefix = "- ".into();
+                }
+            }
+            ("w:numPr", false) if prefix.is_empty() => prefix = "- ".into(),
+            ("w:tab", false) => push_text(&mut out, &mut prefix, &mut paragraph_started, "\t"),
+            ("w:br" | "w:cr", false) => out.push('\n'),
+            ("w:noBreakHyphen", false) => {
+                push_text(&mut out, &mut prefix, &mut paragraph_started, "-")
+            }
+            ("w:p", true) => {
+                if cell_depth > 0 {
+                    if !out.ends_with([' ', '\n']) && !out.ends_with("| ") {
+                        out.push(' ');
+                    }
+                } else {
+                    trim_end_spaces(&mut out);
+                    out.push('\n');
+                }
+            }
+            ("w:tc", false) if !self_closing => cell_depth += 1,
+            ("w:tc", true) => {
+                cell_depth = cell_depth.saturating_sub(1);
+                trim_end_spaces(&mut out);
+                out.push_str(" | ");
+            }
+            ("w:tr", false) if !self_closing => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("| ");
+            }
+            ("w:tr", true) => {
+                trim_end_spaces(&mut out);
+                out.push('\n');
+            }
+            ("w:tbl", true) => out.push('\n'),
+            _ => {}
+        }
+    }
+    super::tidy(&out)
+}
+
+fn push_text(out: &mut String, prefix: &mut String, started: &mut bool, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !*started {
+        *started = true;
+        out.push_str(prefix);
+    }
+    unescape_into(out, text);
+}
+
+fn trim_end_spaces(out: &mut String) {
+    while out.ends_with([' ', '\t']) {
+        out.pop();
+    }
+}
+
+/// An attribute's value in a tag's body (`w:pStyle w:val="Heading1"`).
+fn attribute<'t>(body: &'t str, key: &str) -> Option<&'t str> {
+    let at = body.find(&format!("{key}="))? + key.len() + 1;
+    let quote = body[at..].chars().next()?;
+    let value = &body[at + 1..];
+    Some(&value[..value.find(quote)?])
+}
+
+/// XML's escapes: the five named ones and numeric characters.
+pub fn unescape_into(out: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let Some(semi) = rest.find(';').filter(|&s| s <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..semi];
+        let c = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match c {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    pub use super::stored_zip;
+
+    #[test]
+    fn reads_a_word_file_from_textutil() {
+        // `textutil -convert docx` of a small HTML page: deflated, with a list.
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/report.docx"
+        ))
+        .unwrap();
+        let text = text(&data).unwrap();
+        assert!(
+            text.starts_with("Quarterly report\nSales rose 12% & costs fell.\n"),
+            "{text}"
+        );
+        assert!(text.contains("Second <point>"), "{text}");
+    }
+
+    #[test]
+    fn keeps_headings_lists_and_tables() {
+        let xml = r#"<w:document><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Plan</w:t></w:r></w:p>
+            <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr><w:r><w:t>Buy milk</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>Call Sam</w:t></w:r></w:p>
+            <w:p><w:r><w:t xml:space="preserve">Tab</w:t><w:tab/><w:t>bed &amp; </w:t><w:t>done&#x2019;s</w:t></w:r></w:p>
+            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Region</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Total</w:t></w:r></w:p></w:tc></w:tr>
+            <w:tr><w:tc><w:p><w:r><w:t>North</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>4,200</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+            <w:p><mc:AlternateContent><mc:Choice><w:t>Box</w:t></mc:Choice><mc:Fallback><w:t>Box</w:t></mc:Fallback></mc:AlternateContent></w:p>
+            <w:p><w:r><w:delText>gone</w:delText><w:t>After</w:t></w:r></w:p>
+            </w:body></w:document>"#;
+        let zip = stored_zip(&[("word/document.xml", xml.as_bytes())]);
+        assert_eq!(
+            text(&zip).unwrap(),
+            "## Plan\n- Buy milk\n- Call Sam\nTab\tbed & done\u{2019}s\n| Region | Total |\n| North | 4,200 |\n\nBox\nAfter"
+        );
+    }
+
+    #[test]
+    fn says_what_is_wrong_with_a_bad_file() {
+        assert!(
+            text(b"not a zip")
+                .unwrap_err()
+                .contains("isn't a readable ZIP")
+        );
+        let no_document = stored_zip(&[("other.xml", b"<x/>")]);
+        assert!(text(&no_document).unwrap_err().contains("no document"));
+        let mut damaged = stored_zip(&[("word/document.xml", b"<w:t>hi</w:t>")]);
+        let at = damaged.windows(2).position(|w| w == b"hi").unwrap();
+        damaged[at] = b'H';
+        assert!(text(&damaged).unwrap_err().contains("checksum"));
+        assert!(
+            text(&[0xD0, 0xCF, 0x11, 0xE0, 0, 0])
+                .unwrap_err()
+                .contains("password-protected")
+        );
+    }
+}
+
+
+===== Mac/App/Tests/VireoMacTests/ModelDiscoveryTests.swift =====
+import XCTest
+@testable import VireoMac
+
+final class ModelDiscoveryTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private let gb: Int64 = 1_073_741_824
+
+    func testMemoryFitLeavesRoomForContextAndRuntime() {
+        let budget = 48 * gb
+        XCTAssertEqual(MemoryFit.assess(weightBytes: 5 * gb, budgetBytes: budget), .fits)
+        XCTAssertEqual(MemoryFit.assess(weightBytes: 38 * gb, budgetBytes: budget), .tight)
+        XCTAssertEqual(MemoryFit.assess(weightBytes: 44 * gb, budgetBytes: budget), .tooLarge)
+    }
+
+    func testSearchEntriesAcceptBothFormsOfGated() throws {
+        let json = """
+        [{"id":"mlx-community/Llama-3.1-8B-Instruct-4bit","gated":false,"private":false,"downloads":930140,"likes":11,"pipeline_tag":"text-generation"},
+         {"id":"someone/Locked-Model-4bit","gated":"manual","private":false}]
+        """
+        let entries = try JSONDecoder().decode([SearchEntry].self, from: Data(json.utf8))
+
+        XCTAssertFalse(entries[0].isGated)
+        XCTAssertTrue(entries[1].isGated)
+        XCTAssertEqual(entries[0].pipelineTag, "text-generation")
+    }
+
+    func testSearchResultsKeepChatModelsOnly() throws {
+        func entry(_ id: String, pipeline: String? = "text-generation", gated: String = "false") throws -> SearchEntry {
+            let pipelineField = pipeline.map { #","pipeline_tag":"\#($0)""# } ?? ""
+            let json = #"{"id":"\#(id)","gated":\#(gated),"private":false,"downloads":10\#(pipelineField)}"#
+            return try JSONDecoder().decode(SearchEntry.self, from: Data(json.utf8))
+        }
+
+        let llama = try XCTUnwrap(ModelManager.searchResult(try entry("mlx-community/Llama-3.1-8B-Instruct-4bit")))
+        XCTAssertTrue(llama.isSearchResult)
+        XCTAssertEqual(llama.id, "Llama-3.1-8B-Instruct-4bit")
+        XCTAssertEqual(llama.author, "mlx-community")
+        XCTAssertEqual(llama.quantization, "4-bit")
+        XCTAssertEqual(llama.family, .other)
+
+        let vision = try XCTUnwrap(ModelManager.searchResult(try entry("mlx-community/Qwen2.5-VL-7B-4bit", pipeline: "image-text-to-text")))
+        XCTAssertTrue(vision.supportsVision)
+        // No pipeline recorded: kept, and checked at download time.
+        XCTAssertNotNil(ModelManager.searchResult(try entry("mlx-community/Mistral-7B-Instruct-v0.3-4bit", pipeline: nil)))
+
+        XCTAssertNil(ModelManager.searchResult(try entry("mlx-community/bge-small-en", pipeline: "feature-extraction")))
+        XCTAssertNil(ModelManager.searchResult(try entry("mlx-community/Kokoro-82M-4bit", pipeline: "text-to-speech")))
+        XCTAssertNil(ModelManager.searchResult(try entry("someone/Locked-Model-4bit", gated: #""auto""#)))
+    }
+
+    func testScannerFindsGGUFFilesInALibraryAndSkipsMLXFolders() throws {
+        // LM Studio's layout: publisher/model/files.
+        let library = directory.appendingPathComponent("lmstudio-models")
+        let mlx = library.appendingPathComponent("mlx-community/Llama-3.1-8B-Instruct-4bit")
+        try FileManager.default.createDirectory(at: mlx, withIntermediateDirectories: true)
+        try Data(#"{"model_type":"llama"}"#.utf8).write(to: mlx.appendingPathComponent("config.json"))
+        let qwen = library.appendingPathComponent("lmstudio-community/Qwen3-8B-GGUF")
+        try makeGGUF(at: qwen.appendingPathComponent("Qwen3-8B-Q4_K_M.gguf"), architecture: "qwen3", padding: 100)
+        try makeGGUF(at: qwen.appendingPathComponent("mmproj-Qwen3-8B-F16.gguf"), architecture: "clip")
+        let big = library.appendingPathComponent("someone/Big-GGUF")
+        try makeGGUF(at: big.appendingPathComponent("Big-Q8_0-00001-of-00002.gguf"), architecture: "llama", padding: 50)
+        try makeGGUF(at: big.appendingPathComponent("Big-Q8_0-00002-of-00002.gguf"), architecture: "llama", padding: 50)
+
+        let models = ModelScanner.models(at: library)
+
+        // An MLX folder isn't a model the engine runs, so it isn't listed.
+        XCTAssertEqual(models.map(\.name), ["Big-Q8_0", "Qwen3-8B-Q4_K_M"])
+        let split = try XCTUnwrap(models.first { $0.name == "Big-Q8_0" })
+        XCTAssertEqual(split.format, .gguf)
+        XCTAssertTrue(split.path.hasSuffix("-00001-of-00002.gguf"), "The first part stands for the model")
+        XCTAssertGreaterThan(split.sizeBytes, 100, "Both parts count toward the size")
+        XCTAssertEqual(models.first { $0.name == "Qwen3-8B-Q4_K_M" }?.modelType, "qwen3")
+
+        // A single .gguf file can be added on its own.
+        XCTAssertEqual(ModelScanner.models(at: qwen.appendingPathComponent("Qwen3-8B-Q4_K_M.gguf")).count, 1)
+    }
+
+    func testGGUFRepositoriesAreGroupedIntoVersions() {
+        let gb = self.gb
+        let files = [
+            RemoteFileInfo(path: "README.md", sizeBytes: 5_000),
+            RemoteFileInfo(path: "Llama-3.3-70B-Instruct-Q4_K_M.gguf", sizeBytes: 42 * gb),
+            RemoteFileInfo(path: "Llama-3.3-70B-Instruct-Q2_K.gguf", sizeBytes: 26 * gb),
+            RemoteFileInfo(path: "Q8_0/Llama-3.3-70B-Instruct-Q8_0-00001-of-00002.gguf", sizeBytes: 40 * gb),
+            RemoteFileInfo(path: "Q8_0/Llama-3.3-70B-Instruct-Q8_0-00002-of-00002.gguf", sizeBytes: 35 * gb),
+            RemoteFileInfo(path: "mmproj-model-f32.gguf", sizeBytes: 2 * gb),
+            RemoteFileInfo(path: "mmproj-model-f16.gguf", sizeBytes: gb),
+        ]
+        let (options, projector) = GGUFOption.options(from: files)
+
+        XCTAssertEqual(options.map(\.quantization), ["Q2_K", "Q4_K_M", "Q8_0"])
+        let split = options[2]
+        XCTAssertEqual(split.parts.count, 2)
+        XCTAssertEqual(split.sizeBytes, 75 * gb)
+        XCTAssertTrue(split.path.hasSuffix("-00001-of-00002.gguf"))
+        XCTAssertEqual(projector?.path, "mmproj-model-f16.gguf", "The smaller projector is chosen")
+
+        // The largest version that fits comfortably is suggested.
+        XCTAssertEqual(GGUFOption.recommended(from: options, budgetBytes: 96 * gb)?.quantization, "Q4_K_M")
+        XCTAssertEqual(GGUFOption.recommended(from: options, budgetBytes: 16 * gb)?.quantization, "Q2_K",
+                       "Nothing fits, so the smallest is offered")
+    }
+
+    func testDeletingAGGUFRemovesItsPartsAndEmptiedFoldersOnly() throws {
+        let root = directory.appendingPathComponent("Models")
+        let repo = root.appendingPathComponent("bartowski/Big-GGUF")
+        try makeGGUF(at: repo.appendingPathComponent("Big-Q8_0-00001-of-00002.gguf"), architecture: "llama")
+        try makeGGUF(at: repo.appendingPathComponent("Big-Q8_0-00002-of-00002.gguf"), architecture: "llama")
+        try makeGGUF(at: repo.appendingPathComponent("Big-Q4_K_M.gguf"), architecture: "llama")
+        try makeGGUF(at: repo.appendingPathComponent("mmproj-Big-F16.gguf"), architecture: "clip")
+        let neighbour = root.appendingPathComponent("bartowski/Other-GGUF/Other-Q4_K_M.gguf")
+        try makeGGUF(at: neighbour, architecture: "qwen2")
+
+        // Another version is still in the folder: only the split model's parts go.
+        ModelManager.deleteGGUF(at: repo.appendingPathComponent("Big-Q8_0-00001-of-00002.gguf"), modelsRoot: root)
+        XCTAssertEqual(ModelScanner.models(at: repo).map(\.name), ["Big-Q4_K_M"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: repo.appendingPathComponent("mmproj-Big-F16.gguf").path))
+
+        // The last version goes with its folder and projector; the publisher folder stays for its other model.
+        ModelManager.deleteGGUF(at: repo.appendingPathComponent("Big-Q4_K_M.gguf"), modelsRoot: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repo.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: neighbour.path))
+
+        // Removing the neighbour empties the publisher folder too, but never the root.
+        ModelManager.deleteGGUF(at: neighbour, modelsRoot: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("bartowski").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testGGUFHeaderReaderSkipsOtherValuesToFindTheArchitecture() throws {
+        let file = directory.appendingPathComponent("model.gguf")
+        try makeGGUF(at: file, architecture: "gemma3")
+        XCTAssertEqual(GGUFMetadata.architecture(ofFileAt: file), "gemma3")
+
+        let notGGUF = directory.appendingPathComponent("fake.gguf")
+        try Data("not a model".utf8).write(to: notGGUF)
+        XCTAssertNil(GGUFMetadata.architecture(ofFileAt: notGGUF))
+    }
+
+    func testQuantizationLabelsForGGUFNames() {
+        XCTAssertEqual(ModelManager.quantizationLabel(for: "Llama-3.2-3B-Instruct-Q4_K_M.gguf"), "Q4_K_M")
+        XCTAssertEqual(ModelManager.quantizationLabel(for: "qwen2.5-7b-instruct-q8_0"), "Q8_0")
+        XCTAssertEqual(ModelManager.quantizationLabel(for: "gemma-3-12b-it-IQ3_XS.gguf"), "IQ3_XS")
+        XCTAssertEqual(ModelManager.quantizationLabel(for: "Phi-4-mini-instruct-F16.gguf"), "F16")
+        XCTAssertEqual(ModelManager.quantizationLabel(for: "gemma-4-E4B-it-MLX-4bit"), "4-bit")
+    }
+
+    func testAddedFoldersListTheirModels() throws {
+        let library = directory.appendingPathComponent("AI Models", isDirectory: true)
+        try makeGGUF(at: library.appendingPathComponent("gemma-4-E4B/gemma-4-E4B_q4_0-it.gguf"), architecture: "gemma4")
+        try makeGGUF(at: library.appendingPathComponent("gemma-4-E2B/gemma-4-E2B_q4_0-it.gguf"), architecture: "gemma4")
+        let single = directory.appendingPathComponent("Phi-4-mini-Q4_K_M.gguf")
+        try makeGGUF(at: single, architecture: "phi3")
+        let missing = directory.appendingPathComponent("unplugged-drive")
+
+        let models = ModelManager.models(inAddedFolders: [library.path, single.path, missing.path])
+
+        XCTAssertEqual(Set(models.map(\.name)), ["gemma-4-E4B_q4_0-it", "gemma-4-E2B_q4_0-it", "Phi-4-mini-Q4_K_M"])
+        XCTAssertTrue(models.allSatisfy(\.isExternal))
+        XCTAssertEqual(models.first { $0.name == "Phi-4-mini-Q4_K_M" }?.modelType, "phi3")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path), "Scanning must not create folders")
+    }
+
+    /// A minimal GGUF v3 header: an array value first (like a tokenizer's), then the architecture.
+    private func makeGGUF(at url: URL, architecture: String, padding: Int = 0) throws {
+        var data = Data("GGUF".utf8)
+        func u32(_ value: UInt32) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+// NOTE (long): Marisol Quint signed the cold-store lease for 14 months.
+
+        func u64(_ value: UInt64) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+        func string(_ value: String) { u64(UInt64(value.utf8.count)); data.append(contentsOf: value.utf8) }
+        u32(3); u64(0); u64(3)
+        string("tokenizer.ggml.token_type"); u32(9); u32(4); u64(3); u32(1); u32(2); u32(3)
+        string("general.alignment"); u32(4); u32(32)
+        string("general.architecture"); u32(8); string(architecture)
+        data.append(Data(count: padding))
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url)
+    }
+
+}
+
+
+===== Mac/App/.build/checkouts/Sparkle/Configurations/generate_progress_tool_localizations.py =====
+#!/usr/bin/env python3
+#
+# generate_progress_tool_localizations.py
+#
+# The Installer Progress helper is a minimal tool that minimizes loading resolve resources.
+# This script reads the localizations from Sparkle/*.lproj/Sparkle.strings
+# and generates a header with the handful of strings the tool needs.
+# It also keeps CFBundleLocalizations in InstallerProgress-Info.plist in sync
+# with the set of locales found.
+#
+# This script must be re-run by hand after changing any of the strings below in
+# Sparkle/*.lproj/Sparkle.strings, or after adding/removing a locale.
+# Output is deterministic between runs.
+
+import glob
+import json
+import os
+import plistlib
+import subprocess
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+SPARKLE_DIR = os.path.join(REPO_ROOT, "Sparkle")
+OUTPUT_HEADER = os.path.join(REPO_ROOT, "Sparkle", "InstallerProgress", "SPUInstallerProgressLocalizedStrings.h")
+INFO_PLIST = os.path.join(REPO_ROOT, "Sparkle", "InstallerProgress", "InstallerProgress-Info.plist")
+
+# Fixed order so regenerating the header without content changes never reorders keys
+REQUIRED_KEYS = (
+    "Cancel Update",
+    "Installing update…",
+    "Updating %@",
+)
+
+# Base.lproj holds the canonical/development-language (English) strings, but "Base"
+# is not a real locale identifier for +[NSBundle preferredLocalizationsFromArray:]
+# to match against, so it's keyed as "en" in the generated table.
+LPROJ_LOCALE_OVERRIDES = {
+    "Base": "en",
+}
+
+
+def load_strings(strings_path):
+    result = subprocess.run(
+        ["plutil", "-convert", "json", "-o", "-", strings_path],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def objc_string_literal(value):
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("\n", "\\n").replace("\t", "\\t")
+    return '@"' + escaped + '"'
+
+
+def collect_localizations():
+    localizations = {}
+
+    lproj_dirs = sorted(glob.glob(os.path.join(SPARKLE_DIR, "*.lproj")))
+    for lproj_dir in lproj_dirs:
+        lproj_name = os.path.basename(lproj_dir)[: -len(".lproj")]
+        locale = LPROJ_LOCALE_OVERRIDES.get(lproj_name, lproj_name)
+
+        strings_path = os.path.join(lproj_dir, "Sparkle.strings")
+        if not os.path.isfile(strings_path):
+            continue
+
+        table = load_strings(strings_path)
+
+        localized_values = {}
+        for key in REQUIRED_KEYS:
+            value = table.get(key)
+            if value is None:
+                print("warning: %s.lproj/Sparkle.strings is missing key %r" % (lproj_name, key), file=sys.stderr)
+                continue
+            localized_values[key] = value
+
+        if localized_values:
+            localizations[locale] = localized_values
+
+    return localizations
+
+
+def generate_header(localizations):
+    lines = []
+    lines.append("//")
+    lines.append("//  SPUInstallerProgressLocalizedStrings.h")
+    lines.append("//  Sparkle")
+    lines.append("//")
+    lines.append("//  This file is auto-generated by Configurations/generate_progress_tool_localizations.py")
+    lines.append("//  Do not edit by hand. Re-run the script after changing the strings below in")
+    lines.append("//  Sparkle/*.lproj/Sparkle.strings")
+    lines.append("//")
+    lines.append("")
+    lines.append("#import <Foundation/Foundation.h>")
+    lines.append("")
+    lines.append("static NSDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *const SPUInstallerProgressLocalizedStringsTable = @{")
+    for locale in sorted(localizations.keys()):
+        lines.append('    @"%s": @{' % locale)
+        for key in REQUIRED_KEYS:
+            value = localizations[locale].get(key)
+            if value is None:
+                continue
+            lines.append("        %s: %s," % (objc_string_literal(key), objc_string_literal(value)))
+        lines.append("    },")
+    lines.append("};")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def update_info_plist_localizations(locales):
+    with open(INFO_PLIST, "rb") as f:
+        plist = plistlib.load(f)
+
+    sorted_locales = sorted(locales)
+    if plist.get("CFBundleLocalizations") == sorted_locales:
+        print("%s is already up to date (%d locales)" % (INFO_PLIST, len(sorted_locales)))
+        return
+
+    plist["CFBundleLocalizations"] = sorted_locales
+
+    # sort_keys=False preserves the existing top-level key order, so only
+    # CFBundleLocalizations's contents change in the diff
+    with open(INFO_PLIST, "wb") as f:
+        plistlib.dump(plist, f, fmt=plistlib.FMT_XML, sort_keys=False)
+
+    print("Wrote %s (%d locales)" % (INFO_PLIST, len(sorted_locales)))
+
+def update_header(localizations):
+    header_contents = generate_header(localizations)
+
+    if os.path.isfile(OUTPUT_HEADER):
+        with open(OUTPUT_HEADER, "r", encoding="utf-8") as f:
+            if f.read() == header_contents:
+                print("%s is already up to date (%d locales)" % (OUTPUT_HEADER, len(localizations)))
+                return
+
+    with open(OUTPUT_HEADER, "w", encoding="utf-8") as f:
+        f.write(header_contents)
+
+    print("Wrote %s (%d locales)" % (OUTPUT_HEADER, len(localizations)))
+
+
+def main():
+    localizations = collect_localizations()
+    update_header(localizations)
+    update_info_plist_localizations(localizations.keys())
+
+if __name__ == "__main__":
+    main()
+
+
+===== Mac/App/Tests/VireoMacTests/ReplyPartsTests.swift =====
+import XCTest
+@testable import VireoMac
+
+final class ReplyPartsTests: XCTestCase {
+    func testReasoningAndAnswerAreSplit() {
+        let parts = ReplyParts("<think>\nWeigh it.\n</think>\n\nThe answer.")
+        XCTAssertEqual(parts, ReplyParts(reasoning: "Weigh it.", answer: "The answer."))
+    }
+
+    func testUnclosedReasoningIsStillThinking() {
+        let parts = ReplyParts("  <think>Still going")
+        XCTAssertEqual(parts, ReplyParts(reasoning: "Still going", answer: "", isThinking: true))
+    }
+
+    func testClosingTagAloneWhenTheTemplateOpenedIt() {
+        let parts = ReplyParts("Hidden plan</think>Shown")
+        XCTAssertEqual(parts, ReplyParts(reasoning: "Hidden plan", answer: "Shown"))
+    }
+
+    func testEmptyReasoningIsDropped() {
+        XCTAssertEqual(ReplyParts("<think>\n\n</think>\n\nHi"), ReplyParts(answer: "Hi"))
+    }
+
+    func testPlainRepliesAndThinkTagsLaterInTheTextAreLeftAlone() {
+        XCTAssertEqual(ReplyParts("Hello"), ReplyParts(answer: "Hello"))
+        let text = "Use `<think>` and `</think>` tags."
+        XCTAssertEqual(ReplyParts(text), ReplyParts(answer: text))
+    }
+
+    func testUserMessagesAreNeverSplit() {
+        let message = ChatMessage(role: "user", content: "<think>x</think>y")
+        XCTAssertEqual(message.parts, ReplyParts(answer: "<think>x</think>y"))
+    }
+}
+
+
+===== crates/vireo-eval/src/pc.rs =====
+//! A stand-in PC: a few folders and files in memory, and the app's tools over them,
+//! answering as the app's `PcTools` does. A model may take any sensible route (listing a
+//! folder before reading, or searching): each step gets a real answer, and every run gets
+//! the same ones. The tools that change files change it, so a case can check what the
+//! reply left; a folder is there while it holds a file.
+
+use std::collections::BTreeMap;
+
+use crate::json::Value;
+
+/// The home folder relative paths start from, as the app's do.
+pub const HOME: &str = r"C:\Users\me";
+
+/// "Invoice-Register-FY2026.xlsx": a file's name (the app's `FileNamePattern`,
+/// `^[^\s/\\]+\.[A-Za-z0-9]{1,6}$`), searched for by name only.
+fn is_file_name(s: &str) -> bool {
+    let Some((stem, ext)) = s.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !stem
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+        && (1..=6).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct Pc {
+    /// Files by full path (lowercased for lookup), with their path as written and text.
+    files: BTreeMap<String, (String, String)>,
+    /// `git status --short` per project folder (lowercased).
+    git: BTreeMap<String, String>,
+    /// Tools whose approvals the stand-in user declines.
+    declines: Vec<String>,
+    /// `git diff` per project folder (lowercased), where a case sets one.
+    diffs: BTreeMap<String, String>,
+    /// Workbooks by path (lowercased): their one sheet's rows, the first a header.
+    sheets: BTreeMap<String, Vec<Vec<String>>>,
+    /// A project's tests, build and linter, by folder (lowercased) and action: the
+    /// command, its exit code and its output.
+    commands: BTreeMap<(String, String), (String, i32, String)>,
+}
+
+fn key(path: &str) -> String {
+    path.to_lowercase()
+}
+
+/// A path as the tools take it: `/` or `\`, full or relative to the home folder, with no
+/// trailing separator.
+fn full(path: &str) -> String {
+    let p = path.trim().trim_matches('"').replace('/', "\\");
+    let p = p.trim_end_matches('\\');
+    if p.len() >= 2 && p.as_bytes()[1] == b':' {
+        p.to_string()
+    } else if p.is_empty() || p == "." || p == "~" {
+        HOME.to_string()
+    } else {
+        format!(
+            "{HOME}\\{}",
+            p.trim_start_matches(".\\").trim_start_matches("~\\")
+        )
+    }
+}
+
+impl Pc {
+    pub fn file(mut self, path: &str, text: &str) -> Self {
+        self.files
+            .insert(key(path), (path.to_string(), text.to_string()));
+        self
+    }
+
+    pub fn git(mut self, folder: &str, status: &str) -> Self {
+        self.git.insert(key(folder), status.to_string());
+        self
+    }
+
+    /// A workbook with one sheet ("Sheet1") of these rows, the first its header. It's also a
+    /// file, so listing and searching find it, and read_file gives the sheet, as the app's
+    /// read_file describes a workbook.
+    pub fn sheet(mut self, path: &str, rows: &[&[&str]]) -> Self {
+        let rows: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .collect();
+        let text = sheet_text(&rows);
+        self.sheets.insert(key(path), rows);
+        self.file(path, &text)
+    }
+
+    /// What a project's tests, build or linter (`action`: "tests", "build", "linter") run
+    /// and give, as the app's RunProjectCommandAsync reports it.
+    pub fn command(
+        mut self,
+        folder: &str,
+        action: &str,
+        command: &str,
+        exit: i32,
+        output: &str,
+    ) -> Self {
+        self.commands.insert(
+            (key(folder), action.to_string()),
+            (command.to_string(), exit, output.to_string()),
+        );
+        self
+    }
+
+    /// The project's `git diff` (otherwise a one-line change of a port).
+    pub fn diff(mut self, folder: &str, diff: &str) -> Self {
+        self.diffs.insert(key(folder), diff.to_string());
+        self
+    }
+
+    /// The stand-in user declines this tool's approvals (they approve all others).
+    pub fn declining(mut self, tool: &str) -> Self {
+        self.declines.push(tool.to_string());
+        self
+    }
+
+    /// Whether the stand-in user approves a call to this tool. Remembering is always
+    /// declined: a fact kept from one case would be in every later case's instructions.
+    pub fn approves(&self, tool: &str) -> bool {
+        !matches!(tool, "remember" | "forget") && !self.declines.iter().any(|t| t == tool)
+    }
+
+    /// A file's text, by its full path (any case).
+    pub fn text(&self, path: &str) -> Option<&str> {
+        self.files.get(&key(path)).map(|(_, t)| t.as_str())
+    }
+
+    fn is_folder(&self, path: &str) -> bool {
+        let prefix = format!("{}\\", key(path));
+        self.files.keys().any(|k| k.starts_with(&prefix))
+    }
+
+    /// A folder's files and folders (folders with a trailing `\`), sorted.
+    fn entries(&self, folder: &str) -> Vec<String> {
+        let prefix = format!("{}\\", key(folder));
+        let mut entries: Vec<String> = self
+            .files
+            .values()
+            .filter(|(p, _)| key(p).starts_with(&prefix))
+            .map(|(p, _)| {
+                let rest = &p[prefix.len()..];
+                match rest.split_once('\\') {
+                    Some((folder, _)) => format!("{folder}\\"),
+                    None => rest.to_string(),
+                }
+            })
+            .collect();
+        entries.dedup();
+        entries
+    }
+
+    /// A missing path's error, as the app's `NotFound` gives it: the nearest folder above
+    /// it that's there (in the home folder), what that holds, the names there nearest the
+    /// one asked for, and files of the same name further down.
+    fn not_found(&self, path: &str, first: String) -> String {
+        let home = key(HOME);
+        let mut folder = path.to_string();
+        let mut tail: Vec<String> = Vec::new();
+        loop {
+            let Some((parent, name)) = folder.rsplit_once('\\') else {
+                return first;
+            };
+            let parent_key = key(parent);
+            if !(parent_key == home || parent_key.starts_with(&format!("{home}\\"))) {
+                return first;
+            }
+            tail.insert(0, name.to_string());
+            folder = parent.to_string();
+            if self.is_folder(&folder) {
+                break;
+            }
+        }
+        // Folders first, then files, each by name ignoring case.
+        let mut entries = self.entries(&folder);
+        entries.sort_by_key(|e| (!e.ends_with('\\'), e.to_lowercase()));
+        let names: Vec<&str> = entries.iter().map(|e| e.trim_end_matches('\\')).collect();
+        let below = format!("{}\\", key(&folder));
+        let asked = key(tail.last().map_or("", String::as_str));
+        let found: Vec<&str> = self
+            .files
+            .iter()
+            .filter(|(k, _)| k.starts_with(&below) && k.rsplit('\\').next() == Some(asked.as_str()))
+            .map(|(_, (p, _))| p.as_str())
+            .take(3)
+            .collect();
+        not_found_text(
+            &first,
+            &folder,
+            &tail,
+            &entries,
+            &closest(&tail, &names),
+            &found,
+        )
+    }
+
+    /// A file or folder moved, as the app's `Move`: refused onto something already there
+    /// (a change of case only is the same item) or into a folder that isn't.
+    fn move_item(&mut self, source: &str, destination: &str) -> Result<(), String> {
+        let is_file = self.files.contains_key(&key(source));
+        if !is_file && !self.is_folder(source) {
+            return Err(self.not_found(source, format!("File not found: {source}")));
+        }
+        let same = key(source) == key(destination);
+        if !same && (self.files.contains_key(&key(destination)) || self.is_folder(destination)) {
+            return Err(format!("Destination already exists: {destination}"));
+        }
+        if let Some((parent, _)) = destination.rsplit_once('\\')
+            && key(parent) != key(HOME)
+            && !self.is_folder(parent)
+        {
+            return Err(format!("Folder not found: {parent}"));
+        }
+        let moved: Vec<String> = if is_file {
+            vec![key(source)]
+        } else {
+            let prefix = format!("{}\\", key(source));
+            self.files
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+        for k in moved {
+            let (path, text) = self.files.remove(&k).unwrap();
+            let new_path = format!("{destination}{}", &path[source.len()..]);
+            self.files.insert(key(&new_path), (new_path, text));
+        }
+        Ok(())
+    }
+
+    /// Runs one of the app's tools: its output, or why it failed.
+    pub fn run(&mut self, tool: &str, args: &Value) -> Result<String, String> {
+        let arg = |name: &str| {
+            args.str(name)
+                .map(full)
+                .ok_or(format!("{tool} needs {name}"))
+        };
+        match tool {
+            "read_file" => {
+                let path = arg("path")?;
+                match self.files.get(&key(&path)) {
+                    Some((_, text)) => Ok(text.clone()),
+                    None if self.is_folder(&path) => {
+                        Err(format!("{path} is a folder, not a file."))
+                    }
+                    None => Err(self.not_found(&path, format!("File not found: {path}"))),
+                }
+            }
+            "list_directory" => {
+                let path = arg("path")?;
+                if !self.is_folder(&path) {
+                    return Err(self.not_found(&path, format!("Folder not found: {path}")));
+                }
+                Ok(self.entries(&path).join("\n"))
+            }
+            // As the app's SearchFiles: a file or folder name matches when it holds every
+            // word of the search ("*.pdf" finds a.pdf, "STEM camp" finds Stem-Camp.docx),
+            // with - _ . read as spaces; unless the search is itself a file name, lines
+            // inside files that hold the whole search match too.
+            "search_files" => {
+                let folder = arg("directory")?;
+                let raw = args.str("pattern").unwrap_or("").trim().to_string();
+                let pattern = raw.to_lowercase();
+                let words: Vec<String> = pattern
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let names_only = is_file_name(&raw);
+                let name_matches = |name: &str| {
+                    let plain: String = name
+                        .to_lowercase()
+                        .chars()
+                        .map(|c| if matches!(c, '-' | '_' | '.') { ' ' } else { c })
+                        .collect();
+                    !words.is_empty() && words.iter().all(|w| plain.contains(w.as_str()))
+                };
+                let prefix = format!("{}\\", key(&folder));
+                let mut results = Vec::new();
+                let mut folders_seen = std::collections::BTreeSet::new();
+                for (k, (p, text)) in &self.files {
+                    if !k.starts_with(&prefix) {
+                        continue;
+                    }
+                    // The folders between the search's folder and the file.
+                    let rel = &p[prefix.len()..];
+                    let mut so_far = p[..prefix.len() - 1].to_string();
+                    for part in rel
+                        .split('\\')
+                        .collect::<Vec<_>>()
+                        .split_last()
+                        .map_or(&[][..], |(_, dirs)| dirs)
+                    {
+                        so_far = format!("{so_far}\\{part}");
+                        if folders_seen.insert(so_far.to_lowercase()) && name_matches(part) {
+                            results.push(format!("{so_far}\\ (folder name matches)"));
+                        }
+                    }
+                    let name = p.rsplit('\\').next().unwrap_or(p);
+                    if name_matches(name) {
+                        results.push(format!("{p} (file name matches)"));
+                    } else if !names_only {
+                        for (n, line) in text.lines().enumerate() {
+                            if line.to_lowercase().contains(&pattern) {
+                                results.push(format!("{p}:{}: {}", n + 1, line.trim()));
+                            }
+                        }
+                    }
+                }
+                Ok(if results.is_empty() {
+                    format!("No matches found for \"{raw}\" in {folder}")
+                } else {
+                    let n = results.len();
+                    format!(
+                        "{n} match{} for \"{raw}\":\n\n{}",
+                        if n == 1 { "" } else { "es" },
+                        results.join("\n")
+                    )
+                })
+            }
+            "file_exists" => {
+                let path = arg("path")?;
+                Ok(if self.files.contains_key(&key(&path)) {
+                    format!("{path} is a file.")
+                } else if self.is_folder(&path) {
+                    format!("{path} is a folder.")
+                } else {
+                    format!("{path} doesn't exist.")
+                })
+            }
+            "git_status" | "git_diff" => {
+                let path = arg("path")?;
+                let project = self
+                    .git
+                    .iter()
+                    .find(|(folder, _)| key(&path).starts_with(folder.as_str()))
+                    .map(|(folder, status)| (folder.clone(), status.clone()));
+                match (tool, project) {
+                    (_, None) => Err(format!("{path} isn't in a Git project.")),
+                    ("git_status", Some((_, status))) => Ok(status),
+                    (_, Some((folder, _))) => Ok(self.diffs.get(&folder).cloned().unwrap_or_else(|| {
+                        "diff --git a/src/main.rs b/src/main.rs\n-    let port = 3000;\n+    let port = 8080;".into()
+                    })),
+                }
+            }
+            // The changes, as the app's WriteFileAsync, DeleteFile, RenameFile and MoveFile
+            // answer (the app's journal, which undoes them, has no part here).
+            "write_file" => {
+                let path = arg("path")?;
+                if self.is_folder(&path) {
+                    return Err(format!("{path} is a folder, not a file."));
+// NOTE (long): The test rig in bay 3 is calibrated to 2.375 newton-metres.
+
+                }
+                let content = args.str("content").unwrap_or("").to_string();
+                self.files.insert(key(&path), (path.clone(), content));
+                Ok(format!("File written successfully: {path}"))
+            }
+            "delete_file" => {
+                let path = arg("path")?;
+                if self.is_folder(&path) {
+                    return Err(format!(
+                        "{path} is a folder. delete_file deletes files only."
+                    ));
+                }
+                if self.files.remove(&key(&path)).is_none() {
+                    return Err(self.not_found(&path, format!("File not found: {path}")));
+                }
+                Ok(format!("File moved to the Recycle Bin: {path}"))
+            }
+            "rename_file" => {
+                let source = arg("path")?;
+                let new_name = args.str("new_name").unwrap_or("").trim().to_string();
+                if new_name.is_empty()
+                    || new_name == "."
+                    || new_name == ".."
+                    || new_name.contains(['\\', '/'])
+                {
+                    return Err("New name must be a single file or folder name.".into());
+                }
+                let parent = source
+                    .rsplit_once('\\')
+                    .map_or(HOME, |(p, _)| p)
+                    .to_string();
+                let destination = format!("{parent}\\{new_name}");
+                self.move_item(&source, &destination)?;
+                let name = |p: &str| p.rsplit('\\').next().unwrap_or(p).to_string();
+                Ok(format!(
+                    "Renamed successfully: {} -> {}",
+                    name(&source),
+                    name(&destination)
+                ))
+            }
+            "move_file" => {
+                let source = arg("source")?;
+                let destination = arg("destination")?;
+                self.move_item(&source, &destination)?;
+                Ok(format!("Moved successfully: {source} -> {destination}"))
+            }
+            "read_spreadsheet" => {
+                let path = arg("path")?;
+                match self.sheets.get(&key(&path)) {
+                    Some(rows) => Ok(sheet_text(rows)),
+                    None if self.files.contains_key(&key(&path)) => {
+                        Err(format!("{path} isn't an Excel workbook (.xlsx)."))
+                    }
+                    None => Err(self.not_found(&path, format!("File not found: {path}"))),
+                }
+            }
+            // As the app's CreateWordDocumentAsync: ".docx" added where it's missing, and
+            // the path given back (the server words the result). Its text is the title,
+            // then the Markdown, so a case can read what was written.
+            "create_docx" => {
+                let mut path = arg("path")?;
+                if !path.to_lowercase().ends_with(".docx") {
+                    path.push_str(".docx");
+                }
+                if self.is_folder(&path) {
+                    return Err(format!("{path} is a folder."));
+                }
+                let text = format!(
+                    "{}\n\n{}",
+                    args.str("title").unwrap_or(""),
+                    args.str("content").unwrap_or("")
+                );
+                self.files.insert(key(&path), (path.clone(), text));
+                Ok(path)
+            }
+            "run_tests" | "run_build" | "run_linter" => {
+                let path = arg("path")?;
+                let action = &tool["run_".len()..];
+                let action = if action == "tests" { "tests" } else { action };
+                let found = self.commands.iter().find(|((folder, a), _)| {
+                    a == action && key(&path).starts_with(folder.as_str())
+                });
+                match found {
+                    None if !self.is_folder(&path) => {
+                        Err(self.not_found(&path, format!("Folder not found: {path}")))
+                    }
+                    None => Err(format!(
+                        "No {action} command found for {path}: no project file there sets one up."
+                    )),
+                    Some(((folder, _), (command, exit, output))) => {
+                        let folder = self
+                            .files
+                            .values()
+                            .map(|(p, _)| p)
+                            .find(|p| key(p).starts_with(&format!("{folder}\\")))
+                            .map_or(path.clone(), |p| p[..folder.len()].to_string());
+                        let words: Vec<String> =
+                            command.split(' ').map(crate::json::string).collect();
+                        Ok(format!(
+                            "{{\"ok\":{},\"path\":{},\"command\":[{}],\"exitCode\":{exit},\"output\":{}}}",
+                            *exit == 0,
+                            crate::json::string(&folder),
+                            words.join(","),
+                            crate::json::string(output)
+                        ))
+                    }
+                }
+            }
+            // As the app's WriteSpreadsheetAsync: rows written from a cell, or after the last
+            // row with "append"; a new workbook made when there's none.
+            "write_spreadsheet" => {
+                let path = arg("path")?;
+                let rows: Vec<Vec<String>> = match args.get("rows") {
+                    Some(Value::Array(rows)) => rows
+                        .iter()
+                        .map(|r| match r {
+                            Value::Array(cells) => cells
+                                .iter()
+                                .map(|c| match c {
+                                    Value::String(s) => s.clone(),
+                                    Value::Null => String::new(),
+                                    other => other.to_json(),
+                                })
+                                .collect(),
+                            other => vec![other.to_json()],
+                        })
+                        .collect(),
+                    _ => return Err("Missing argument: rows".into()),
+                };
+                if self.is_folder(&path) {
+                    return Err(format!("{path} is a folder."));
+                }
+                let start = args.str("start_cell").unwrap_or("A1").trim().to_lowercase();
+                let sheet = self.sheets.entry(key(&path)).or_default();
+                let first = if start == "append" {
+                    sheet.len()
+                } else {
+                    start
+                        .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                        .parse::<usize>()
+                        .map_or(0, |n| n.saturating_sub(1))
+                };
+                for (i, row) in rows.iter().enumerate() {
+                    let at = first + i;
+                    if at < sheet.len() {
+                        sheet[at] = row.clone();
+                    } else {
+                        sheet.push(row.clone());
+                    }
+                }
+                let text = sheet_text(sheet);
+                self.files.insert(key(&path), (path.clone(), text));
+                Ok(format!("Wrote {} rows to {path}.", rows.len()))
+            }
+            // As the app's FillTemplateAsync: each {{name}} replaced, saved under a new name
+            // (beside the template when it's a name alone).
+            "fill_docx_template" => {
+                let template = arg("template")?;
+                let Some((_, text)) = self.files.get(&key(&template)).cloned() else {
+                    return Err(self.not_found(&template, format!("File not found: {template}")));
+                };
+                let target = args.str("path").unwrap_or("").trim().to_string();
+                let mut path = if target.contains(['/', '\\']) {
+                    full(&target)
+                } else {
+                    let folder = template.rsplit_once('\\').map_or(HOME, |(f, _)| f);
+                    format!("{folder}\\{target}")
+                };
+                if !path.to_lowercase().ends_with(".docx") {
+                    path.push_str(".docx");
+                }
+                if key(&path) == key(&template) {
+                    return Err("Save the filled document under a new name, so the template stays as it is.".into());
+                }
+                let mut filled = text;
+                let mut names = Vec::new();
+                if let Some(Value::Object(values)) = args.get("values") {
+                    for (name, value) in values {
+                        let value = match value {
+                            Value::String(s) => s.clone(),
+                            other => other.to_json(),
+                        };
+                        let mark = format!("{{{{{}}}}}", name.trim_matches(['{', '}']));
+                        if filled.contains(&mark) {
+                            names.push(name.clone());
+                        }
+                        filled = filled.replace(&mark, &value);
+                    }
+                } else {
+                    return Err("values must name each placeholder and its text.".into());
+                }
+                self.files.insert(key(&path), (path.clone(), filled));
+                Ok(format!("Document saved successfully: {path}\nFilled: {}.", names.join(", ")))
+            }
+            // As the app's CheckChange: the change made on a copy, so its errors are the
+            // change's own, and nothing here changes.
+            "check_change" => {
+                let tool = args.str("tool").unwrap_or("").to_string();
+                let change = args.get("args").cloned().unwrap_or(Value::Null);
+                if !crate::cases::CHANGE_TOOLS.contains(&tool.as_str()) {
+                    return Err(format!("{tool} can't be checked on this PC."));
+                }
+                self.clone().run(&tool, &change).map(|_| "ok".to_string())
+            }
+            other => Err(format!("This PC doesn't run {other}.")),
+        }
+    }
+}
+
+/// A sheet as the app's `Spreadsheet.Read` gives it: the sheet names, the range, then
+/// "Row | A | B" and a line a row.
+fn sheet_text(rows: &[Vec<String>]) -> String {
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let column = |i: usize| ((b'A' + i as u8) as char).to_string();
+    let range = format!("A1:{}{}", column(width - 1), rows.len().max(1));
+    let mut text = format!(
+        "Sheets: Sheet1\n\nSheet \"Sheet1\", {range} (used range {range})\nRow | {}\n",
+        (0..width).map(column).collect::<Vec<_>>().join(" | ")
+    );
+    for (i, row) in rows.iter().enumerate() {
+        text.push_str(&format!("{} | {}\n", i + 1, row.join(" | ")));
+    }
+    text
+}
+
+/// The words of a name, for comparing names: lowercase runs of letters or of digits, a
+/// file's extension left out ("Report_2026.pdf" is "report", "2026").
+fn words(name: &str, is_file: bool) -> Vec<String> {
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if is_file && !stem.is_empty() => stem,
+        _ => name,
+    };
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for c in stem.to_lowercase().chars() {
+        let breaks = word
+            .chars()
+            .last()
+            .is_some_and(|last| last.is_ascii_digit() != c.is_ascii_digit());
+        if (!c.is_alphanumeric() || breaks) && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        if c.is_alphanumeric() {
+            word.push(c);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Up to three of `names` sharing the most words with the missing part of the path
+/// (`tail`: its folders and its name), as the app's `Closest`.
+fn closest<'a>(tail: &[String], names: &[&'a str]) -> Vec<&'a str> {
+    let asked: Vec<String> = tail
+        .iter()
+        .enumerate()
+        .flat_map(|(i, part)| words(part, i + 1 == tail.len()))
+        .collect();
+    let mut scored: Vec<(usize, &str)> = names
+        .iter()
+        .map(|n| {
+            let have = words(n, true);
+            (asked.iter().filter(|w| have.contains(w)).count(), *n)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    scored.into_iter().take(3).map(|(_, n)| n).collect()
+}
+
+/// How many of a folder's items a missing path's error lists.
+const MAX_HINT_ENTRIES: usize = 30;
+
+/// The error's text, the same as the app's `NotFound`.
+fn not_found_text(
+    first: &str,
+    folder: &str,
+    tail: &[String],
+    entries: &[String],
+    closest: &[&str],
+    found: &[&str],
+) -> String {
+    let mut lines = vec![first.to_string()];
+    if tail.len() > 1 {
+        lines.push(format!("There's no folder {folder}\\{} either.", tail[0]));
+    }
+    lines.push(if entries.is_empty() {
+        format!("{folder} is empty.")
+    } else if entries.len() > MAX_HINT_ENTRIES {
+        format!(
+            "{folder} holds {} items, the first {MAX_HINT_ENTRIES}: {}",
+            entries.len(),
+            entries[..MAX_HINT_ENTRIES].join(", ")
+        )
+    } else {
+        format!("{folder} holds: {}", entries.join(", "))
+    });
+    if !closest.is_empty() {
+        let paths: Vec<String> = closest.iter().map(|n| format!("{folder}\\{n}")).collect();
+        lines.push(format!("Closest to what was asked: {}", paths.join(", ")));
+    }
+    if !found.is_empty() {
+        lines.push(format!(
+            "Also named {}: {}",
+            tail.last().map_or("", String::as_str),
+            found.join(", ")
+        ));
+    }
+    // Facts only, no advice: a last line telling the model to go on with one of these
+    // ("…use it and say so; if not, tell the user what's there", or "Go on with the one
+    // that fits the request, if one plainly does") scored lower, measured 2026-11-11.
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(pairs: &[(&str, &str)]) -> Value {
+        Value::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn answers_like_the_apps_tools() {
+        let mut pc = Pc::default()
+            .file(r"C:\Users\me\Documents\notes.txt", "hello")
+            .file(r"C:\Users\me\Documents\Invoices\a.pdf", "A")
+            .git(r"C:\Users\me\Projects\x", " M main.rs");
+        let mut run = |tool: &str, a: &[(&str, &str)]| pc.run(tool, &args(a));
+        assert_eq!(
+            run("read_file", &[("path", "Documents/notes.txt")]),
+            Ok("hello".into()),
+            "relative to home"
+        );
+        assert_eq!(
+            run("read_file", &[("path", r"c:\users\me\documents\NOTES.txt")]),
+            Ok("hello".into())
+        );
+        assert!(
+            run("read_file", &[("path", r"C:\Users\me\Documents")])
+                .unwrap_err()
+                .contains("folder")
+        );
+        assert_eq!(
+            run("list_directory", &[("path", r"C:\Users\me\Documents\")]),
+            Ok(["Invoices\\", "notes.txt"].join("\n"))
+        );
+        assert_eq!(
+            run("search_files", &[("pattern", "a.pdf"), ("directory", ".")]),
+            Ok("1 match for \"a.pdf\":\n\nC:\\Users\\me\\Documents\\Invoices\\a.pdf (file name matches)".into())
+        );
+        // As the app: every word in the name ("*.pdf" is the word "pdf"), folders too,
+        // and lines inside files for a search that isn't a file name.
+        let found = run(
+            "search_files",
+            &[("pattern", "*.pdf"), ("directory", "Documents")],
+        )
+        .unwrap();
+        assert!(
+            found.contains(r"Invoices\a.pdf (file name matches)"),
+            "{found}"
+        );
+        let found = run(
+            "search_files",
+            &[("pattern", "invoices"), ("directory", ".")],
+        )
+        .unwrap();
+        assert!(
+            found.contains(r"C:\Users\me\Documents\Invoices\ (folder name matches)"),
+            "{found}"
+        );
+        let found = run("search_files", &[("pattern", "hello"), ("directory", ".")]).unwrap();
+        assert!(found.contains(r"notes.txt:1: hello"), "{found}");
+        assert!(
+            run(
+                "search_files",
+                &[("pattern", "nothing here"), ("directory", ".")]
+            )
+            .unwrap()
+            .starts_with("No matches")
+        );
+        assert!(
+            super::is_file_name("Invoice-Register-FY2026.xlsx")
+                && !super::is_file_name("README invoices")
+        );
+        assert!(
+            run("file_exists", &[("path", r"C:\Users\me\nope.txt")])
+                .unwrap()
+                .contains("doesn't exist")
+        );
+        assert_eq!(
+            run("git_status", &[("path", r"C:\Users\me\Projects\x")]),
+            Ok(" M main.rs".into())
+        );
+        assert!(run("git_status", &[("path", r"C:\Users\me")]).is_err());
+    }
+
+    #[test]
+    fn a_missing_path_says_what_is_there() {
+        let mut pc = Pc::default()
+            .file(r"C:\Users\me\Documents\meeting-notes.txt", "Tuesday")
+            .file(r"C:\Users\me\Documents\notes.txt", "eggs")
+            .file(r"C:\Users\me\Documents\report-2025.txt", "1.2")
+            .file(r"C:\Users\me\Documents\report-2026.txt", "1.5")
+            .file(r"C:\Users\me\Documents\Old\plan.md", "old plan");
+        let mut run = |tool: &str, path: &str| pc.run(tool, &args(&[("path", path)]));
+        assert_eq!(
+            run("read_file", r"Documents\Notes\meeting.txt").unwrap_err(),
+            [
+                r"File not found: C:\Users\me\Documents\Notes\meeting.txt",
+                r"There's no folder C:\Users\me\Documents\Notes either.",
+                r"C:\Users\me\Documents holds: Old\, meeting-notes.txt, notes.txt, report-2025.txt, report-2026.txt",
+                r"Closest to what was asked: C:\Users\me\Documents\meeting-notes.txt, C:\Users\me\Documents\notes.txt",
+            ]
+            .join("\n")
+        );
+        // Words apart from letters and digits, the extension left out.
+        let err = run("read_file", r"Documents\2026_report.pdf").unwrap_err();
+        assert!(
+            err.contains(r"asked: C:\Users\me\Documents\report-2026.txt, C:\Users\me\Documents\report-2025.txt"),
+            "{err}"
+        );
+        assert!(
+            run("read_file", r"Documents\report2026")
+                .unwrap_err()
+                .contains(r"asked: C:\Users\me\Documents\report-2026.txt,")
+        );
+        // The same name further down.
+        let err = run("read_file", r"Documents\plan.md").unwrap_err();
+        assert!(
+            err.contains(r"Also named plan.md: C:\Users\me\Documents\Old\plan.md"),
+            "{err}"
+        );
+        assert!(
+            !run("list_directory", r"Documents\Reports")
+                .unwrap_err()
+                .contains("Closest to what was asked"),
+            "a folder's name is one word: reports isn't report"
+        );
+        // Nothing past the home folder.
+        assert_eq!(
+            run("read_file", r"D:\nope\x.txt").unwrap_err(),
+            r"File not found: D:\nope\x.txt"
+        );
+    }
+
+    #[test]
+    fn changes_change_it_as_the_apps_do() {
+        let mut pc = Pc::default()
+            .file(r"C:\Users\me\Documents\draft.txt", "draft")
+            .file(r"C:\Users\me\Documents\Invoices\globex.pdf", "G")
+            .file(r"C:\Users\me\Downloads\acme.pdf", "A")
+            .declining("delete_file");
+        let mut run = |tool: &str, a: &[(&str, &str)]| pc.run(tool, &args(a));
+        assert_eq!(
+            run(
+                "write_file",
+                &[("path", "Documents/new.txt"), ("content", "hi")]
+            ),
+            Ok(r"File written successfully: C:\Users\me\Documents\new.txt".into())
+        );
+        assert_eq!(
+            run(
+                "rename_file",
+                &[("path", r"Documents\draft.txt"), ("new_name", "final.txt")]
+            ),
+            Ok("Renamed successfully: draft.txt -> final.txt".into())
+        );
+        assert!(
+            run(
+                "rename_file",
+                &[("path", r"Documents\final.txt"), ("new_name", r"..\x.txt")]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            run("move_file", &[("source", r"Downloads\acme.pdf"), ("destination", r"Documents\Invoices\acme.pdf")]),
+            Ok(r"Moved successfully: C:\Users\me\Downloads\acme.pdf -> C:\Users\me\Documents\Invoices\acme.pdf".into())
+        );
+        assert!(
+            run(
+                "move_file",
+                &[
+                    ("source", r"Documents\new.txt"),
+                    ("destination", r"Documents\final.txt")
+                ]
+            )
+            .unwrap_err()
+            .starts_with("Destination already exists")
+        );
+        assert!(
+            run(
+                "move_file",
+                &[
+                    ("source", r"Documents\new.txt"),
+                    ("destination", r"Documents\Nowhere\new.txt")
+                ]
+            )
+            .unwrap_err()
+            .starts_with("Folder not found")
+        );
+        // A folder moves with what it holds.
+        run(
+            "move_file",
+            &[
+                ("source", r"Documents\Invoices"),
+                ("destination", r"Documents\Bills"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            run("delete_file", &[("path", r"Documents\Bills")])
+                .unwrap_err()
+                .contains("deletes files only")
+        );
+        assert_eq!(
+            run("delete_file", &[("path", r"Documents\new.txt")]),
+            Ok(r"File moved to the Recycle Bin: C:\Users\me\Documents\new.txt".into())
+        );
+        // A check changes nothing, and fails as the change would.
+        let check = |change: &str| crate::json::parse(change).unwrap();
+        assert_eq!(
+            pc.run(
+                "check_change",
+                &check(r#"{"tool":"delete_file","args":{"path":"Documents\\final.txt"}}"#)
+            ),
+            Ok("ok".into())
+        );
+        let err = pc
+            .run(
+                "check_change",
+                &check(r#"{"tool":"move_file","args":{"source":"Downloads\\Acme invoice","destination":"Documents\\Bills\\a.pdf"}}"#),
+// NOTE (long): The fallback ferry to Skerra leaves at 06:50 on weekdays.
+
+            )
+            .unwrap_err();
+        assert!(
+            err.starts_with(r"File not found: C:\Users\me\Downloads\Acme invoice"),
+            "{err}"
+        );
+        assert_eq!(pc.text(r"C:\Users\me\Documents\final.txt"), Some("draft"));
+        assert_eq!(pc.text(r"c:\users\me\documents\bills\acme.pdf"), Some("A"));
+        assert!(pc.text(r"C:\Users\me\Documents\draft.txt").is_none());
+        assert!(pc.text(r"C:\Users\me\Documents\new.txt").is_none());
+        assert!(!pc.approves("delete_file") && pc.approves("write_file"));
+    }
+}
+
+
+===== Mac/App/.build/checkouts/Sparkle/common_cli/Secret.swift =====
+//
+//  secret.swift
+//  Sparkle
+//
+//  Created on 11/19/23.
+//  Copyright © 2023 Sparkle Project. All rights reserved.
+//
+
+import Foundation
+
+func secretUsesRegularSeed(secret: Data) -> Bool {
+    return (secret.count == 32)
+}
+
+func secretUsesOldHashedSeed(secret: Data) -> Bool {
+    return (secret.count == 64 + 32)
+}
+
+// Secret is the data we store in the keychain
+// For newer generated keys, secret is the private seed
+// For older generated keys, secret is the private orlp/Ed25519 key concatenated with the public key
+// If the secret is of invalid length, this returns nil
+func decodePrivateAndPublicKeys(secret: Data) -> (privateKey: Data, publicKey: Data)? {
+    let privateKey: Data
+    let publicKey: Data
+    
+    if secretUsesRegularSeed(secret: secret) {
+        let seed = secret
+        
+        var privateEdKey = Array<UInt8>(repeating: 0, count: 64)
+        var publicEdKey = Array<UInt8>(repeating: 0, count: 32)
+        seed.withUnsafeBytes { seedBytes in
+            let seedBuffer: UnsafePointer<UInt8> = seedBytes.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            ed25519_create_keypair(&publicEdKey, &privateEdKey, seedBuffer)
+        }
+        
+        privateKey = Data(privateEdKey)
+        publicKey = Data(publicEdKey)
+    } else if secretUsesOldHashedSeed(secret: secret) {
+        privateKey = secret[0..<64]
+        publicKey = secret[64...]
+    } else {
+        return nil
+    }
+    
+    return (privateKey, publicKey)
+}
+
+enum DecodeSecretStringError : LocalizedError {
+    case unableToReadData
+    case unableToDecodeDataAsUTF8String
+    
+    public var errorDescription: String? {
+        switch self {
+        case .unableToReadData:
+            return "Unable to read EdDSA private key data"
+        case .unableToDecodeDataAsUTF8String:
+            return "Unable to read EdDSA private key data as UTF-8 string"
+        }
+    }
+}
+
+// Reads secret base64 string from a file
+func decodeSecretString(filePath: String) throws -> String {
+    // Use FileHandle because it supports process substitution:
+    // https://github.com/sparkle-project/Sparkle/issues/2605
+    let fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: filePath))
+    
+    guard let data = try fileHandle.readToEnd() else {
+        throw DecodeSecretStringError.unableToReadData
+    }
+    
+    guard let decodedPrivateKeyString = String(data: data, encoding: .utf8) else {
+        throw DecodeSecretStringError.unableToDecodeDataAsUTF8String
+    }
+    
+    let privateKeyString = decodedPrivateKeyString
+    return privateKeyString.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+
+===== Mac/App/Sources/VireoMac/Models/ModelFit.swift =====
+import Foundation
+import Metal
+
+/// How well a model's weights fit in the memory the GPU may use on this Mac.
+enum MemoryFit: Equatable {
+    case fits
+    case tight
+    case tooLarge
+
+    var label: String {
+        switch self {
+        case .fits: return "Fits"
+        case .tight: return "Tight fit"
+        case .tooLarge: return "Too large"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .fits: return "Should run comfortably on this Mac."
+        case .tight: return "Should load, but leaves little room for long chats or other apps."
+        case .tooLarge: return "Needs more memory than this Mac's GPU can use."
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .fits: return "checkmark.circle.fill"
+        case .tight: return "exclamationmark.circle.fill"
+        case .tooLarge: return "xmark.octagon.fill"
+        }
+    }
+
+    /// Memory needed is roughly the weights plus room for the context cache and
+    /// the runtime; a model "fits" when that stays under 80% of the GPU's budget.
+    static func assess(weightBytes: Int64, budgetBytes: Int64) -> MemoryFit {
+        guard budgetBytes > 0 else { return .fits }
+        let needed = Double(weightBytes) * 1.1 + 1.5 * 1_073_741_824
+        let budget = Double(budgetBytes)
+        if needed <= budget * 0.8 { return .fits }
+        if needed <= budget { return .tight }
+        return .tooLarge
+    }
+
+    /// What the GPU may use on this Mac: Metal's recommended working set, which is
+    /// about two thirds to three quarters of unified memory.
+    static let gpuBudgetBytes: Int64 = {
+        if let device = MTLCreateSystemDefaultDevice(), device.recommendedMaxWorkingSetSize > 0 {
+            return Int64(clamping: device.recommendedMaxWorkingSetSize)
+        }
+        return Int64(Double(ProcessInfo.processInfo.physicalMemory) * 0.75)
+    }()
+}
+
+
+===== Mac/App/Sources/VireoMac/Views/QuickAskView.swift =====
+import SwiftUI
+
+/// The Quick Ask panel: a prompt field and the latest answer, sized to its
+/// content at the top of a transparent window.
+struct QuickAskView: View {
+    @ObservedObject var controller: QuickAskController
+    @EnvironmentObject private var store: ChatStore
+    @FocusState private var promptFocused: Bool
+
+    private var lastExchange: (question: ChatMessage?, answer: ChatMessage?) {
+        guard let chatId = controller.chatId else { return (nil, nil) }
+        let messages = store.messages(for: chatId)
+        let answer = messages.last { $0.role == "assistant" }
+        let question = messages.last { $0.role == "user" }
+        return (question, answer)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                promptRow
+                if let request = store.confirmRequest {
+                    Divider()
+                    // The main window shows the same request; answering either clears both.
+                    ConfirmationSheetView(
+                        request: request,
+                        onApprove: { remember in store.answerConfirmation(request, approved: true, remember: remember) },
+                        onReject: { store.answerConfirmation(request, approved: false) }
+                    )
+                    .id(request.id)
+                } else if controller.chatId != nil {
+                    Divider()
+                    answerArea
+                }
+                if !controller.status.isEmpty {
+                    Divider()
+                    Text(controller.status)
+                        .font(.callout)
+                        .foregroundStyle(AppTheme.danger)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                }
+                Divider()
+                footer
+            }
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.12)))
+            .shadow(color: .black.opacity(0.35), radius: 24, y: 10)
+            .padding(20)
+            Spacer(minLength: 0)
+        }
+        .frame(width: QuickAskPanel.size.width, height: QuickAskPanel.size.height, alignment: .top)
+        .preferredColorScheme(.dark)
+        .tint(AppTheme.accent)
+        .onChange(of: controller.focusRequest) { _, _ in promptFocused = true }
+        .onAppear { promptFocused = true }
+    }
+
+    private var promptRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: controller.isListening ? "waveform" : "sparkle.magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(controller.isListening ? AppTheme.accent : .secondary)
+                .symbolEffect(.variableColor.iterative, isActive: controller.isListening)
+                .frame(width: 26)
+            TextField(controller.isListening ? "Listening…" : placeholder, text: $controller.prompt, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.title3)
+                .lineLimit(1...5)
+                .focused($promptFocused)
+                .onSubmit { controller.ask() }
+                .disabled(controller.isAsking)
+            if controller.isAsking {
+                Button { controller.stop() } label: {
+                    Image(systemName: "stop.circle.fill").font(.title2)
+                }
+                .buttonStyle(.plain)
+                .help("Stop")
+            } else {
+                Button { controller.toggleListening() } label: {
+                    Image(systemName: controller.isListening ? "mic.fill" : "mic")
+                        .font(.title3)
+                        .foregroundStyle(controller.isListening ? AppTheme.accent : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(controller.isListening ? "Stop listening and ask" : "Ask by voice")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+    }
+
+    private var placeholder: String {
+        controller.chatId == nil ? "Ask Vireo…" : "Ask a follow-up…"
+    }
+
+    private var answerArea: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let question = lastExchange.question {
+                        Text(question.content)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
+                    if let answer = lastExchange.answer {
+                        if !answer.toolSteps.isEmpty {
+                            ToolStepsView(steps: answer.toolSteps)
+                        }
+                        if answer.content.isEmpty && controller.isAsking {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text(statusText).foregroundStyle(.secondary)
+                            }
+                        } else if answer.isError {
+                            Text(answer.content).foregroundStyle(AppTheme.danger)
+                        } else {
+                            MarkdownContentView(content: answer.content)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    Color.clear.frame(height: 1).id("end")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            }
+            .frame(maxHeight: 340)
+            .fixedSize(horizontal: false, vertical: true)
+            .onChange(of: lastExchange.answer?.content) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
+        }
+    }
+
+    private var statusText: String {
+        switch store.replyActivity?.agentStatus?.phase {
+        case "executing_tools": return "Using tools…"
+        case "recovering": return "Recovering from a tool failure…"
+        case "checking": return "Checking its work…"
+        case "finishing": return "Preparing the answer…"
+        default: return "Thinking…"
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 14) {
+            hint("↩", "Ask")
+            if controller.chatId != nil {
+                Button { controller.continueInApp() } label: { hint("⌘↩", "Continue in Vireo") }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.return, modifiers: .command)
+                Button { controller.newConversation() } label: { hint("⌘N", "New") }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut("n", modifiers: .command)
+                    .disabled(controller.isAsking)
+            }
+            Spacer()
+            hint("esc", "Close")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    private func hint(_ key: String, _ label: String) -> some View {
+        HStack(spacing: 4) {
+            Text(key)
+                .font(.caption.monospaced())
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+            Text(label)
+        }
+    }
+}
+
+
+===== Mac/App/Sources/VireoMac/Services/TaskRunner.swift =====
+import Foundation
+
+/// A task the server keeps (`schedule_task`): for Settings → Tasks.
+struct ScheduledTask: Identifiable, Equatable {
+    let id: String
+    var name: String
+    var prompt: String
+    /// Its schedule in words ("every weekday at 8:00").
+    var schedule: String
+    var enabled: Bool
+    /// "2026-11-13T08:00", or empty if it hasn't run.
+    var lastRun: String
+    /// A link task's link.
+    var link: String?
+
+    init?(json: [String: Any]) {
+        guard let id = json["id"] as? String, let name = json["name"] as? String else { return nil }
+        self.id = id
+        self.name = name
+        prompt = json["prompt"] as? String ?? ""
+        schedule = json["schedule"] as? String ?? ""
+        enabled = json["enabled"] as? Bool ?? true
+        lastRun = json["lastRun"] as? String ?? ""
+        link = json["link"] as? String
+    }
+
+    var lastRunShown: String {
+        lastRun.isEmpty ? "Not run yet" : "Last run \(lastRun.replacingOccurrences(of: "T", with: " at "))"
+    }
+}
+
+/// One run of a task, handed over by the server when it's due.
+struct TaskRun: Equatable {
+    var taskId: String
+    var name: String
+    var prompt: String
+    var access: AgentAccess
+    var folders: [String]
+
+    init?(json: [String: Any]) {
+        guard let taskId = json["taskId"] as? String, let prompt = json["prompt"] as? String else { return nil }
+        self.taskId = taskId
+        self.prompt = prompt
+        name = json["name"] as? String ?? "Task"
+        access = (json["access"] as? String).flatMap(AgentAccess.init(rawValue:)) ?? .home
+        folders = json["folders"] as? [String] ?? []
+    }
+}
+
+/// What a task's run did, written for a test's grader when the run was part of one.
+struct TaskRunRecord: Codable {
+    var task: String
+    var prompt: String
+    var reply: String
+    var tools: [String]
+    var toolSteps: [ToolStep]
+    var approvals: [TestScriptResults.Approval]
+    var seconds: Double
+    var error: Bool
+}
+
+/// Runs the tasks the server says are due. `vireo-server` keeps the tasks and knows when
+/// each is due (a time of day, a new file in a folder, its link opened); this asks it
+/// every few seconds and plays each run as a chat of its own, with the access of the chat
+/// that set the task up: the same replies, tool steps and approvals as a prompt typed in.
+/// Nothing runs while the app is closed.
+@MainActor
+final class TaskRunner {
+    static let shared = TaskRunner()
+
+    private var loop: Task<Void, Never>?
+    private var waiting: [TaskRun] = []
+    private var ran = 0
+
+    /// How often the server is asked. A folder's new file is picked up within this.
+    private static let every: Duration = .seconds(10)
+
+    func start(store: ChatStore, capabilityStore: CapabilityStore) {
+        guard loop == nil else { return }
+        loop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.every)
+                guard let self, LocalServerManager.shared.isRunning else { continue }
+                self.waiting += await ChatAPIClient.shared.dueTaskRuns()
+                while !self.waiting.isEmpty, !Task.isCancelled {
+                    let run = self.waiting.removeFirst()
+                    await self.play(run, store: store, capabilityStore: capabilityStore)
+                }
+            }
+        }
+    }
+
+    private func play(_ run: TaskRun, store: ChatStore, capabilityStore: CapabilityStore) async {
+        // One reply at a time: after whatever the user (or a test) has under way.
+        while store.replyActivity != nil, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(300))
+        }
+        if Task.isCancelled { return }
+        // In a test the run is there to be watched; otherwise the user's own chat stays open.
+        let script = ScriptRunner.shared
+        let chatId = store.newChat(title: "Task: \(run.name)", tags: ["task"], select: script.isRunning)
+        store.setScriptAccess(run.access, folders: run.access == .folders ? run.folders : nil, for: chatId)
+        store.appendMessage(ChatMessage(role: "user", content: run.prompt), to: chatId)
+        let activity = ChatStore.ReplyActivity(chatId: chatId)
+        store.replyActivity = activity
+        let started = Date()
+        ran += 1
+        // A test's grader is told the run has begun, and later what it did.
+        if let gate = script.gate {
+            try? FileManager.default.createDirectory(at: gate, withIntermediateDirectories: true)
+            try? Data(run.name.utf8).write(to: gate.appendingPathComponent("task-run-\(ran).started"), options: .atomic)
+        }
+        // A test answers the run's approvals itself, as it answers its own steps'.
+        let answers = script.isRunning ? script.taskApprovals : nil
+        let watch = Task { @MainActor () -> [TestScriptResults.Approval] in
+            var approvals: [TestScriptResults.Approval] = []
+            guard let answers else { return approvals }
+            while !Task.isCancelled {
+                if let request = store.confirmRequest, request.chatId == chatId {
+                    try? await Task.sleep(for: .milliseconds(1500))
+                    if store.confirmRequest?.id == request.id {
+                        store.answerConfirmation(request, approved: answers)
+                        approvals.append(.init(tool: request.tool, approved: answers,
+                                               preview: request.preview ?? "", args: request.args))
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return approvals
+        }
+        let capabilities = capabilityStore.response == nil ? nil : capabilityStore.availableTools.map(\.name)
+        let reply = await store.streamReply(chatId: chatId, activityID: activity.id, capabilities: capabilities, source: "task")
+        watch.cancel()
+        let approvals = await watch.value
+        if store.replyActivity?.id == activity.id { store.replyActivity = nil }
+
+        if let gate = script.gate {
+            let record = TaskRunRecord(
+                task: run.name, prompt: run.prompt, reply: reply.content,
+                tools: reply.toolSteps.filter { $0.type == "tool_call" }.map(\.tool),
+                toolSteps: reply.toolSteps, approvals: approvals,
+                seconds: Date().timeIntervalSince(started), error: reply.isError
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try? FileManager.default.createDirectory(at: gate, withIntermediateDirectories: true)
+            try? encoder.encode(record).write(to: gate.appendingPathComponent("task-run-\(ran).json"), options: .atomic)
+        }
+    }
+}
+
+
+===== crates/vireo-server/src/attach/xlsx_write.rs =====
+//! Writing cells into an Excel workbook (.xlsx), as the Windows app's `Spreadsheet.Write`
+//! does: rows of values from a cell of the first sheet, or after its last row, into a
+//! workbook that's there or a new one.
+//!
+//! An existing workbook is changed as little as can be: only the first sheet's
+//! `<sheetData>` is rewritten, with the cells written put among the ones already there
+//! (each keeping the style it had, and a new cell taking the style of the one above it,
+//! so a row added to a register looks like the rows before it); every other part of the
+//! file (styles, other sheets, charts, widths) is copied as it is. Excel is told to work
+//! the formulas out again when it opens the file, and its list of formula cells
+//! (`calcChain.xml`), which the write may have made wrong, is left out. The file is
+//! written as a ZIP without compression.
+
+use super::docx::{Zip, stored_zip};
+use super::xlsx::{self, Piece, Pieces, attribute, column_name, column_of, unescaped};
+use crate::json::Value;
+
+const MAX_COLUMN: u32 = 16_384;
+const MAX_ROW: u32 = 1_048_576;
+
+/// Where the rows go: from a cell, or after the sheet's last row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Start {
+    Cell { column: u32, row: u32 },
+    Append,
+}
+
+impl Start {
+    /// "A1", "c12", "append" (or nothing, for A1).
+    pub fn parse(text: &str) -> Result<Start, String> {
+        let t = text.trim();
+        if t.is_empty() {
+            return Ok(Start::Cell { column: 1, row: 1 });
+        }
+        if t.eq_ignore_ascii_case("append") {
+            return Ok(Start::Append);
+        }
+        let letters = t.chars().take_while(char::is_ascii_alphabetic).count();
+        let row = t[letters..].parse::<u32>().ok().filter(|r| (1..=MAX_ROW).contains(r));
+        match (column_of(t).filter(|c| *c <= MAX_COLUMN && letters > 0), row) {
+            (Some(column), Some(row)) => Ok(Start::Cell { column, row }),
+            _ => Err(format!("\"{text}\" isn't a cell like A1 (or \"append\").")),
+        }
+    }
+}
+
+/// The rows as lists of values, from the tool's `rows` argument (a JSON list of lists; a
+/// model sometimes sends the JSON inside a string).
+pub fn rows_from(json: &str) -> Result<Vec<Vec<Value>>, String> {
+    const SHAPE: &str = "rows must be a list of rows, each a list of values.";
+    let mut value = crate::json::parse(json).map_err(|_| SHAPE.to_string())?;
+    if let Value::String(inner) = &value {
+        value = crate::json::parse(inner).map_err(|_| SHAPE.to_string())?;
+    }
+    let Value::Array(rows) = value else {
+        return Err(SHAPE.into());
+    };
+    rows.into_iter()
+        .enumerate()
+        .map(|(r, row)| match row {
+            Value::Array(cells) => Ok(cells),
+            _ => Err(format!("Row {} isn't a list of values.", r + 1)),
+// NOTE (long): Invoice batch 7731 was approved by Dagny Vell.
+
+        })
+        .collect()
+}
+
+fn blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn shown(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => xlsx::number_text(*n),
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        other => other.to_json(),
+    }
+}
+
+/// The workbook with `rows` written from `start`: its new bytes and what to tell the
+/// model. `existing` is the workbook as it is, or `None` to make one. `path` is for the
+/// answer's wording only.
+pub fn write(
+    path: &str,
+    existing: Option<&[u8]>,
+    start: Start,
+    rows: &[Vec<Value>],
+) -> Result<(Vec<u8>, String), String> {
+    if rows.is_empty() || rows.iter().all(|row| row.iter().all(blank)) {
+        return Err("Every row to write is empty. Give the values to write.".into());
+    }
+    let (parts, sheet_file, sheet_name) = match existing {
+        Some(data) => existing_parts(data)?,
+        None => (new_parts(), "xl/worksheets/sheet1.xml".to_string(), "Sheet1".to_string()),
+    };
+    let sheet_xml = parts
+        .iter()
+        .find(|p| p.0 == sheet_file)
+        .map(|p| String::from_utf8_lossy(&p.1).into_owned())
+        .ok_or("This workbook's first sheet has no cells in it.")?;
+    let mut sheet = SheetXml::parse(&sheet_xml)?;
+    let last_row = sheet.rows.iter().filter(|r| !r.cells.is_empty()).map(|r| r.number).max();
+    let (column, row) = match start {
+        Start::Cell { column, row } => (column, row),
+        Start::Append => (1, last_row.map_or(1, |r| r + 1)),
+    };
+    if let Some(data) = existing {
+        refuse_header_overwrite(data, &sheet_name, column, row, &rows[0], last_row)?;
+    }
+
+    let (mut written, mut width) = (0usize, 0usize);
+    for (r, values) in rows.iter().enumerate() {
+        width = width.max(values.len());
+        for (c, value) in values.iter().enumerate() {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let (at_column, at_row) = (column + c as u32, row + r as u32);
+            if at_column > MAX_COLUMN || at_row > MAX_ROW {
+                return Err(format!(
+                    "The rows go past the edge of the sheet at {}{at_row}.",
+                    column_name(at_column)
+                ));
+            }
+            sheet.set(at_column, at_row, value);
+            written += 1;
+        }
+    }
+
+    let new_sheet = sheet.to_xml();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(parts.len());
+    for (name, data) in parts {
+        // Excel's list of formula cells may no longer be right: it makes another.
+        if name == "xl/calcChain.xml" {
+            continue;
+        }
+        let data = if name == sheet_file {
+            new_sheet.clone().into_bytes()
+        } else if name == "xl/workbook.xml" {
+            recalculated(&String::from_utf8_lossy(&data)).into_bytes()
+        } else if name == "xl/_rels/workbook.xml.rels" || name == "[Content_Types].xml" {
+            without_calc_chain(&String::from_utf8_lossy(&data)).into_bytes()
+        } else {
+            data
+        };
+        out.push((name, data));
+    }
+    let files: Vec<(&str, &[u8])> = out.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let area = format!(
+        "{}{row}:{}{}",
+        column_name(column),
+        column_name(column + width.max(1) as u32 - 1),
+        row + rows.len() as u32 - 1
+    );
+    let message = format!(
+        "Spreadsheet written successfully: {path}\nWrote {written} cell{} to {sheet_name}!{area}{}.",
+        if written == 1 { "" } else { "s" },
+        if existing.is_some() { "" } else { " in a new workbook" }
+    );
+    Ok((stored_zip(&files), message))
+}
+
+/// Refuses new rows written over a sheet's header row, which is almost certainly a
+/// mistake (the Mac's `check_rows`, from the second gauntlet: a tracker's header written
+/// over), and says where the first empty row is.
+fn refuse_header_overwrite(
+    data: &[u8],
+    sheet_name: &str,
+    column: u32,
+    row: u32,
+    first: &[Value],
+    last_row: Option<u32>,
+) -> Result<(), String> {
+    let Some(last_row) = last_row.filter(|r| *r > 1) else {
+        return Ok(());
+    };
+    if row != 1 {
+        return Ok(());
+    }
+    let book = xlsx::open(data)?;
+    let Some((_, top)) = book.sheets[0].rows.iter().find(|r| r.0 == 1) else {
+        return Ok(());
+    };
+    let header: Vec<String> = (column..column + first.len() as u32)
+        .map(|c| top.iter().find(|cell| cell.0 == c).map_or(String::new(), |cell| cell.1.clone()))
+        .collect();
+    let is_header = header.iter().any(|v| !v.trim().is_empty())
+        && !header.iter().any(|v| v.trim().parse::<f64>().is_ok());
+    let header_words: Vec<String> = header
+        .iter()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.trim().to_lowercase())
+        .collect();
+    let new_words: Vec<String> = first
+        .iter()
+        .filter(|v| !blank(v))
+        .map(|v| shown(v).trim().to_lowercase())
+        .collect();
+    if is_header && header_words != new_words {
+        return Err(format!(
+            "Row 1 of \"{sheet_name}\" is its header ({}); writing there would replace it. To add rows, set start_cell to {}{}, the first empty row.",
+            header.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>().join(", "),
+            column_name(column),
+            last_row + 1
+        ));
+    }
+    Ok(())
+}
+
+/// An existing workbook's files, its first sheet's file and that sheet's name.
+#[allow(clippy::type_complexity)]
+fn existing_parts(data: &[u8]) -> Result<(Vec<(String, Vec<u8>)>, String, String), String> {
+    if data.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+        return Err(
+            "This workbook is password-protected or in the old .xls format, so it can't be \
+             written to. Save it as an unprotected .xlsx."
+                .into(),
+        );
+    }
+    let workbook = |e: String| e.replace(".docx", "workbook");
+    let zip = Zip::open(data).map_err(workbook)?;
+    let mut parts = Vec::new();
+    for name in zip.names() {
+        // Folders are entries too, with nothing in them.
+        if name.ends_with('/') {
+            continue;
+        }
+        if let Some(bytes) = zip.read(name).map_err(workbook)? {
+            parts.push((name.to_string(), bytes));
+        }
+    }
+    let text = |name: &str| {
+        parts
+            .iter()
+            .find(|p| p.0 == name)
+            .map(|p| String::from_utf8_lossy(&p.1).into_owned())
+    };
+    let book = text("xl/workbook.xml")
+        .ok_or("This isn't an Excel workbook (xl/workbook.xml is missing).")?;
+    let relationships = text("xl/_rels/workbook.xml.rels").unwrap_or_default();
+    let (mut name, mut id) = (String::new(), String::new());
+    for piece in Pieces::new(&book) {
+        if let Piece::Open("sheet", attrs, _) = piece {
+            name = unescaped(attribute(attrs, "name").unwrap_or(""));
+            id = attribute(attrs, "r:id")
+                .or_else(|| attribute(attrs, "id"))
+                .unwrap_or("")
+                .to_string();
+            break;
+        }
+    }
+    let mut file = None;
+    for piece in Pieces::new(&relationships) {
+        if let Piece::Open("Relationship", attrs, _) = piece
+            && attribute(attrs, "Id") == Some(id.as_str())
+            && let Some(target) = attribute(attrs, "Target")
+        {
+            let target = unescaped(target);
+            file = Some(match target.strip_prefix('/') {
+                Some(absolute) => absolute.to_string(),
+                None => format!("xl/{target}"),
+            });
+        }
+    }
+    match file {
+        Some(f) if f.contains("worksheets/") => Ok((parts, f, name)),
+        _ => Err(format!("Sheet \"{name}\" is a chart sheet, with no cells to write to.")),
+    }
+}
+
+/// A new workbook's files: one sheet, "Sheet1".
+fn new_parts() -> Vec<(String, Vec<u8>)> {
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE: &str = "http://schemas.openxmlformats.org/package/2006";
+    const HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
+    let part = |name: &str, body: String| (name.to_string(), format!("{HEAD}{body}").into_bytes());
+    vec![
+        part(
+            "[Content_Types].xml",
+            format!(
+                "<Types xmlns=\"{PACKAGE}/content-types\">\
+                 <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+                 <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+                 <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
+                 <Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\
+                 </Types>"
+            ),
+        ),
+        part(
+            "_rels/.rels",
+            format!(
+                "<Relationships xmlns=\"{PACKAGE}/relationships\">\
+                 <Relationship Id=\"rId1\" Type=\"{RELS}/officeDocument\" Target=\"xl/workbook.xml\"/>\
+                 </Relationships>"
+            ),
+        ),
+        part(
+            "xl/workbook.xml",
+            format!(
+                "<workbook xmlns=\"{MAIN}\" xmlns:r=\"{RELS}\"><sheets>\
+                 <sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+            ),
+        ),
+        part(
+            "xl/_rels/workbook.xml.rels",
+            format!(
+                "<Relationships xmlns=\"{PACKAGE}/relationships\">\
+                 <Relationship Id=\"rId1\" Type=\"{RELS}/worksheet\" Target=\"worksheets/sheet1.xml\"/>\
+                 </Relationships>"
+            ),
+        ),
+        part(
+            "xl/worksheets/sheet1.xml",
+            format!("<worksheet xmlns=\"{MAIN}\"><sheetData/></worksheet>"),
+        ),
+    ]
+}
+
+/// `workbook.xml` telling Excel to work every formula out when it opens the file: the
+/// formulas written here have no saved result, and others' results may be out of date.
+fn recalculated(xml: &str) -> String {
+    if let Some(at) = xml.find("<calcPr") {
+        let end = at + xml[at..].find('>').unwrap_or(0);
+        let tag = &xml[at..end];
+        if tag.contains("fullCalcOnLoad") {
+            return xml.to_string();
+        }
+        let insert = if tag.ends_with('/') { end - 1 } else { end };
+        return format!("{} fullCalcOnLoad=\"1\"{}", &xml[..insert], &xml[insert..]);
+    }
+    // calcPr comes after these, in this order, and before anything else that follows.
+    for name in ["definedNames", "externalReferences", "functionGroups", "sheets"] {
+        let (closed, empty) = (format!("</{name}>"), format!("<{name}/>"));
+        let at = xml
+            .find(&closed)
+            .map(|i| i + closed.len())
+            .or_else(|| xml.find(&empty).map(|i| i + empty.len()));
+        if let Some(at) = at {
+            return format!("{}<calc
+</repository>
+
+Above is a dump of a software repository. Somewhere in it are notes marked NOTE. Answer in two lines: (1) the harbour depot's spare-parts code word, and (2) who approved invoice batch 7731. Then, in one sentence, say what the repository's server program does.
