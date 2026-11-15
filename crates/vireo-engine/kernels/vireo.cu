@@ -17,6 +17,12 @@ typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 
+// Where a position's keys and values sit in a layer's cache: its row, or for a ring (a
+// sliding-window layer that keeps only its last `ring` positions) its row modulo the ring.
+// The ring travels in the window argument's high 16 bits (Gpu::attention_ring), as on
+// Metal.
+__device__ __forceinline__ size_t ring_row(int t, int ring) { return (size_t)(ring > 0 ? t % ring : t); }
+
 // Small whole numbers in each byte as signed bytes, minus their offset: 4-bit n (0..15) as
 // n − 8 and 6-bit n (0..63) as n − 32. n ^ 8 (n ^ 32) is the answer in 4-bit (6-bit) two's
 // complement; copying its sign bit into the byte's top bits (a multiply with no carries
@@ -578,6 +584,39 @@ extern "C" __global__ void quantize_q8(const float* x, signed char* xq, float* x
     for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     if (lane == 0) xd[block] = d;
     if (lane == 0 || lane == 16) xs[(size_t)block * 2 + lane / 16] = d * (float)sum;
+}
+
+// quantize_q8 for x = act(gate) × up (SiLU, or Gemma's tanh-GELU), worked out here and
+// not written anywhere as f32: the feed-forward's middle is only ever the next product's
+// input. One pass over gate and up instead of the activation's pass and the rounding's
+// (a 2,400-token prompt: Gemma 4 E4B's geglu 20 ms and about half of quantize_q8's 23).
+// Rows of n (a multiple of 32); up's rows are `up_stride` apart.
+template <bool GELU>
+__device__ __forceinline__ void gated_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                         float* xd, float* xs, int blocks) {
+    const int block = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (block >= blocks) return;
+    const size_t i = (size_t)block * 32 + lane;
+    const float x = gate[i], u = up[(i / n) * up_stride + i % n];
+    const float v = GELU ? 0.5f * x * (1.0f + tanhf(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u
+                         : x / (1.0f + expf(-x)) * u;
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    xq[i] = (signed char)q;
+    int sum = q;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (lane == 0) xd[block] = d;
+    if (lane == 0 || lane == 16) xs[(size_t)block * 2 + lane / 16] = d * (float)sum;
+}
+extern "C" __global__ void swiglu_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                     float* xd, float* xs, int blocks) {
+    gated_q8<false>(gate, up, n, up_stride, xq, xd, xs, blocks);
+}
+extern "C" __global__ void geglu_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                    float* xd, float* xs, int blocks) {
+    gated_q8<true>(gate, up, n, up_stride, xq, xd, xs, blocks);
 }
 
 __device__ __forceinline__ int i32_at(const signed char* p) { return *reinterpret_cast<const int*>(p); }
@@ -1534,17 +1573,35 @@ __device__ __forceinline__ void ldmatrix_x4_trans(u32 (&r)[4], const __half* p) 
                  : "r"(shared_address(p)));
 }
 
+// A batch's queries rounded to f16 where they lie, a row's halves at the start of its
+// floats: a block a row (a token's head, up to 512 numbers), each thread reading its four
+// numbers before any is written.
+extern "C" __global__ void q_rows_to_half(float* q, int d) {
+    float* row = q + (size_t)blockIdx.x * d;
+    const int i = threadIdx.x;
+    const bool mine = i * 4 < d;
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (mine) v = f4(row + i * 4);
+    __syncthreads();
+    if (mine) {
+        __half2* dst = reinterpret_cast<__half2*>(row) + i * 2;
+        dst[0] = __floats2half2_rn(v.x, v.y);
+        dst[1] = __floats2half2_rn(v.z, v.w);
+    }
+}
+
 template <int D, int ROWS, int SPLIT, int KC>
 __device__ void attention_mma(const float* q, const __half* keys, const __half* values, float* out,
                               const int* pos, int window, int kv_dim, int group, float scale, int tokens) {
+    const int ring = window >> 16;  // see ring_row
+    window &= 0xFFFF;
     constexpr int WARPS = ROWS * SPLIT, THREADS = 32 * WARPS, QT = 16 * ROWS;
     constexpr int DS = D + 8;            // padded rows: no bank conflicts
     constexpr int DP = D / SPLIT;        // the numbers of a head each warp takes
     constexpr int NS = KC / 8 * 4;       // a thread's share of S
     static_assert(DP % 16 == 0 && KC % 16 == 0, "tile sizes");
     extern __shared__ __align__(16) unsigned char smem[];
-    __half* qs = reinterpret_cast<__half*>(smem);  // QT × DS
-    __half* ks = qs + QT * DS;                      // KC × DS
+    __half* ks = reinterpret_cast<__half*>(smem);  // KC × DS
     __half* vs = ks + KC * DS;                      // KC × DS
     float* sx = reinterpret_cast<float*>(vs + KC * DS);  // SPLIT > 1: [ROWS][SPLIT][NS][32]
 
@@ -1560,23 +1617,21 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
         for (int i = tid; i < KC * D / 8; i += THREADS) {
             const int r = i / (D / 8), d = (i % (D / 8)) * 8;
             const bool valid = start + r <= last_row;
-            cp_async16(dst + r * DS + d, src + (size_t)(valid ? start + r : 0) * kv_dim + kv + d, valid);
+            cp_async16(dst + r * DS + d, src + ring_row(valid ? start + r : 0, ring) * kv_dim + kv + d, valid);
         }
         cp_async_commit();
     };
     load(ks, keys, lo);
 
-    // The queries, as f16.
-    for (int i = tid; i < QT * D / 4; i += THREADS) {
-        const int r = (i * 4) / D, d = (i * 4) % D;
-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (t0 + r < tokens) v = f4(q + ((size_t)(t0 + r) * heads + head) * D + d);
-        *reinterpret_cast<__half2*>(&qs[r * DS + d]) = __floats2half2_rn(v.x, v.y);
-        *reinterpret_cast<__half2*>(&qs[r * DS + d + 2]) = __floats2half2_rn(v.z, v.w);
-    }
-
     // This thread's two rows (gid and gid + 8 of the warp's 16) and where they look.
+    // Their queries are read where they lie, in f16 (q_rows_to_half): out of shared
+    // memory, a block's is its two chunks only, and an SM holds more blocks. (A row past
+    // the batch's end reads the last token's; its scores are never used.)
     const int row0 = rw * 16 + gid;
+    const __half* q0 =
+        reinterpret_cast<const __half*>(q + ((size_t)min(t0 + row0, tokens - 1) * heads + head) * D);
+    const __half* q1 =
+        reinterpret_cast<const __half*>(q + ((size_t)min(t0 + row0 + 8, tokens - 1) * heads + head) * D);
     int at[2], first[2];
     bool live[2];
     for (int h = 0; h < 2; h++) {
@@ -1601,8 +1656,8 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
         for (int n = 0; n < KC / 8; n++) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
 #pragma unroll 4
         for (int kk = dp; kk < dp + DP; kk += 16) {
-            const __half* qa = qs + row0 * DS + kk + tig * 2;
-            const u32 a0 = u32_of(qa), a1 = u32_of(qa + 8 * DS), a2 = u32_of(qa + 8), a3 = u32_of(qa + 8 * DS + 8);
+            const __half *qa = q0 + kk + tig * 2, *qb = q1 + kk + tig * 2;
+            const u32 a0 = u32_of(qa), a1 = u32_of(qb), a2 = u32_of(qa + 8), a3 = u32_of(qb + 8);
 #pragma unroll
             for (int n = 0; n < KC / 8; n++) {
                 const __half* kb = ks + (n * 8 + gid) * DS + kk + tig * 2;
@@ -1723,11 +1778,19 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
 
 // Head sizes 64 to 512: (rows of 16 tokens, warps per row, positions per chunk), the
 // fastest of the shapes measured on an RTX 5060 Laptop. The host side's ATTENTION_MMA
-// table must match.
+// tables must match. With the queries out of shared memory a block of twice the rows
+// and positions fits, and reads a long prompt faster (a ~30K-token prompt: Gemma 4 E2B
+// 3.70 -> 3.25 s, E4B 7.85 -> 7.24, Qwen 3.5 4B 11.30 -> 10.70; 512-wide 4 x 2 x 32 best
+// of 4x2x16, 2x2x32, 6x2x32, 8x2x16, 8x2x32, 4x4x32 and 8x1x32, 256-wide 8 x 1 x 64 of
+// 8x1x32, 4x1x64, 12x1x64, 16x1x32 and 16x1x64). A batch of up to 64 tokens keeps the
+// smaller shapes (`_short`): it has too few of the larger blocks to fill the GPU (Qwen
+// 3.5 4B, 16 tokens 27K deep: 41.5 ms against 47.9).
 ATTENTION_MMA(attention_mma_64, 64, 4, 1, 32)
 ATTENTION_MMA(attention_mma_128, 128, 4, 1, 32)
-ATTENTION_MMA(attention_mma_256, 256, 4, 1, 32)
-ATTENTION_MMA(attention_mma_512, 512, 2, 2, 16)
+ATTENTION_MMA(attention_mma_256, 256, 8, 1, 64)
+ATTENTION_MMA(attention_mma_512, 512, 4, 2, 32)
+ATTENTION_MMA(attention_mma_256_short, 256, 4, 1, 32)
+ATTENTION_MMA(attention_mma_512_short, 512, 2, 2, 16)
 #endif
 
 // ---- Everything else in a layer, for `tokens` rows at a time --------------------------
@@ -1850,7 +1913,7 @@ extern "C" __global__ void qkv_prep(const float* q_src, int q_stride, int q_head
                                     float* q_dst, const float* k_src, const float* k_norm, const float* v_src,
                                     int v_norm, void* k_cache, void* v_cache, int heads, int kv_heads,
                                     int hd, int rope_dims, float base, const float* factors, int neox,
-                                    const int* pos, float eps, int half_cache, int tokens) {
+                                    const int* pos, float eps, int half_cache, int tokens, int ring) {
     __shared__ float scratch[32];
     __shared__ float buf[512];
     const int slot = blockIdx.x, kv_dim = kv_heads * hd;
@@ -1878,7 +1941,7 @@ extern "C" __global__ void qkv_prep(const float* q_src, int q_stride, int q_head
             dst = q_dst + ((size_t)t * heads + h) * hd;
         } else {
             src = (kind == 1 ? k_src : v_src) + (size_t)t * kv_dim + h * hd;
-            const size_t at_cache = (size_t)at * kv_dim + h * hd;
+            const size_t at_cache = ring_row(at, ring) * kv_dim + h * hd;
             void* cache = kind == 1 ? k_cache : v_cache;
             if (half_cache)
                 half_dst = static_cast<__half*>(cache) + at_cache;
@@ -1941,6 +2004,8 @@ __device__ __forceinline__ float load1(const __half* p) { return __half2float(*p
 template <typename KV>
 __device__ void attention_one(const float* q, const KV* keys, const KV* values, float* out, const int* pos,
                               int window, int hd, int kv_dim, int group, float scale) {
+    const int ring = window >> 16;  // see ring_row
+    window &= 0xFFFF;
     __shared__ float scratch[32];
     __shared__ __align__(16) float qs[512];
     __shared__ float ps[128];
@@ -1958,7 +2023,7 @@ __device__ void attention_one(const float* q, const KV* keys, const KV* values, 
         const int at = start + tid;
         float s = -INFINITY;
         if (at < len) {
-            const KV* k = keys + (size_t)at * kv_dim + kv;
+            const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
             float dot = 0.0f;
             for (int d = 0; d < hd; d += 4) {
                 const float4 kv4 = load4(k + d), q4 = f4(qs + d);
@@ -1979,8 +2044,8 @@ __device__ void attention_one(const float* q, const KV* keys, const KV* values, 
             const int d = tid + j * 128;
             if (d >= hd) break;
             float a = acc[j] * correction;
-            const KV* v = values + (size_t)start * kv_dim + kv + d;
-            for (int i = 0; i < count; i++) a += ps[i] * load1(v + (size_t)i * kv_dim);
+            const KV* v = values + kv + d;
+            for (int i = 0; i < count; i++) a += ps[i] * load1(v + ring_row(start + i, ring) * kv_dim);
             acc[j] = a;
         }
         max_so_far = new_max;
@@ -2011,6 +2076,8 @@ extern "C" __global__ void attention_h(const float* q, const __half* keys, const
 template <typename KV>
 __device__ void attention_part(const float* q, const KV* keys, const KV* values, float* partial, const int* pos,
                                int window, int hd, int kv_dim, int group, float scale) {
+    const int ring = window >> 16;  // see ring_row
+    window &= 0xFFFF;
     __shared__ float scratch[32];
     __shared__ __align__(16) float qs[512];
     __shared__ float ps[128];
@@ -2029,7 +2096,7 @@ __device__ void attention_part(const float* q, const KV* keys, const KV* values,
         const int at = start + tid;
         float s = -INFINITY;
         if (at < hi) {
-            const KV* k = keys + (size_t)at * kv_dim + kv;
+            const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
             float dot = 0.0f;
             for (int d = 0; d < hd; d += 4) {
                 const float4 kv4 = load4(k + d), q4 = f4(qs + d);
@@ -2050,8 +2117,8 @@ __device__ void attention_part(const float* q, const KV* keys, const KV* values,
             const int d = tid + j * 128;
             if (d >= hd) break;
             float a = acc[j] * correction;
-            const KV* v = values + (size_t)start * kv_dim + kv + d;
-            for (int i = 0; i < count; i++) a += ps[i] * load1(v + (size_t)i * kv_dim);
+            const KV* v = values + kv + d;
+            for (int i = 0; i < count; i++) a += ps[i] * load1(v + ring_row(start + i, ring) * kv_dim);
             acc[j] = a;
         }
         max_so_far = new_max;
@@ -2117,6 +2184,8 @@ __device__ __forceinline__ void halves_to_float(const __half* p, float (&out)[N]
 template <int HD>
 __device__ void attention_part_kv(const float* q, const __half* keys, const __half* values, float* partial,
                                   const int* pos, int window, int kv_dim, int group, float scale, int heads) {
+    const int ring = window >> 16;  // see ring_row
+    window &= 0xFFFF;
     constexpr int PER = HD / 32, G = 4, WARPS = 4;
     __shared__ float wm[WARPS][G], wl[WARPS][G];
     __shared__ __align__(16) float wacc[WARPS][G][HD];
@@ -2175,9 +2244,9 @@ __device__ void attention_part_kv(const float* q, const __half* keys, const __ha
     for (; at + (U - 1) * WARPS < hi; at += U * WARPS) {
         float k[U][PER], v[U][PER], sc[U][G];
 #pragma unroll
-        for (int u = 0; u < U; u++) halves_to_float(keys + (size_t)(at + u * WARPS) * kv_dim + off, k[u]);
+        for (int u = 0; u < U; u++) halves_to_float(keys + ring_row(at + u * WARPS, ring) * kv_dim + off, k[u]);
 #pragma unroll
-        for (int u = 0; u < U; u++) halves_to_float(values + (size_t)(at + u * WARPS) * kv_dim + off, v[u]);
+        for (int u = 0; u < U; u++) halves_to_float(values + ring_row(at + u * WARPS, ring) * kv_dim + off, v[u]);
 #pragma unroll
         for (int u = 0; u < U; u++) scores(k[u], sc[u]);
 #pragma unroll
@@ -2207,8 +2276,8 @@ __device__ void attention_part_kv(const float* q, const __half* keys, const __ha
     }
     for (; at < hi; at += WARPS) {
         float k[PER], v[PER], sc[G];
-        halves_to_float(keys + (size_t)at * kv_dim + off, k);
-        halves_to_float(values + (size_t)at * kv_dim + off, v);
+        halves_to_float(keys + ring_row(at, ring) * kv_dim + off, k);
+        halves_to_float(values + ring_row(at, ring) * kv_dim + off, v);
         scores(k, sc);
         reduce(sc);
 #pragma unroll
@@ -2300,6 +2369,8 @@ extern "C" __global__ void attention_combine(const float* partial, float* out, i
 template <int LANES, int PER, int CHUNK>
 __device__ void attention_tiled(const float* q, const float* keys, const float* values, float* out,
                                 const int* pos, int window, int kv_dim, int group, float scale, int tokens) {
+    const int ring = window >> 16;  // see ring_row
+    window &= 0xFFFF;
     constexpr int HD = LANES * PER, ROWS = 256 / LANES;
     __shared__ __align__(16) float ks[CHUNK][HD];
     __shared__ __align__(16) float vs[CHUNK][HD];
@@ -2329,8 +2400,8 @@ __device__ void attention_tiled(const float* q, const float* keys, const float* 
             const int r = (i * 4) / HD, d = (i * 4) % HD;
             float4 kv4 = make_float4(0.f, 0.f, 0.f, 0.f), vv4 = kv4;
             if (r < count) {
-                kv4 = f4(keys + (size_t)(start + r) * kv_dim + kv + d);
-                vv4 = f4(values + (size_t)(start + r) * kv_dim + kv + d);
+                kv4 = f4(keys + ring_row(start + r, ring) * kv_dim + kv + d);
+                vv4 = f4(values + ring_row(start + r, ring) * kv_dim + kv + d);
             }
             *reinterpret_cast<float4*>(&ks[r][d]) = kv4;
             *reinterpret_cast<float4*>(&vs[r][d]) = vv4;
