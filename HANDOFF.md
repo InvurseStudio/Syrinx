@@ -304,6 +304,12 @@ only: nothing here changes on the Mac.
 - **CUDA only: `matmul8` reads one side's fragments with `ldmatrix`** (the weights' for
   Q4_0 and Q8_0, x's for Q4_K and Q5_K): ~3K reads 5% faster on the Gemmas, 2% on the
   Qwens, the same numbers.
+- **CUDA only (server): guesses deep in a chat** (`guesses_pay`, `mtp_share`,
+  `CHAT_GUESSES_FROM`, `MTP_GUESSES_FROM` in `crates/vireo-server/src/main.rs`). Past
+  24,000 tokens the chat's guesses, and past 48,000 a Gemma draft model's, stop for a
+  reply once too few of them were taken: a round's check costs each guess a pass over
+  the context there. `guesses_pay` is always true on the Mac; worth measuring there with
+  the same script idea (a 200-token reply after a long prompt, `--mtp off`, `--lookup 0`).
 - **Nsight Compute works here** (`ncu --kernel-name <kernel> --launch-skip <n>
   --launch-count 1 --set full`; kernels inside a recorded graph don't show, a prompt's
   batches do). It says what a kernel waits on, which Nsight Systems doesn't.
