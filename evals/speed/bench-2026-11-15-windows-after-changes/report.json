@@ -1,0 +1,122 @@
+{
+ "title": "Vireo after today's changes",
+ "eyebrow": "Vireo engine · Windows (RTX 5060 Laptop, 8 GB) · 2026-11-15, afternoon · the Mac's own harness · four small models at Q4 · 7e00a19 + three uncommitted changes",
+ "headline": "Smaller Gemma caches, faster long reads, Qwen reading less, the same answers",
+ "lede": "This morning's run of the Mac's harness on this laptop, repeated after three changes to Vireo's engine and server: Qwen keeps a saved state at the end of the system turn; the Gemmas' sliding-window layers keep only their window on CUDA, as on the Mac; and the prompt attention kernel reads its queries in f16 and uses larger blocks for long batches. Gemma 4 E4B's GPU memory went from {old:Gemma 4 E4B|vireo|memory.gb} GB to {Gemma 4 E4B|vireo|memory.gb} GB at a 65,536-token context, and both Gemmas now hold 131,072 tokens and a ~95K-token prompt without spilling. Reading the ~32K prompt is {ba:vireo|long.read_tps} faster. Against llama.cpp, Vireo still reads long prompts more slowly ({long.read_tps}) and uses more of the GPU ({memory.gb}), and is still faster on the tool task on three of four. The project's eval passed {ev:passed} of 172 cases, before → after: four cases changed, all close choices tipping (three now pass, one now fails with a right answer worked out without the calculate tool). The tokens Qwen reads over it change {ev:Qwen 3.5 4B|read.change} and {ev:Qwen 3.5 9B|read.change}, from the saved state, and its 43 cases took {ev:Qwen 3.5 4B|seconds} s (4B) and {ev:Qwen 3.5 9B|seconds} s (9B).",
+ "cards": [
+  {
+   "big": "{old:Gemma 4 E4B|vireo|memory.gb} → {Gemma 4 E4B|vireo|memory.gb} GB",
+   "text": "Gemma 4 E4B's highest GPU memory at 65,536 tokens (Gemma 4 E2B {old:Gemma 4 E2B|vireo|memory.gb} → {Gemma 4 E2B|vireo|memory.gb} GB); llama.cpp {Gemma 4 E4B|llama|memory.gb} GB"
+  },
+  {
+   "big": "{ba:vireo|long.read_tps}",
+   "text": "Vireo reading the ~32K prompt, this morning → now, across the four models; llama.cpp, unchanged, moved {ba:llama|long.read_tps}"
+  },
+  {
+   "big": "{ev:passed}",
+   "text": "eval cases passed of 172, before → after; {ev:flips} changed (three to pass, one to fail, none a wrong answer), {ev:same} of 172 answers and calls identical"
+  },
+  {
+   "big": "{long.read_tps}",
+   "text": "Vireo reading the ~32K prompt against llama.cpp now (this morning {old:long.read_tps}): still behind on all four"
+  }
+ ],
+ "rig": [
+  {
+   "label": "Laptop",
+   "value": "ASUS TUF Gaming A14",
+   "detail": "FA401GM · on mains, Turbo power plan (powercfg /getactivescheme: Turbo)"
+  },
+  {
+   "label": "GPU",
+   "value": "GeForce RTX 5060 Laptop",
+   "detail": "8 GB · Blackwell · driver 621.14 · at full speed: Gemma 4 E4B read medium.txt at {check:read} tokens/s and wrote {check:write} before the run"
+  },
+  {
+   "label": "CPU · memory",
+   "value": "AMD Ryzen AI 9 465",
+   "detail": "31 GB system memory"
+  },
+  {
+   "label": "Software",
+   "value": "Windows 11 · Vireo at 7e00a19 + changes",
+   "detail": "git rev-parse --short HEAD: 7e00a19; the three changes uncommitted on top of it · llama.cpp b12262 (CUDA build) · vireo-server with --context and --thinking off"
+  }
+ ],
+ "where": [
+  "<b>Memory:</b> the Gemmas' sliding-window layers now keep only their window, so Vireo's Gemma servers load at {Gemma 4 E2B|vireo|load.gb} GB (E2B, was {old:Gemma 4 E2B|vireo|load.gb}) and {Gemma 4 E4B|vireo|load.gb} GB (E4B, was {old:Gemma 4 E4B|vireo|load.gb}). Vireo still uses more than llama.cpp on all four ({memory.gb}; this morning {old:memory.gb}): it sets aside the whole context's caches for the other layers when it starts, and holds the Gemmas' draft models and its skill picker. The Qwens have no sliding-window layers and didn't change.",
+  "<b>Reading:</b> still behind llama.cpp on every ~32K prompt ({long.read_tps}; this morning {old:long.read_tps}), and so on the first token after it ({long.ttft}). At ~3K tokens the run's rows put Vireo behind on all four ({medium.read_tps}), but the Gemmas' two were one-offs: re-run, they read at the morning's speeds ({re:Gemma 4 E2B|medium.read_tps} and {re:Gemma 4 E4B|medium.read_tps} tokens/s; RECHECKS.md), level with or ahead of llama.cpp.",
+  "<b>Agent tasks:</b> the tool task is faster than llama.cpp's on three ({tools.total}), the skill task on two ({skill.total}); the long tool task is slower on all four ({longtools.total}), mostly reading its ~56K-token log. llama.cpp's own task times moved between its two runs because its answers did: Gemma 4 E4B's tool task took {old:Gemma 4 E4B|llama|tools.total} s this morning and got it wrong, {Gemma 4 E4B|llama|tools.total} s now and got it right.",
+  "<b>Writing:</b> after the ~32K prompt level overall ({long.gen_tps}); a short reply {short.gen_tps}. Writing wasn't touched by the changes; its moves are one reply each (re-checked for Gemma 4 E4B: {re:Gemma 4 E4B|short.gen_tps} tokens/s).",
+  "<b>Answers:</b> Vireo {vireo_total} of 20 here, as this morning ({old:vireo_total}); llama.cpp {llama_total} ({old:llama_total} this morning, with the same program: its answers vary from run to run)."
+ ],
+ "method": "Harness: evals/speed/bench-2026-11-13/bench.py (the Mac's, with its Windows-only changes), run once for all four models with ENGINES=vireo,llama MODELS=e2b,e4b,q4b,q9b REPS=1 and python -X utf8 -I, the same contexts as the morning. Results: evals/speed/bench-2026-11-15-windows-after-changes/results.jsonl (64 rows, no errors), server logs in its bench-logs; re-checks and the 131,072-token probe beside it (RECHECKS.md). This morning's: bench-2026-11-15-windows-mac-harness. Eval: vireo-eval, all 43 cases on the four models, on this build (evals/windows-cuda-changes.json) and on 7e00a19 built in a scratch worktree (evals/windows-cuda-changes-before.json). Page: evals/speed/bench_after_changes_report.py; every number and percentage on it is worked out from those files.",
+ "contexts": {
+  "Gemma 4 E2B": 65536,
+  "Gemma 4 E4B": 65536,
+  "Qwen 3.5 4B": 65536,
+  "Qwen 3.5 9B": 32768
+ },
+ "panels": {
+  "short": "Vireo through its server, as shipped: guesses from the chat, and from Google's draft models for the Gemmas. One reply each.",
+  "longwrite": "The answer quotes the two hidden facts, which the chat's guesses copy.",
+  "ttft": "Mostly the prompt's reading. On the Gemmas Vireo now reads its own {Gemma 4 E2B|vireo|short.kept} tokens of instructions and tools again after a long prompt (see the before-and-after section).",
+  "memory": "The whole GPU, Windows' share included. Vireo's caches are set aside when it starts; the Gemmas' sliding-window layers now only for their window.",
+  "medium": "medium.txt with a question: ~3,000 tokens read. The Gemmas' Vireo rows were one-offs: re-run, {re:Gemma 4 E2B|medium.read_tps} (E2B) and {re:Gemma 4 E4B|medium.read_tps} (E4B).",
+  "long": "long.txt whole: 32,510–33,798 tokens for the Gemmas, 29,665–31,144 for the Qwens, by each engine's count.",
+  "tool": "Vireo offers its own tools as well (calculate among them); llama.cpp gets the harness's five, a request per step.",
+  "skill": "Vireo picks the skill itself (use_skill); llama.cpp is given the skill's text in the message, as on the Mac.",
+  "longtool": "Mostly reading the ~56K-token log (~29K for Qwen 3.5 9B, its log cut to half).",
+  "score": "Long recall, multiturn, tool, skill, long tool, scored by the Mac's aggregate.py.",
+  "ba_long": "The prompt attention kernel's f16 queries and larger blocks: {ba:Gemma 4 E2B|vireo|long.read_tps} and {ba:Gemma 4 E4B|vireo|long.read_tps} on the Gemmas, {ba:Qwen 3.5 4B|vireo|long.read_tps} and {ba:Qwen 3.5 9B|vireo|long.read_tps} on the Qwens (fewer of their layers use attention).",
+  "ba_longtool": "Mostly reading the log, so it follows the read speed: {ba:vireo|longtools.total}.",
+  "ba_tool": "Level ({ba:vireo|tools.total}). The Gemmas now read the task's whole prompt (their instructions and tools again), which costs ~0.1–0.3 s here.",
+  "ba_memory": "The Gemmas' sliding-window rings: {ba:Gemma 4 E2B|vireo|memory.gb} and {ba:Gemma 4 E4B|vireo|memory.gb}. The Qwens have no such layers."
+ },
+ "ba_intro": "Vireo this morning (7e00a19) against Vireo now (7e00a19 with the three changes), the same harness, contexts and prompts, one run each. llama.cpp, unchanged, was run both times as the check that the laptop was in the same state: its reading and writing speeds and first-token times moved {llama_drift.speeds.median} at the median and {llama_drift.speeds.max} at most, its GPU memory {llama_drift.memory.max} at most. Its task times moved more ({llama_drift.tasks.max} at most) because its answers changed (more or fewer tool calls), not its speed.",
+ "changes": [
+  "<b>1. Qwen's saved state at the system turn's end</b> (vireo-server, Kept::turn): when Qwen reads a system turn, its DeltaNet layers are saved a few tokens before the turn's end, so the next chat with the same instructions and tools starts from there. Before, the one saved state was where the first two chats parted. In this harness each Qwen task kept the start it shares with the chat before it ({Qwen 3.5 4B|vireo|medium.kept} tokens on Qwen 3.5 4B) or none (the tool and skill tasks' system turns differ from the chats before them), so it shows in the eval, where every case shares one system turn.",
+  "<b>2. Sliding-window rings on CUDA</b> (attention_ring, ring_row in vireo.cu; gemma4_cuda.rs): a sliding-window layer keeps its window and a batch's new positions, position p at row p mod ring, as the Mac has done. The Gemmas' GPU memory drops; the cost is that a ring which has gone round can't go back, so after a prompt longer than the ring the next chat reads its instructions and tools again (0 kept), as on the Mac.",
+  "<b>3. The prompt attention kernel</b> (q_rows_to_half, attention_mma and a _short set for batches up to 64 tokens): a batch's queries are turned to f16 where they lie instead of being copied into each block's shared memory, which frees that memory for larger blocks on batches over 64 tokens. Long prompts read faster; Gpu::attention now leaves a batch's queries in f16."
+ ],
+ "ba_from": {
+  "medium.read_tps": "3. The run's Gemma rows were one-offs (re-run: {re:Gemma 4 E2B|medium.read_tps} and {re:Gemma 4 E4B|medium.read_tps}, as this morning).",
+  "long.read_tps": "3, the attention kernel; on the Gemmas partly offset by 2 (the {Gemma 4 E2B|vireo|short.kept} tokens of instructions now read again, counted in the read).",
+  "long.ttft": "3, less 2 on the Gemmas ({Gemma 4 E2B|vireo|short.kept} more tokens read).",
+  "short.gen_tps": "None (writing not changed): one reply each. E2B's this morning was a one-off low; E4B's re-checked at {re:Gemma 4 E4B|short.gen_tps}.",
+  "long.gen_tps": "None: one reply each.",
+  "tools.total": "None to speak of.",
+  "tools.read": "2 on the Gemmas: after the long prompts before it, the ring can't go back, so the task's instructions and tools are read again.",
+  "skill.total": "The model's own path: Gemma 4 E4B made {Gemma 4 E4B|vireo|skill.calls} tool calls, not {old:Gemma 4 E4B|vireo|skill.calls} (answers differ by rounding, 3).",
+  "skill.read": "2, as the tool task.",
+  "longtools.total": "3: the ~56K-token log reads faster.",
+  "longtools.read": "2: ~1,700 tokens more on the Gemmas.",
+  "load.gb": "2: the Gemmas' sliding-window layers keep only their window.",
+  "memory.gb": "2, as loaded.",
+  "score": "None: the same tasks right and wrong on each model."
+ },
+ "ba_note": "This morning → now, one run each; the small grey figure is now ÷ this morning − 1 (a time or memory going down is negative, and better). Tokens read: the whole task's, every request's. GPU memory: the whole GPU's in use, Windows' ~0.4 GB included.",
+ "llama_note": "The same program both times. Speeds and memory within a few percent; task times and tokens read follow the model's path through the task (Gemma 4 E4B's tool task: {Gemma 4 E4B|llama|tools.calls} tool calls now and right, {old:Gemma 4 E4B|llama|tools.calls} this morning and wrong).",
+ "eval_intro": "vireo-eval, all 43 cases on each of the four models, greedy (temperature 0), run on this build and then on 7e00a19 built in a scratch git worktree, one after the other, with the same model files. A case passes on the tools it called, their arguments and the answer.",
+ "eval_note": "Tokens read: the prompt's tokens not kept from an earlier chat, over all 43 cases; Qwen's fall from the saved state at the system turn's end ({ev:Qwen 3.5 4B|read.change}, {ev:Qwen 3.5 9B|read.change}), the Gemmas' rise from the rings ({ev:Gemma 4 E2B|read.change}, {ev:Gemma 4 E4B|read.change}: after a case longer than a ring, the next reads its instructions and tools again). All 43 cases: the eval's own total time; the grey figure is before ÷ after − 1, so positive is faster now. Reading and writing: the eval's totals (tokens ÷ seconds). Identical: the same answer and the same tool calls, character for character; the rest differ in wording or in a call, as greedy replies do when sums are added in a different order.",
+ "eval_flips": {
+  "Gemma 4 E2B|skill-review": "Only different: the same calls; the answer now names the discount applied twice. A close choice tipped.",
+  "Gemma 4 E2B|office-policy": "Only different: the same calls; the table now includes SmileCo's request.",
+  "Gemma 4 E4B|calc-tip": "Only different: the same answer ($15.55 tip, $101.95 total), right, but worked out without calling calculate, which the case requires.",
+  "Qwen 3.5 4B|office-invoices": "Only different: the same reads; both invoices that can go ahead are now logged."
+ },
+ "probe_title": "Extra: the Gemmas at a 131,072-token context",
+ "probe_intro": "Possible now that the Gemmas' sliding-window layers keep only their window. Each Gemma and engine at 131,072 tokens, the Mac's large prompt (~95K tokens, two facts hidden in it) sent whole, with Windows' per-process GPU counters read after loading and again after the prompt while the server held its memory: shared memory growing would mean the caches spilled into the PC's memory. It didn't grow on any of the four, so all four fit. Not part of the main comparison: one prompt each (probe-131k.jsonl).",
+ "probe_note": "Reading: the prompt's tokens not kept (Vireo kept its instructions from the warm-up) ÷ the engine's own reading time. Vireo reads {probe:Gemma 4 E2B|vireo|read_tps} tokens/s on E2B against llama.cpp's {probe:Gemma 4 E2B|llama|read_tps}, and {probe:Gemma 4 E4B|vireo|read_tps} against {probe:Gemma 4 E4B|llama|read_tps} on E4B; first token after {probe:Gemma 4 E4B|vireo|ttft} s against {probe:Gemma 4 E4B|llama|ttft} on E4B. Dedicated and shared: Windows' counters for the server's process. Whole GPU: nvidia-smi after the prompt.",
+ "odd": [
+  "<b>Gemma · Vireo · instructions read again:</b> after any prompt longer than a sliding-window ring, the next chat keeps 0 tokens: Vireo's {Gemma 4 E2B|vireo|short.kept} tokens of instructions and tools are read again (tool task {old:Gemma 4 E2B|vireo|tools.read} → {Gemma 4 E2B|vireo|tools.read} tokens on E2B). This is the Mac's behaviour too (its rows show 0 kept after the long prompt), a cost of the rings; a saved copy of the rings at the system turn's end would avoid it.",
+  "<b>Gemma · eval a little slower:</b> the rings' cost shows in the eval, where cases follow each other on one server: the Gemmas read {ev:Gemma 4 E2B|read} and {ev:Gemma 4 E4B|read} tokens (before → after), and Gemma 4 E4B's 43 cases took {ev:Gemma 4 E4B|seconds} s. The Qwens were faster ({ev:Qwen 3.5 4B|seconds} s, {ev:Qwen 3.5 9B|seconds} s).",
+  "<b>Gemma · Vireo · one-off ~3K reads:</b> the run's ~3K-token reads were {Gemma 4 E2B|vireo|medium.read_tps} (E2B) and {Gemma 4 E4B|vireo|medium.read_tps} (E4B) tokens/s; re-run, {re:Gemma 4 E2B|medium.read_tps} and {re:Gemma 4 E4B|medium.read_tps}, as this morning. Gemma 4 E4B's short reply ({Gemma 4 E4B|vireo|short.gen_tps} tokens/s) re-checked at {re:Gemma 4 E4B|short.gen_tps}. Rows kept as measured (RECHECKS.md).",
+  "<b>Qwen · saved state not used in this harness:</b> the tool and skill tasks read from 0 on both builds: their system turns (with the harness's client tools) differ from the chats before them, so neither saved state matches. The change shows in the eval instead.",
+  "<b>llama.cpp's answers vary between runs:</b> the same program scored {old:llama_total} this morning and {llama_total} now: Gemma 4 E4B's and Qwen 3.5 4B's tool tasks are now right, Gemma 4 E2B's skill task gave 88 hours (63 this morning).",
+  "<b>Vireo · answers differ by rounding:</b> greedy replies changed in places on both engines' runs; on Vireo the attention kernel's new blocks add up in a different order, so a close choice between two tokens can tip (Gemma 4 E2B's tool task gave Q3 as 6,496.75, 4,317.75 this morning, wrong both times).",
+  "<b>Eval · four cases changed:</b> Gemma 4 E2B's skill-review and office-policy and Qwen 3.5 4B's office-invoices now pass; Gemma 4 E4B's calc-tip now fails because it did the sum itself, with the right result. All four tipped on close choices; none is a wrong answer caused by the changes."
+ ],
+ "detail_note": "Context: what both engines were given. GPU memory: the whole GPU's in use (nvidia-smi), loaded and the highest after any workload. Multiturn: eight turns, each pasting a ~600-token report; first token averaged over turns 2–8.",
+ "tokens_note": "Read · written · tool calls, summed over the whole task (llama.cpp's over its requests). Vireo's prompts hold its own instructions and tools; llama.cpp's holds the harness's system prompt and five tools."
+}
