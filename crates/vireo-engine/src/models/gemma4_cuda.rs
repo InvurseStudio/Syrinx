@@ -1104,7 +1104,7 @@ impl<'a> Gemma4Cuda<'a> {
             s.graph = Some(graph);
         }
         s.graph.as_ref().unwrap().launch().map_err(gpu_error)?;
-        (s.hidden_from, s.hidden_rows) = (s.len, self.final_rows(1));
+        (s.hidden_from, s.hidden_rows) = (s.len, 1);
         s.len += 1;
         if !want_logits {
             return Ok(None);
@@ -1181,9 +1181,11 @@ impl<'a> Gemma4Cuda<'a> {
                 self.queue_batch(s, t, wanted)?;
             }
             (s.hidden_from, s.hidden_rows) = match wanted {
+                // Every layer ran for every token.
+                Logits::All => (s.len, t),
                 // The last token's in row 0.
-                Logits::Last => (s.len + t - 1, self.final_rows(1)),
-                _ => (s.len, self.final_rows(t)),
+                Logits::Last => (s.len + t - 1, 1),
+                Logits::None => (s.len, self.rows_without_logits(t)),
             };
             s.len += t;
             match wanted {
@@ -1198,9 +1200,9 @@ impl<'a> Gemma4Cuda<'a> {
         })
     }
 
-    /// How many of a batch's `t` rows of `h` hold final states after a read: all of them,
-    /// unless some layers share keys and values (they ran for one token, or none).
-    fn final_rows(&self, t: usize) -> usize {
+    /// How many of a batch's `t` rows of `h` hold final states after a read for no
+    /// logits: all of them, unless some layers share keys and values (they didn't run).
+    fn rows_without_logits(&self, t: usize) -> usize {
         if self.config.first_shared_layer >= self.config.layers {
             t
         } else {

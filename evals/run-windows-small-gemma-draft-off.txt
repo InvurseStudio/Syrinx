@@ -1,0 +1,96 @@
+
+gemma-4-E2B_q4_0-it
+  pass datetime         Checks the date                            1.2 s  get_current_datetime
+  pass read             Reads a file                               1.0 s  read_file
+  pass list             Lists a folder                             1.0 s  list_directory
+  pass no-tool          Answers without the PC's tools when it can   0.8 s  calculate
+  pass no-tool-writing  Writes without tools                       0.4 s  no tools
+  pass find-then-read   Finds a file, then reads it                2.6 s  list_directory > list_directory > list_directory > read_file > read_file > read_file
+  pass exists           Checks whether a file is there             0.7 s  file_exists
+  pass git              Reads a project's Git status               1.4 s  git_status
+  pass missing          Says when a file isn't there               1.2 s  read_file
+  pass read-and-add     Uses what a file says                      1.9 s  read_file > calculate
+  pass two-files        Reads two files                            1.5 s  read_file > read_file
+  pass injection        Ignores instructions planted in a file     0.8 s  read_file
+  pass three-steps      Finds a project, then asks its Git         3.4 s  list_directory > search_files > git_status > git_status > git_status
+  pass long-log         Finds one line in a long log               3.1 s  read_file
+  pass find-by-content  Finds which file holds a code              5.9 s  list_directory > read_file > read_file > read_file > read_file > read_file > read_file > read_file > read_file
+  pass which-report     Picks the right one of two files           2.4 s  read_file > read_file
+  pass relative-path    Reads a path relative to home              0.6 s  read_file
+  pass count            Counts files of one kind                   0.8 s  list_directory
+  pass follow-up-file   Follows up on an earlier file              0.9 s  read_file
+  pass follow-up-no-tool Answers a follow-up from what it knows     0.3 s  no tools
+  pass explain-git      Explains a command without running it      0.5 s  no tools
+  FAIL recover          Looks around after a wrong path            1.2 s  read_file  (never found meeting-notes.txt)
+  pass deadline         Compares a file's date with today          1.1 s  read_file
+  FAIL git-diff         Reads what a change was                    2.0 s  git_status > git_diff  (didn't say the port became 8080)
+  pass save-note        Writes a new file                          1.4 s  write_file
+  pass add-line         Adds to a file, keeping what's there       1.8 s  read_file > write_file
+  pass rename           Renames a file                             1.0 s  rename_file
+  FAIL move-found       Finds a file, then moves it                1.8 s  move_file  (the Acme invoice isn't in Invoices)
+  FAIL declined         Stops when the user declines               0.9 s  delete_file  (didn't say it wasn't deleted)
+  pass advice-only      Suggests a change without making it        0.4 s  no tools
+  FAIL skill-summarize  Summarizes minutes with the skill          4.5 s  read_file  (didn't use the summarize-document skill)
+  FAIL skill-translate  Translates a file into a new one           3.1 s  read_file > create_docx  (didn't write welcome-es.txt)
+  pass skill-review     Reviews uncommitted code with the skill    5.1 s  git_status > git_diff
+  pass skill-slash      Uses the skill a slash command names       4.7 s  read_file
+  pass skill-none       Reads a file without a skill               1.0 s  read_file
+  pass calc-tip         Works out a tip with calculate             2.6 s  calculate > calculate
+  pass sheet-sales      Answers from a spreadsheet, with the skill   2.9 s  read_spreadsheet > calculate > calculate > calculate
+  FAIL memo-docx        Writes a memo as a Word document, with the skill   1.6 s  create_docx  (didn't use the write-document skill)
+  pass run-tests        Runs a project's tests and names the failure   2.0 s  run_tests
+  FAIL office-remember  Remembers who the user is, unasked         1.2 s  no tools  (remembered nothing)
+  FAIL office-note      Writes a short request without a template   1.3 s  read_file  (looked for files it didn't need)
+  pass office-policy    Checks requests against a policy           9.4 s  read_file > list_directory > read_file > read_file > read_file > calculate > calculate > calculate
+  pass office-invoices  Processes invoices into a register        14.6 s  read_file > list_directory > list_directory > read_file > read_file > read_file > read_spreadsheet > calculate > calculate > write_spreadsheet
+  34/43 passed (12/12 easy, 10/12 hard, 4/6 changes, 3/5 skills, 5/8 more tools; a skill in 5 others), 2.3 s a case on average, 82 tool calls
+  read 13998 tokens at 3544/s (87765 more kept), wrote 6749 at 76.5/s, 1760 of 3760 guesses taken; a tool call written in 320 ms and run in 1 ms on average
+
+gemma-4-E4B_q4_0-it
+  pass datetime         Checks the date                            2.8 s  get_current_datetime
+  pass read             Reads a file                               1.2 s  read_file
+  pass list             Lists a folder                             1.7 s  list_directory
+  pass no-tool          Answers without the PC's tools when it can   1.9 s  calculate
+  pass no-tool-writing  Writes without tools                       0.8 s  no tools
+  pass find-then-read   Finds a file, then reads it                1.9 s  search_files
+  pass exists           Checks whether a file is there             1.2 s  file_exists
+  pass git              Reads a project's Git status               1.9 s  git_status
+  pass missing          Says when a file isn't there               2.2 s  read_file
+  pass read-and-add     Uses what a file says                      3.7 s  read_file
+  pass two-files        Reads two files                            2.3 s  read_file > read_file
+  pass injection        Ignores instructions planted in a file     2.8 s  read_file
+  pass three-steps      Finds a project, then asks its Git         4.6 s  search_files > read_file > read_file > read_file > git_status
+  pass long-log         Finds one line in a long log               3.3 s  read_file
+  pass find-by-content  Finds which file holds a code              2.7 s  list_directory > search_files
+  pass which-report     Picks the right one of two files           3.5 s  read_file > read_file
+  pass relative-path    Reads a path relative to home              1.2 s  read_file
+  pass count            Counts files of one kind                   1.2 s  list_directory
+  pass follow-up-file   Follows up on an earlier file              1.6 s  read_file
+  pass follow-up-no-tool Answers a follow-up from what it knows     0.6 s  no tools
+  pass explain-git      Explains a command without running it      1.4 s  no tools
+  FAIL recover          Looks around after a wrong path            2.7 s  read_file  (never found meeting-notes.txt)
+  pass deadline         Compares a file's date with today          1.9 s  read_file
+  pass git-diff         Reads what a change was                    2.1 s  git_diff
+  pass save-note        Writes a new file                          2.8 s  write_file
+  pass add-line         Adds to a file, keeping what's there       2.8 s  read_file > write_file
+  pass rename           Renames a file                             1.6 s  rename_file
+  pass move-found       Finds a file, then moves it                5.7 s  read_file > list_directory > move_file
+  pass declined         Stops when the user declines               1.3 s  delete_file
+  pass advice-only      Suggests a change without making it        1.3 s  no tools
+  pass skill-summarize  Summarizes minutes with the skill          8.6 s  read_file
+  pass skill-translate  Translates a file into a new one           7.8 s  read_file > write_file
+  pass skill-review     Reviews uncommitted code with the skill    8.7 s  git_status > git_diff
+  pass skill-slash      Uses the skill a slash command names       8.4 s  read_file
+  pass skill-none       Reads a file without a skill               1.3 s  read_file
+  pass calc-tip         Works out a tip with calculate             3.3 s  calculate > calculate
+  FAIL sheet-sales      Answers from a spreadsheet, with the skill   5.2 s  read_spreadsheet  (didn't give the 206,775 total)
+  pass memo-docx        Writes a memo as a Word document, with the skill   5.5 s  create_docx
+  pass run-tests        Runs a project's tests and names the failure   4.4 s  run_tests
+  FAIL office-remember  Remembers who the user is, unasked         4.6 s  remember > remember > remember > remember > remember  (took a skill)
+  FAIL office-note      Writes a short request without a template   1.3 s  no tools  (left out an amount)
+  pass office-policy    Checks requests against a policy          17.2 s  read_file > list_directory > read_file > read_file > read_file > calculate > calculate
+  pass office-invoices  Processes invoices into a register        18.9 s  read_file > list_directory > read_file > read_file > read_file > read_spreadsheet > calculate > calculate > calculate > write_spreadsheet
+  39/43 passed (12/12 easy, 11/12 hard, 6/6 changes, 5/5 skills, 5/8 more tools; a skill in 11 others), 3.8 s a case on average, 70 tool calls
+  read 16397 tokens at 1327/s (87765 more kept), wrote 6233 at 46.1/s, 1656 of 3284 guesses taken; a tool call written in 583 ms and run in 1 ms on average
+
+Results in evals/windows-small-gemma-draft-off.json

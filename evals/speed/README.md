@@ -12,6 +12,9 @@ server (fonts come from Google Fonts and fall back to system fonts offline).
 | `windows-rtx5060-2026-11-12.html` (and a dark image of it without the table, `windows-rtx5060-2026-11-12-dark.png`) | ASUS TUF A14, RTX 5060 Laptop (8 GB), Windows 11 | llama.cpp b12262, CUDA build |
 | `mac-m5max-2026-11-12.html` | MacBook Pro, M5 Max (40-core GPU, 128 GB), macOS 27.2 | llama.cpp b12228 (Metal) and the shipped Vireo 0.9.0 (MLX) |
 | `mac-m5max-2026-11-12-pm.html` | The same Mac, after the afternoon's tuning (PLAN.md, "Twelfth pass") | The same; the Vireo engine and llama.cpp measured again (`prompts-mac/results-2026-11-12-pm.jsonl`), Vireo 0.9 from the morning |
+| `windows-rtx5060-2026-11-15.html` (and `windows-rtx5060-2026-11-15.pdf`, the same page in dark, printed) | The same laptop, the GPU held to ~33 W that day | Gemma 4 E2B and E4B with Google's draft models against the chat's guesses alone (PLAN.md, "Fifteenth round"); also the eval's read, write and tool times as tables (`REPORT.tables`) |
+
+To print a report to PDF: `msedge --headless=new --no-pdf-header-footer --print-to-pdf=<out.pdf> "file:///<report>.html?theme=dark"` (the 15 November page has the print styles).
 
 ## Making one for another machine (the Mac, say)
 
@@ -57,6 +60,14 @@ The Windows numbers came from:
   (`/api/chat/completions`, the speed from its `Reply:` log line) against
   `llama-server -ngl 99 -fa on -c 8192` (`/v1/chat/completions`, `timings`), the second
   of two rounds.
+
+Whole replies one way of running the server against another (a draft model on and off,
+say), on any machine: `tools/reply_speed.py --model <gguf> --way "name=server args"` twice
+or more, `--out` a JSON file. Four prompts (a document as a list, a code file with an
+edit, a story, an explanation), greedy and at the model's own sampling, the ways taking
+turns; each row has the writing speed, the guesses taken by source and the prompt's
+reading speed. `windows-2026-11-15/` has Gemma 4 E2B and E4B with and without their
+draft models (PLAN.md, "Fifteenth round"; the GPU was held to ~33 W that day).
 
 Measure on mains power in the fastest power mode, and say which: on the Windows
 laptop a slower power state made both engines ~3× slower and shifted the comparison
