@@ -185,6 +185,31 @@ position read and the token just picked. Weights rounded to Q8_0 on load (about 
   shared GPU path, never run there); the 26B-A4B's and E2B/E4B's draft models (the E2B/E4B
   ones have a centroid head, `use_ordered_embeddings`, not built).
 
+## Draft models for Gemma 4 E2B and E4B (Windows, 2026-11-15)
+
+Google's draft models for the small Gemmas run now, and the 31B's path runs on CUDA
+(PLAN.md, "Fifteenth round"). Shared code, **not compiled or run on a Mac**:
+
+- **Engine** (`gemma4_assistant.rs`): the centroid head (`use_ordered_embeddings`), a
+  draft's own count of query heads, `mtp_draft_sure` (each guess with the draft's
+  probability, stopping under a floor), and on CUDA a recorded graph for a guess's
+  layers. `gemma4_cuda.rs`: a shared-layer model's states count as final after a
+  one-token read or a check of every token (they were never, so E2B and E4B could not
+  draft). `tests/gemma_assistant.rs` runs on both machines now (still ignored; it wants
+  `VIREO_GEMMA_MODEL`), with a third test for a round's costs.
+- **Server:** behind `cfg!(target_os = "macos")`, the Mac drafts as before (any guess,
+  the draft model or the chat, not both). On CUDA: `MTP_FLOOR` 0.7, and the chat's
+  guesses of 3 or more beside the draft's. To try on the Mac: the 31B with a floor
+  (its first guess was right 74% without one), and E2B/E4B with their draft models
+  (`mlx-community/gemma-4-E2B-it-assistant-bf16`, found beside the GGUF or in
+  DraftModels as the 31B's is; `find` also reads Google's `gemma-4-E2B_q4_0-it` names).
+- **The eval's results have speeds now** (`speeds` for a model, and each case's
+  `readTokensPerSecond`, `writtenTokensPerSecond`, `toolTimes` and the rest), and the
+  server's `Tool:` line says how long the tool ran. Run the Mac's evals with `--out` as
+  before; older result files don't have them.
+- **Measured on Windows:** E2B writes 6-26% faster and E4B 5-50% (copied code least,
+  lists and explanations most), every eval case scoring as it did (`evals/windows-small-gemma-draft.json` against `-draft-off.json`: 34 and 39 of 43 either way, all 43 answers identical, writing 11% and 16% faster over the eval).
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as

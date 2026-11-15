@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vireo Engine vs llama.cpp</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+/* Layout: a spec strip like a benchmark rig's label, then a 2×2 grid of bar panels (one per workload), stacking to one column on phones. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --line: #e3e6ec;
+  --grid: #eceef2;
+  --fg: #12151a;
+  --fg-2: #4d5460;
+  --fg-3: #7a8190;
+  --vireo: #2a78d6;
+  --llama: #eb6834;
+  --before: #12151a;
+  --good-bg: #e6f3ec;
+  --good-fg: #1b6b43;
+  --even-bg: #eef0f4;
+  --even-fg: #4d5460;
+  --behind-bg: #fbeee6;
+  --behind-fg: #9a4214;
+  --display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111317; --surface: #191c21; --line: #2a2e36; --grid: #23262d;
+    --fg: #eef0f3; --fg-2: #b7bcc6; --fg-3: #858b97;
+    --vireo: #3987e5; --llama: #d95926; --before: #eef0f3;
+    --good-bg: #16301f; --good-fg: #7fd3a2; --even-bg: #23262d; --even-fg: #b7bcc6;
+    --behind-bg: #36210f; --behind-fg: #f0a676;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111317; --surface: #191c21; --line: #2a2e36; --grid: #23262d;
+  --fg: #eef0f3; --fg-2: #b7bcc6; --fg-3: #858b97;
+  --vireo: #3987e5; --llama: #d95926; --before: #eef0f3;
+  --good-bg: #16301f; --good-fg: #7fd3a2; --even-bg: #23262d; --even-fg: #b7bcc6;
+  --behind-bg: #36210f; --behind-fg: #f0a676;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 32px 48px;
+}
+.wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 28px; }
+header { display: grid; gap: 10px; }
+.top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.theme { font: 500 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--fg-2); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.theme:hover { color: var(--fg); }
+.theme:focus-visible { outline: 2px solid var(--vireo); outline-offset: 2px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--fg-3); }
+h1 { font-family: var(--display); font-weight: 600; font-size: clamp(28px, 4.4vw, 42px); line-height: 1.1; margin: 0; text-wrap: balance; letter-spacing: -.01em; }
+.lede { margin: 0; max-width: 68ch; color: var(--fg-2); }
+
+.rig { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.rig div { padding: 14px 16px; display: grid; gap: 2px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-width: 0; }
+.rig dt { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--fg-3); }
+.rig dd { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+.rig dd small { display: block; font-weight: 400; color: var(--fg-2); font-size: 13px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; font-size: 14px; color: var(--fg-2); }
+.key { display: inline-flex; align-items: center; gap: 8px; }
+.sw { width: 14px; height: 10px; border-radius: 3px; display: inline-block; }
+.tick { width: 2px; height: 14px; background: var(--before); display: inline-block; border-radius: 1px; }
+
+.panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+@media (max-width: 760px) { .panels { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 18px 12px; display: grid; gap: 10px; min-width: 0; }
+.panel-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.panel h2 { font-family: var(--display); font-weight: 600; font-size: 19px; margin: 0; }
+.panel .sub { font-size: 13px; color: var(--fg-3); font-family: var(--mono); }
+.verdict { font-size: 13px; font-weight: 500; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+.verdict.ahead { background: var(--good-bg); color: var(--good-fg); }
+.verdict.even { background: var(--even-bg); color: var(--even-fg); }
+.verdict.behind { background: var(--behind-bg); color: var(--behind-fg); }
+.panel p.note { margin: 0; font-size: 13.5px; color: var(--fg-2); }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { font-family: var(--body); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 6px 20px rgb(0 0 0 / .14); min-width: 170px; }
+#tip .t { font-weight: 600; margin-bottom: 4px; }
+#tip .r { display: flex; justify-content: space-between; gap: 14px; color: var(--fg-2); }
+#tip .r b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
+
+.foot { display: grid; gap: 14px; }
+details { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; }
+summary { cursor: pointer; font-weight: 500; }
+summary:focus-visible { outline: 2px solid var(--vireo); outline-offset: 3px; border-radius: 4px; }
+.tablewrap { overflow-x: auto; margin-top: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 640px; }
+th, td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+th { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--fg-3); font-weight: 500; }
+td { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td:first-child, td:nth-child(2) { font-family: var(--body); }
+.tables { display: grid; gap: 18px; }
+.tables:empty { display: none; }
+.tablepanel h2 { margin-bottom: 2px; }
+table.wide { font-size: 12.5px; min-width: 0; }
+table.wide th, table.wide td { padding: 7px 8px; }
+table.wide th { white-space: normal; vertical-align: bottom; }
+table.wide td:nth-child(2) { font-family: var(--mono); text-align: right; }
+table.wide th:nth-child(2) { text-align: right; }
+@page { size: 1240px 1754px; margin: 44px 0; }
+@media print {
+  html, body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { padding-block: 0; }
+  .theme, #tip, details { display: none; }
+  .panels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .panel, .rig, header, .method { break-inside: avoid; }
+  .method { max-width: none; }
+}
+.method { font-size: 13.5px; color: var(--fg-2); max-width: 80ch; margin: 0; }
+.method code { font-family: var(--mono); font-size: 12.5px; color: var(--fg); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <div class="top"><div class="eyebrow" id="eyebrow"></div><button class="theme" id="theme" type="button"></button></div>
+    <h1 id="headline"></h1>
+    <p class="lede" id="lede"></p>
+  </header>
+
+  <dl class="rig" id="rig" aria-label="Test machine"></dl>
+
+  <div class="legend" id="legend" aria-hidden="true"></div>
+
+  <section class="panels" id="panels"></section>
+
+  <section class="tables" id="tables"></section>
+
+  <div class="foot">
+    <details>
+      <summary>All numbers as a table</summary>
+      <div class="tablewrap"><table id="table"></table></div>
+    </details>
+    <p class="method" id="method"></p>
+  </div>
+</div>
+<div id="tip" hidden></div>
+<script>
+// ---- The report: everything platform-specific is here. -----------------------------
+// To make another machine's report (the Mac's, say), copy this file and change only
+// REPORT. Speeds are tokens per second, one number per model in `models` order. `before`
+// is optional on each panel: leave it out everywhere and the "before" markers, legend
+// entry and table columns go. Text fields are plain text, except `method`, which may
+// use <code>.
+const REPORT = {
+  "title": "Vireo Engine: draft models for Gemma 4 E2B and E4B",
+  "eyebrow": "Vireo core prototype · Windows · 15 Nov 2026",
+  "headline": "Google's draft models for the small Gemmas, on a small laptop GPU",
+  "lede": "Gemma 4 E2B and E4B now write with Google's own draft models on Windows: four small layers that guess the next tokens from the model's own state, for it to check in one pass. E2B writes 6–26% faster and E4B 5–50%, most on lists and explanations, least on copied code, which the chat's own guesses already covered. Every token is still the model's own pick: all 43 eval answers are identical with the draft model on and off.",
+  "rig": [
+    {
+      "label": "Laptop",
+      "value": "ASUS TUF Gaming A14",
+      "detail": "FA401GM · on mains, Performance power plan · GPU held to ~33 W this day"
+    },
+    {
+      "label": "GPU",
+      "value": "GeForce RTX 5060 Laptop",
+      "detail": "8 GB · Blackwell, 26 SMs"
+    },
+    {
+      "label": "CPU · memory",
+      "value": "AMD Ryzen AI 9 465",
+      "detail": "31 GB system memory"
+    },
+    {
+      "label": "Software",
+      "value": "Windows 11 · CUDA 13.5",
+      "detail": "Vireo in 8-bit mode · draft models: gemma-4-E2B / E4B-it-assistant (bf16, 158 MB each)"
+    }
+  ],
+  "labels": {
+    "now": "With Google's draft model",
+    "other": "the chat's guesses alone",
+    "subject": "Draft model"
+  },
+  "models": [
+    {
+      "name": "Gemma 4 E2B",
+      "quant": "Q4_0"
+    },
+    {
+      "name": "Gemma 4 E4B",
+      "quant": "Q4_0"
+    }
+  ],
+  "panels": [
+    {
+      "title": "Rewriting a document as a list",
+      "sub": "through the server · greedy · ~450-token request · 400 tokens",
+      "vireo": [
+        104.7,
+        66.2
+      ],
+      "other": [
+        85.0,
+        45.9
+      ],
+      "note": "Part copied, part new: the chat's long runs are still taken, and the draft model fills in between them. Guessed tokens: 56% → 72% (E2B), 42% → 68% (E4B)."
+    },
+    {
+      "title": "Explaining, with a code example",
+      "sub": "through the server · greedy · short request · 400 tokens",
+      "vireo": [
+        97.1,
+        61.8
+      ],
+      "other": [
+        78.0,
+        46.3
+      ],
+      "note": "Nothing to copy. The draft model guesses only where it gives a token 70% or more; about half the reply comes from its guesses. Guessed tokens: 4% → 48% (E2B), 14% → 58% (E4B)."
+    },
+    {
+      "title": "Writing a new story",
+      "sub": "through the server · greedy · short request · 400 tokens",
+      "vireo": [
+        85.9,
+        53.3
+      ],
+      "other": [
+        79.2,
+        42.4
+      ],
+      "note": "The hardest text to guess: about 30% of the reply comes from guesses, where the chat alone offered 2–4%. Guessed tokens: 3% → 29% (E2B), 3% → 31% (E4B)."
+    },
+    {
+      "title": "Returning a code file with an edit",
+      "sub": "through the server · greedy · ~500-token request · 400 tokens",
+      "vireo": [
+        179.0,
+        109.4
+      ],
+      "other": [
+        169.5,
+        104.4
+      ],
+      "note": "Nearly all copying, which the chat's own guesses already covered (95% of the reply). The draft model adds the rest. Guessed tokens: 96% → 97% (E2B), 96% → 97% (E4B)."
+    },
+    {
+      "title": "Rewriting a document as a list",
+      "sub": "through the server · the model's own sampling · ~450-token request · 400 tokens",
+      "vireo": [
+        108.8,
+        64.3
+      ],
+      "other": [
+        88.4,
+        42.7
+      ],
+      "note": "Part copied, part new: the chat's long runs are still taken, and the draft model fills in between them. Guessed tokens: 53% → 72% (E2B), 35% → 66% (E4B). Temperature 1, top-p 0.95, top-k 64."
+    },
+    {
+      "title": "Explaining, with a code example",
+      "sub": "through the server · the model's own sampling · short request · 400 tokens",
+      "vireo": [
+        97.2,
+        60.7
+      ],
+      "other": [
+        76.9,
+        44.7
+      ],
+      "note": "Nothing to copy. The draft model guesses only where it gives a token 70% or more; about half the reply comes from its guesses. Guessed tokens: 4% → 50% (E2B), 4% → 50% (E4B). Temperature 1, top-p 0.95, top-k 64."
+    },
+    {
+      "title": "Writing a new story",
+      "sub": "through the server · the model's own sampling · short request · 400 tokens",
+      "vireo": [
+        86.5,
+        51.2
+      ],
+      "other": [
+        76.3,
+        42.6
+      ],
+      "note": "The hardest text to guess: about 30% of the reply comes from guesses, where the chat alone offered 2–4%. Guessed tokens: 5% → 33% (E2B), 2% → 30% (E4B). Temperature 1, top-p 0.95, top-k 64."
+    },
+    {
+      "title": "Returning a code file with an edit",
+      "sub": "through the server · the model's own sampling · ~500-token request · 400 tokens",
+      "vireo": [
+        178.2,
+        105.7
+      ],
+      "other": [
+        167.7,
+        95.9
+      ],
+      "note": "Nearly all copying, which the chat's own guesses already covered (95% of the reply). The draft model adds the rest. Guessed tokens: 96% → 97% (E2B), 96% → 97% (E4B). Temperature 1, top-p 0.95, top-k 64."
+    },
+    {
+      "title": "Writing, over the whole eval",
+      "sub": "43 tool-use cases · greedy · calls, answers and all",
+      "vireo": [
+        85.0,
+        53.3
+      ],
+      "other": [
+        76.5,
+        46.1
+      ],
+      "note": "Every one of the 43 answers is the same, letter for letter, with the draft model on and off, on both models: a guess is only kept when it is the token the model picks itself."
+    },
+    {
+      "title": "Reading prompts, over the whole eval",
+      "sub": "43 cases · tokens not already kept in the chat's cache",
+      "vireo": [
+        3544,
+        1310
+      ],
+      "other": [
+        3544,
+        1327
+      ],
+      "note": "Unchanged, as it should be: the draft model plays no part in reading. Of 101,763 prompt tokens, 87,765 were kept from the chat's cache and not read again."
+    }
+  ],
+  "tables": [
+    {
+      "title": "The full eval, draft model off → on",
+      "head": [
+        "Model",
+        "Passed",
+        "Answers identical",
+        "All 43 cases",
+        "Writing, tokens/s",
+        "Faster",
+        "Guesses taken"
+      ],
+      "rows": [
+        [
+          "Gemma 4 E2B",
+          "34 → 34 of 43",
+          "43 of 43",
+          "98 → 90 s",
+          "76.5 → 85.0",
+          "11%",
+          "1,760 of 3,760 → 2,784 of 4,813"
+        ],
+        [
+          "Gemma 4 E4B",
+          "39 → 39 of 43",
+          "43 of 43",
+          "162 → 144 s",
+          "46.1 → 53.3",
+          "16%",
+          "1,656 of 3,284 → 2,718 of 4,294"
+        ]
+      ],
+      "note": "vireo-eval, 43 cases, temperature 0, the two runs back to back: --mtp off, then the default."
+    },
+    {
+      "title": "The eval's speeds, all four small models (draft model on)",
+      "head": [
+        "Model",
+        "Passed",
+        "A case",
+        "Read",
+        "Read/s",
+        "Kept",
+        "Wrote",
+        "Wrote/s",
+        "Tool calls",
+        "Call written",
+        "Tool run",
+        "Guesses taken"
+      ],
+      "rows": [
+        [
+          "Gemma 4 E2B",
+          "34 of 43",
+          "2.1 s",
+          "13,998",
+          "3,544",
+          "87,765",
+          "6,749",
+          "85.0",
+          "82",
+          "322 ms",
+          "0.9 ms",
+          "2,784 of 4,813"
+        ],
+        [
+          "Gemma 4 E4B",
+          "39 of 43",
+          "3.4 s",
+          "16,397",
+          "1,310",
+          "87,765",
+          "6,233",
+          "53.3",
+          "70",
+          "584 ms",
+          "0.9 ms",
+          "2,718 of 4,294"
+        ],
+        [
+          "Qwen 3.5 4B",
+          "38 of 43 (39 on 13 Nov)",
+          "7.5 s",
+          "49,700",
+          "782",
+          "72,034",
+          "8,212",
+          "36.2",
+          "127",
+          "824 ms",
+          "1.0 ms",
+          "1,162 of 3,499"
+        ],
+        [
+          "Qwen 3.5 9B",
+          "41 of 43",
+          "12.1 s",
+          "49,630",
+          "451",
+          "72,034",
+          "7,916",
+          "22.4",
+          "73",
+          "1,452 ms",
+          "1.1 ms",
+          "none"
+        ]
+      ],
+      "note": "Read: prompt tokens the model read (the rest were kept from the chat's cache). Call written: the model's time writing one tool call under its grammar. Tool run: the tool's own time (the eval's stand-in PC answers at once). Qwen 3.5 has no draft model; the 9B makes no guesses on this laptop (8 GB leaves no room to undo a wrong one). Qwen 3.5 4B's 38 for 39 (office-invoices, in a full run only) is the same on main without this work."
+    },
+    {
+      "title": "What a round costs, in the engine",
+      "head": [
+        "Model",
+        "One token",
+        "Each guess checked",
+        "Each guess drafted",
+        "First guess right",
+        "Sure (0.9+) and right",
+        "Greedy, same text"
+      ],
+      "rows": [
+        [
+          "Gemma 4 E2B",
+          "10.6 ms",
+          "+3.4 ms",
+          "0.6 ms (was 0.9)",
+          "63%",
+          "90%",
+          "1.25× as fast"
+        ],
+        [
+          "Gemma 4 E4B",
+          "19.8 ms",
+          "+5.3 ms",
+          "0.6 ms (was 1.0)",
+          "69%",
+          "90%",
+          "1.41× as fast"
+        ]
+      ],
+      "note": "tests/gemma_assistant.rs. A guess checked costs about a third of a token on these models (every layer and the 262,144-token output run again for it), so the draft model guesses only where it gives a token 70% or more; with no floor E2B gained 1% and E4B 28%."
+    }
+  ],
+  "method": "How it was measured: whole replies through <code>vireo-server</code> with <code>tools/reply_speed.py</code>: one server with <code>--mtp off</code> (guesses from the chat only, as before this work) and one at its defaults (the draft model found beside the GGUF), taking turns at each prompt, two rounds each, 400 tokens at most, speeds from each server's own <code>Reply:</code> line. The eval is <code>vireo-eval</code>'s 43 cases at temperature 0, which now saves each case's reading, writing and tool times (<code>evals/windows-small-gemma-draft.json</code> and <code>-draft-off.json</code>). The GPU drew about 33 W under load all day and a token took about twice as long as on 12 November, so compare within a row, not with the 12 November report: the ratios were measured back to back."
+};
+</script>
+<script>
+// ---- Rendering: nothing below needs changing for another report. -------------------
+const MODELS = REPORT.models.map(m => m.name);
+const QUANT = REPORT.models.map(m => m.quant || "");
+const OTHER = REPORT.labels.other;
+const HAS_BEFORE = REPORT.panels.some(p => p.before);
+const PANELS = REPORT.panels.map(p => ({ ...p, llama: p.other }));
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+document.title = REPORT.title;
+document.getElementById("eyebrow").textContent = REPORT.eyebrow;
+document.getElementById("headline").textContent = REPORT.headline;
+document.getElementById("lede").textContent = REPORT.lede;
+document.getElementById("method").innerHTML = REPORT.method;
+document.getElementById("rig").innerHTML = REPORT.rig.map(x =>
+  `<div><dt>${esc(x.label)}</dt><dd>${esc(x.value)}${x.detail ? `<small>${esc(x.detail)}</small>` : ""}</dd></div>`).join("");
+document.getElementById("legend").innerHTML =
+  `<span class="key"><span class="sw" style="background:var(--vireo)"></span>${esc(REPORT.labels.now)}</span>` +
+  `<span class="key"><span class="sw" style="background:var(--llama)"></span>${esc(OTHER)}</span>` +
+  (HAS_BEFORE ? `<span class="key"><span class="tick"></span>${esc(REPORT.labels.before)}</span>` : "") +
+  `<span class="key" style="color:var(--fg-3)">Tokens per second · longer is better</span>`;
+
+const fmt = v => v >= 1000 ? v.toLocaleString("en-US", { maximumFractionDigits: 0 }) : v.toFixed(1);
+const pct = (a, b) => Math.round(100 * a / b);
+
+function verdict(p) {
+  const r = p.vireo.map((v, i) => pct(v, p.llama[i]));
+  const lo = Math.min(...r), hi = Math.max(...r);
+  const range = lo === hi ? `${lo}%` : `${lo}–${hi}%`;
+  const faster = lo === hi ? `${lo - 100}%` : `${lo - 100}–${hi - 100}%`;
+  if (lo >= 105) return { cls: "ahead", text: `${REPORT.labels.subject || "Vireo"} ${faster} faster` };
+  if (lo >= 94) return { cls: "even", text: `Level · ${range} of ${OTHER}` };
+  return { cls: "behind", text: `${range} of ${OTHER}` };
+}
+
+function niceMax(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+
+function draw(p) {
+  const W = 520, LEFT = 104, RIGHT = 58, TOP = 6, BAR = 13, GAP = 2, GROUP = 2 * BAR + GAP, ROWGAP = 22;
+  const H = TOP + MODELS.length * GROUP + (MODELS.length - 1) * ROWGAP + 26;
+  const max = niceMax(Math.max(...p.vireo, ...p.llama, ...(p.before || [])));
+  const x = v => LEFT + (W - LEFT - RIGHT) * v / max;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${p.title}: tokens per second for each model, Vireo and ${OTHER}` });
+
+  // grid and axis
+  const ticks = 4, plotBottom = H - 22;
+  for (let i = 0; i <= ticks; i++) {
+    const v = max * i / ticks, xx = x(v);
+    el("line", { x1: xx, x2: xx, y1: TOP - 2, y2: plotBottom, stroke: "var(--grid)", "stroke-width": 1, fill: "none" }, svg);
+    const t = el("text", { x: xx, y: H - 6, "text-anchor": "middle", "font-size": 11, fill: "var(--fg-3)", class: "num" }, svg);
+    t.textContent = fmt(v).replace(/\.0$/, "");
+  }
+
+  MODELS.forEach((m, i) => {
+    const y0 = TOP + i * (GROUP + ROWGAP);
+    const name = el("text", { x: 0, y: y0 + GROUP / 2 - 3, "font-size": 13, "font-weight": 500, fill: "var(--fg)" }, svg);
+    name.textContent = m;
+    const q = el("text", { x: 0, y: y0 + GROUP / 2 + 12, "font-size": 11, fill: "var(--fg-3)", class: "num" }, svg);
+    q.textContent = QUANT[i];
+
+    const rows = [["vireo", p.vireo[i]], ["llama", p.llama[i]]];
+    rows.forEach(([k, v], j) => {
+      const y = y0 + j * (BAR + GAP), w = Math.max(2, x(v) - LEFT);
+      // bar with a rounded data end anchored to the baseline
+      el("path", { d: `M${LEFT},${y} h${w - 4} a4,4 0 0 1 4,4 v${BAR - 8} a4,4 0 0 1 -4,4 h${-(w - 4)} z`, fill: `var(--${k})` }, svg);
+      // Vireo's label clears the "before" marker where that sits past the bar's end.
+      const end = k === "vireo" && p.before ? Math.max(x(v), x(p.before[i])) : x(v);
+      const lab = el("text", { x: end + 6, y: y + BAR - 2.5, "font-size": 11.5, fill: "var(--fg-2)", class: "num" }, svg);
+      lab.textContent = fmt(v);
+    });
+    // "before" marker on the Vireo bar, with a 2px surface ring
+    if (p.before) {
+      const bx = x(p.before[i]);
+      el("line", { x1: bx, x2: bx, y1: y0 - 3, y2: y0 + BAR + 3, stroke: "var(--surface)", "stroke-width": 5, "stroke-linecap": "round", fill: "none" }, svg);
+      el("line", { x1: bx, x2: bx, y1: y0 - 3, y2: y0 + BAR + 3, stroke: "var(--before)", "stroke-width": 2, "stroke-linecap": "round", fill: "none" }, svg);
+    }
+
+    // hit target for the whole model row
+    const hit = el("rect", { x: 0, y: y0 - 8, width: W, height: GROUP + 16, fill: "transparent", tabindex: 0, "aria-label": `${m}: Vireo ${fmt(p.vireo[i])}, ${OTHER} ${fmt(p.llama[i])}${p.before ? `, before ${fmt(p.before[i])}` : ""} tokens per second` }, svg);
+    const show = ev => tip(ev, p, i);
+    hit.addEventListener("pointermove", show);
+    hit.addEventListener("focus", ev => tip(ev, p, i, hit));
+    hit.addEventListener("pointerleave", hideTip);
+    hit.addEventListener("blur", hideTip);
+  });
+  return svg;
+}
+
+const tipEl = document.getElementById("tip");
+function tip(ev, p, i, anchor) {
+  const vs = pct(p.vireo[i], p.llama[i]);
+  const gain = p.before ? Math.round(100 * (p.vireo[i] / p.before[i] - 1)) : null;
+  tipEl.innerHTML = `<div class="t">${esc(MODELS[i])} · ${esc(p.title.toLowerCase())}</div>` +
+    `<div class="r"><span>Vireo now</span><b>${fmt(p.vireo[i])}</b></div>` +
+    `<div class="r"><span>${esc(OTHER)}</span><b>${fmt(p.llama[i])}</b></div>` +
+    (p.before ? `<div class="r"><span>Vireo before</span><b>${fmt(p.before[i])}</b></div>` : "") +
+    `<div class="r"><span>Now vs ${esc(OTHER)}</span><b>${vs}%</b></div>` +
+    (p.before ? `<div class="r"><span>Now vs before</span><b>${gain >= 0 ? "+" : ""}${gain}%</b></div>` : "");
+  tipEl.hidden = false;
+  let cx, cy;
+  if (anchor) { const r = anchor.getBoundingClientRect(); cx = r.left + r.width / 2; cy = r.top; }
+  else { cx = ev.clientX; cy = ev.clientY; }
+  const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+  let left = cx + 14, top = cy - th - 10;
+  if (left + tw > innerWidth - 8) left = cx - tw - 14;
+  if (left < 8) left = 8;
+  if (top < 8) top = cy + 16;
+  tipEl.style.left = left + "px"; tipEl.style.top = top + "px";
+}
+function hideTip() { tipEl.hidden = true; }
+
+// Light or dark: follows the system unless chosen here (remembered) or with ?theme=dark|light.
+const themeBtn = document.getElementById("theme");
+const root = document.documentElement;
+const systemDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+const isDark = () => root.dataset.theme ? root.dataset.theme === "dark" : systemDark();
+function setTheme(t, keep) {
+  if (t) root.dataset.theme = t; else delete root.dataset.theme;
+  if (keep) { try { localStorage.setItem("vireo-speed-theme", t); } catch (e) {} }
+  themeBtn.textContent = isDark() ? "Light mode" : "Dark mode";
+  themeBtn.setAttribute("aria-label", `Switch to ${isDark() ? "light" : "dark"} mode`);
+}
+let saved = new URLSearchParams(location.search).get("theme");
+if (!saved) { try { saved = localStorage.getItem("vireo-speed-theme"); } catch (e) {} }
+setTheme(saved === "dark" || saved === "light" ? saved : null, false);
+themeBtn.addEventListener("click", () => setTheme(isDark() ? "light" : "dark", true));
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTheme(root.dataset.theme, false));
+
+// Optional tables under the panels (REPORT.tables: title, head, rows, note).
+document.getElementById("tables").innerHTML = (REPORT.tables || []).map(t =>
+  `<div class="panel tablepanel"><h2>${esc(t.title)}</h2><div class="tablewrap"><table class="wide">` +
+  `<tr>${t.head.map(h => `<th>${esc(h)}</th>`).join("")}</tr>` +
+  t.rows.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join("")}</tr>`).join("") +
+  `</table></div>${t.note ? `<p class="note">${esc(t.note)}</p>` : ""}</div>`).join("");
+
+const host = document.getElementById("panels");
+for (const p of PANELS) {
+  const v = verdict(p);
+  const sec = document.createElement("article");
+  sec.className = "panel";
+  sec.innerHTML = `<div class="panel-head"><div><h2>${esc(p.title)}</h2><div class="sub">${esc(p.sub)}</div></div><span class="verdict ${v.cls}">${esc(v.text)}</span></div>`;
+  sec.appendChild(draw(p));
+  const n = document.createElement("p"); n.className = "note"; n.textContent = p.note; sec.appendChild(n);
+  host.appendChild(sec);
+}
+
+const t = document.getElementById("table");
+let html = `<thead><tr><th>Workload</th><th>Model</th>${HAS_BEFORE ? "<th>Vireo before</th>" : ""}<th>Vireo now</th><th>${esc(OTHER)}</th><th>Now vs ${esc(OTHER)}</th>${HAS_BEFORE ? "<th>Now vs before</th>" : ""}</tr></thead><tbody>`;
+for (const p of PANELS) MODELS.forEach((m, i) => {
+  const g = p.before ? Math.round(100 * (p.vireo[i] / p.before[i] - 1)) : null;
+  html += `<tr><td>${esc(p.title)}</td><td>${esc(m)}</td>` +
+    (HAS_BEFORE ? `<td>${p.before ? fmt(p.before[i]) : "–"}</td>` : "") +
+    `<td>${fmt(p.vireo[i])}</td><td>${fmt(p.llama[i])}</td><td>${pct(p.vireo[i], p.llama[i])}%</td>` +
+    (HAS_BEFORE ? `<td>${g === null ? "–" : (g >= 0 ? "+" : "") + g + "%"}</td>` : "") + "</tr>";
+});
+t.innerHTML = html + "</tbody>";
+</script>
+</body>
+</html>
