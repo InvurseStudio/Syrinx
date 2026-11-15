@@ -93,8 +93,9 @@ guesses up to <n> tokens a round from the chat itself (what followed the last fe
 tokens where they appeared before; 3 by default, 0 for none), checked the same way.
 Gemma 4, and Qwen 3.5 on the Mac. A Qwen model with its own multi-token-prediction
 layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac), and a
-Gemma 4 with Google's draft model (gemma-4-31B-it-assistant, safetensors) beside it or in
-the Mac app's DraftModels folder with that, or with --draft's folder.
+Gemma 4 with Google's draft model (gemma-4-31B-it-assistant, or the E2B's or E4B's;
+safetensors) beside it or in the Mac app's DraftModels folder with that, or with --draft's
+folder. On CUDA it guesses only where it's sure, and the chat's long runs are still taken.
 
 --thinking is what a request gets when it doesn't say (\"thinking\": true or false): off by
 default. On, Gemma 4 and Qwen think before they answer and after each tool's result (at
@@ -1144,6 +1145,23 @@ fn is_assistant(path: &str) -> bool {
 /// story at 30.1 / 29.6 / 26.5: 3.
 const MTP_GUESSES: usize = 3;
 
+/// How sure Gemma 4's draft model must be of a guess for the model to check it (its
+/// probability for the token; a round's guesses stop before the first it gives less). On
+/// CUDA a guess checked costs the small models about a third of a token (every layer and
+/// the logits again for each: Gemma 4 E2B 10.6 ms one token, 3.4 more a guess; E4B 19.8
+/// and 5.3), and the draft knows when it's guessing: of first guesses it gave 0.9 or more,
+/// 90% were the model's pick, of those under 0.7, one in five (`tests/gemma_assistant.rs`).
+/// Writing greedy, 3 guesses a round, any / 0.5 / 0.7 / 0.9: E2B 1.01 / 1.14 / 1.25 / 1.21
+/// times one token at a time, E4B 1.28 / 1.42 / 1.41 / 1.36. Not measured on the Mac, where
+/// the 31B's draft model guesses as before.
+const MTP_FLOOR: f32 = if cfg!(target_os = "macos") { 0.0 } else { 0.7 };
+
+/// With a draft model, the chat's own guesses are still taken where they're a long run
+/// (this many or more: what followed 4 or more of the chat's last tokens before), since a
+/// copied line is right far more often than a draft and costs nothing to guess. Shorter
+/// ones are left to the draft model. On CUDA; the Mac drafts from one or the other.
+const CHAT_RUN_OVER_DRAFT: usize = 3;
+
 /// The most picker sessions kept: the change question, the skill questions and the group
 /// question each start their own way.
 const PICKERS: usize = 4;
@@ -1387,9 +1405,10 @@ impl Model {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 m.mtp_draft(s, first, k).map_err(|e| e.to_string())
             }
-            (Model::Gemma4(m), Session::Gemma4(s)) => {
-                m.mtp_draft(s, first, k).map_err(|e| e.to_string())
-            }
+            (Model::Gemma4(m), Session::Gemma4(s)) => m
+                .mtp_draft_sure(s, first, k, MTP_FLOOR)
+                .map(|g| g.into_iter().map(|(token, _)| token).collect())
+                .map_err(|e| e.to_string()),
             _ => Ok(Vec::new()),
         }
     }
@@ -2456,8 +2475,13 @@ fn reply(
             _ => false,
         };
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
-    let mut lookup = (drafter.is_none() && !mtp && options().lookup > 0 && can_go_back)
+    // Gemma 4 with its draft model on CUDA guesses from the chat too, where the chat has
+    // a long run to offer (`CHAT_RUN_OVER_DRAFT`).
+    let both = mtp && matches!(kept.session, Session::Gemma4(_)) && !cfg!(target_os = "macos");
+    let mut lookup = (drafter.is_none() && (!mtp || both) && options().lookup > 0 && can_go_back)
         .then(|| draft::Lookup::new(options().lookup));
+    // Whether the guesses read ahead are the draft model's (or the layer's), not the chat's.
+    let mut ahead_drafted = false;
     let drafting = drafter.is_some() || lookup.is_some() || mtp;
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
@@ -2492,13 +2516,29 @@ fn reply(
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
         if ahead.is_empty() && !muse_turn {
-            let guesses = match (drafter.as_deref_mut(), lookup.as_mut(), unread) {
-                (Some(d), _, _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
-                (None, Some(l), _) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
+            // The chat's guesses, where it guesses from the chat: all of them without a
+            // draft model, only a long run with one.
+            let from_chat = match lookup.as_mut() {
+                Some(l) if room > 1 => {
+                    let g = l.guess(&kept.tokens, l.max.min(room - 1));
+                    if mtp && g.len() < CHAT_RUN_OVER_DRAFT {
+                        l.guessed -= g.len();
+                        Vec::new()
+                    } else {
+                        g
+                    }
+                }
+                _ => Vec::new(),
+            };
+            ahead_drafted = false;
+            let guesses = match (drafter.as_deref_mut(), unread) {
+                (Some(d), _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
+                (None, _) if !from_chat.is_empty() => from_chat,
                 // The layer guesses what follows the token just picked.
-                (None, None, Some(first)) if mtp && room > 1 => {
+                (None, Some(first)) if mtp && room > 1 => {
                     let g = model.mtp_draft(kept, first, MTP_GUESSES.min(room - 1))?;
                     mtp_stats.0 += g.len();
+                    ahead_drafted = true;
                     g
                 }
                 _ => Vec::new(),
@@ -2736,6 +2776,7 @@ fn reply(
                 if repeated {
                     repeats += 1;
                 }
+                let run_started = Instant::now();
                 let result = if repeated && repeats >= 2 {
                     "This is the same call as the last one, and its result is above. Answer the user from it now."
                         .to_string()
@@ -2756,9 +2797,10 @@ fn reply(
                 }
                 last_call = Some(call.clone());
                 eprintln!(
-                    "Tool: {} {args} (written in {:.0} ms{}), {} characters back.",
+                    "Tool: {} {args} (written in {:.0} ms, run in {:.0} ms{}), {} characters back.",
                     call.tool,
                     written.as_secs_f64() * 1000.0,
+                    run_started.elapsed().as_secs_f64() * 1000.0,
                     if together > 1 {
                         format!(", {} of {together} together", i + 1)
                     } else {
@@ -2874,11 +2916,10 @@ fn reply(
             if let Some(d) = drafter.as_deref_mut() {
                 d.taken += 1;
             }
-            if let Some(l) = lookup.as_mut() {
-                l.taken += 1;
-            }
-            if mtp {
+            if ahead_drafted {
                 mtp_stats.1 += 1;
+            } else if let Some(l) = lookup.as_mut() {
+                l.taken += 1;
             }
         } else if drafting {
             unread = Some(next);
@@ -2937,24 +2978,37 @@ fn reply(
                 100.0 * d.taken as f64 / d.guessed.max(1) as f64,
                 d.seconds
             ))
-            .or_else(|| lookup.as_ref().map(|l| format!(
-                ", {} of {} guesses from the chat taken ({:.0}%)",
-                l.taken,
-                l.guessed,
-                100.0 * l.taken as f64 / l.guessed.max(1) as f64
-            )))
-            .or_else(|| mtp.then(|| format!(
-                ", {} of {} guesses from the multi-token-prediction layer taken ({:.0}%)",
-                mtp_stats.1,
-                mtp_stats.0,
-                100.0 * mtp_stats.1 as f64 / mtp_stats.0.max(1) as f64
-            )))
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                let chat = lookup.as_ref().map(|l| {
+                    format!(
+                        ", {} of {} guesses from the chat taken ({:.0}%)",
+                        l.taken,
+                        l.guessed,
+                        100.0 * l.taken as f64 / l.guessed.max(1) as f64
+                    )
+                });
+                let drafted = mtp.then(|| {
+                    format!(
+                        ", {} of {} guesses from the {} taken ({:.0}%)",
+                        mtp_stats.1,
+                        mtp_stats.0,
+                        if matches!(kept.session, Session::Gemma4(_)) {
+                            "draft model"
+                        } else {
+                            "multi-token-prediction layer"
+                        },
+                        100.0 * mtp_stats.1 as f64 / mtp_stats.0.max(1) as f64
+                    )
+                });
+                chat.unwrap_or_default() + &drafted.unwrap_or_default()
+            })
     );
     let (guessed, taken) = match (drafter.as_deref(), lookup.as_ref()) {
         (Some(d), _) => (d.guessed, d.taken),
-        (None, Some(l)) => (l.guessed, l.taken),
-        _ => mtp_stats,
+        (None, l) => (
+            l.map_or(0, |l| l.guessed) + mtp_stats.0,
+            l.map_or(0, |l| l.taken) + mtp_stats.1,
+        ),
     };
     let _ = job.out.send(Out::Usage(stats::Usage {
         prompt_tokens: ids.len(),
