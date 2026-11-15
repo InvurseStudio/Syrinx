@@ -1101,6 +1101,9 @@ struct Kept {
     /// chat, the end of the system prompt and tools it shares with the last), so the
     /// next new chat doesn't read them again.
     base: Option<Qwen35Checkpoint>,
+    /// Qwen: its DeltaNet layers at the end of the last system turn read (its
+    /// instructions and tools), so the next chat with the same ones reads none of it.
+    turn: Option<Qwen35Checkpoint>,
     /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
     scratch: Option<Qwen35Checkpoint>,
     /// Small sessions apart, for questions the server asks the model itself (which tools a
@@ -1519,13 +1522,20 @@ impl Model {
                 } else if let Some(cp) = kept.checkpoint.as_ref().filter(|c| c.len() <= shared) {
                     m.restore(s, cp).map_err(e)?;
                     cp.len()
+                } else if let Some(cp) = kept.turn.as_ref().filter(|c| c.len() <= shared) {
+                    m.restore(s, cp).map_err(e)?;
+                    cp.len()
                 } else if let Some(cp) = kept.base.as_ref().filter(|c| c.len() <= shared) {
+                    // Another system turn from here on: the one kept is no longer the
+                    // session's.
+                    kept.turn = None;
                     m.restore(s, cp).map_err(e)?;
                     cp.len()
                 } else {
                     m.reset(s).map_err(e)?;
                     kept.checkpoint = None;
                     kept.base = None;
+                    kept.turn = None;
                     0
                 }
             }
@@ -1533,24 +1543,30 @@ impl Model {
         };
         kept.tokens.truncate(from);
         let reused = from;
-        // Qwen, read from the start again: a checkpoint where this prompt parts from the
-        // last (a few tokens early, as the next may part a token sooner), when that's before
-        // the history's end: the system prompt and tools a new chat shares. Read from
-        // empty with nothing to part from (the first chat since the model loaded), one
-        // at the system turn's end, so the second chat doesn't read that turn again.
+        // Qwen, reading a system turn (or a good part of one) again: two checkpoints on
+        // the way (each a few tokens early, as the next chat may part a token sooner).
+        // One where this prompt parts from the last, when none is kept: what chats with
+        // different tools still share. One at the system turn's end, for the next chat
+        // with the same instructions and tools: each of the benchmark's tasks read
+        // Vireo's ~1,100 tokens of tools again without it (the one checkpoint was where
+        // the first two chats parted, before the tools).
         let mut from = from;
         if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &mut kept.session) {
-            let base_at = if from == 0 && shared < 64 + 8 {
-                head.saturating_sub(8)
-            } else {
-                shared.saturating_sub(8)
-            };
-            if kept.base.is_none() && base_at >= from + 64 && base_at < mark {
-                m.forward_batch(s, &ids[from..base_at], Logits::None)
+            let head_at = head.saturating_sub(8);
+            let parted_at = shared.saturating_sub(8);
+            if kept.base.is_none() && parted_at >= from + 64 && parted_at < mark {
+                m.forward_batch(s, &ids[from..parted_at], Logits::None)
                     .map_err(e)?;
                 m.save(s, &mut kept.base).map_err(e)?;
-                kept.tokens.extend_from_slice(&ids[from..base_at]);
-                from = base_at;
+                kept.tokens.extend_from_slice(&ids[from..parted_at]);
+                from = parted_at;
+            }
+            if head_at >= from + 64 && head_at < mark {
+                m.forward_batch(s, &ids[from..head_at], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut kept.turn).map_err(e)?;
+                kept.tokens.extend_from_slice(&ids[from..head_at]);
+                from = head_at;
             }
         }
         // Qwen: the history read on its own, and its DeltaNet saved where the next
@@ -1604,7 +1620,7 @@ impl Model {
     fn reusable(&self, kept: &Kept, ids: &[u32]) -> usize {
         let shared = shared_start(&kept.tokens, ids);
         match &kept.session {
-            Session::Qwen35(s) if shared != s.len() => [&kept.checkpoint, &kept.base]
+            Session::Qwen35(s) if shared != s.len() => [&kept.checkpoint, &kept.turn, &kept.base]
                 .into_iter()
                 .flatten()
                 .map(|c| c.len())
@@ -1669,6 +1685,7 @@ impl Model {
                 s.import(state).map_err(e)?;
                 m.save(s, &mut kept.checkpoint).map_err(e)?;
                 kept.base = None;
+                kept.turn = None;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1688,6 +1705,7 @@ impl Model {
                 m.reset(s).map_err(|e| e.to_string())?;
                 kept.checkpoint = None;
                 kept.base = None;
+                kept.turn = None;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -1840,6 +1858,7 @@ fn engine(
                 tokens: Vec::new(),
                 checkpoint: None,
                 base: None,
+                turn: None,
                 scratch: None,
                 pickers: Vec::new(),
                 skill_controls: HashMap::new(),
@@ -1935,6 +1954,7 @@ fn engine(
                         tokens: Vec::new(),
                         checkpoint: None,
                         base: None,
+                    turn: None,
                         scratch: None,
                         pickers: Vec::new(),
                         skill_controls: HashMap::new(),

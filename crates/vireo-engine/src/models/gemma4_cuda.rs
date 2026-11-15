@@ -450,13 +450,13 @@ impl<'a> Gemma4Cuda<'a> {
             4
         };
         let cache_buffer = |n: usize| self.gpu.alloc(n * cache_bytes).map_err(gpu_error);
-        // On the Mac a sliding-window layer keeps its window and a batch's new positions
-        // (rounded to the attention kernels' longest chunk, 256), not every position: for
-        // 31B at 32K tokens, 1.6 GB instead of 27.
+        // A sliding-window layer keeps its window and a batch's new positions (rounded to
+        // the attention kernels' longest chunk, 256), not every position: for 31B at 32K
+        // tokens, 1.6 GB instead of 27. On CUDA too since 2026-11-15.
         let rings: Vec<usize> = (0..c.layers)
             .map(|l| {
                 let ring = (c.sliding_window + batch).next_multiple_of(256);
-                if cfg!(target_os = "macos") && c.is_swa[l] && ring < capacity {
+                if c.is_swa[l] && ring < capacity {
                     ring
                 } else {
                     0
@@ -740,16 +740,22 @@ impl<'a> Gemma4Cuda<'a> {
                 let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
                 layer.gate.mul(&h, s.gate.ptr())?;
                 layer.up.mul(&h, s.up.ptr())?;
-                if c.muse {
-                    g.swiglu(s.gate.ptr(), s.up.ptr(), f, f, t).map_err(e)?;
-                } else {
-                    g.geglu(s.gate.ptr(), s.up.ptr(), f, f, t).map_err(e)?;
-                }
+                debug_assert_eq!(f, layer.down.cols);
+                layer.down.mul_gated(
+                    g,
+                    s.gate.ptr(),
+                    s.up.ptr(),
+                    t,
+                    s.q8.as_ref(),
+                    !c.muse,
+                    s.projected.ptr(),
+                )?;
+            } else {
+                layer.down.mul(
+                    &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
+                    s.projected.ptr(),
+                )?;
             }
-            layer.down.mul(
-                &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
-                s.projected.ptr(),
-            )?;
             // A mixture of experts: the dense network's output, normed, plus the experts'.
             #[cfg(target_os = "macos")]
             if let (Some(m), Some(x), Some(b)) = (&layer.experts, c.experts, &s.experts) {

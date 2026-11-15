@@ -222,15 +222,25 @@ impl Drop for Graph {
 const ATTENTION_MMA: [(u32, u32, u32, u32); 4] = [
     (64, 4, 1, 32),
     (128, 4, 1, 32),
+    (256, 8, 1, 64),
+    (512, 4, 2, 32),
+];
+/// The same for a batch of up to `ATTENTION_SHORT` tokens (its kernels' names end in
+/// `_short` where the shape differs): fewer rows a block, so a short batch has more
+/// blocks to fill the GPU with.
+const ATTENTION_MMA_SHORT: [(u32, u32, u32, u32); 4] = [
+    (64, 4, 1, 32),
+    (128, 4, 1, 32),
     (256, 4, 1, 32),
     (512, 2, 2, 16),
 ];
+const ATTENTION_SHORT: usize = 64;
 
-/// Shared memory for a tensor-core attention kernel: the queries, a chunk of keys and a
-/// chunk of values in f16 (rows padded by 8), and with warps splitting a head, their
-/// parts of S in f32.
+/// Shared memory for a tensor-core attention kernel: a chunk of keys and a chunk of
+/// values in f16 (rows padded by 8), and with warps splitting a head, their parts of S
+/// in f32. (The queries are read from where they lie: `q_rows_to_half`.)
 fn attention_mma_bytes(d: u32, rows: u32, split: u32, chunk: u32) -> u32 {
-    let halves = (16 * rows + 2 * chunk) * (d + 8);
+    let halves = 2 * chunk * (d + 8);
     let parts = if split > 1 {
         rows * split * chunk / 8 * 4 * 32 * 4
     } else {
@@ -274,6 +284,10 @@ struct Kernels {
     /// blocks an SM holds at once.
     attention_part_kv: [(CuFunction, u32); 4],
     attention_combine: CuFunction,
+    /// `attention_mma` for a batch of up to `ATTENTION_SHORT` tokens.
+    attention_mma_short: Option<[AttentionMma; 4]>,
+    /// A batch's queries to f16 in place, for `attention_mma` (with the tensor cores).
+    q_rows_to_half: Option<CuFunction>,
     /// On the tensor cores over an f16 cache, for head sizes 64, 128, 256 and 512:
     /// only on compute capability 8.0 and later.
     attention_mma: Option<[AttentionMma; 4]>,
@@ -281,6 +295,9 @@ struct Kernels {
     attention_tiled: [CuFunction; 4],
     swiglu: CuFunction,
     geglu: CuFunction,
+    /// The activations with their result rounded to 8 bits in the same pass.
+    swiglu_q8: CuFunction,
+    geglu_q8: CuFunction,
     add: CuFunction,
     softcap: CuFunction,
     apply_gate: CuFunction,
@@ -520,10 +537,43 @@ impl Gpu {
                     out
                 },
                 attention_combine: function("attention_combine")?,
+                q_rows_to_half: if tensor_cores {
+                    Some(function("q_rows_to_half")?)
+                } else {
+                    None
+                },
                 attention_mma: if tensor_cores {
                     let mut out = [AttentionMma::default(); 4];
                     for (slot, &(d, rows, split, chunk)) in out.iter_mut().zip(&ATTENTION_MMA) {
                         let f = function(&format!("attention_mma_{d}"))?;
+                        let bytes = attention_mma_bytes(d, rows, split, chunk);
+                        let r = (context.driver.cuFuncSetAttribute)(
+                            f,
+                            FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            bytes as i32,
+                        );
+                        context.check("cuFuncSetAttribute", r)?;
+                        *slot = AttentionMma {
+                            function: f,
+                            shared: bytes,
+                            rows: 16 * rows,
+                            threads: 32 * rows * split,
+                        };
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                attention_mma_short: if tensor_cores {
+                    let mut out = [AttentionMma::default(); 4];
+                    let shapes = ATTENTION_MMA_SHORT.iter().zip(&ATTENTION_MMA);
+                    for (slot, (&(d, rows, split, chunk), long)) in out.iter_mut().zip(shapes) {
+                        let name = if (d, rows, split, chunk) == *long {
+                            format!("attention_mma_{d}")
+                        } else {
+                            format!("attention_mma_{d}_short")
+                        };
+                        let f = function(&name)?;
                         let bytes = attention_mma_bytes(d, rows, split, chunk);
                         let r = (context.driver.cuFuncSetAttribute)(
                             f,
@@ -550,6 +600,8 @@ impl Gpu {
                 ],
                 swiglu: function("swiglu")?,
                 geglu: function("geglu")?,
+                swiglu_q8: function("swiglu_q8")?,
+                geglu_q8: function("geglu_q8")?,
                 add: function("add")?,
                 softcap: function("softcap")?,
                 apply_gate: function("apply_gate")?,
@@ -937,7 +989,7 @@ impl Gpu {
     /// [`QkvPrep`].
     pub fn qkv_prep(&self, p: &QkvPrep, tokens: usize) -> Result<()> {
         assert!(p.head_dim <= 512, "head size {} is over 512", p.head_dim);
-        assert_eq!(p.ring, 0, "no rings on CUDA");
+        assert!(p.ring < 1 << 15, "a ring of {} rows", p.ring);
         let kv = p.cache.is_some();
         let (k_cache, v_cache) = p.cache.unwrap_or((0, 0));
         let args = [
@@ -963,6 +1015,7 @@ impl Gpu {
             Arg::F32(p.eps),
             Arg::I32(p.half_cache as i32),
             Arg::I32(tokens as i32),
+            Arg::I32(p.ring as i32),
         ];
         let slots = p.heads + if kv { 2 * p.kv_heads } else { 0 };
         // A thread per number of a head, up to 256 (Llama's 64-wide heads left 3 in 4
@@ -977,7 +1030,10 @@ impl Gpu {
         )
     }
 
-    /// [`Gpu::attention`], for the Metal backend's rings, which this one doesn't have.
+    /// [`Gpu::attention`] over a cache that may be a ring: a sliding-window layer that
+    /// keeps only its last `ring` positions, position p at row p mod `ring` (0: every
+    /// position, in order). The ring goes to the kernels in the window argument's high 16
+    /// bits, as on Metal.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_ring(
         &self,
@@ -996,10 +1052,13 @@ impl Gpu {
         group: usize,
         scale: f32,
     ) -> Result<()> {
-        assert_eq!(ring, 0, "no rings on CUDA");
-        self.attention(
-            half_cache, q, keys, values, out, pos, window, heads, tokens, head_dim, kv_dim, group,
-            scale,
+        assert!(
+            window < 1 << 16 && ring < 1 << 15,
+            "a window of {window} positions in a ring of {ring}"
+        );
+        self.attention_packed(
+            half_cache, q, keys, values, out, pos, window, ring, heads, tokens, head_dim, kv_dim,
+            group, scale,
         )
     }
 
@@ -1007,7 +1066,8 @@ impl Gpu {
     /// `*pos + t` (read on the GPU), over the cache up to its own position; `window`
     /// positions at most (0 for no limit). `q` and `out` hold a row of heads × head_dim
     /// per token. With `half_cache` the cache holds f16: a prompt then goes to the tensor
-    /// cores where there are some.
+    /// cores where there are some, and `q` is left rounded to f16 in place (each row's
+    /// halves at the start of its floats): don't read it as f32 again.
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
@@ -1025,17 +1085,43 @@ impl Gpu {
         group: usize,
         scale: f32,
     ) -> Result<()> {
+        self.attention_packed(
+            half_cache, q, keys, values, out, pos, window, 0, heads, tokens, head_dim, kv_dim,
+            group, scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_packed(
+        &self,
+        half_cache: bool,
+        q: CuDevicePtr,
+        keys: CuDevicePtr,
+        values: CuDevicePtr,
+        out: CuDevicePtr,
+        pos: CuDevicePtr,
+        window: usize,
+        ring: usize,
+        heads: usize,
+        tokens: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        group: usize,
+        scale: f32,
+    ) -> Result<()> {
         assert!(
             head_dim <= 512 && head_dim.is_multiple_of(4),
             "head size {head_dim}"
         );
+        // What the kernels take for the window: the ring with it (`ring_row`).
+        let packed = (window | ring << 16) as i32;
         let args = [
             Arg::Ptr(q),
             Arg::Ptr(keys),
             Arg::Ptr(values),
             Arg::Ptr(out),
             Arg::Ptr(pos),
-            Arg::I32(window as i32),
+            Arg::I32(packed),
             Arg::I32(head_dim as i32),
             Arg::I32(kv_dim as i32),
             Arg::I32(group as i32),
@@ -1078,7 +1164,7 @@ impl Gpu {
                     Arg::Ptr(values),
                     Arg::Ptr(self.attention_parts.ptr()),
                     Arg::Ptr(pos),
-                    Arg::I32(window as i32),
+                    Arg::I32(packed),
                     Arg::I32(kv_dim as i32),
                     Arg::I32(group as i32),
                     Arg::F32(scale),
@@ -1106,7 +1192,7 @@ impl Gpu {
                 Arg::Ptr(values),
                 Arg::Ptr(self.attention_parts.ptr()),
                 Arg::Ptr(pos),
-                Arg::I32(window as i32),
+                Arg::I32(packed),
                 Arg::I32(head_dim as i32),
                 Arg::I32(kv_dim as i32),
                 Arg::I32(group as i32),
@@ -1135,8 +1221,18 @@ impl Gpu {
                 512 => Some(3),
                 _ => None,
             };
-            if let (true, Some(kernels), Some(i)) = (tokens > 1, self.kernels.attention_mma, wide) {
+            let mma = if tokens <= ATTENTION_SHORT {
+                self.kernels.attention_mma_short
+            } else {
+                self.kernels.attention_mma
+            };
+            if let (true, Some(kernels), Some(i), Some(to_half)) =
+                (tokens > 1, mma, wide, self.kernels.q_rows_to_half)
+            {
                 let k = kernels[i];
+                // The queries to f16 where they lie (they aren't read again as f32).
+                let rows = (heads * tokens) as u32;
+                self.run(to_half, (rows, 1), 128, &[Arg::Ptr(q), Arg::I32(head_dim as i32)])?;
                 let mut args = args.to_vec();
                 args.push(Arg::I32(tokens as i32));
                 let grid = (heads as u32, (tokens as u32).div_ceil(k.rows), 1);
@@ -1482,6 +1578,40 @@ impl Gpu {
     }
 
     /// Rounds `tokens` rows of `cols` numbers (a multiple of 32) at `x` to 8 bits, into `q8`.
+    /// `act(gate) × up` (SiLU, or tanh-GELU with `gelu`) over `tokens` rows of `n`,
+    /// rounded to 8 bits into `q8` as [`Gpu::quantize`] would round it, in one pass and
+    /// without writing it as f32: for a feed-forward's middle, which only the next product
+    /// reads. `n` must be whole blocks of 32.
+    pub fn gated_quantize(
+        &self,
+        gate: CuDevicePtr,
+        up: CuDevicePtr,
+        n: usize,
+        q8: &Q8,
+        tokens: usize,
+        gelu: bool,
+    ) -> Result<()> {
+        assert!(n.is_multiple_of(32), "rows of {n} aren't whole blocks of 32");
+        assert!(tokens * n <= q8.q.len_bytes(), "the 8-bit buffer is too small");
+        let blocks = tokens * n / 32;
+        let args = [
+            Arg::Ptr(gate),
+            Arg::Ptr(up),
+            Arg::I32(n as i32),
+            Arg::I32(n as i32),
+            Arg::Ptr(q8.q.ptr()),
+            Arg::Ptr(q8.scales.ptr()),
+            Arg::Ptr(q8.sums.ptr()),
+            Arg::I32(blocks as i32),
+        ];
+        let kernel = if gelu {
+            self.kernels.geglu_q8
+        } else {
+            self.kernels.swiglu_q8
+        };
+        self.run(kernel, ((blocks as u32).div_ceil(8), 1), 256, &args)
+    }
+
     pub fn quantize(&self, x: CuDevicePtr, q8: &Q8, tokens: usize, cols: usize) -> Result<()> {
         assert!(
             cols.is_multiple_of(32),
@@ -1646,7 +1776,7 @@ pub struct QkvPrep {
     pub eps: f32,
     /// The cache holds f16 (8-bit mode), not f32.
     pub half_cache: bool,
-    /// Rings (see the Metal backend's `attention_ring`) are Metal's only: 0 here.
+    /// The cache's ring (see `attention_ring`): 0 for one that keeps every position.
     pub ring: usize,
 }
 

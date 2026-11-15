@@ -182,6 +182,13 @@ pub const DEFAULT_LOOKUP: usize = 7;
 /// The longest and shortest runs of the chat's last tokens looked for, longest first.
 const LONGEST_RUN: usize = 8;
 const SHORTEST_RUN: usize = 2;
+/// The shortest run guessed from. On CUDA a run of 2 isn't: its one guess is seldom taken
+/// and a check costs Qwen a quarter of a token there. Qwen 3.5 4B on an RTX 5060 Laptop,
+/// 400-token replies, tokens/s with no guesses / from runs of 2 / of 3 / of 4: a
+/// document as a list 89.6 / 96.9 / 98.4 / 97.2, a code request 90.2 / 90.4 / 92.9 /
+/// 92.0, a new story 89.8 / 86.9 / 89.6 / 89.6, an explanation 89.7 / 90.9 / 93.0 /
+/// 92.2. (A longer run still guesses as many as before: 2 after a run of 3.)
+const LEAST_RUN: usize = if cfg!(target_os = "macos") { 2 } else { 3 };
 
 impl Lookup {
     pub fn new(max: usize) -> Self {
@@ -204,7 +211,7 @@ impl Lookup {
 
 fn continuation(tokens: &[u32], n: usize) -> Vec<u32> {
     let len = tokens.len();
-    for run in (SHORTEST_RUN..=LONGEST_RUN).rev() {
+    for run in (LEAST_RUN..=LONGEST_RUN).rev() {
         if len <= run {
             continue;
         }
@@ -233,9 +240,10 @@ mod tests {
         // A run of 4: up to 3 guesses, and no further than what's there.
         let tokens = [1, 2, 3, 4, 5, 6, 1, 2, 3, 4];
         assert_eq!(continuation(&tokens, 8), vec![5, 6, 1]);
-        // A run of 2: one guess.
+        // A run of 2: one guess, where a run of 2 is guessed from.
         let tokens = [4, 5, 6, 4, 5];
-        assert_eq!(continuation(&tokens, 5), vec![6]);
+        let want: &[u32] = if LEAST_RUN <= 2 { &[6] } else { &[] };
+        assert_eq!(continuation(&tokens, 5), want);
         // A longer run guesses further, where the platform looks for one.
         let tokens = [
             9, 1, 2, 3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7, 8,

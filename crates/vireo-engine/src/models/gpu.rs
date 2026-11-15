@@ -122,6 +122,44 @@ impl GpuMatrix {
     }
 }
 
+impl GpuMatrix {
+    /// `y = W (act(gate) × up)` over `tokens` rows of this matrix's columns: a
+    /// feed-forward's last product, with its activation (SiLU, or tanh-GELU with `gelu`).
+    /// With 8-bit activations on CUDA the activation and the rounding are one pass
+    /// (`Gpu::gated_quantize`) and `gate` is left as it was; otherwise `gate` holds the
+    /// activation's result, as after `swiglu` or `geglu`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_gated(
+        &self,
+        gpu: &Gpu,
+        gate: CuDevicePtr,
+        up: CuDevicePtr,
+        tokens: usize,
+        q8: Option<&Q8>,
+        gelu: bool,
+        y: CuDevicePtr,
+    ) -> Result<()> {
+        let n = self.cols;
+        #[cfg(not(target_os = "macos"))]
+        if let Some(q8) = q8
+            && Gpu::supports_8bit(self.kind)
+            && n.is_multiple_of(32)
+        {
+            gpu.gated_quantize(gate, up, n, q8, tokens, gelu)
+                .map_err(gpu_error)?;
+            return gpu
+                .matmul_8bit(self.kind, self.data.ptr(), q8, y, self.rows, n, tokens)
+                .map_err(gpu_error);
+        }
+        if gelu {
+            gpu.geglu(gate, up, n, n, tokens).map_err(gpu_error)?;
+        } else {
+            gpu.swiglu(gate, up, n, n, tokens).map_err(gpu_error)?;
+        }
+        self.mul(&Input::new(gpu, gate, tokens, q8), y)
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl GpuMatrix {
     /// One token's `y = act(self x) × (up x)` (SiLU, or tanh-GELU with `gelu`) in one

@@ -1121,13 +1121,21 @@ impl<'a> Qwen35Cuda<'a> {
                 let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
                 layer.gate.mul(&h, s.gate.ptr())?;
                 layer.up.mul(&h, s.up.ptr())?;
-                g.swiglu(s.gate.ptr(), s.up.ptr(), c.ffn_dim, c.ffn_dim, t)
-                    .map_err(e)?;
+                layer.down.mul_gated(
+                    g,
+                    s.gate.ptr(),
+                    s.up.ptr(),
+                    t,
+                    s.q8.as_ref(),
+                    false,
+                    s.mixed.ptr(),
+                )?;
+            } else {
+                layer.down.mul(
+                    &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
+                    s.mixed.ptr(),
+                )?;
             }
-            layer.down.mul(
-                &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
-                s.mixed.ptr(),
-            )?;
             let next = match self.layers.get(l + 1) {
                 Some(next) => &next.attn_norm,
                 None => &self.output_norm,

@@ -577,13 +577,12 @@ fn reading_in_batches_matches_one_token_at_a_time() {
     }
 }
 
-/// On the Mac a Gemma sliding-window layer keeps only its window and a batch's new
-/// positions, in a ring. Read in batches of 64 (a ring of 576 for E2B's window of 512),
+/// A Gemma sliding-window layer keeps only its window and a batch's new positions, in a
+/// ring. Read in batches of 64 (a ring of 576 for E2B's window of 512),
 /// a text of over 1,700 tokens wraps it three times; its logits match a session that
 /// keeps every position (its batch makes the ring longer than the text: no ring) read a
 /// token at a time. And a rewind inside the ring keeps its place, while one past what the
 /// ring still holds starts over.
-#[cfg(target_os = "macos")]
 #[test]
 fn gemma_sliding_window_rings_match_a_full_cache() {
     let Some(file) = model("gemma-4-E2B_q4_0-it.gguf") else {
@@ -639,10 +638,16 @@ fn gemma_sliding_window_rings_match_a_full_cache() {
         // In the default mode a short batch's attention splits the context into parts
         // (attention_tcg), each rounding its probabilities to f16 against its own largest:
         // the same numbers to that rounding, not to the bit.
+        // On CUDA the 8-bit mode's prompt attention chunks a batch's context from the
+        // batch's own first row, so ten tokens read alone round differently from the
+        // same ten inside a longer batch: 0.51 of a range of 29 here, with or without a
+        // ring (the same number to every digit with the rings turned off).
         let same = if precision == Precision::Exact {
             1e-3
-        } else {
+        } else if cfg!(target_os = "macos") {
             0.1
+        } else {
+            1.0
         };
         assert!(
             worst_again < same,
@@ -998,6 +1003,9 @@ fn attention_over_an_f16_cache_matches_f64() {
         run(0, tokens);
         out.read_f32(&mut got).unwrap();
         let batch = worst(&got);
+        // A batch on the tensor cores leaves its queries in f16 where they lay: as given
+        // again for the one-token kernel.
+        q_gpu.write_f32(&q).unwrap();
         for t in 0..tokens {
             run(t, 1);
         }
