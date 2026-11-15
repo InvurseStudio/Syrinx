@@ -1987,14 +1987,15 @@ fn short_batch_tiles_match_the_64_token_tile() {
                 continue;
             }
             let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
-            let most = 64;
-            let x: Vec<f32> = (0..most * w.cols)
+            // Up to 200 tokens, for the K-quants' 128-token tile.
+            let (most, all) = (64, 200);
+            let x: Vec<f32> = (0..all * w.cols)
                 .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
                 .collect();
             let x_gpu = gpu.upload_f32(&x).unwrap();
-            let q8 = gpu.alloc_q8(most, w.cols).unwrap();
-            let y = gpu.alloc(most * w.rows * 4).unwrap();
-            gpu.quantize(x_gpu.ptr(), &q8, most, w.cols).unwrap();
+            let q8 = gpu.alloc_q8(all, w.cols).unwrap();
+            let y = gpu.alloc(all * w.rows * 4).unwrap();
+            gpu.quantize(x_gpu.ptr(), &q8, all, w.cols).unwrap();
             let run = |tokens: usize| {
                 gpu.matmul_8bit(w.kind, weights.ptr(), &q8, y.ptr(), w.rows, w.cols, tokens)
                     .unwrap();
@@ -2010,6 +2011,26 @@ fn short_batch_tiles_match_the_64_token_tile() {
                 assert!(
                     got == whole[..tokens * w.rows],
                     "{t} ({:?}), {tokens} tokens: not the 64-token tile's numbers",
+                    w.kind
+                );
+            }
+            // A long batch (the K-quants' in tiles of 128 tokens), and one that leaves a
+            // few tokens over for a small tile: the 64-token tile's numbers too.
+            run(all);
+            let mut long = vec![0.0; all * w.rows];
+            y.read_f32(&mut long).unwrap();
+            assert!(
+                long[..most * w.rows] == whole[..],
+                "{t} ({:?}), {all} tokens: not the 64-token tile's numbers",
+                w.kind
+            );
+            for tokens in [128, 140, 192] {
+                run(tokens);
+                let mut got = vec![0.0; tokens * w.rows];
+                y.read_f32(&mut got).unwrap();
+                assert!(
+                    got == long[..tokens * w.rows],
+                    "{t} ({:?}), {tokens} tokens: not the {all}-token batch's numbers",
                     w.kind
                 );
             }

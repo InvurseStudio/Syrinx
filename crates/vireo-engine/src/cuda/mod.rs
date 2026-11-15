@@ -323,6 +323,9 @@ struct Kernels {
     matmul8: Option<[CuFunction; 5]>,
     /// The same with tiles of 16 and of 32 tokens, for batches of up to that many.
     matmul8_small: Option<[[CuFunction; 5]; 2]>,
+    /// The same with tiles of 128 tokens, for the K-quants in batches of at least that
+    /// many (`WIDE_TOKENS`).
+    matmul8_wide: Option<[CuFunction; 5]>,
 }
 
 /// The weight types with 8-bit-activation kernels, in the order of `Kernels::matvec8`.
@@ -386,6 +389,8 @@ const MAX_PARTS: u32 = 16;
 /// fewer blocks a part, so more parts.
 const MAX_PARTS_KV: u32 = 64;
 const TILE_TOKENS: u32 = 64;
+/// The K-quants' wider tile, in tokens.
+const WIDE_TOKENS: usize = 128;
 
 /// A parameter for the kernels, which take raw addresses: 0 stands for "none".
 fn or_null(buffer: Option<&Buffer>) -> CuDevicePtr {
@@ -673,6 +678,15 @@ impl Gpu {
                     let mut out = [std::ptr::null_mut(); 5];
                     for (slot, kind) in out.iter_mut().zip(KINDS_8) {
                         *slot = function(&format!("matmul8_{}", kind.name().to_lowercase()))?;
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                matmul8_wide: if tensor_cores {
+                    let mut out = [std::ptr::null_mut(); 5];
+                    for (slot, kind) in out.iter_mut().zip(KINDS_8) {
+                        *slot = function(&format!("matmul8_t128_{}", kind.name().to_lowercase()))?;
                     }
                     Some(out)
                 } else {
@@ -1775,28 +1789,53 @@ impl Gpu {
         }
         match self.kernels.matmul8 {
             Some(kernels) => {
-                let args = [
-                    Arg::Ptr(w),
-                    Arg::Ptr(q8.q.ptr()),
-                    Arg::Ptr(q8.scales.ptr()),
-                    Arg::Ptr(q8.sums.ptr()),
-                    Arg::Ptr(y),
-                    Arg::I32(rows as i32),
-                    Arg::I32(cols as i32),
-                    Arg::I32(tokens as i32),
-                ];
+                // `n` tokens from token `from` on, in tiles of `tile`.
+                let run = |kernel: CuFunction, tile: u32, from: usize, n: usize| {
+                    let args = [
+                        Arg::Ptr(w),
+                        Arg::Ptr(q8.q.ptr() + (from * cols) as u64),
+                        Arg::Ptr(q8.scales.ptr() + (from * cols / 32 * 4) as u64),
+                        Arg::Ptr(q8.sums.ptr() + (from * cols / 16 * 4) as u64),
+                        Arg::Ptr(y + (from * rows * 4) as u64),
+                        Arg::I32(rows as i32),
+                        Arg::I32(cols as i32),
+                        Arg::I32(n as i32),
+                    ];
+                    let grid = ((rows as u32).div_ceil(TILE_ROWS), (n as u32).div_ceil(tile));
+                    self.run(kernel, grid, 256, &args)
+                };
+                // The K-quants in tiles of 128 tokens where a batch has them: a block then
+                // unpacks its rows' weights once for twice the tokens (a ~2.3K-token
+                // prompt: Qwen 3.5 4B 636 -> 615 ms, 9B 1.13 -> 1.06 s; Q4_0 and Q8_0,
+                // quicker to unpack, read no faster so). What is left over, when a tile of
+                // 64 or less holds it, goes on below.
+                let wide = match (self.kernels.matmul8_wide, kind) {
+                    (Some(_), TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K) => {
+                        let whole = tokens / WIDE_TOKENS * WIDE_TOKENS;
+                        if whole > 0 && tokens - whole > TILE_TOKENS as usize {
+                            tokens
+                        } else {
+                            whole
+                        }
+                    }
+                    _ => 0,
+                };
+                if wide > 0 {
+                    let kernel = self.kernels.matmul8_wide.unwrap()[index];
+                    run(kernel, WIDE_TOKENS as u32, 0, wide)?;
+                    if wide == tokens {
+                        return Ok(());
+                    }
+                }
                 // A short batch takes a tile of 16 or 32 tokens: a tile of 64 costs the
                 // same for 9 tokens as for 64.
-                let (kernel, tile) = match (self.kernels.matmul8_small, tokens) {
+                let rest = tokens - wide;
+                let (kernel, tile) = match (self.kernels.matmul8_small, rest) {
                     (Some(small), 0..=16) => (small[0][index], 16),
                     (Some(small), 17..=32) => (small[1][index], 32),
                     _ => (kernels[index], TILE_TOKENS),
                 };
-                let grid = (
-                    (rows as u32).div_ceil(TILE_ROWS),
-                    (tokens as u32).div_ceil(tile),
-                );
-                self.run(kernel, grid, 256, &args)
+                run(kernel, tile, wide, rest)
             }
             None => {
                 // No tensor cores: the 8-bit matrix-vector kernel for each token.
