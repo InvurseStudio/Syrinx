@@ -2,8 +2,8 @@
 """How fast vireo-server writes four kinds of reply, one way of running it against another.
 
 Each way is a set of server arguments (say "--mtp off" against none, to see what a draft
-model adds). A server is started for each, and the ways take turns at each prompt, so
-both are timed in the same sitting:
+model adds). A server is started for each in turn (one loaded at a time: two may not fit
+the GPU), and every way answers the same prompts in the same sitting:
 
   list     a document rewritten as a list (copied text: the chat's own guesses)
   code     a code file returned with one edit (copied text)
@@ -119,6 +119,11 @@ def ask(server, prompt, max_tokens, greedy):
     for event in long_run.events(response):
         if "content" in event:
             reply += event["content"]
+        elif event.get("type") == "confirm_required":
+            # A tool that asks first (a small model may call `remember` unasked): refused at
+            # once, so the reply's time isn't the wait for an answer nobody gives.
+            long_run.post(f"http://127.0.0.1:{server.port}/api/agent/confirm",
+                          {"id": event["id"], "approved": False, "remember": False}, server.token).read()
     time.sleep(0.05)
     log = server.new_log()
     row = {"reply": reply}
@@ -140,17 +145,17 @@ def main():
     parser.add_argument("--out")
     args = parser.parse_args()
     ways = [w.split("=", 1) for w in args.way]
-    servers = {name: long_run.Vireo(args.model, 0, args.max_tokens, shlex.split(extra))
-               for name, extra in ways}
     rows = []
-    try:
-        # Each server's first reply is slower (graphs recorded, caches cold): not timed.
-        for server in servers.values():
+    # One server at a time: two models at once may not fit the GPU, and the one that spills
+    # into the PC's memory writes at half speed (Qwen 3.5 4B twice on 8 GB: a list at 51
+    # tokens/s against 97). So a way's replies are all timed before the next way loads.
+    for name, extra in ways:
+        server = long_run.Vireo(args.model, 0, args.max_tokens, shlex.split(extra))
+        try:
+            # A server's first reply is slower (graphs recorded, caches cold): not timed.
             ask(server, "Say hello.", 16, True)
-        for sampling in args.sampling.split(","):
-            for prompt in args.prompts.split(","):
-                cells = []
-                for name, server in servers.items():
+            for sampling in args.sampling.split(","):
+                for prompt in args.prompts.split(","):
                     tokens, seconds, guesses, read, read_s = 0, 0.0, {}, 0, 0.0
                     for _ in range(args.rounds):
                         row = ask(server, PROMPTS[prompt], args.max_tokens, sampling == "greedy")
@@ -169,12 +174,18 @@ def main():
                                  "read_tokens": read, "read_seconds": round(read_s, 3),
                                  "read_tokens_per_s": round(read / read_s) if read_s else 0})
                     taken = sum(g[0] for g in guesses.values())
-                    cells.append(f"{name} {rate:6.1f} tokens/s ({100 * taken // max(tokens, 1)}% guessed)")
-                print(f"{sampling:6} {prompt:8} " + "   ".join(cells), flush=True)
-    finally:
-        for server in servers.values():
+                    print(f"{name:10} {sampling:6} {prompt:8} {rate:6.1f} tokens/s "
+                          f"({100 * taken // max(tokens, 1)}% guessed)", flush=True)
+        finally:
             server.stop()
             shutil.rmtree(server.dir, ignore_errors=True)
+            time.sleep(2)
+    # Side by side, a row a prompt.
+    for sampling in args.sampling.split(","):
+        for prompt in args.prompts.split(","):
+            cells = [f"{r['way']} {r['tokens_per_s']:6.1f}" for r in rows
+                     if r["sampling"] == sampling and r["prompt"] == prompt]
+            print(f"{sampling:6} {prompt:8} " + "   ".join(cells), flush=True)
     if args.out:
         Path(args.out).write_text(json.dumps({"model": Path(args.model).name, "ways": dict(ways),
                                               "max_tokens": args.max_tokens, "rounds": args.rounds,
