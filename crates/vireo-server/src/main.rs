@@ -2085,6 +2085,7 @@ fn reply(
     // The tools a call may name: all those offered, less the ones that change files
     // when the request doesn't ask for a change.
     let mut callable = offered.clone();
+    let every_tool = offered.clone();
     // `declared`, and this request doesn't ask for a change: the tools offered with the
     // ones that change files still among them, for a chat whose cache declares them.
     let mut with_changes: Option<Vec<tools::Tool>> = None;
@@ -2112,6 +2113,19 @@ fn reply(
             args: vec![("name".into(), tools::Arg::Text(skill.name.clone()))],
         };
         let result = skills::instructions(&skill);
+        // A skill that names a tool that changes files asks for the change itself, whatever
+        // the request's own words ("use the weekly-report skill for this" doesn't say the
+        // report is saved: Gemma 4 31B, the tool kept from it, read and summed in circles
+        // in the Nov 13 benchmark).
+        if callable.len() < every_tool.len()
+            && every_tool
+                .iter()
+                .any(|t| t.changes_files() && result.contains(t.name))
+        {
+            callable = every_tool.clone();
+            offered = every_tool.clone();
+            with_changes = None;
+        }
         let (before, body, after) = tools::after_call(family, "use_skill", &result, thinking_on);
         skill_ids = tokenizer.encode(&tools::call_text(family, &call), false, true);
         skill_ids.extend(tokenizer.encode(&before, false, true));
@@ -2160,9 +2174,18 @@ fn reply(
     let debug_prompt = std::env::var_os("VIREO_DEBUG_PROMPT").is_some();
     let system_turn = |tools: &[tools::Tool], known: usize| -> (Option<String>, String) {
         // With tools, the system prompt opens with what they're for.
-        let preamble = || match tools::family_notes(family) {
-            Some(notes) => format!("{}\n\n{notes}", tools::PREAMBLE),
-            None => tools::PREAMBLE.to_string(),
+        let preamble = || {
+            let mut text = match tools::family_notes(family) {
+                Some(notes) => format!("{}\n\n{notes}", tools::PREAMBLE),
+                None => tools::PREAMBLE.to_string(),
+            };
+            // Gemma with thinking off: the small ones (E2B, E4B) otherwise write their
+            // plan as the answer under these instructions, and run out of reply before the
+            // answer itself (0 and 1 of the Nov 13 benchmark's 6 tasks right).
+            if family == Family::Gemma4 && !prompt_thinking {
+                text.push_str(tools::GEMMA_NO_THINKING);
+            }
+            text
         };
         let system = match (tools.is_empty(), job.system.as_deref().map(str::trim)) {
             (true, s) => s.filter(|s| !s.is_empty()).map(str::to_string),
@@ -2412,7 +2435,9 @@ fn reply(
     };
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
-    let mut last_call: Option<tools::Call> = None;
+    // The calls made since the reply last changed anything: the same one again would
+    // get the same answer.
+    let mut seen: Vec<tools::Call> = Vec::new();
     let (mut calls, mut call_tokens, mut repeats) = (0usize, 0usize, 0usize);
     let mut turn_start = true;
     // Once calls are used up (or the model repeats one), it may only answer: the tokens
@@ -2436,14 +2461,18 @@ fn reply(
     // token, and it pays on every size (4B rewriting a document as a list 86 → 199
     // tokens/s, 9B returning an edited code file 52 → 157; a new story 1-3% slower),
     // where the GPU has the memory for the steps besides what's kept free.
+    // Inside a tool call the guesses are nearly all taken (a path or a number the chat
+    // already holds), so there the chat's guesses pay on the small ones too: `text_drafts`
+    // says whether the reply's own text is guessed at as well.
+    let mut text_drafts = true;
     let can_go_back = match (model, &mut kept.session) {
         (Model::Gemma4(_) | Model::Llama(_), _) => true,
         (Model::Qwen35(m), Session::Qwen35(s)) if m.can_rewind() => {
-            let pays = s.keeps_mtp() || m.config.dim >= 5120 || !cfg!(target_os = "macos");
+            text_drafts = s.keeps_mtp() || m.config.dim >= 5120 || !cfg!(target_os = "macos");
             let room = cfg!(target_os = "macos")
                 || s.keeps_steps()
                 || m.gpu().free_memory() >= m.steps_bytes() + STEPS_HEADROOM;
-            pays && room && m.keep_steps(s).is_ok()
+            (text_drafts || !offered.is_empty()) && room && m.keep_steps(s).is_ok()
         }
         _ => false,
     };
@@ -2458,7 +2487,7 @@ fn reply(
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
     let mut lookup = (drafter.is_none() && !mtp && options().lookup > 0 && can_go_back)
         .then(|| draft::Lookup::new(options().lookup));
-    let drafting = drafter.is_some() || lookup.is_some() || mtp;
+    let drafting = drafter.is_some() || (lookup.is_some() && text_drafts) || mtp;
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
     // longer list of tools, ended its turn on the result three times in 39 cases,
@@ -2494,7 +2523,9 @@ fn reply(
         if ahead.is_empty() && !muse_turn {
             let guesses = match (drafter.as_deref_mut(), lookup.as_mut(), unread) {
                 (Some(d), _, _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
-                (None, Some(l), _) if room > 1 => l.guess(&kept.tokens, l.max.min(room - 1)),
+                (None, Some(l), _) if room > 1 && text_drafts => {
+                    l.guess(&kept.tokens, l.max.min(room - 1))
+                }
                 // The layer guesses what follows the token just picked.
                 (None, None, Some(first)) if mtp && room > 1 => {
                     let g = model.mtp_draft(kept, first, MTP_GUESSES.min(room - 1))?;
@@ -2619,6 +2650,8 @@ fn reply(
             model.rewind(kept)?;
         }
         if opens_call {
+            // Where the call starts, to take it back if it runs too long.
+            let call_begin = kept.tokens.len();
             if in_thought {
                 in_thought = false;
                 shown.tag(job, THINK_CLOSE, false);
@@ -2646,7 +2679,7 @@ fn reply(
                 Some((no_thinking, _)) if !may_think => no_thinking,
                 _ => &grammar,
             };
-            let text = write_call(
+            let text = match write_call(
                 model,
                 kept,
                 tokenizer,
@@ -2655,7 +2688,23 @@ fn reply(
                 &mut logits,
                 &mut call_tokens,
                 context,
-            )?;
+                call_draft(mtp, &mut mtp_stats, &mut lookup),
+            ) {
+                // Too long to be a call a tool would take: taken back, and the model
+                // answers from what it has (failing the reply left the user with nothing
+                // after minutes of writing).
+                Err(e) if e == CALL_TOO_LONG && family != Family::Muse => {
+                    eprintln!("A tool call ran past its limit: taken back, no more calls this reply.");
+                    logits = take_back(model, kept, call_begin)?;
+                    if let Some(d) = drafter.as_deref_mut() {
+                        d.sync(&kept.tokens)?;
+                    }
+                    ahead.clear();
+                    may_call = false;
+                    continue;
+                }
+                other => other?,
+            };
             if family == Family::Muse
                 && (text == tools::MUSE_TO_USER || text == tools::MUSE_TO_SELF)
             {
@@ -2688,10 +2737,11 @@ fn reply(
                         break;
                     }
                     let started = Instant::now();
+                    let call_begin = kept.tokens.len();
                     model.next(&mut kept.session, peek, &mut logits)?;
                     kept.tokens.push(peek);
                     call_tokens += 1;
-                    let text = write_call(
+                    let text = match write_call(
                         model,
                         kept,
                         tokenizer,
@@ -2700,7 +2750,21 @@ fn reply(
                         &mut logits,
                         &mut call_tokens,
                         context,
-                    )?;
+                        call_draft(mtp, &mut mtp_stats, &mut lookup),
+                    ) {
+                        // As above: this call is taken back, the ones before it stand.
+                        Err(e) if e == CALL_TOO_LONG => {
+                            eprintln!("A tool call ran past its limit: taken back, no more calls this reply.");
+                            // (The results read next give the logits to go on from.)
+                            take_back(model, kept, call_begin)?;
+                            if let Some(d) = drafter.as_deref_mut() {
+                                d.sync(&kept.tokens)?;
+                            }
+                            may_call = false;
+                            break;
+                        }
+                        other => other?,
+                    };
                     let call = tools::parse_call(family, &text, &callable)
                         .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
                     group.push((call, format!("{}{text}", start.token), started.elapsed()));
@@ -2719,6 +2783,7 @@ fn reply(
             let together = group.len();
             let mut ids = Vec::new();
             let mut stopped = false;
+            let mut round_repeated = false;
             for (i, (call, written_call, written)) in group.into_iter().enumerate() {
                 let last = i + 1 == together;
                 calls += 1;
@@ -2728,19 +2793,23 @@ fn reply(
                     json::string(&call.tool)
                 )));
                 // The same call again, with the same arguments, would get the same answer: a
-                // small model can loop on one. It isn't run again. The first time, the model
-                // may still call another tool (Qwen 3.5 4B repeated a sum in the test
-                // gauntlet, then had no way left to fill the template it was asked to); the
-                // second, it must answer.
-                let repeated = last_call.as_ref() == Some(&call);
-                if repeated {
+                // model can loop on one, or on a round of several (Gemma 4 31B read, summed
+                // and read again four times over in the Nov 13 benchmark's skill task, never
+                // reaching the file it was to write). It isn't run again, whether it was the
+                // last call or an earlier one, as long as nothing was changed in between. The
+                // first round that repeats, the model may still call another tool (Qwen 3.5
+                // 4B repeated a sum in the test gauntlet, then had no way left to fill the
+                // template it was asked to); the second, it must answer.
+                let repeated = seen.contains(&call);
+                if repeated && !round_repeated {
                     repeats += 1;
+                    round_repeated = true;
                 }
                 let result = if repeated && repeats >= 2 {
-                    "This is the same call as the last one, and its result is above. Answer the user from it now."
+                    "This is the same call as one before, and its result is above. Answer the user from it now."
                         .to_string()
                 } else if repeated {
-                    "This is the same call as the last one, and its result is above. Go on from it: call the next tool the task needs, or answer."
+                    "This is the same call as one before, and its result is above. Go on from it: call the next tool the task needs, or answer."
                         .to_string()
                 } else {
                     match run_tool(&call, &offered, job) {
@@ -2754,7 +2823,12 @@ fn reply(
                 if repeats >= 2 || calls == MAX_CALLS {
                     may_call = false;
                 }
-                last_call = Some(call.clone());
+                if offered.iter().any(|t| t.name == call.tool && t.asks.is_some()) {
+                    // A change: what the earlier calls read may read differently now.
+                    seen.clear();
+                } else if !repeated {
+                    seen.push(call.clone());
+                }
                 eprintln!(
                     "Tool: {} {args} (written in {:.0} ms{}), {} characters back.",
                     call.tool,
@@ -3225,6 +3299,13 @@ const GEMMA_THOUGHT_LABEL: &[u8] = b"thought\n";
 const MUSE_THOUGHT_TOKENS: usize = 2048;
 /// The most tokens one call may take: a document's text or a spreadsheet's rows at most.
 const MAX_CALL_TOKENS: usize = 4096;
+/// A `calculate` call's: the tool takes 2,000 characters at most, and a model that writes
+/// more is copying its data into the sum (Qwen 3.8 27B wrote a log's numbers out for five
+/// minutes in the Nov 13 benchmark).
+const MAX_CALCULATE_TOKENS: usize = 768;
+/// What `write_call` gives back for a call past its limit: the reply takes the call back
+/// and goes on without tools (`take_back`).
+const CALL_TOO_LONG: &str = "A tool call ran too long.";
 /// The most of a tool's result the model reads, in characters (about 2,000 tokens).
 const MAX_RESULT: usize = 8000;
 
@@ -3300,6 +3381,40 @@ impl Shown {
     }
 }
 
+/// Where a tool call's guesses come from, as the reply's own do: the model's draft layer
+/// or draft model, or the chat's own tokens. (Not a separate small model's: `Drafter`
+/// would have to read the call too.)
+enum CallDraft<'a> {
+    None,
+    Mtp(&'a mut (usize, usize)),
+    Lookup(&'a mut draft::Lookup),
+}
+
+/// The most guesses a round inside a tool call.
+const CALL_GUESSES: usize = 8;
+
+fn call_draft<'a>(
+    mtp: bool,
+    stats: &'a mut (usize, usize),
+    lookup: &'a mut Option<draft::Lookup>,
+) -> CallDraft<'a> {
+    match lookup {
+        _ if mtp => CallDraft::Mtp(stats),
+        Some(l) => CallDraft::Lookup(l),
+        None => CallDraft::None,
+    }
+}
+
+/// Takes the session back to its first `len` tokens (a call that ran too long, from its
+/// start token on): the last of them's logits. Whatever the model's cache can't be cut
+/// back to is read again from the chat's last kept point.
+fn take_back(model: &Model, kept: &mut Kept, len: usize) -> Result<Vec<f32>, String> {
+    let ids = kept.tokens[..len].to_vec();
+    let mark = kept.history_end.min(len);
+    let (logits, _) = model.continue_with(kept, &ids, mark, 0)?;
+    Ok(logits)
+}
+
 /// Writes a tool call under `grammar`: what the grammar forces goes in without asking the
 /// model (read in one pass), and elsewhere the model's likeliest allowed token. The
 /// call's text, from just after its start.
@@ -3313,8 +3428,12 @@ fn write_call(
     logits: &mut Vec<f32>,
     tokens: &mut usize,
     context: usize,
+    mut draft: CallDraft,
 ) -> Result<String, String> {
     let mut m = grammar.matcher();
+    let timing = std::env::var_os("VIREO_CALL_TIME").is_some();
+    let (mut t_forced, mut t_scored, mut t_free, mut t_allowed) = (0f64, 0f64, 0f64, 0f64);
+    let (mut n_forced, mut n_scored, mut n_free) = (0usize, 0usize, 0usize);
     let mut text = Vec::new();
     let first = *tokens;
     let room = |kept: &Kept, n: usize| {
@@ -3356,7 +3475,10 @@ fn write_call(
                 m.advance_all(&fed_bytes);
                 text.extend_from_slice(&fed_bytes);
                 room(kept, keep)?;
+                let t0 = Instant::now();
                 *logits = model.feed(kept, &ids[..keep])?;
+                t_forced += t0.elapsed().as_secs_f64();
+                n_forced += keep;
                 *tokens += keep;
             }
         }
@@ -3373,6 +3495,7 @@ fn write_call(
         if options().score_choices
             && let Some(choices) = ahead.scored_options().filter(|c| c.len() > 1)
         {
+            let t0 = Instant::now();
             let mut best: Option<(f64, Vec<u8>, Vec<u32>)> = None;
             for option in choices {
                 let bytes = [held.as_slice(), &option].concat();
@@ -3398,10 +3521,14 @@ fn write_call(
             text.extend_from_slice(&bytes);
             room(kept, ids.len())?;
             *logits = model.feed(kept, &ids)?;
+            t_scored += t0.elapsed().as_secs_f64();
+            n_scored += ids.len();
             *tokens += ids.len();
             continue;
         }
+        let t0 = Instant::now();
         let allowed = m.allowed(trie);
+        t_allowed += t0.elapsed().as_secs_f64();
         let next = (0..logits.len() as u32)
             .filter(|&id| allowed[id as usize / 64] >> (id % 64) & 1 == 1)
             .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]))
@@ -3423,13 +3550,89 @@ fn write_call(
             return Err("A token the grammar allowed didn't fit it.".into());
         }
         text.extend_from_slice(&bytes);
-        room(kept, 1)?;
-        model.next(&mut kept.session, next, logits)?;
+        room(kept, 1 + CALL_GUESSES)?;
+        let t0 = Instant::now();
+        // The token is read with the draft layer's guesses at what follows it, where the
+        // model is free to write (a path, a sum, a file's text): each guess the model
+        // would have picked itself, under the grammar, is taken without a pass of its
+        // own, as in the reply's own text. Where the grammar writes the next text or
+        // scores a choice, the guesses are dropped and it goes on as before. (Tool calls
+        // were 70% of the writing in Gemma 4 31B's tool tasks, a token at a time.)
+        let free_next = |m: &vireo_engine::grammar::Matcher| {
+            !m.is_complete() && m.forced().is_empty() && m.scored_options().is_none()
+        };
         kept.tokens.push(next);
         *tokens += 1;
-        if *tokens - first > MAX_CALL_TOKENS {
-            return Err("A tool call ran too long.".into());
+        n_free += 1;
+        let guesses = match &mut draft {
+            CallDraft::Mtp(stats) if free_next(&m) => {
+                let g = model.mtp_draft(kept, next, MTP_GUESSES)?;
+                stats.0 += g.len();
+                g
+            }
+            CallDraft::Lookup(l) if free_next(&m) => {
+                l.guess(&kept.tokens, l.max.min(CALL_GUESSES))
+            }
+            _ => Vec::new(),
+        };
+        if guesses.is_empty() {
+            model.next(&mut kept.session, next, logits)?;
+        } else {
+            let batch: Vec<u32> = std::iter::once(next).chain(guesses.iter().copied()).collect();
+            let rows = model.read_all(&mut kept.session, &batch)?;
+            let vocab = rows.len() / batch.len();
+            let mut taken = 0;
+            for &guess in &guesses {
+                if !free_next(&m) {
+                    break;
+                }
+                let row = &rows[taken * vocab..(taken + 1) * vocab];
+                let allowed = m.allowed(trie);
+                let pick = (0..vocab as u32)
+                    .filter(|&id| allowed[id as usize / 64] >> (id % 64) & 1 == 1)
+                    .max_by(|&a, &b| row[a as usize].total_cmp(&row[b as usize]));
+                if pick != Some(guess) {
+                    break;
+                }
+                bytes.clear();
+                tokenizer.token_bytes(guess, false, &mut bytes);
+                if !m.advance_all(&bytes) {
+                    return Err("A token the grammar allowed didn't fit it.".into());
+                }
+                text.extend_from_slice(&bytes);
+                kept.tokens.push(guess);
+                *tokens += 1;
+                n_free += 1;
+                taken += 1;
+            }
+            logits.copy_from_slice(&rows[taken * vocab..(taken + 1) * vocab]);
+            if taken < guesses.len() {
+                model.rewind(kept)?;
+            }
+            match &mut draft {
+                CallDraft::Mtp(stats) => stats.1 += taken,
+                CallDraft::Lookup(l) => l.taken += taken,
+                CallDraft::None => {}
+            }
         }
+        t_free += t0.elapsed().as_secs_f64();
+        let limit = if text.len() >= 48 && text[..48].windows(9).any(|w| w == b"calculate") {
+            MAX_CALCULATE_TOKENS
+        } else {
+            MAX_CALL_TOKENS
+        };
+        if *tokens - first > limit {
+            return Err(CALL_TOO_LONG.into());
+        }
+    }
+    if timing {
+        eprintln!(
+            "[call time] forced {n_forced} tokens {:.0} ms, scored {n_scored} tokens {:.0} ms, free {n_free} tokens {:.0} ms, allowed sets {:.0} ms",
+            t_forced * 1e3,
+            t_scored * 1e3,
+            t_free * 1e3,
+            t_allowed * 1e3
+        );
     }
     String::from_utf8(text).map_err(|_| "A tool call wasn't text.".to_string())
 }

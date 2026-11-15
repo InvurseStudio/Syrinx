@@ -44,7 +44,7 @@ static inline u32 u32_at2(device const u8* p) {
 
 static inline float4 f4(device const float* p) { return *reinterpret_cast<device const float4*>(p); }
 
-// Four bytes from a 4-byte-aligned address: Q6_K's numbers, its blocks padded to 224 bytes
+// Four bytes from a 4-byte-aligned address: Q6_K's numbers, its blocks padded to 212 bytes
 // on the GPU (Q4_0's and Q8_0's blocks keep GGUF's odd sizes, so they use u32_at2).
 static inline u32 u32_at4(device const u8* p) { return *reinterpret_cast<device const u32*>(p); }
 
@@ -116,8 +116,9 @@ static inline float q4_0_scale(device const u8* row, int blocks, int b) {
     return half_at(row + (ulong)blocks * 16 + b * 2);
 }
 
-// Q6_K's 210-byte blocks padded to 224 on the GPU.
-#define Q6K_BYTES 224
+// Q6_K's 210-byte blocks padded to 212 on the GPU: whole 4-byte words, and no more of
+// them than that (one token's pass reads every weight once, and is bound by it).
+#define Q6K_BYTES 212
 
 // ---- Matrix-vector products: y = W x, one SIMD group per row of W -------------------
 
@@ -933,8 +934,9 @@ inline void decode32<K_Q6_K>(device const u8* row, int blocks, int k, threadgrou
     device const u8* block = row + (k / 256) * Q6K_BYTES;
     const int n = k % 256, hf = n / 128, run = (n % 128) / 32;
     const float d = half_at(block + 208);
-    device const uint4* ql = reinterpret_cast<device const uint4*>(block + hf * 64 + (run & 1) * 32);
-    device const uint4* qh = reinterpret_cast<device const uint4*>(block + 128 + hf * 32);
+    // (packed: a block starts at a 4-byte word, not always a 16-byte one.)
+    device const packed_uint4* ql = reinterpret_cast<device const packed_uint4*>(block + hf * 64 + (run & 1) * 32);
+    device const packed_uint4* qh = reinterpret_cast<device const packed_uint4*>(block + 128 + hf * 32);
     device const char* sc = reinterpret_cast<device const char*>(block + 192 + hf * 8 + 2 * run);
     const int shift = run < 2 ? 0 : 4;
     threadgroup half4* o = reinterpret_cast<threadgroup half4*>(out);
