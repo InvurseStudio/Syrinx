@@ -210,6 +210,71 @@ Google's draft models for the small Gemmas run now, and the 31B's path runs on C
 - **Measured on Windows:** E2B writes 6-26% faster and E4B 5-50% (copied code least,
   lists and explanations most), every eval case scoring as it did (`evals/windows-small-gemma-draft.json` against `-draft-off.json`: 34 and 39 of 43 either way, all 43 answers identical, writing 11% and 16% faster over the eval).
 
+## The Mac's speed harness on Windows (2026-11-15)
+
+`evals/speed/bench-2026-11-13/bench.py` now runs on both machines. On the Mac nothing
+changed; on Windows (`os.name == "nt"`) it takes the four small models' Q4 GGUFs from
+`models/`, `reference/llama.cpp-b12262/llama-server.exe`, no `large` or `xlarge` rows and
+no mlx-vlm, and reads the whole GPU's memory with `nvidia-smi` after each workload (there
+is no process footprint to sample). From `evals/speed/bench-2026-11-13`, one model at a
+time with nothing else on the GPU, in Python's UTF-8 mode (Windows' default code page
+would garble the prompts):
+
+    ENGINES=vireo,llama MODELS=e4b REPS=1 OUT=<folder>/results.jsonl LOGS=<folder> python -X utf8 -I bench.py
+
+(`MODELS` takes `e2b,e4b,q4b,q9b`; `python -X utf8 report.py <results.jsonl>` prints the
+Mac's summary of it.) Things that matter:
+
+- **Contexts are forced** (`WIN_MODELS`; `CONTEXT=` overrides): vireo-server's own choice
+  stops at 32,768, and the Mac's long prompt is 33,797 tokens on Vireo for the Gemmas and
+  its long tool prompt ~57K. 65,536 fits Gemma 4 E2B, E4B and Qwen 3.5 4B with nothing in
+  Windows' shared GPU memory; Qwen 3.5 9B spills past 32,768 on Vireo, so it runs at
+  32,768 with its long tool log cut to the first half (`WIN_LOG_SHARE`), for both engines.
+  To check a context, read `\GPU Process Memory(pid_<server>*)\Shared Usage` while the
+  server holds its memory: if it grows, that context spills and reading slows ~10×.
+- **Paths in the questions use forward slashes** (`desk.root.as_posix()`): a model copying
+  `C:\Users\twitc\…` into a tool call can turn `\t` and `\n` into a tab and a new line.
+- `vireo-plain` (no guesses) adds little here: on Windows it only turns off the Gemmas'
+  draft models and the chat's guesses, measured on their own already.
+- The page is `evals/speed/bench_mac_harness_report.py` (its text in the results folder's
+  `report.json`); 15 November's run is `windows-rtx5060-2026-11-15-mac-harness.html` and
+  `.pdf`, raw in `evals/speed/bench-2026-11-15-windows-mac-harness/`.
+
+## Three engine and server changes on Windows (2026-11-15, afternoon)
+
+Uncommitted on `windows/cuda-reading-memory`, on top of 7e00a19. Measured on Windows only
+(`evals/speed/windows-rtx5060-2026-11-15-after-changes.html`, PLAN.md's Progress). For the Mac:
+
+- **Shared code, both machines: Qwen's saved state at the system turn's end**
+  (`crates/vireo-server/src/main.rs`, `Kept::turn`). When Qwen reads a system turn, its
+  DeltaNet layers are now saved a few tokens before that turn's end, beside the saved state
+  where the first two chats parted (`Kept::base`), so a new chat with the same instructions
+  and tools reads none of them. On Windows the eval's Qwens read 55-61% fewer tokens and ran
+  18-20% quicker, the same cases passing. **It has not been compiled or run on a Mac**: run
+  the workspace tests and the eval there before relying on it.
+- **CUDA only: sliding-window rings** (`attention_ring` and `ring_row` in `vireo.cu`,
+  `src/cuda/mod.rs`; `gemma4_cuda.rs` drops its `cfg!(target_os = "macos")`). The Gemmas'
+  sliding-window layers keep only their window on CUDA, as Metal already did. Nothing
+  changes on the Mac.
+- **CUDA only: the prompt attention kernel.** `Gpu::attention` on CUDA now leaves a batch's
+  queries in f16 where they lie (`q_rows_to_half`, each row's halves at the start of its
+  floats): a caller must not read `q` as f32 after it. Larger blocks for batches over 64
+  tokens, a `_short` set for 64 or fewer. Metal's kernels are unchanged.
+
+## Two more Windows changes (2026-11-15, evening)
+
+After the three above, both passing every test but **not yet run through the eval or the
+benchmark** (PLAN.md's row of that evening has the measurements and what was tried and
+dropped). Shared code, not compiled on a Mac:
+
+- **`GpuMatrix::mul_gated`** (`models/gpu.rs`) is now the feed-forward's last product in
+  the Gemma, Qwen and Llama GPU code. On the Mac it does what was there before (the
+  activation, then the product). On CUDA in 8-bit mode the activation is rounded to 8
+  bits as it is worked out (`swiglu_q8`, `geglu_q8`) and `gate` is left unchanged.
+- **`draft::LEAST_RUN`**: guesses from the chat need a run of 3 on CUDA; 2 on the Mac, as
+  before.
+- `tools/reply_speed.py` loads one server at a time now.
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as
