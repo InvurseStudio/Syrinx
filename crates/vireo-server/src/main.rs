@@ -1170,6 +1170,49 @@ const MTP_FLOOR: f32 = if cfg!(target_os = "macos") { 0.0 } else { 0.7 };
 /// ones are left to the draft model. On CUDA; the Mac drafts from one or the other.
 const CHAT_RUN_OVER_DRAFT: usize = 3;
 
+/// On CUDA, how deep in a chat (in tokens) guesses have to earn their keep: the chat's own
+/// from `CHAT_GUESSES_FROM`, a Gemma draft model's from `MTP_GUESSES_FROM`. Checking a
+/// round's guesses costs each one a pass over the whole context there, so a round that
+/// isn't mostly taken is slower than a token at a time. Past that depth, once a reply
+/// has made a few guesses of a kind (`CHAT_GUESSES_TRIED`, `MTP_GUESSES_TRIED`), it goes
+/// on guessing only while enough of them were taken (`guesses_pay`): copied text keeps
+/// its speed (nearly all taken), new text stops. The draft model's share to reach grows
+/// with the depth, from `MTP_GUESSES_TAKEN.0` to `.1` at 120,000 tokens: the smaller the
+/// model and the deeper the chat, the more of a token's time is its attention.
+/// A 200-token description after a repository dump, tokens/s with no guesses / the draft
+/// model's / both, as it was: Gemma 4 E2B at 32K tokens 131 / 152 / 137, at 63K
+/// 109 / 103 / 105, at 119K 85 / 75 / 72; E4B 74 / 98 / 91, 61 / 71 / 61, 48 / 49 / 42
+/// (the chat's guesses taken 10-25% there, the draft model's 52-78%).
+const CHAT_GUESSES_FROM: usize = 24_000;
+const CHAT_GUESSES_TAKEN: f64 = 0.6;
+const CHAT_GUESSES_TRIED: usize = 8;
+const MTP_GUESSES_FROM: usize = 48_000;
+const MTP_GUESSES_TAKEN: (f64, f64) = (0.5, 0.75);
+const MTP_GUESSES_TRIED: usize = 16;
+
+/// The share of a draft model's guesses that has to be taken `depth` tokens into a chat.
+fn mtp_share(depth: usize) -> f64 {
+    let (from, to) = MTP_GUESSES_TAKEN;
+    let along = depth.saturating_sub(MTP_GUESSES_FROM) as f64 / (120_000 - MTP_GUESSES_FROM) as f64;
+    from + (to - from) * along.min(1.0)
+}
+
+/// Whether a kind of guess is still worth a round `depth` tokens into a chat, after
+/// `taken` of this reply's `guessed` were right (see `CHAT_GUESSES_FROM`).
+fn guesses_pay(
+    depth: usize,
+    from: usize,
+    share: f64,
+    tried: usize,
+    guessed: usize,
+    taken: usize,
+) -> bool {
+    cfg!(target_os = "macos")
+        || depth < from
+        || guessed < tried
+        || taken as f64 >= share * guessed as f64
+}
+
 /// The most picker sessions kept: the change question, the skill questions and the group
 /// question each start their own way.
 const PICKERS: usize = 4;
@@ -2601,7 +2644,18 @@ fn reply(
             // where `text_drafts`): all of them without a draft model, only a long run with
             // one.
             let from_chat = match lookup.as_mut() {
-                Some(l) if room > 1 && text_drafts => {
+                Some(l)
+                    if room > 1
+                        && text_drafts
+                        && guesses_pay(
+                            kept.tokens.len(),
+                            CHAT_GUESSES_FROM,
+                            CHAT_GUESSES_TAKEN,
+                            CHAT_GUESSES_TRIED,
+                            l.guessed,
+                            l.taken,
+                        ) =>
+                {
                     let g = l.guess(&kept.tokens, l.max.min(room - 1));
                     if mtp && g.len() < CHAT_RUN_OVER_DRAFT {
                         l.guessed -= g.len();
@@ -2617,7 +2671,18 @@ fn reply(
                 (Some(d), _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
                 (None, _) if !from_chat.is_empty() => from_chat,
                 // The layer guesses what follows the token just picked.
-                (None, Some(first)) if mtp && room > 1 => {
+                (None, Some(first))
+                    if mtp
+                        && room > 1
+                        && guesses_pay(
+                            kept.tokens.len(),
+                            MTP_GUESSES_FROM,
+                            mtp_share(kept.tokens.len()),
+                            MTP_GUESSES_TRIED,
+                            mtp_stats.0,
+                            mtp_stats.1,
+                        ) =>
+                {
                     let g = model.mtp_draft(kept, first, MTP_GUESSES.min(room - 1))?;
                     mtp_stats.0 += g.len();
                     ahead_drafted = true;
