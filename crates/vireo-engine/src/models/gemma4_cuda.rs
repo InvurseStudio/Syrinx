@@ -196,6 +196,12 @@ impl Gemma4CudaSession {
             / self.capacity.max(1)
     }
 
+    /// Whether a sliding-window layer keeps only a ring of its positions here (a session
+    /// longer than the ring): then [`Self::truncate`] can't always go back.
+    pub fn has_rings(&self) -> bool {
+        self.rings.iter().any(|&r| r > 0)
+    }
+
     /// Forgets every position from `len` on (nothing, if the session is shorter), so the
     /// next tokens run from there: the keys and values before it stay as they are. For
     /// continuing a chat whose new prompt starts with the tokens already read. The length
