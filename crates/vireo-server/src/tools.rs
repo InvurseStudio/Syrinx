@@ -1352,6 +1352,9 @@ Changing files, the calendar or reminders and scheduling tasks ask the user for 
 
 Do not put tool calls or tokenizer markers in your answer's text.";
 
+/// After Gemma's lines when thinking is off (see `reply`'s system turn).
+pub const GEMMA_NO_THINKING: &str = "\n\nThinking is off for this reply: do not write out your reasoning, a plan, or what the user asked for. Begin with the answer itself, or with a tool call when the task needs one.";
+
 /// For a family trained to make several calls in one step: ask for all a step needs at
 /// once (0.9's `PARALLEL_CALLS_RULE`). Not Muse's (one call at a time, Meta's guide) nor
 /// Llama's.

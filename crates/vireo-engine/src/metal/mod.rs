@@ -1290,7 +1290,7 @@ impl Gpu {
 
     /// A weight matrix of `rows` × `cols` numbers of type `kind` (GGUF's layout) in GPU
     /// memory, in the layout the kernels read: as `cuda` lays it out (Q4_0's numbers then
-    /// scales per row, Q6_K's blocks padded to 224 bytes).
+    /// scales per row, Q6_K's blocks padded to 212 bytes, whole 4-byte words).
     pub fn upload_weights(
         &self,
         kind: TensorType,
@@ -1299,12 +1299,12 @@ impl Gpu {
         cols: usize,
     ) -> Result<Buffer> {
         if kind == TensorType::Q6_K {
-            let mut out = vec![0u8; data.len() / 210 * 224];
+            let mut out = vec![0u8; data.len() / 210 * 212];
             for (src, dst) in data
                 .as_chunks::<210>()
                 .0
                 .iter()
-                .zip(out.as_chunks_mut::<224>().0)
+                .zip(out.as_chunks_mut::<212>().0)
             {
                 dst[..210].copy_from_slice(src);
             }
