@@ -1169,6 +1169,14 @@ __device__ __forceinline__ void mma_s8_k32(int (&c)[4], const u32 (&a)[4], const
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
+// Four 8 x 8 matrices of 2-byte numbers from shared memory (their rows from lanes 0-7,
+// 8-15, 16-23, 24-31): thread (gid, tig) gets bytes 4 tig to 4 tig + 3 of row gid of each.
+__device__ __forceinline__ void ldmatrix_x4_bytes(u32 (&r)[4], const u8* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(static_cast<u32>(__cvta_generic_to_shared(p))));
+}
+
 // NT is the tile's tokens: 64, or 32 or 16 for a short batch (a tool's result, a new turn),
 // whose 8 warps then take 16 rows each and multiply only the tokens there are: a tile of
 // 64 costs the same for 9 tokens as for 64.
@@ -1394,24 +1402,43 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
         for (int g = 0; g < NG; g++) {
             int c[MI][NI][4] = {};
             if (GROUP == 32) {
-                // A whole group in one product a tile (mma.m16n8k32). (Loading the
-                // fragments with ldmatrix measured 2% slower than these loads.)
+                // A whole group in one product a tile (mma.m16n8k32). One side's
+                // fragments come by ldmatrix, four reads in one: the weights' where there
+                // are no minimums, x's where there are (a ~2.3K-token read: Gemma 4 E4B
+                // 377 -> 357 ms, Qwen 3.5 4B 653 -> 636; the other side for each a little
+                // less, and both sides at once 366 and 675: the reads queue for shared
+                // memory, and which mix suits a kernel was only found by timing).
+                constexpr bool LDA = !has_min, LDB = has_min;
                 const int kk = g * 32;
                 u32 a[MI][4], b[NI][2];
+                const int mat = lane >> 3, mrow = lane & 7;
 #pragma unroll
                 for (int mi = 0; mi < MI; mi++) {
-                    const u8* r0 = &wq[wr + mi * 16 + gid][kk + tig * 4];
-                    const u8* r1 = &wq[wr + mi * 16 + gid + 8][kk + tig * 4];
-                    a[mi][0] = *reinterpret_cast<const u32*>(r0);
-                    a[mi][1] = *reinterpret_cast<const u32*>(r1);
-                    a[mi][2] = *reinterpret_cast<const u32*>(r0 + 16);
-                    a[mi][3] = *reinterpret_cast<const u32*>(r1 + 16);
+                    if (LDA) {
+                        ldmatrix_x4_bytes(a[mi], &wq[wr + mi * 16 + (mat & 1) * 8 + mrow][kk + (mat >> 1) * 16]);
+                    } else {
+                        const u8* r0 = &wq[wr + mi * 16 + gid][kk + tig * 4];
+                        const u8* r1 = &wq[wr + mi * 16 + gid + 8][kk + tig * 4];
+                        a[mi][0] = *reinterpret_cast<const u32*>(r0);
+                        a[mi][1] = *reinterpret_cast<const u32*>(r1);
+                        a[mi][2] = *reinterpret_cast<const u32*>(r0 + 16);
+                        a[mi][3] = *reinterpret_cast<const u32*>(r1 + 16);
+                    }
                 }
 #pragma unroll
-                for (int ni = 0; ni < NI; ni++) {
-                    const u8* t = &xqs[wt + ni * 8 + gid][kk + tig * 4];
-                    b[ni][0] = *reinterpret_cast<const u32*>(t);
-                    b[ni][1] = *reinterpret_cast<const u32*>(t + 16);
+                for (int ni = 0; ni < NI; ni += 2) {
+                    if (LDB) {
+                        u32 r[4];
+                        ldmatrix_x4_bytes(r, &xqs[wt + (ni + (mat >> 1)) * 8 + mrow][kk + (mat & 1) * 16]);
+                        b[ni][0] = r[0], b[ni][1] = r[1], b[ni + 1][0] = r[2], b[ni + 1][1] = r[3];
+                    } else {
+#pragma unroll
+                        for (int x = ni; x < ni + 2; x++) {
+                            const u8* t = &xqs[wt + x * 8 + gid][kk + tig * 4];
+                            b[x][0] = *reinterpret_cast<const u32*>(t);
+                            b[x][1] = *reinterpret_cast<const u32*>(t + 16);
+                        }
+                    }
                 }
 #pragma unroll
                 for (int mi = 0; mi < MI; mi++)
@@ -1573,9 +1600,21 @@ __device__ __forceinline__ void ldmatrix_x4_trans(u32 (&r)[4], const __half* p) 
                  : "r"(shared_address(p)));
 }
 
+// Four 8 x 8 f16 matrices as they lie (rows from lanes 0-7, 8-15, 16-23, 24-31): each
+// thread gets the B fragments of mma.m16n8k16 for two tiles (r0, r1 and r2, r3) when a
+// matrix's rows are positions and its columns a head's numbers.
+__device__ __forceinline__ void ldmatrix_x4(u32 (&r)[4], const __half* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(shared_address(p)));
+}
+
 // A batch's queries rounded to f16 where they lie, a row's halves at the start of its
 // floats: a block a row (a token's head, up to 512 numbers), each thread reading its four
-// numbers before any is written.
+// numbers before any is written. Each 32 numbers are laid out as attention_mma's threads
+// take them, so one 16-byte read gives a thread its part of two steps of the first
+// product: the thread of a group of four that takes numbers 2t, 2t + 1 of each 8 finds
+// those of the four 8s side by side, at 8t.
 extern "C" __global__ void q_rows_to_half(float* q, int d) {
     float* row = q + (size_t)blockIdx.x * d;
     const int i = threadIdx.x;
@@ -1584,34 +1623,67 @@ extern "C" __global__ void q_rows_to_half(float* q, int d) {
     if (mine) v = f4(row + i * 4);
     __syncthreads();
     if (mine) {
-        __half2* dst = reinterpret_cast<__half2*>(row) + i * 2;
-        dst[0] = __floats2half2_rn(v.x, v.y);
-        dst[1] = __floats2half2_rn(v.z, v.w);
+        // Numbers 4i to 4i + 3: of the 32 they are in, the 8 numbered (i / 2) % 4, its
+        // first or second half.
+        const int g = i >> 3, b = (i >> 1) & 3, t = (i & 1) * 2;
+        __half2* dst = reinterpret_cast<__half2*>(row) + g * 16 + b;
+        dst[t * 4] = __floats2half2_rn(v.x, v.y);
+        dst[(t + 1) * 4] = __floats2half2_rn(v.z, v.w);
     }
 }
 
-template <int D, int ROWS, int SPLIT, int KC>
+//
+// PART, for a batch of a few dozen tokens deep in a chat (a tool's result, a new turn):
+// it has too few blocks to fill the GPU, each reading the whole context alone. So a block
+// takes ROWS sets of 16 tokens of query heads that share a key/value head (not 16 × ROWS
+// tokens of one head, most of them past the batch's end), and the context is split into
+// gridDim.y parts, a block each: block (x, part) leaves its rows' sums as attention_part
+// does (the largest score, the sum, the weighted values), for attention_combine. No
+// sliding windows (they are short already). `all_heads` is the query heads.
+template <int D, int ROWS, int SPLIT, int KC, bool PART>
 __device__ void attention_mma(const float* q, const __half* keys, const __half* values, float* out,
-                              const int* pos, int window, int kv_dim, int group, float scale, int tokens) {
+                              const int* pos, int window, int all_heads, int kv_dim, int group, float scale,
+                              int tokens) {
     const int ring = window >> 16;  // see ring_row
     window &= 0xFFFF;
     constexpr int WARPS = ROWS * SPLIT, THREADS = 32 * WARPS, QT = 16 * ROWS;
     constexpr int DS = D + 8;            // padded rows: no bank conflicts
     constexpr int DP = D / SPLIT;        // the numbers of a head each warp takes
     constexpr int NS = KC / 8 * 4;       // a thread's share of S
-    static_assert(DP % 16 == 0 && KC % 16 == 0, "tile sizes");
+    static_assert(DP % 32 == 0 && KC % 16 == 0, "tile sizes");
     extern __shared__ __align__(16) unsigned char smem[];
     __half* ks = reinterpret_cast<__half*>(smem);  // KC × DS
     __half* vs = ks + KC * DS;                      // KC × DS
     float* sx = reinterpret_cast<float*>(vs + KC * DS);  // SPLIT > 1: [ROWS][SPLIT][NS][32]
 
-    const int head = blockIdx.x, heads = gridDim.x;
-    const int t0 = (gridDim.y - 1 - blockIdx.y) * QT;  // the longest rows first
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
     const int rw = warp / SPLIT, sp = warp % SPLIT, dp = sp * DP;
-    const int p0 = *pos, kv = (head / group) * D;
-    const int last_row = p0 + min(t0 + QT, tokens) - 1;
-    const int lo = window > 0 ? max(0, p0 + t0 + 1 - window) : 0;
+    const int p0 = *pos;
+    // The warp's query head and its first token less 16 rw (so row r of the block is token
+    // t0 + r), the positions the block reads (lo to end) and the last any of its rows sees.
+    int head, heads, t0, kv, last_row, lo, end;
+    bool warp_live = true;
+    if constexpr (PART) {
+        const int tiles = (tokens + 15) / 16, units = group * tiles;
+        const int per_kv = (units + ROWS - 1) / ROWS;
+        const int kvh = blockIdx.x / per_kv, unit = (blockIdx.x % per_kv) * ROWS + rw;
+        warp_live = unit < units;
+        heads = all_heads;
+        head = kvh * group + (warp_live ? unit / tiles : 0);
+        t0 = (warp_live ? unit % tiles : 0) * 16 - rw * 16;
+        kv = kvh * D;
+        last_row = p0 + tokens - 1;
+        const int chunks = last_row / KC + 1, share = (chunks + (int)gridDim.y - 1) / (int)gridDim.y;
+        lo = (int)blockIdx.y * share * KC;
+        end = min(last_row, lo + share * KC - 1);
+    } else {
+        head = blockIdx.x, heads = gridDim.x;
+        t0 = (gridDim.y - 1 - blockIdx.y) * QT;  // the longest rows first
+        kv = (head / group) * D;
+        last_row = p0 + min(t0 + QT, tokens) - 1;
+        lo = window > 0 ? max(0, p0 + t0 + 1 - window) : 0;
+        end = last_row;
+    }
 
     auto load = [&](__half* dst, const __half* src, int start) {
         for (int i = tid; i < KC * D / 8; i += THREADS) {
@@ -1636,7 +1708,7 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
     bool live[2];
     for (int h = 0; h < 2; h++) {
         const int r = row0 + h * 8;
-        live[h] = t0 + r < tokens;
+        live[h] = warp_live && t0 + r < tokens;
         at[h] = p0 + t0 + r;
         first[h] = window > 0 ? max(0, at[h] + 1 - window) : 0;
     }
@@ -1645,7 +1717,16 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
     for (int n = 0; n < DP / 8; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
 
-    for (int start = lo; start <= last_row; start += KC) {
+    // The queries of the next two steps of S = Q Kᵀ (32 of a head's numbers each), read
+    // ahead: see the loop.
+    constexpr int AHEAD = 2;
+    uint4 qna[AHEAD], qnb[AHEAD];
+#pragma unroll
+    for (int a = 0; a < AHEAD; a++) {
+        qna[a] = *reinterpret_cast<const uint4*>(q0 + dp + a * 32 + tig * 8);
+        qnb[a] = *reinterpret_cast<const uint4*>(q1 + dp + a * 32 + tig * 8);
+    }
+    for (int start = lo; start <= end; start += KC) {
         load(vs, values, start);  // the last chunk's P V is done with vs (the sync below)
         cp_async_wait1();         // this chunk's keys are in
         __syncthreads();
@@ -1654,14 +1735,37 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
         float s[KC / 8][4];
 #pragma unroll
         for (int n = 0; n < KC / 8; n++) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
-#pragma unroll 4
-        for (int kk = dp; kk < dp + DP; kk += 16) {
-            const __half *qa = q0 + kk + tig * 2, *qb = q1 + kk + tig * 2;
-            const u32 a0 = u32_of(qa), a1 = u32_of(qb), a2 = u32_of(qa + 8), a3 = u32_of(qb + 8);
+#pragma unroll 2
+        for (int kk = dp; kk < dp + DP; kk += 32) {
+            // Two steps' queries come in one read each (q_rows_to_half laid them out so),
+            // and are asked for AHEAD steps before their products (after the last steps,
+            // the first ones', for the next chunk). A block's queries are larger than
+            // what is left of the L1 cache beside its shared memory, so most reads go to
+            // L2, and a warp that waited for each lost a fifth of its time (Nsight
+            // Compute: 32% of the reads found in L1; a ~30K-token batch 28.0 -> 24.5 ms
+            // 512 wide and 21.1 -> 18.8 ms 256 wide, one step ahead about half of that).
+            const uint4 qa = qna[0], qb = qnb[0];
+            {
 #pragma unroll
-            for (int n = 0; n < KC / 8; n++) {
-                const __half* kb = ks + (n * 8 + gid) * DS + kk + tig * 2;
-                mma_f16(s[n], a0, a1, a2, a3, u32_of(kb), u32_of(kb + 8));
+                for (int a = 0; a + 1 < AHEAD; a++) qna[a] = qna[a + 1], qnb[a] = qnb[a + 1];
+                int next = kk + 32 * AHEAD;
+                if (next >= dp + DP) next -= DP;
+                qna[AHEAD - 1] = *reinterpret_cast<const uint4*>(q0 + next + tig * 8);
+                qnb[AHEAD - 1] = *reinterpret_cast<const uint4*>(q1 + next + tig * 8);
+            }
+#pragma unroll
+            for (int n = 0; n < KC / 8; n += 2) {
+                u32 b[4];
+                ldmatrix_x4(b, ks + ((n + (lane >> 4)) * 8 + (lane & 7)) * DS + kk + ((lane >> 3) & 1) * 8);
+                mma_f16(s[n], qa.x, qb.x, qa.y, qb.y, b[0], b[1]);
+                mma_f16(s[n + 1], qa.x, qb.x, qa.y, qb.y, b[2], b[3]);
+            }
+#pragma unroll
+            for (int n = 0; n < KC / 8; n += 2) {
+                u32 b[4];
+                ldmatrix_x4(b, ks + ((n + (lane >> 4)) * 8 + (lane & 7)) * DS + kk + 16 + ((lane >> 3) & 1) * 8);
+                mma_f16(s[n], qa.z, qb.z, qa.w, qb.w, b[0], b[1]);
+                mma_f16(s[n + 1], qa.z, qb.z, qa.w, qb.w, b[2], b[3]);
             }
         }
         if constexpr (SPLIT > 1) {
@@ -1683,7 +1787,7 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
                 }
         }
         __syncthreads();  // every warp is done with ks (and sx)
-        if (start + KC <= last_row) {
+        if (start + KC <= end) {
             load(ks, keys, start + KC);
         } else {
             cp_async_commit();  // an empty group, so the waits count the same
@@ -1757,6 +1861,23 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
         __syncthreads();  // every warp is done with vs
     }
 
+    if constexpr (PART) {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            if (!live[h]) continue;
+            float* dst = out + (((size_t)(t0 + row0 + h * 8) * heads + head) * gridDim.y + blockIdx.y) * (2 + D);
+            if (tig == 0 && sp == 0) {
+                dst[0] = m[h];  // -inf for a part the row sees nothing of
+                dst[1] = l[h];
+            }
+#pragma unroll
+            for (int n = 0; n < DP / 8; n++) {
+                dst[2 + dp + n * 8 + tig * 2] = o[n][2 * h];
+                dst[2 + dp + n * 8 + tig * 2 + 1] = o[n][2 * h + 1];
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int h = 0; h < 2; h++) {
         if (!live[h]) continue;
@@ -1769,12 +1890,14 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
     }
 }
 
-#define ATTENTION_MMA(name, D, ROWS, SPLIT, KC)                                                              \
+#define ATTENTION_MMA_AS(name, D, ROWS, SPLIT, KC, PART)                                                     \
     extern "C" __global__ void __launch_bounds__(32 * ROWS * SPLIT) name(                                    \
         const float* q, const __half* keys, const __half* values, float* out, const int* pos, int window,    \
         int hd, int kv_dim, int group, float scale, int tokens) {                                            \
-        attention_mma<D, ROWS, SPLIT, KC>(q, keys, values, out, pos, window, kv_dim, group, scale, tokens);  \
+        attention_mma<D, ROWS, SPLIT, KC, PART>(q, keys, values, out, pos, window, hd, kv_dim, group, scale, \
+                                                tokens);                                                     \
     }
+#define ATTENTION_MMA(name, D, ROWS, SPLIT, KC) ATTENTION_MMA_AS(name, D, ROWS, SPLIT, KC, false)
 
 // Head sizes 64 to 512: (rows of 16 tokens, warps per row, positions per chunk), the
 // fastest of the shapes measured on an RTX 5060 Laptop. The host side's ATTENTION_MMA
@@ -1791,6 +1914,11 @@ ATTENTION_MMA(attention_mma_256, 256, 8, 1, 64)
 ATTENTION_MMA(attention_mma_512, 512, 4, 2, 32)
 ATTENTION_MMA(attention_mma_256_short, 256, 4, 1, 32)
 ATTENTION_MMA(attention_mma_512_short, 512, 2, 2, 16)
+// The short shapes with the context in parts (PART above; `hd` is the query heads there).
+ATTENTION_MMA_AS(attention_mma_64_part, 64, 4, 1, 32, true)
+ATTENTION_MMA_AS(attention_mma_128_part, 128, 4, 1, 32, true)
+ATTENTION_MMA_AS(attention_mma_256_part, 256, 4, 1, 32, true)
+ATTENTION_MMA_AS(attention_mma_512_part, 512, 2, 2, 16, true)
 #endif
 
 // ---- Everything else in a layer, for `tokens` rows at a time --------------------------

@@ -1106,6 +1106,11 @@ struct Kept {
     turn: Option<Qwen35Checkpoint>,
     /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
     scratch: Option<Qwen35Checkpoint>,
+    /// Gemma, in a session whose sliding-window layers keep rings: the tokens of the last
+    /// system turn read (its instructions and tools, less a few) and the state after
+    /// them. A prompt longer than a ring writes over the window after that turn, and the
+    /// next chat would read the turn again; it loads this instead.
+    head: Option<(Vec<u32>, SavedState)>,
     /// Small sessions apart, for questions the server asks the model itself (which tools a
     /// request needs, whether a skill fits), so the chat's own cache is left as it is.
     /// One a kind of question (up to [`PICKERS`]), each going on from the start its last
@@ -1510,7 +1515,19 @@ impl Model {
             // Back to the shared start, or to the beginning when the sliding-window
             // layers no longer hold the window before it.
             (Model::Gemma4(_), Session::Gemma4(s)) => {
-                let kept_len = s.truncate(shared);
+                let mut kept_len = s.truncate(shared);
+                // A ring wrote over the window there: the system turn's saved state, if
+                // this prompt starts with that turn.
+                if kept_len < shared
+                    && let Some((tokens, state)) = kept
+                        .head
+                        .as_ref()
+                        .filter(|(t, _)| t.len() <= shared && ids.starts_with(t))
+                {
+                    s.import(state, tokens.len()).map_err(e)?;
+                    kept_len = tokens.len();
+                    kept.tokens.clone_from(tokens);
+                }
                 kept.history_end = kept.history_end.min(kept_len);
                 kept_len
             }
@@ -1565,6 +1582,19 @@ impl Model {
                 m.forward_batch(s, &ids[from..head_at], Logits::None)
                     .map_err(e)?;
                 m.save(s, &mut kept.turn).map_err(e)?;
+                kept.tokens.extend_from_slice(&ids[from..head_at]);
+                from = head_at;
+            }
+        }
+        // Gemma with rings, reading a system turn (or a good part of one) again: its state
+        // saved at the turn's end (a few tokens early, as Qwen's), for the chat after a
+        // prompt longer than a ring.
+        if let (Model::Gemma4(m), Session::Gemma4(s)) = (self, &mut kept.session) {
+            let head_at = head.saturating_sub(8);
+            if s.has_rings() && head_at >= from + 64 && head_at < mark {
+                m.forward_batch(s, &ids[from..head_at], Logits::None)
+                    .map_err(e)?;
+                kept.head = Some((ids[..head_at].to_vec(), s.export(head_at).map_err(e)?));
                 kept.tokens.extend_from_slice(&ids[from..head_at]);
                 from = head_at;
             }
@@ -1860,6 +1890,7 @@ fn engine(
                 base: None,
                 turn: None,
                 scratch: None,
+                head: None,
                 pickers: Vec::new(),
                 skill_controls: HashMap::new(),
                 history_end: 0,
@@ -1956,6 +1987,7 @@ fn engine(
                         base: None,
                     turn: None,
                         scratch: None,
+                        head: None,
                         pickers: Vec::new(),
                         skill_controls: HashMap::new(),
                         history_end: 0,
@@ -2404,8 +2436,8 @@ fn reply(
     if let Some(store) = store {
         switch_chat(model, kept, store, &ids, context)?;
     }
-    // Qwen: where the system turn ends, for a saved start for new chats.
-    let head = if matches!(family, Family::Qwen35) {
+    // Qwen and Gemma: where the system turn ends, for a saved start for new chats.
+    let head = if matches!(family, Family::Qwen35 | Family::Gemma4) {
         let turn = chat::history(
             family,
             system.as_deref(),

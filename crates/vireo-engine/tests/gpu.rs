@@ -920,6 +920,16 @@ fn attention_over_an_f16_cache_matches_f64() {
         (128, 8, 2, 40, 0.088, 300, 4),
         (256, 8, 1, 40, 1.0, 300, 2),
         (256, 16, 4, 0, 0.0625, 2000, 7),
+        // A short batch with no window (a tool's result, a new turn): heads that share
+        // keys and values fill a block, and the context is split into parts. Deep, in
+        // one, two and three sets of 16 tokens; with a key/value head a query head (rows
+        // of a block left empty); and so early that most parts are empty.
+        (512, 8, 1, 0, 1.0, 3000, 16),
+        (512, 8, 2, 0, 1.0, 2500, 20),
+        (256, 16, 4, 0, 0.0625, 4000, 12),
+        (256, 16, 4, 0, 1.0, 37, 33),
+        (128, 8, 8, 0, 0.088, 900, 24),
+        (64, 8, 2, 0, 0.125, 5, 16),
     ] {
         let len = p0 + tokens;
         let kv_dim = kv_heads * hd;

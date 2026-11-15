@@ -286,6 +286,8 @@ struct Kernels {
     attention_combine: CuFunction,
     /// `attention_mma` for a batch of up to `ATTENTION_SHORT` tokens.
     attention_mma_short: Option<[AttentionMma; 4]>,
+    /// `attention_mma` with a short batch's context in parts (the short shapes).
+    attention_mma_part: Option<[AttentionMma; 4]>,
     /// A batch's queries to f16 in place, for `attention_mma` (with the tensor cores).
     q_rows_to_half: Option<CuFunction>,
     /// On the tensor cores over an f16 cache, for head sizes 64, 128, 256 and 512:
@@ -546,6 +548,29 @@ impl Gpu {
                     let mut out = [AttentionMma::default(); 4];
                     for (slot, &(d, rows, split, chunk)) in out.iter_mut().zip(&ATTENTION_MMA) {
                         let f = function(&format!("attention_mma_{d}"))?;
+                        let bytes = attention_mma_bytes(d, rows, split, chunk);
+                        let r = (context.driver.cuFuncSetAttribute)(
+                            f,
+                            FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            bytes as i32,
+                        );
+                        context.check("cuFuncSetAttribute", r)?;
+                        *slot = AttentionMma {
+                            function: f,
+                            shared: bytes,
+                            rows: 16 * rows,
+                            threads: 32 * rows * split,
+                        };
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                attention_mma_part: if tensor_cores {
+                    let mut out = [AttentionMma::default(); 4];
+                    for (slot, &(d, rows, split, chunk)) in out.iter_mut().zip(&ATTENTION_MMA_SHORT)
+                    {
+                        let f = function(&format!("attention_mma_{d}_part"))?;
                         let bytes = attention_mma_bytes(d, rows, split, chunk);
                         let r = (context.driver.cuFuncSetAttribute)(
                             f,
@@ -1221,6 +1246,63 @@ impl Gpu {
                 512 => Some(3),
                 _ => None,
             };
+            // A short batch with no window: query heads that share keys and values fill
+            // a block's rows, and the context is split into as many parts as give every
+            // SM a block (deep in a chat the batch's few blocks each read all of it).
+            if let (true, Some(kernels), Some(i), Some(to_half)) = (
+                tokens > 1
+                    && tokens <= ATTENTION_SHORT
+                    && window == 0
+                    && ring == 0
+                    && heads.is_multiple_of(group),
+                self.kernels.attention_mma_part,
+                wide,
+                self.kernels.q_rows_to_half,
+            ) {
+                let k = kernels[i];
+                let units = group * tokens.div_ceil(16);
+                let blocks = (heads / group * units.div_ceil(k.rows as usize / 16)) as u32;
+                let sms = self.info.multiprocessors.max(1) as u32;
+                let row_bytes = (2 + head_dim) * 4;
+                let room = self.attention_parts.len_bytes() / (tokens * heads * row_bytes);
+                let parts = (sms / blocks).min(MAX_PARTS_KV).min(room as u32);
+                if parts > 1 {
+                    let rows = (heads * tokens) as u32;
+                    self.run(
+                        to_half,
+                        (rows, 1),
+                        128,
+                        &[Arg::Ptr(q), Arg::I32(head_dim as i32)],
+                    )?;
+                    let part_args = [
+                        Arg::Ptr(q),
+                        Arg::Ptr(keys),
+                        Arg::Ptr(values),
+                        Arg::Ptr(self.attention_parts.ptr()),
+                        Arg::Ptr(pos),
+                        Arg::I32(0),
+                        Arg::I32(heads as i32),
+                        Arg::I32(kv_dim as i32),
+                        Arg::I32(group as i32),
+                        Arg::F32(scale),
+                        Arg::I32(tokens as i32),
+                    ];
+                    self.run_3d(
+                        k.function,
+                        (blocks, parts, 1),
+                        k.threads,
+                        k.shared,
+                        &part_args,
+                    )?;
+                    let combine = [
+                        Arg::Ptr(self.attention_parts.ptr()),
+                        Arg::Ptr(out),
+                        Arg::I32(parts as i32),
+                        Arg::I32(head_dim as i32),
+                    ];
+                    return self.run(self.kernels.attention_combine, (rows, 1), 128, &combine);
+                }
+            }
             let mma = if tokens <= ATTENTION_SHORT {
                 self.kernels.attention_mma_short
             } else {
