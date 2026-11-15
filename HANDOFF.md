@@ -275,6 +275,39 @@ dropped). Shared code, not compiled on a Mac:
   before.
 - `tools/reply_speed.py` loads one server at a time now.
 
+## The prompt attention kernel on Windows (2026-11-15, night)
+
+On the branch `windows/speed-hunt`, uncommitted; all tests pass, no eval or benchmark run
+(PLAN.md's row of that night has the profile, the numbers and what was dropped). CUDA
+only: nothing here changes on the Mac.
+
+- **`q_rows_to_half` lays the queries out differently**: each 32 numbers of a row in the
+  order `attention_mma`'s threads take them. Only `attention_mma` reads them (as before,
+  a caller must not read `q` again after `Gpu::attention` on an f16 cache).
+- **The queries are read two steps ahead** in `attention_mma`. They sit in global memory
+  and mostly miss the L1 cache: reading ~34K tokens is 6.8% faster on Gemma 4 E2B, 2.9% on
+  E4B, about 1% on the Qwens, with the same numbers.
+- **A batch of 9 to 64 tokens with no sliding window** goes to `attention_mma_*_part`:
+  heads that share keys and values fill a block, the context is split into parts and
+  `attention_combine` merges them. 27,000 tokens deep a 16-token batch takes 40% less time
+  (Qwen 3.5 4B 40.7 → 24.0 ms). The Mac has done the same in `attention_tcg` for a while.
+- `tests/prompt_attention_speed_cuda.rs` times a batch's attention for the small models'
+  shapes (the Mac's `prompt_attention_speed.rs` is for the large ones and Metal only).
+- **Shared code, both machines, not compiled on a Mac: Gemma's state at the system
+  turn's end** (`crates/vireo-server/src/main.rs`, `Kept::head`;
+  `Gemma4CudaSession::has_rings`). Where the sliding-window layers keep rings, the
+  server exports the session's state a few tokens before the system turn's end when it
+  reads one, and imports it when `truncate` can't go back (a prompt longer than a ring
+  wrote over the window). A new chat after a long prompt keeps 1,267 of 1,307 tokens
+  where it kept none (Gemma 4 E4B: first token 225 → 59 ms). The Mac's rings had the
+  same cost, so it should gain the same; run the server's tests and the eval there.
+- **CUDA only: `matmul8` reads one side's fragments with `ldmatrix`** (the weights' for
+  Q4_0 and Q8_0, x's for Q4_K and Q5_K): ~3K reads 5% faster on the Gemmas, 2% on the
+  Qwens, the same numbers.
+- **Nsight Compute works here** (`ncu --kernel-name <kernel> --launch-skip <n>
+  --launch-count 1 --set full`; kernels inside a recorded graph don't show, a prompt's
+  batches do). It says what a kernel waits on, which Nsight Systems doesn't.
+
 ## To do, roughly in order
 
 1. **Changes on the Mac:** done 2026-11-12 (write, rename, move, delete and `write_spreadsheet` in `files.rs`, to the Trash; no undo journal yet, and Word and PowerPoint are still the Windows app's only). The original note: `files.rs` makes the four changes (to the Trash, with undo as
