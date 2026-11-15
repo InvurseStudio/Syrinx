@@ -1,0 +1,156 @@
+{"part": "raw", "engine": "vireo", "model": "Llama 3.2 1B", "work": "short", "rep": 0, "prompt_n": 34, "prompt_tps": 3292.0, "gen_n": 128, "gen_tps": 305.2, "time": "11:26:35"}
+{"part": "raw", "engine": "vireo", "model": "Llama 3.2 1B", "work": "medium", "rep": 0, "prompt_n": 2255, "prompt_tps": 13431.8, "gen_n": 64, "gen_tps": 291.0, "time": "11:26:36"}
+{"part": "raw", "engine": "vireo", "model": "Llama 3.2 1B", "work": "long", "rep": 0, "prompt_n": 27065, "prompt_tps": 7609.4, "gen_n": 64, "gen_tps": 141.6, "time": "11:26:40"}
+{"part": "raw", "engine": "llama", "model": "Llama 3.2 1B", "work": "short", "rep": 0, "prompt_n": 34, "prompt_tps": 3426.037887948408, "gen_n": 128, "gen_tps": 289.2707870670903, "time": "11:26:43"}
+{"part": "raw", "engine": "llama", "model": "Llama 3.2 1B", "work": "medium", "rep": 0, "prompt_n": 2252, "prompt_tps": 17027.840367777157, "gen_n": 64, "gen_tps": 266.35099141757917, "time": "11:26:43"}
+{"part": "raw", "engine": "llama", "model": "Llama 3.2 1B", "work": "long", "rep": 0, "prompt_n": 27026, "prompt_tps": 9526.444820044097, "gen_n": 64, "gen_tps": 142.30952547679337, "time": "11:26:46"}
+{"part": "memory", "engine": "llama", "model": "Llama 3.2 1B", "rep": 0, "after": "raw, 36,000-token context", "gpu_mb": 2706, "time": "11:26:46"}
+{"part": "raw", "engine": "llama", "model": "Llama 3.2 1B", "work": "short", "rep": 1, "prompt_n": 34, "prompt_tps": 3830.985915492958, "gen_n": 128, "gen_tps": 297.0996523700131, "time": "11:26:52"}
+{"part": "raw", "engine": "llama", "model": "Llama 3.2 1B", "work": "medium", "rep": 1, "prompt_n": 2252, "prompt_tps": 16925.20442520442, "gen_n": 64, "gen_tps": 271.37743432019954, "time": "11:26:52"}
+{"part": "raw", "engine": "llama", "model": "Llama 3.2 1B", "work": "long", "rep": 1, "prompt_n": 27026, "prompt_tps": 9511.140203624129, "gen_n": 64, "gen_tps": 136.23713045678363, "time": "11:26:55"}
+{"part": "memory", "engine": "llama", "model": "Llama 3.2 1B", "rep": 1, "after": "raw, 36,000-token context", "gpu_mb": 2706, "time": "11:26:55"}
+{"part": "raw", "engine": "vireo", "model": "Llama 3.2 1B", "work": "short", "rep": 1, "prompt_n": 34, "prompt_tps": 3259.1, "gen_n": 128, "gen_tps": 319.4, "time": "11:27:01"}
+{"part": "raw", "engine": "vireo", "model": "Llama 3.2 1B", "work": "medium", "rep": 1, "prompt_n": 2255, "prompt_tps": 13388.3, "gen_n": 64, "gen_tps": 292.3, "time": "11:27:02"}
+{"part": "raw", "engine": "vireo", "model": "Llama 3.2 1B", "work": "long", "rep": 1, "prompt_n": 27065, "prompt_tps": 7576.2, "gen_n": 64, "gen_tps": 161.4, "time": "11:27:06"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 0.8B", "work": "short", "rep": 0, "prompt_n": 33, "prompt_tps": 3707.9, "gen_n": 128, "gen_tps": 355.9, "time": "11:27:08"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 0.8B", "work": "medium", "rep": 0, "prompt_n": 2312, "prompt_tps": 15721.5, "gen_n": 64, "gen_tps": 323.3, "time": "11:27:09"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 0.8B", "work": "long", "rep": 0, "prompt_n": 29166, "prompt_tps": 10397.5, "gen_n": 64, "gen_tps": 207.1, "time": "11:27:13"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 0.8B", "work": "short", "rep": 0, "prompt_n": 33, "prompt_tps": 1065.9259019994188, "gen_n": 128, "gen_tps": 301.4543391622418, "time": "11:27:15"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 0.8B", "work": "medium", "rep": 0, "prompt_n": 2312, "prompt_tps": 14683.187369410449, "gen_n": 64, "gen_tps": 310.80261074193027, "time": "11:27:16"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 0.8B", "work": "long", "rep": 0, "prompt_n": 29166, "prompt_tps": 12900.554795511212, "gen_n": 64, "gen_tps": 198.9094709323803, "time": "11:27:18"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 0.8B", "rep": 0, "after": "raw, 36,000-token context", "gpu_mb": 1758, "time": "11:27:18"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 0.8B", "work": "short", "rep": 1, "prompt_n": 33, "prompt_tps": 1039.17369945837, "gen_n": 128, "gen_tps": 310.1070479762463, "time": "11:27:24"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 0.8B", "work": "medium", "rep": 1, "prompt_n": 2312, "prompt_tps": 14228.743045640293, "gen_n": 64, "gen_tps": 293.3917012061659, "time": "11:27:24"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 0.8B", "work": "long", "rep": 1, "prompt_n": 29166, "prompt_tps": 12887.159368022825, "gen_n": 64, "gen_tps": 209.44009680786695, "time": "11:27:27"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 0.8B", "rep": 1, "after": "raw, 36,000-token context", "gpu_mb": 1757, "time": "11:27:27"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 0.8B", "work": "short", "rep": 1, "prompt_n": 33, "prompt_tps": 3355.5, "gen_n": 128, "gen_tps": 320.9, "time": "11:27:32"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 0.8B", "work": "medium", "rep": 1, "prompt_n": 2312, "prompt_tps": 14702.2, "gen_n": 64, "gen_tps": 310.1, "time": "11:27:33"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 0.8B", "work": "long", "rep": 1, "prompt_n": 29166, "prompt_tps": 10517.5, "gen_n": 64, "gen_tps": 211.8, "time": "11:27:37"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E2B", "work": "short", "rep": 0, "prompt_n": 34, "prompt_tps": 2603.6, "gen_n": 128, "gen_tps": 163.5, "time": "11:27:42"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E2B", "work": "medium", "rep": 0, "prompt_n": 2452, "prompt_tps": 17196.2, "gen_n": 64, "gen_tps": 165.1, "time": "11:27:44"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E2B", "work": "long", "rep": 0, "prompt_n": 33915, "prompt_tps": 9545.8, "gen_n": 64, "gen_tps": 115.5, "time": "11:27:50"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E2B", "work": "short", "rep": 0, "prompt_n": 34, "prompt_tps": 1211.6892373485389, "gen_n": 128, "gen_tps": 156.01007309133345, "time": "11:27:54"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E2B", "work": "medium", "rep": 0, "prompt_n": 2329, "prompt_tps": 15714.29535318368, "gen_n": 64, "gen_tps": 152.20185348034906, "time": "11:27:54"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E2B", "work": "long", "rep": 0, "prompt_n": 30948, "prompt_tps": 12240.573061958705, "gen_n": 64, "gen_tps": 124.05653039483451, "time": "11:27:57"}
+{"part": "memory", "engine": "llama", "model": "Gemma 4 E2B", "rep": 0, "after": "raw, 36,000-token context", "gpu_mb": 2538, "time": "11:27:57"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E2B", "work": "short", "rep": 1, "prompt_n": 34, "prompt_tps": 1174.6821448313985, "gen_n": 128, "gen_tps": 156.52673341032312, "time": "11:28:04"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E2B", "work": "medium", "rep": 1, "prompt_n": 2329, "prompt_tps": 15976.238004102099, "gen_n": 64, "gen_tps": 151.43611919705205, "time": "11:28:05"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E2B", "work": "long", "rep": 1, "prompt_n": 30948, "prompt_tps": 12307.873412002762, "gen_n": 64, "gen_tps": 122.53281156398546, "time": "11:28:08"}
+{"part": "memory", "engine": "llama", "model": "Gemma 4 E2B", "rep": 1, "after": "raw, 36,000-token context", "gpu_mb": 2533, "time": "11:28:08"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E2B", "work": "short", "rep": 1, "prompt_n": 34, "prompt_tps": 2696.6, "gen_n": 128, "gen_tps": 170.2, "time": "11:28:15"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E2B", "work": "medium", "rep": 1, "prompt_n": 2452, "prompt_tps": 17254.0, "gen_n": 64, "gen_tps": 171.7, "time": "11:28:17"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E2B", "work": "long", "rep": 1, "prompt_n": 33915, "prompt_tps": 9636.2, "gen_n": 64, "gen_tps": 122.4, "time": "11:28:23"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "list", "rep": 0, "prompt_n": 340, "prompt_tps": 11333.3, "gen_n": 377, "gen_tps": 267.4, "guessed_share": 0.719, "guesses": {"chat": [116, 234], "draft model": [155, 180]}, "time": "11:28:27"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "code", "rep": 0, "prompt_n": 515, "prompt_tps": 12875.0, "gen_n": 400, "gen_tps": 493.8, "guessed_share": 0.973, "guesses": {"chat": [376, 399], "draft model": [13, 13]}, "time": "11:28:28"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "story", "rep": 0, "prompt_n": 38, "prompt_tps": 1900.0, "gen_n": 400, "gen_tps": 189.6, "guessed_share": 0.302, "guesses": {"chat": [8, 12], "draft model": [113, 227]}, "time": "11:28:30"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "explain", "rep": 0, "prompt_n": 36, "prompt_tps": 3600.0, "gen_n": 400, "gen_tps": 227.3, "guessed_share": 0.482, "guesses": {"chat": [1, 7], "draft model": [192, 316]}, "time": "11:28:32"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "list", "rep": 1, "prompt_n": 22, "prompt_tps": 2200.0, "gen_n": 400, "gen_tps": 264.9, "guessed_share": 0.698, "guesses": {"chat": [116, 240], "draft model": [163, 197]}, "time": "11:28:33"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "code", "rep": 1, "prompt_n": 22, "prompt_tps": 1100.0, "gen_n": 400, "gen_tps": 500.0, "guessed_share": 0.973, "guesses": {"chat": [376, 399], "draft model": [13, 13]}, "time": "11:28:34"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "story", "rep": 1, "prompt_n": 1274, "prompt_tps": 15925.0, "gen_n": 400, "gen_tps": 190.5, "guessed_share": 0.302, "guesses": {"chat": [8, 12], "draft model": [113, 213]}, "time": "11:28:37"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E2B", "work": "explain", "rep": 1, "prompt_n": 36, "prompt_tps": 3600.0, "gen_n": 400, "gen_tps": 226.0, "guessed_share": 0.482, "guesses": {"chat": [1, 7], "draft model": [192, 316]}, "time": "11:28:38"}
+{"part": "memory", "engine": "vireo", "model": "Gemma 4 E2B", "after": "replies, the server's own context", "context": 32768, "gpu_mb": 3180, "time": "11:28:39"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "list", "rep": 0, "prompt_n": 334, "prompt_tps": 4019.4, "gen_n": 400, "gen_tps": 154.3, "time": "11:28:47"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "code", "rep": 0, "prompt_n": 509, "prompt_tps": 9330.4, "gen_n": 400, "gen_tps": 153.0, "time": "11:28:50"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "story", "rep": 0, "prompt_n": 32, "prompt_tps": 947.3, "gen_n": 400, "gen_tps": 154.7, "time": "11:28:52"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "explain", "rep": 0, "prompt_n": 30, "prompt_tps": 900.9, "gen_n": 400, "gen_tps": 154.1, "time": "11:28:55"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "list", "rep": 1, "prompt_n": 334, "prompt_tps": 7820.4, "gen_n": 400, "gen_tps": 153.8, "time": "11:28:58"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "code", "rep": 1, "prompt_n": 509, "prompt_tps": 9709.8, "gen_n": 400, "gen_tps": 153.8, "time": "11:29:00"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "story", "rep": 1, "prompt_n": 32, "prompt_tps": 1042.9, "gen_n": 400, "gen_tps": 154.8, "time": "11:29:03"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E2B", "work": "explain", "rep": 1, "prompt_n": 30, "prompt_tps": 904.1, "gen_n": 400, "gen_tps": 155.6, "time": "11:29:06"}
+{"part": "memory", "engine": "llama", "model": "Gemma 4 E2B", "after": "replies, 8,192-token context", "gpu_mb": 2364, "time": "11:29:06"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E4B", "work": "short", "rep": 0, "prompt_n": 34, "prompt_tps": 1436.5, "gen_n": 128, "gen_tps": 83.3, "time": "11:29:16"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E4B", "work": "medium", "rep": 0, "prompt_n": 2452, "prompt_tps": 6307.8, "gen_n": 64, "gen_tps": 88.8, "time": "11:29:20"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E4B", "work": "long", "rep": 0, "prompt_n": 33915, "prompt_tps": 4452.7, "gen_n": 64, "gen_tps": 64.7, "time": "11:29:31"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E4B", "work": "short", "rep": 0, "prompt_n": 34, "prompt_tps": 841.4591892293223, "gen_n": 128, "gen_tps": 91.12081472053175, "time": "11:29:36"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E4B", "work": "medium", "rep": 0, "prompt_n": 2329, "prompt_tps": 6248.624980548506, "gen_n": 64, "gen_tps": 86.60389030173894, "time": "11:29:38"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E4B", "work": "long", "rep": 0, "prompt_n": 30948, "prompt_tps": 5251.846113509996, "gen_n": 64, "gen_tps": 70.77220337459839, "time": "11:29:44"}
+{"part": "memory", "engine": "llama", "model": "Gemma 4 E4B", "rep": 0, "after": "raw, 36,000-token context", "gpu_mb": 4328, "time": "11:29:44"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E4B", "work": "short", "rep": 1, "prompt_n": 34, "prompt_tps": 838.2436330465225, "gen_n": 128, "gen_tps": 91.0483029169869, "time": "11:29:52"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E4B", "work": "medium", "rep": 1, "prompt_n": 2329, "prompt_tps": 6221.450514224655, "gen_n": 64, "gen_tps": 85.87704315798514, "time": "11:29:53"}
+{"part": "raw", "engine": "llama", "model": "Gemma 4 E4B", "work": "long", "rep": 1, "prompt_n": 30948, "prompt_tps": 5252.692921644954, "gen_n": 64, "gen_tps": 71.1779958310031, "time": "11:30:00"}
+{"part": "memory", "engine": "llama", "model": "Gemma 4 E4B", "rep": 1, "after": "raw, 36,000-token context", "gpu_mb": 4331, "time": "11:30:00"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E4B", "work": "short", "rep": 1, "prompt_n": 34, "prompt_tps": 1416.2, "gen_n": 128, "gen_tps": 89.9, "time": "11:30:11"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E4B", "work": "medium", "rep": 1, "prompt_n": 2452, "prompt_tps": 6365.1, "gen_n": 64, "gen_tps": 86.9, "time": "11:30:14"}
+{"part": "raw", "engine": "vireo", "model": "Gemma 4 E4B", "work": "long", "rep": 1, "prompt_n": 33915, "prompt_tps": 4405.2, "gen_n": 64, "gen_tps": 67.3, "time": "11:30:26"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "list", "rep": 0, "prompt_n": 340, "prompt_tps": 4857.1, "gen_n": 400, "gen_tps": 170.2, "guessed_share": 0.685, "guesses": {"chat": [77, 210], "draft model": [197, 230]}, "time": "11:30:31"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "code", "rep": 0, "prompt_n": 515, "prompt_tps": 5150.0, "gen_n": 400, "gen_tps": 333.3, "guessed_share": 0.973, "guesses": {"chat": [376, 399], "draft model": [13, 13]}, "time": "11:30:33"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "story", "rep": 0, "prompt_n": 38, "prompt_tps": 1266.7, "gen_n": 400, "gen_tps": 114.0, "guessed_share": 0.31, "guesses": {"chat": [7, 9], "draft model": [117, 215]}, "time": "11:30:36"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "explain", "rep": 0, "prompt_n": 36, "prompt_tps": 1800.0, "gen_n": 400, "gen_tps": 159.4, "guessed_share": 0.568, "guesses": {"chat": [23, 55], "draft model": [204, 272]}, "time": "11:30:39"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "list", "rep": 1, "prompt_n": 22, "prompt_tps": 1100.0, "gen_n": 400, "gen_tps": 168.8, "guessed_share": 0.667, "guesses": {"chat": [63, 199], "draft model": [204, 241]}, "time": "11:30:42"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "code", "rep": 1, "prompt_n": 22, "prompt_tps": 733.3, "gen_n": 400, "gen_tps": 336.1, "guessed_share": 0.973, "guesses": {"chat": [376, 399], "draft model": [13, 13]}, "time": "11:30:43"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "story", "rep": 1, "prompt_n": 1274, "prompt_tps": 5790.9, "gen_n": 400, "gen_tps": 117.6, "guessed_share": 0.328, "guesses": {"chat": [0, 3], "draft model": [131, 216]}, "time": "11:30:47"}
+{"part": "replies", "engine": "vireo", "model": "Gemma 4 E4B", "work": "explain", "rep": 1, "prompt_n": 36, "prompt_tps": 1800.0, "gen_n": 400, "gen_tps": 160.0, "guessed_share": 0.568, "guesses": {"chat": [23, 55], "draft model": [204, 272]}, "time": "11:30:49"}
+{"part": "memory", "engine": "vireo", "model": "Gemma 4 E4B", "after": "replies, the server's own context", "context": 32768, "gpu_mb": 6021, "time": "11:30:49"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "list", "rep": 0, "prompt_n": 334, "prompt_tps": 2611.6, "gen_n": 400, "gen_tps": 89.9, "time": "11:31:00"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "code", "rep": 0, "prompt_n": 509, "prompt_tps": 4424.9, "gen_n": 400, "gen_tps": 89.2, "time": "11:31:04"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "story", "rep": 0, "prompt_n": 32, "prompt_tps": 608.2, "gen_n": 400, "gen_tps": 89.7, "time": "11:31:09"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "explain", "rep": 0, "prompt_n": 30, "prompt_tps": 588.2, "gen_n": 400, "gen_tps": 91.1, "time": "11:31:13"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "list", "rep": 1, "prompt_n": 334, "prompt_tps": 3703.3, "gen_n": 400, "gen_tps": 89.6, "time": "11:31:18"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "code", "rep": 1, "prompt_n": 509, "prompt_tps": 4466.3, "gen_n": 400, "gen_tps": 89.8, "time": "11:31:23"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "story", "rep": 1, "prompt_n": 32, "prompt_tps": 623.3, "gen_n": 400, "gen_tps": 90.5, "time": "11:31:27"}
+{"part": "replies", "engine": "llama", "model": "Gemma 4 E4B", "work": "explain", "rep": 1, "prompt_n": 30, "prompt_tps": 579.0, "gen_n": 400, "gen_tps": 90.8, "time": "11:31:32"}
+{"part": "memory", "engine": "llama", "model": "Gemma 4 E4B", "after": "replies, 8,192-token context", "gpu_mb": 3920, "time": "11:31:32"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "short", "rep": 0, "prompt_n": 33, "prompt_tps": 1110.9, "gen_n": 128, "gen_tps": 87.5, "time": "11:31:43"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "medium", "rep": 0, "prompt_n": 2312, "prompt_tps": 3436.2, "gen_n": 64, "gen_tps": 87.8, "time": "11:31:47"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "long", "rep": 0, "prompt_n": 29166, "prompt_tps": 2638.5, "gen_n": 64, "gen_tps": 66.0, "time": "11:32:01"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 4B", "work": "short", "rep": 0, "prompt_n": 33, "prompt_tps": 612.2221809951393, "gen_n": 128, "gen_tps": 89.72620789491718, "time": "11:32:05"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 4B", "work": "medium", "rep": 0, "prompt_n": 2312, "prompt_tps": 3935.9019974021685, "gen_n": 64, "gen_tps": 80.09092226603917, "time": "11:32:07"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 4B", "work": "long", "rep": 0, "prompt_n": 29166, "prompt_tps": 3185.114726814656, "gen_n": 64, "gen_tps": 70.76449239955653, "time": "11:32:17"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 4B", "rep": 0, "after": "raw, 36,000-token context", "gpu_mb": 4725, "time": "11:32:17"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 4B", "work": "short", "rep": 1, "prompt_n": 33, "prompt_tps": 612.7450980392157, "gen_n": 128, "gen_tps": 90.59405446200685, "time": "11:32:25"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 4B", "work": "medium", "rep": 1, "prompt_n": 2312, "prompt_tps": 3969.337213394796, "gen_n": 64, "gen_tps": 81.30007859007597, "time": "11:32:26"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 4B", "work": "long", "rep": 1, "prompt_n": 29166, "prompt_tps": 3197.7647442435086, "gen_n": 64, "gen_tps": 70.58720713311739, "time": "11:32:37"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 4B", "rep": 1, "after": "raw, 36,000-token context", "gpu_mb": 4725, "time": "11:32:37"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "short", "rep": 1, "prompt_n": 33, "prompt_tps": 1246.9, "gen_n": 128, "gen_tps": 91.1, "time": "11:32:45"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "medium", "rep": 1, "prompt_n": 2312, "prompt_tps": 3409.8, "gen_n": 64, "gen_tps": 83.1, "time": "11:32:48"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "long", "rep": 1, "prompt_n": 29166, "prompt_tps": 2629.0, "gen_n": 64, "gen_tps": 68.1, "time": "11:33:02"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "list", "rep": 0, "prompt_n": 359, "prompt_tps": 2761.5, "gen_n": 318, "gen_tps": 94.9, "guessed_share": 0.314, "guesses": {"chat": [100, 225]}, "time": "11:33:08"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "code", "rep": 0, "prompt_n": 486, "prompt_tps": 2557.9, "gen_n": 1019, "gen_tps": 95.6, "guessed_share": 0.211, "guesses": {"chat": [215, 355]}, "time": "11:33:19"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "story", "rep": 0, "prompt_n": 54, "prompt_tps": 771.4, "gen_n": 400, "gen_tps": 87.1, "guessed_share": 0.052, "guesses": {"chat": [21, 89]}, "time": "11:33:24"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "explain", "rep": 0, "prompt_n": 52, "prompt_tps": 1040.0, "gen_n": 400, "gen_tps": 87.3, "guessed_share": 0.033, "guesses": {"chat": [13, 91]}, "time": "11:33:28"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "list", "rep": 1, "prompt_n": 26, "prompt_tps": 650.0, "gen_n": 318, "gen_tps": 94.9, "guessed_share": 0.314, "guesses": {"chat": [100, 225]}, "time": "11:33:32"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "code", "rep": 1, "prompt_n": 26, "prompt_tps": 433.3, "gen_n": 1019, "gen_tps": 97.9, "guessed_share": 0.211, "guesses": {"chat": [215, 355]}, "time": "11:33:42"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "story", "rep": 1, "prompt_n": 1510, "prompt_tps": 2903.8, "gen_n": 400, "gen_tps": 86.8, "guessed_share": 0.018, "guesses": {"chat": [7, 64]}, "time": "11:33:47"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 4B", "work": "explain", "rep": 1, "prompt_n": 49, "prompt_tps": 980.0, "gen_n": 400, "gen_tps": 87.0, "guessed_share": 0.028, "guesses": {"chat": [11, 87]}, "time": "11:33:52"}
+{"part": "memory", "engine": "vireo", "model": "Qwen 3.5 4B", "after": "replies, the server's own context", "context": 32768, "gpu_mb": 5651, "time": "11:33:52"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "list", "rep": 0, "prompt_n": 332, "prompt_tps": 2830.8, "gen_n": 400, "gen_tps": 90.8, "time": "11:34:03"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "code", "rep": 0, "prompt_n": 459, "prompt_tps": 3115.5, "gen_n": 400, "gen_tps": 89.7, "time": "11:34:08"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "story", "rep": 0, "prompt_n": 27, "prompt_tps": 508.5, "gen_n": 400, "gen_tps": 90.8, "time": "11:34:13"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "explain", "rep": 0, "prompt_n": 25, "prompt_tps": 495.3, "gen_n": 400, "gen_tps": 90.6, "time": "11:34:17"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "list", "rep": 1, "prompt_n": 332, "prompt_tps": 2843.7, "gen_n": 400, "gen_tps": 90.7, "time": "11:34:22"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "code", "rep": 1, "prompt_n": 459, "prompt_tps": 3112.6, "gen_n": 400, "gen_tps": 90.0, "time": "11:34:26"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "story", "rep": 1, "prompt_n": 27, "prompt_tps": 538.9, "gen_n": 400, "gen_tps": 91.1, "time": "11:34:31"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 4B", "work": "explain", "rep": 1, "prompt_n": 25, "prompt_tps": 441.9, "gen_n": 400, "gen_tps": 91.1, "time": "11:34:35"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 4B", "after": "replies, 8,192-token context", "gpu_mb": 3851, "time": "11:34:35"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "short", "rep": 0, "prompt_n": 33, "prompt_tps": 726.8, "gen_n": 128, "gen_tps": 56.7, "time": "11:34:52"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "medium", "rep": 0, "prompt_n": 2312, "prompt_tps": 1926.5, "gen_n": 64, "gen_tps": 50.7, "time": "11:34:57"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "long", "rep": 0, "prompt_n": 29166, "prompt_tps": 1686.7, "gen_n": 64, "gen_tps": 45.7, "time": "11:35:19"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 9B", "work": "short", "rep": 0, "prompt_n": 33, "prompt_tps": 424.58474325489243, "gen_n": 128, "gen_tps": 56.42280316483056, "time": "11:35:26"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 9B", "work": "medium", "rep": 0, "prompt_n": 2312, "prompt_tps": 2441.8941155843963, "gen_n": 64, "gen_tps": 54.99887383258343, "time": "11:35:28"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 9B", "work": "long", "rep": 0, "prompt_n": 29166, "prompt_tps": 2088.2213746634006, "gen_n": 64, "gen_tps": 46.03731945880573, "time": "11:35:43"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 9B", "rep": 0, "after": "raw, 36,000-token context", "gpu_mb": 7034, "time": "11:35:44"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 9B", "work": "short", "rep": 1, "prompt_n": 33, "prompt_tps": 427.15681832891073, "gen_n": 128, "gen_tps": 56.29784485643828, "time": "11:35:54"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 9B", "work": "medium", "rep": 1, "prompt_n": 2312, "prompt_tps": 2438.1755866069075, "gen_n": 64, "gen_tps": 54.9163179916318, "time": "11:35:56"}
+{"part": "raw", "engine": "llama", "model": "Qwen 3.5 9B", "work": "long", "rep": 1, "prompt_n": 29166, "prompt_tps": 2094.613082606007, "gen_n": 64, "gen_tps": 45.84075213759793, "time": "11:36:12"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 9B", "rep": 1, "after": "raw, 36,000-token context", "gpu_mb": 7030, "time": "11:36:12"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "short", "rep": 1, "prompt_n": 33, "prompt_tps": 733.8, "gen_n": 128, "gen_tps": 56.8, "time": "11:36:24"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "medium", "rep": 1, "prompt_n": 2312, "prompt_tps": 1942.2, "gen_n": 64, "gen_tps": 50.2, "time": "11:36:30"}
+{"part": "raw", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "long", "rep": 1, "prompt_n": 29166, "prompt_tps": 1691.0, "gen_n": 64, "gen_tps": 46.4, "time": "11:36:51"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "list", "rep": 0, "prompt_n": 359, "prompt_tps": 1560.9, "gen_n": 376, "gen_tps": 56.5, "guessed_share": 0.0, "guesses": {}, "time": "11:46:13"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "code", "rep": 0, "prompt_n": 486, "prompt_tps": 1620.0, "gen_n": 400, "gen_tps": 56.7, "guessed_share": 0.0, "guesses": {}, "time": "11:46:21"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "story", "rep": 0, "prompt_n": 54, "prompt_tps": 540.0, "gen_n": 400, "gen_tps": 57.0, "guessed_share": 0.0, "guesses": {}, "time": "11:46:28"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "explain", "rep": 0, "prompt_n": 52, "prompt_tps": 650.0, "gen_n": 400, "gen_tps": 56.8, "guessed_share": 0.0, "guesses": {}, "time": "11:46:35"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "list", "rep": 1, "prompt_n": 26, "prompt_tps": 433.3, "gen_n": 376, "gen_tps": 103.9, "guessed_share": 0.769, "guesses": {"chat": [289, 377]}, "time": "11:46:39"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "code", "rep": 1, "prompt_n": 26, "prompt_tps": 325.0, "gen_n": 400, "gen_tps": 174.7, "guessed_share": 0.96, "guesses": {"chat": [384, 410]}, "time": "11:46:41"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "story", "rep": 1, "prompt_n": 1510, "prompt_tps": 1797.6, "gen_n": 400, "gen_tps": 54.4, "guessed_share": 0.033, "guesses": {"chat": [13, 68]}, "time": "11:46:49"}
+{"part": "replies", "engine": "vireo", "model": "Qwen 3.5 9B", "work": "explain", "rep": 1, "prompt_n": 49, "prompt_tps": 612.5, "gen_n": 400, "gen_tps": 53.6, "guessed_share": 0.098, "guesses": {"chat": [39, 157]}, "time": "11:46:57"}
+{"part": "memory", "engine": "vireo", "model": "Qwen 3.5 9B", "after": "replies, the server's own context", "context": 15360, "gpu_mb": 7426, "time": "11:46:57"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "list", "rep": 0, "prompt_n": 332, "prompt_tps": 1887.2, "gen_n": 400, "gen_tps": 57.0, "time": "11:47:12"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "code", "rep": 0, "prompt_n": 459, "prompt_tps": 2034.1, "gen_n": 400, "gen_tps": 57.0, "time": "11:47:19"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "story", "rep": 0, "prompt_n": 27, "prompt_tps": 400.8, "gen_n": 400, "gen_tps": 57.3, "time": "11:47:26"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "explain", "rep": 0, "prompt_n": 25, "prompt_tps": 354.0, "gen_n": 400, "gen_tps": 56.9, "time": "11:47:33"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "list", "rep": 1, "prompt_n": 332, "prompt_tps": 1835.7, "gen_n": 400, "gen_tps": 56.8, "time": "11:47:41"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "code", "rep": 1, "prompt_n": 459, "prompt_tps": 2066.6, "gen_n": 400, "gen_tps": 56.8, "time": "11:47:48"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "story", "rep": 1, "prompt_n": 27, "prompt_tps": 386.7, "gen_n": 400, "gen_tps": 57.0, "time": "11:47:55"}
+{"part": "replies", "engine": "llama", "model": "Qwen 3.5 9B", "work": "explain", "rep": 1, "prompt_n": 25, "prompt_tps": 333.1, "gen_n": 400, "gen_tps": 57.2, "time": "11:48:02"}
+{"part": "memory", "engine": "llama", "model": "Qwen 3.5 9B", "after": "replies, 8,192-token context", "gpu_mb": 6128, "time": "11:48:02"}

@@ -25,6 +25,13 @@ sampled every 2 s).
 
   ENGINES=vireo,vireo-plain,llama,mlx MODELS=e2b,e4b REPS=2 python3 -I bench.py
 Results: $OUT (default ./results.jsonl); server logs in $LOGS (default $TMPDIR).
+
+On Windows (an 8 GB NVIDIA GPU; 15 Nov) the same script runs the four small models' Q4
+GGUFs against reference/llama.cpp-b12262 (CUDA), in the contexts in WIN_MODELS (CONTEXT=
+overrides them all), with no large or xlarge rows and no mlx-vlm. Memory is the whole
+GPU's in use (nvidia-smi), read between workloads, in place of the process's peak. Run it
+in Python's UTF-8 mode, as the Mac reads the prompts:
+  ENGINES=vireo,llama MODELS=e4b REPS=1 python -X utf8 -I bench.py   (Git Bash)
 """
 import ast
 import json
@@ -43,6 +50,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+WIN = os.name == "nt"
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 PROMPTS = HERE / "prompts"
@@ -55,7 +63,7 @@ GG = Path.home() / "Library/Application Support/InvurseChat/Models"
 SM = REPO / "models"
 MX = REPO / "models/mlx"
 VENV_PY = Path.home() / ".venvs/mlxbench/bin/python"
-LLAMA_DIR = REPO / "reference/llama-b12228"
+LLAMA_DIR = REPO / ("reference/llama.cpp-b12262" if WIN else "reference/llama-b12228")
 
 # name, key, gguf, mlx folder, context (tokens), large workload?
 MODELS = [
@@ -69,6 +77,18 @@ MODELS = [
     ("Qwen 3.8 27B", "q27", GG / "Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf", GG / "Qwen3.8-27B-MLX-6bit", 131072, True),
     ("Muse Glimmer 30B", "muse", GG / "Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-Q6_K.gguf", GG / "Muse-Glimmer-30B-6bit", 131072, True),
 ]
+if WIN:
+    # The Q4 files on this PC, no MLX folder, no large or xlarge workload (an 8 GB GPU).
+    # Contexts: what each model holds on the GPU without spilling into the PC's memory,
+    # measured 15 Nov; the same for both engines.
+    WIN_MODELS = {"e2b": ("gemma-4-E2B_q4_0-it.gguf", 65536), "e4b": ("gemma-4-E4B_q4_0-it.gguf", 65536),
+                  "q4b": ("Qwen3.5-4B-Q4_K_M.gguf", 65536), "q9b": ("Qwen3.5-9B-Q4_K_M.gguf", 32768)}
+    # Qwen 3.5 9B's caches past 32,768 spill into the PC's memory on Vireo (it read 145 tokens/s,
+    # not 1,650), so its longtools log is cut to its first half, at a line's end, for both
+    # engines (inventory-sync still logs the most ERROR lines there: 24, card-reader 13).
+    WIN_LOG_SHARE = {"q9b": 0.5}
+    MODELS = [(name, key, SM / WIN_MODELS[key][0], None, int(os.environ.get("CONTEXT", WIN_MODELS[key][1])), False)
+              for name, key, *_ in MODELS if key in WIN_MODELS]
 WORKLOADS = ["short", "medium", "long", "large", "xlarge", "multiturn", "tools", "skill", "longtools"]
 SYSTEM = "You are a helpful assistant for Harbor Bikes, a small bike shop. Be concise and accurate."
 TOKEN = "bench"
@@ -108,7 +128,7 @@ class Desk:
         p = (p or "").strip().strip("'\"")
         q = Path(p) if p.startswith("/") else self.root.parent / p
         q = q.resolve()
-        if not str(q).startswith(str(self.root.resolve().parent)):
+        if not os.path.normcase(str(q)).startswith(os.path.normcase(str(self.root.resolve().parent))):
             raise ValueError(f"{p}: no such file or folder")
         return q
 
@@ -226,6 +246,24 @@ class MemWatch:
 
     def stop(self):
         self.stop_ = True
+
+
+class GpuWatch(MemWatch):
+    """Windows: the GPU's memory in use (nvidia-smi), read when asked (between workloads,
+    not while a request runs), as peak_total; there's no process footprint to sample."""
+
+    def __init__(self, pid):
+        self.pid, self.peak_rss, self.peak_fp, self.peak_total, self.stop_ = pid, 0, 0, 0, True
+
+    def sample(self):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True).stdout
+            used = int(out.split()[0]) << 20
+        except Exception:
+            used = 0
+        self.peak_total = max(self.peak_total, used)
+        return 0, 0, used
 
 
 # ---- HTTP -------------------------------------------------------------------------------
@@ -487,6 +525,12 @@ def prompt(name):
     return (PROMPTS / f"{name}.txt").read_text()
 
 
+def incident_log(key):
+    text = prompt("incident-log")
+    share = WIN_LOG_SHARE.get(key) if WIN else None
+    return text[:text.rindex("\n", 0, int(len(text) * share))] if share else text
+
+
 def run_workload(eng, w, mem):
     desk = Desk()
     rows = []
@@ -507,12 +551,12 @@ def run_workload(eng, w, mem):
             msgs.append({"role": "assistant", "content": r["text"]})
             rows.append(r)
     elif w == "tools":
-        q = (nonce() + f"Our back-office folder is {desk.root}. Using the quarterly sales files in its "
+        q = (nonce() + f"Our back-office folder is {desk.root.as_posix()}. Using the quarterly sales files in its "
              "sales folder, work out each quarter's revenue for 2026 (units times unit price), say which "
              "quarter was best, and give the year's total.")
         rows.append(eng.chat([{"role": "user", "content": q}], 1024, True, desk))
     elif w == "skill":
-        q = (nonce() + f"Use the weekly-report skill for this: the notes are in {desk.root}/notes.")
+        q = (nonce() + f"Use the weekly-report skill for this: the notes are in {desk.root.as_posix()}/notes.")
         msgs = [{"role": "user", "content": q}]
         if not isinstance(eng, Vireo):
             # Vireo puts the named skill's instructions in for itself; the others get the same text.
@@ -522,8 +566,8 @@ def run_workload(eng, w, mem):
         r["wrote"] = list(desk.written.values())
         rows.append(r)
     elif w == "longtools":
-        q = (nonce() + "Here is yesterday's point-of-sale incident log:\n\n<log>\n" + prompt("incident-log") +
-             f"\n</log>\n\nWhich component logged the most ERROR lines? Then check our folder {desk.root} "
+        q = (nonce() + "Here is yesterday's point-of-sale incident log:\n\n<log>\n" + incident_log(getattr(eng, "key", "")) +
+             f"\n</log>\n\nWhich component logged the most ERROR lines? Then check our folder {desk.root.as_posix()} "
              "(the README and suppliers.md) and tell me whether any supplier is involved with that "
              "component. Keep the answer short.")
         rows.append(eng.chat([{"role": "user", "content": q}], 512, True, desk))
@@ -553,10 +597,11 @@ def block(kind, model, rep, workloads):
     name, key = model[0], model[1]
     try:
         eng = start(kind, model)
+        eng.key = key
     except Exception as e:
         record(engine=kind, model=name, rep=rep, error=f"start: {e!r}")
         return
-    mem = MemWatch(eng.pid)
+    mem = (GpuWatch if WIN else MemWatch)(eng.pid)
     try:
         time.sleep(2)
         idle_rss, idle_fp, idle_total = mem.reset()
@@ -578,6 +623,8 @@ def block(kind, model, rep, workloads):
                     r.pop("text_full", None)
                     r["text"] = (r.get("text") or "")[:600]
                 time.sleep(2.2)
+                if WIN:
+                    mem.sample()
                 record(engine=kind, model=name, rep=rep, work=w, wall=round(time.time() - t, 2),
                        peak_rss=mem.peak_rss, peak_fp=mem.peak_fp, peak_total=mem.peak_total, rows=rows)
             except Exception as e:
