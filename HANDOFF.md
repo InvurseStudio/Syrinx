@@ -310,6 +310,10 @@ only: nothing here changes on the Mac.
   reply once too few of them were taken: a round's check costs each guess a pass over
   the context there. `guesses_pay` is always true on the Mac; worth measuring there with
   the same script idea (a 200-token reply after a long prompt, `--mtp off`, `--lookup 0`).
+- **CUDA only: the K-quants' 8-bit products take tiles of 128 tokens** in batches of
+  128 or more (`matmul8_t128_*`, `WIDE_TOKENS` in `src/cuda/mod.rs`), the rest of a
+  batch going to the smaller tiles. The Qwens read 7-9% faster at ~2.3K and ~30K tokens,
+  with the same numbers.
 - **Nsight Compute works here** (`ncu --kernel-name <kernel> --launch-skip <n>
   --launch-count 1 --set full`; kernels inside a recorded graph don't show, a prompt's
   batches do). It says what a kernel waits on, which Nsight Systems doesn't.

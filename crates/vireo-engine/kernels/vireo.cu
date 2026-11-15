@@ -1179,7 +1179,9 @@ __device__ __forceinline__ void ldmatrix_x4_bytes(u32 (&r)[4], const u8* p) {
 
 // NT is the tile's tokens: 64, or 32 or 16 for a short batch (a tool's result, a new turn),
 // whose 8 warps then take 16 rows each and multiply only the tokens there are: a tile of
-// 64 costs the same for 9 tokens as for 64.
+// 64 costs the same for 9 tokens as for 64. Or 128, a warp taking 32 rows by 64 tokens:
+// the rows' weights are then read and unpacked once for twice the tokens, which pays for
+// the K-quants (the host's WIDE_TOKENS).
 template <int KIND, int GROUP, int NT>
 __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, const float* xd, const float* xs,
                         float* y, int rows, int cols, int tokens) {
@@ -1187,7 +1189,7 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     // bytes padded to 144 in shared memory, so reading fragments has no bank conflicts.
     constexpr int K = 128, KS = K + 16, NG = K / GROUP, NX = K / 32;
     // Row tiles of 16 and token tiles of 8 a warp, and the threads' turns storing x.
-    constexpr int MI = NT == 64 ? 2 : 1, NI = NT == 16 ? 2 : 4, XI = NT == 64 ? 2 : 1;
+    constexpr int MI = NT >= 64 ? 2 : 1, NI = NT == 128 ? 8 : NT == 16 ? 2 : 4, XI = NT == 128 ? 4 : NT == 64 ? 2 : 1;
     __shared__ __align__(16) u8 wq[M8_ROWS][KS];
     __shared__ __align__(16) u8 xqs[NT][KS];
     // Scales by group, then row or token, so a warp reads them in pairs (a row's scale
@@ -1199,7 +1201,7 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     const int gid = lane >> 2, tig = lane & 3;
     const int row0 = blockIdx.x * M8_ROWS, tok0 = blockIdx.y * NT;
     // This warp's rows and tokens in the tile.
-    const int wr = NT == 64 ? (warp & 3) * 32 : warp * 16, wt = NT == 64 ? (warp >> 2) * 32 : 0;
+    const int wr = NT >= 64 ? (warp & 3) * 32 : warp * 16, wt = NT >= 64 ? (warp >> 2) * (NT / 2) : 0;
     constexpr bool has_min = KIND == K_Q4_K || KIND == K_Q5_K;
     float acc[MI][NI][4] = {};
     const int xd_cols = cols / 32, xs_cols = cols / 16;
@@ -1544,6 +1546,12 @@ MATMUL8(matmul8_q6_k, K_Q6_K, 16, 64, cols / 256 * Q6K_BYTES, 2)
     MATMUL8(matmul8_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, 2)
 MATMUL8_SMALL(32)
 MATMUL8_SMALL(16)
+// Tiles of 128 tokens, one block an SM (Q6_K's as well: the sums take twice the registers).
+MATMUL8(matmul8_t128_q4_0, K_Q4_0, 32, 128, q4_0_row_bytes(cols), 1)
+MATMUL8(matmul8_t128_q8_0, K_Q8_0, 32, 128, cols / 32 * 34, 1)
+MATMUL8(matmul8_t128_q4_k, K_Q4_K, 32, 128, cols / 256 * 144, 1)
+MATMUL8(matmul8_t128_q5_k, K_Q5_K, 32, 128, cols / 256 * 176, 1)
+MATMUL8(matmul8_t128_q6_k, K_Q6_K, 16, 128, cols / 256 * Q6K_BYTES, 1)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //
