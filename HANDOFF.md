@@ -241,3 +241,39 @@ Google's draft models for the small Gemmas run now, and the 31B's path runs on C
    `vireo-cli`; prompt attention on CUDA for long prompts (78–87% of
    llama.cpp at ~31K tokens at full clocks; see PLAN.md, "What limits speed now"); the GPU performance counters on the Windows machine are open to all users
    for Nsight and should go back to administrators only when the tuning is done.
+7. **From the Mac's all-Q6 comparison** (2026-11-13, eight models against llama.cpp and
+   mlx-vlm on the build with PR #165; the rows are in
+   `evals/speed/bench-2026-11-13/results-q6-merged-build.jsonl`, the numbers in PLAN.md's
+   progress rows of that day and the next). Worked through on 2026-11-14 (PLAN.md's row):
+   1. **E2B and E4B answered with their reasoning:** done. With thinking off, Gemma's
+      system turn now says so (`tools::GEMMA_NO_THINKING`): E4B 1 → 6 of the 6 scored
+      tasks, E2B 0 → 4 (its tool and skill tasks still fail; llama.cpp and mlx-vlm get 5),
+      the 26B and 31B as before.
+   2. **Gemma 4 31B's skill task:** done. The file-changing tools were kept from it (the
+      request's own words didn't ask for a change); a skill that names one now makes them
+      callable. 113 s and wrong → 27 s and right. **No drafting inside tool calls:** done
+      (`write_call`: the draft layer's or the chat's guesses, each checked under the
+      grammar): the 31B's tool task 56 → 28 s, Qwen 3.8 27B's 56 → 30, Muse's 66 → 50,
+      Qwen 3.5 4B's 9.5 → 6.5 and 9B's 16 → 11 (the small Qwens guess from the chat in
+      calls only).
+   3. **Qwen 3.8 27B's long tool task:** done. A call past its limit (4,096 tokens; 768
+      for `calculate`) is taken back and the model answers without more calls: 365 s and
+      an error → 209 s and right (measured at a limit of 1,536).
+   4. **Gemma 4 26B-A4B's long tool task:** right again in three later runs; the wrong
+      answer was one run's count of a 57K-token log, not the kernels.
+   5. **Muse's first token:** it is Muse's reasoning before the answer (83-391 tokens a
+      reply in the log), as designed, and why only this engine answers Muse right. Left.
+   6. **Loading with a draft model:** not the draft model (1.1-1.6 s). The engine ran
+      first on each model, with the file not yet in the disk cache: the 31B loads in
+      4.2-4.5 s with its draft model once it is.
+   7. **Qwen reads prompts 8-20% slower than mlx-vlm** at every length (4B, 9B and 27B);
+      the Gemmas and Muse are level or ahead. Open: at 3K tokens 69% of the GPU's time is
+      the weights' products and 10% DeltaNet; at 96K half is attention.
+   8. **Short replies on the smaller models** wrote 8-16% slower than mlx-vlm. Q6_K's
+      blocks are now padded to 212 bytes on the GPU, not 224 (one token reads every weight
+      once): Qwen 3.5 9B 63 → 66 tokens/s. The rest is open.
+   9. **The 26B's default mode on a repeating text:** open (the next token's probability
+      0.71 against exact mode's 0.95 with the f16 attention cache alone; perplexity on
+      ordinary text within 2%).
+   10. **E2B's tool and skill tasks** still fail with thinking off (the skill task ends in
+      1 s with nothing done). Open.
