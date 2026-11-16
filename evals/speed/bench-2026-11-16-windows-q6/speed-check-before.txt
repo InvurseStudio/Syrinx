@@ -1,0 +1,2 @@
+Prompt: 2452 tokens in 488.16ms (5023.0 tokens/s). Generated: 64 tokens in 982.55ms (65.1 tokens/s).
+Prompt: 2452 tokens in 510.26ms (4805.4 tokens/s). Generated: 64 tokens in 978.75ms (65.4 tokens/s).
