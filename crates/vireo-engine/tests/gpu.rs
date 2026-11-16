@@ -2189,3 +2189,109 @@ fn gemma4_26b_a4b_on_the_gpu_matches_the_cpu() {
     let ft = top(&fast);
     assert_eq!(ft, likeliest);
 }
+
+/// The feed-forward's gate and up products with the activation in one kernel
+/// (`Gpu::glu_8bit`) round to the same bytes, scales and sums as the two products and
+/// `Gpu::gated_quantize`. With `VIREO_TIME`, both ways are timed on 1,024 tokens.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn the_gated_feed_forward_kernel_matches_two_products_and_the_activation() {
+    let Some(gpu) = open_gpu() else { return };
+    let timing = std::env::var_os("VIREO_TIME").is_some();
+    let sets = [
+        ("Qwen3.5-4B-Q4_K_M.gguf", false),
+        ("Qwen3.5-9B-Q4_K_M.gguf", false),
+        ("gemma-4-E2B_q4_0-it.gguf", true),
+        ("gemma-4-E4B_q4_0-it.gguf", true),
+    ];
+    for (name, gelu) in sets {
+        let Some(file) = model(name) else { continue };
+        let (gate, up) = (
+            matrix(&file, "blk.0.ffn_gate.weight"),
+            matrix(&file, "blk.0.ffn_up.weight"),
+        );
+        assert_eq!((gate.kind, gate.rows, gate.cols), (up.kind, up.rows, up.cols));
+        let (rows, cols) = (gate.rows, gate.cols);
+        let gate_w = gpu.upload_weights(gate.kind, gate.data, rows, cols).unwrap();
+        let up_w = gpu.upload_weights(up.kind, up.data, rows, cols).unwrap();
+        let all = if timing { 1024 } else { 264 };
+        let x: Vec<f32> = (0..all * cols)
+            .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
+            .collect();
+        let x_gpu = gpu.upload_f32(&x).unwrap();
+        let q8 = gpu.alloc_q8(all, cols).unwrap();
+        gpu.quantize(x_gpu.ptr(), &q8, all, cols).unwrap();
+        let (gate_y, up_y) = (
+            gpu.alloc(all * rows * 4).unwrap(),
+            gpu.alloc(all * rows * 4).unwrap(),
+        );
+        let (apart, fused) = (gpu.alloc_q8(all, rows).unwrap(), gpu.alloc_q8(all, rows).unwrap());
+        let three = |tokens: usize| {
+            gpu.matmul_8bit(gate.kind, gate_w.ptr(), &q8, gate_y.ptr(), rows, cols, tokens)
+                .unwrap();
+            gpu.matmul_8bit(gate.kind, up_w.ptr(), &q8, up_y.ptr(), rows, cols, tokens)
+                .unwrap();
+            gpu.gated_quantize(gate_y.ptr(), up_y.ptr(), rows, &apart, tokens, gelu)
+                .unwrap();
+        };
+        let one = |tokens: usize| {
+            gpu.glu_8bit(
+                gate.kind,
+                gate_w.ptr(),
+                up_w.ptr(),
+                &q8,
+                &fused,
+                rows,
+                cols,
+                tokens,
+                gelu,
+            )
+            .unwrap()
+        };
+        assert!(!one(32), "{name}: a batch of 32 has no gated kernel");
+        for tokens in [33, 64, 65, 100, 128, 136, 200, 264] {
+            three(tokens);
+            assert!(one(tokens), "{name}: no gated kernel for {tokens} tokens");
+            let (want, got) = (apart.read(tokens, rows).unwrap(), fused.read(tokens, rows).unwrap());
+            assert!(want.0.iter().any(|q| *q != 0), "{name}: all zeros");
+            let differ = want.0.iter().zip(&got.0).filter(|(a, b)| a != b).count();
+            assert!(
+                differ == 0,
+                "{name} ({:?}), {tokens} tokens: {differ} of {} bytes differ",
+                gate.kind,
+                want.0.len()
+            );
+            assert!(want.1 == got.1, "{name}, {tokens} tokens: the scales differ");
+            assert!(want.2 == got.2, "{name}, {tokens} tokens: the sums differ");
+        }
+        if !timing {
+            continue;
+        }
+        let time = |run: &dyn Fn()| {
+            let warm = std::time::Instant::now();
+            while warm.elapsed().as_millis() < 400 {
+                run();
+                gpu.synchronize().unwrap();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                for _ in 0..10 {
+                    run();
+                }
+                gpu.synchronize().unwrap();
+                best = best.min(started.elapsed().as_secs_f64() / 10.0);
+            }
+            best * 1e3
+        };
+        for tokens in [1024, 264, 64] {
+            let (a, b) = (time(&|| three(tokens)), time(&|| {
+                let _ = one(tokens);
+            }));
+            println!(
+                "{name} ({:?} {rows} x {cols}), {tokens} tokens: two products and the activation {a:.3} ms, one kernel {b:.3} ms",
+                gate.kind
+            );
+        }
+    }
+}
