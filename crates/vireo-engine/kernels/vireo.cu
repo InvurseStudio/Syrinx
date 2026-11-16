@@ -1415,13 +1415,14 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             // nibbles) and all the high bits.
             const int r = tid >> 1, p = tid & 1;
             uint4 lo[2] = {}, hi[2] = {};
-            float sc[4] = {};
+            // A run of 32's two scales stay whole numbers (as two 16-bit halves of a word) and
+            // the block's d a float: the products scale a 32's two sums together (below).
+            float d = 0.0f;
+            int sc[2] = {};
             if (raw.ok[0]) {
-                const float d = __half2float(__ushort_as_half((unsigned short)raw.sc[0]));
-                sc[0] = d * (float)(signed char)(raw.sc[1] & 0xFF);
-                sc[1] = d * (float)(signed char)(raw.sc[1] >> 8);
-                sc[2] = d * (float)(signed char)(raw.sc[2] & 0xFF);
-                sc[3] = d * (float)(signed char)(raw.sc[2] >> 8);
+                d = __half2float(__ushort_as_half((unsigned short)raw.sc[0]));
+                sc[0] = ((int)(signed char)(raw.sc[1] & 0xFF) & 0xFFFF) | ((int)(signed char)(raw.sc[1] >> 8) << 16);
+                sc[1] = ((int)(signed char)(raw.sc[2] & 0xFF) & 0xFFFF) | ((int)(signed char)(raw.sc[2] >> 8) << 16);
                 for (int i = 0; i < 2; i++) {
                     const uint4 l = raw.v[i], h = raw.h[i];
                     const u32 lw[4] = {l.x, l.y, l.z, l.w}, hw[4] = {h.x, h.y, h.z, h.w};
@@ -1438,10 +1439,8 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             *reinterpret_cast<uint4*>(&wq[r][p * 32 + 16]) = lo[1];
             *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32]) = hi[0];
             *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32 + 16]) = hi[1];
-            w_sm[2 * p][r].x = sc[0];
-            w_sm[2 * p + 1][r].x = sc[1];
-            w_sm[2 * (p + 2)][r].x = sc[2];
-            w_sm[2 * (p + 2) + 1][r].x = sc[3];
+            w_sm[p][r] = make_float2(d, __int_as_float(sc[0]));
+            w_sm[p + 2][r] = make_float2(d, __int_as_float(sc[1]));
         } else {
             // The weights: 128 rows × 8 runs of 16, 4 runs a thread.
 #pragma unroll
@@ -1493,6 +1492,64 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
         if constexpr (prefetch)
             if (k0 + K < cols) fetch(k0 + K);
 
+        if constexpr (KIND == K_Q6_K) {
+            // Q6_K has a scale every 16 numbers, a whole number, and x one every 32. A 32's
+            // two sums are put together as whole numbers, each times its scale (under 2^24,
+            // so exact in f32 too), and scaled into the results once: half the float work
+            // of scaling each 16 (which was 15% of a read: a row's scale read, a multiply
+            // and a multiply-add for every result and 16). Four token tiles at a time, so
+            // both 16s' sums are in registers together.
+            constexpr int NB = 1;
+#pragma unroll
+            for (int g = 0; g < K / 32; g++) {
+                const int kk = g * 32;
+                u32 a[MI][2][2];
+                float wd[MI][2];
+                int s1[MI][2], s2[MI][2];
+#pragma unroll
+                for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int r = wr + mi * 16 + gid + h * 8;
+                        a[mi][0][h] = *reinterpret_cast<const u32*>(&wq[r][kk + tig * 4]);
+                        a[mi][1][h] = *reinterpret_cast<const u32*>(&wq[r][kk + 16 + tig * 4]);
+                        const float2 sm = w_sm[g][r];
+                        const int both = __float_as_int(sm.y);
+                        wd[mi][h] = sm.x;
+                        s1[mi][h] = (short)(both & 0xFFFF);
+                        s2[mi][h] = both >> 16;
+                    }
+#pragma unroll
+                for (int nh = 0; nh < NI; nh += NB) {
+                    int c1[MI][NB][4] = {}, c2[MI][NB][4] = {};
+                    float xsc[NB][2];
+#pragma unroll
+                    for (int x = 0; x < NB; x++) {
+                        const u8* row = &xqs[wt + (nh + x) * 8 + gid][kk + tig * 4];
+                        const u32 b1 = *reinterpret_cast<const u32*>(row);
+                        const u32 b2 = *reinterpret_cast<const u32*>(row + 16);
+#pragma unroll
+                        for (int mi = 0; mi < MI; mi++) {
+                            mma_s8(c1[mi][x], a[mi][0][0], a[mi][0][1], b1);
+                            mma_s8(c2[mi][x], a[mi][1][0], a[mi][1][1], b2);
+                        }
+                        const float2 s = *reinterpret_cast<const float2*>(&x_scale[g][wt + (nh + x) * 8 + tig * 2]);
+                        xsc[x][0] = s.x;
+                        xsc[x][1] = s.y;
+                    }
+#pragma unroll
+                    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                        for (int x = 0; x < NB; x++)
+#pragma unroll
+                            for (int i = 0; i < 4; i++) {
+                                const int h = i >> 1, j = i & 1;
+                                const int both = c1[mi][x][i] * s1[mi][h] + c2[mi][x][i] * s2[mi][h];
+                                acc[mi][nh + x][i] = fmaf((float)both, wd[mi][h] * xsc[x][j], acc[mi][nh + x][i]);
+                            }
+                }
+            }
+        } else {
 #pragma unroll
         for (int g = 0; g < NG; g++) {
             int c[MI][NI][4] = {};
@@ -1600,6 +1657,7 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                         acc[mi][ni][i] = fmaf((float)c[mi][ni][i], ws[mi][h] * xsc[ni][j], acc[mi][ni][i]);
                         if (has_min) acc[mi][ni][i] = fmaf(wm[mi][h], xsm[ni][j], acc[mi][ni][i]);
                     }
+        }
         }
         __syncthreads();
     }
