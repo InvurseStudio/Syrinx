@@ -20,6 +20,21 @@ pub(super) struct GpuMatrix {
 
 impl GpuMatrix {
     pub fn upload(gpu: &Gpu, m: Matrix) -> Result<Self> {
+        // BF16 where the GPU has no kernel for it (CUDA; Gemma 4's Q6_K files keep
+        // per_layer_model_proj so): as f32, which holds every BF16 number exactly.
+        if m.kind == crate::TensorType::BF16 && !Gpu::supports(m.kind) {
+            let mut wide = Vec::with_capacity(m.data.len() * 2);
+            for pair in m.data.as_chunks::<2>().0 {
+                wide.extend_from_slice(&((u16::from_le_bytes(*pair) as u32) << 16).to_le_bytes());
+            }
+            let as_f32 = Matrix {
+                kind: crate::TensorType::F32,
+                rows: m.rows,
+                cols: m.cols,
+                data: &wide,
+            };
+            return Self::upload(gpu, as_f32);
+        }
         if !Gpu::supports(m.kind) {
             return Err(gpu_error(cuda::Error::Unsupported(m.kind)));
         }
