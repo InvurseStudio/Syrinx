@@ -1,0 +1,26 @@
+{
+  "_about": "S6 greedy-match: raw text to continue (no chat template), greedy, 256 tokens. Each engine's continuation is compared with llama.cpp's on the same file: how many words agree before the first difference. Two engines doing the same arithmetic agree for a long way; a kernel bug shows as an early split on many prompts.",
+  "tokens": 256,
+  "prompts": [
+    "The lighthouse keeper had not seen another person in forty days when",
+    "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+    "A bicycle's derailleur works by",
+    "Shopping list for the weekend:\n1.",
+    "The three main causes of the First World War were",
+    "#include <stdio.h>\n\nint main(void) {\n",
+    "Dear Ms. Quint,\n\nThank you for your letter of 3 November. Regarding the cold-store lease,",
+    "In mathematics, a prime number is",
+    "SELECT customer_id, SUM(total) AS spent\nFROM orders\n",
+    "The recipe for a simple sourdough loaf starts with",
+    "Photosynthesis is the process by which",
+    "| Year | Revenue | Profit |\n|---|---|---|\n| 2021 |",
+    "Once upon a time, in a village at the edge of a great forest,",
+    "To configure the server, open the settings file and",
+    "The history of the printing press begins in",
+    "fn main() {\n    let numbers = vec![3, 1, 4, 1, 5, 9];\n",
+    "Q: What is the difference between weather and climate?\nA:",
+    "The quarterly report shows that sales of saddles rose",
+    "Here are five tips for staying productive while working from home:\n\n1.",
+    "<html>\n<head>\n  <title>Harbor Bikes</title>\n</head>\n<body>\n"
+  ]
+}

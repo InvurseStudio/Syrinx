@@ -1,0 +1,93 @@
+{
+  "version": "v1",
+  "_about": "Vireo Bench v1. Everything a run depends on: pinned engines, the model roster per platform, and what each tier runs. Changing a model or a pinned engine is a version bump (v1 -> v2) or, for an engine, a deliberate step noted in the run. Paths: '~' is the home folder; a relative path is from VireoPrototype/.",
+
+  "platforms": {
+    "mac": {
+      "engines": {
+        "vireo": {"server": "target/release/vireo-server", "cli": "target/release/vireo-cli"},
+        "llama": {"dir": "reference/llama-b12228", "version": "b12228"},
+        "mlx": {"python": "~/.venvs/mlxbench/bin/python", "version": "mlx-vlm 0.7.12"}
+      },
+      "chat_context": 32768,
+      "heat_models": ["g31"],
+      "models": [
+        {"key": "e2b", "name": "Gemma 4 E2B", "group": "small", "gguf": "models/gemma-4-E2B-it-Q6_K.gguf", "mlx": "models/mlx/gemma-4-e2b-it-6bit", "max_context": 131072},
+        {"key": "e4b", "name": "Gemma 4 E4B", "group": "small", "gguf": "models/gemma-4-E4B-it-Q6_K.gguf", "mlx": "models/mlx/gemma-4-e4b-it-6bit", "max_context": 131072},
+        {"key": "q4b", "name": "Qwen 3.5 4B", "group": "small", "gguf": "models/Qwen3.5-4B-Q6_K.gguf", "mlx": "models/mlx/Qwen3.5-4B-6bit", "max_context": 262144},
+        {"key": "q9b", "name": "Qwen 3.5 9B", "group": "small", "gguf": "models/Qwen3.5-9B-Q6_K.gguf", "mlx": "models/mlx/Qwen3.5-9B-6bit", "max_context": 262144},
+        {"key": "g26", "name": "Gemma 4 26B-A4B", "group": "moe", "gguf": "~/Library/Application Support/InvurseChat/Models/unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf", "mlx": "models/mlx/gemma-4-26b-a4b-it-6bit", "max_context": 262144},
+        {"key": "g31", "name": "Gemma 4 31B", "group": "large", "gguf": "~/Library/Application Support/InvurseChat/Models/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q6_K.gguf", "mlx": "~/Library/Application Support/InvurseChat/Models/gemma-4-31B-it-MLX-6bit", "max_context": 262144},
+        {"key": "q27", "name": "Qwen 3.8 27B", "group": "large", "gguf": "~/Library/Application Support/InvurseChat/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf", "mlx": "~/Library/Application Support/InvurseChat/Models/Qwen3.8-27B-MLX-6bit", "max_context": 262144},
+        {"key": "muse", "name": "Muse Glimmer 30B", "group": "large", "gguf": "~/Library/Application Support/InvurseChat/Models/Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-Q6_K.gguf", "mlx": "~/Library/Application Support/InvurseChat/Models/Muse-Glimmer-30B-6bit", "max_context": 131072}
+      ]
+    },
+    "windows": {
+      "_about": "The ASUS laptop: RTX 5060 Laptop, 8 GB. Q4 files (the Mac's Q6 don't fit), no mlx-vlm. max_context is what each model holds on the GPU without spilling into the PC's memory (measured 15 Nov), so the context ladder stops there.",
+      "engines": {
+        "vireo": {"server": "target/release/vireo-server.exe", "cli": "target/release/vireo-cli.exe"},
+        "llama": {"dir": "reference/llama.cpp-b12262", "version": "b12262 (CUDA)"}
+      },
+      "chat_context": 32768,
+      "heat_models": ["q9b"],
+      "models": [
+        {"key": "e2b", "name": "Gemma 4 E2B", "group": "small", "gguf": "models/gemma-4-E2B_q4_0-it.gguf", "max_context": 65536},
+        {"key": "e4b", "name": "Gemma 4 E4B", "group": "small", "gguf": "models/gemma-4-E4B_q4_0-it.gguf", "max_context": 65536},
+        {"key": "q4b", "name": "Qwen 3.5 4B", "group": "small", "gguf": "models/Qwen3.5-4B-Q4_K_M.gguf", "max_context": 65536},
+        {"key": "q9b", "name": "Qwen 3.5 9B", "group": "small", "gguf": "models/Qwen3.5-9B-Q4_K_M.gguf", "max_context": 32768, "log_share": 0.5,
+         "_log_share": "t-longlog's ~20K-token log cut to its first half at a line's end: the whole log overflows 32K with the tools and answer (inventory-sync still logs the most ERROR lines in that half)"}
+      ]
+    }
+  },
+
+  "ladder": {"4k": 4096, "16k": 16384, "32k": 32768, "64k": 65536, "128k": 131072, "256k": 262144},
+
+  "tiers": {
+    "quick": {
+      "_about": "After a tuning change: Vireo only, compared with baselines.json (the last standard run) for llama.cpp and mlx-vlm. About 15 minutes on the Mac.",
+      "engines": ["vireo"],
+      "models": {"mac": ["e4b", "g31"], "windows": ["e4b", "q4b"]},
+      "suites": {
+        "S1": "all",
+        "S3": {"rungs": ["4k", "16k", "32k"]},
+        "S5": {"tasks": ["t-multistep", "t-skill"]},
+        "S6": {"tests": ["greedy-match"]},
+        "S7": "all"
+      },
+      "reps": {"speed": 2, "other": 1}
+    },
+    "standard": {
+      "_about": "Before merging an engine PR, or weekly. All models, all engines. About 4-5 hours on the Mac, ~1.5 on Windows.",
+      "engines": ["vireo", "vireo-plain", "llama", "mlx"],
+      "models": "all",
+      "suites": {
+        "S1": "all", "S2": "all",
+        "S3": {"rungs": ["4k", "16k", "32k", "64k", "128k"]},
+        "S4": "all", "S5": "all", "S6": "all", "S7": "all"
+      },
+      "reps": {"speed": 3, "other": 1}
+    },
+    "full": {
+      "_about": "Overnight, before a release. Everything but energy (run that as its own tier).",
+      "engines": ["vireo", "vireo-plain", "llama", "mlx"],
+      "models": "all",
+      "suites": {
+        "S1": "all", "S2": "all",
+        "S3": {"rungs": ["4k", "16k", "32k", "64k", "128k", "256k"]},
+        "S4": "all", "S5": {"thinking": [false, true]}, "S6": "all", "S7": "all",
+        "S8": {"soak_minutes": 30, "heat_minutes": 10},
+        "S9": {"together": [2, 4]}
+      },
+      "reps": {"speed": 3, "other": 1}
+    },
+    "energy": {
+      "_about": "S10 on its own: nothing else runs while power is read. Needs `sudo -v` first on the Mac (powermetrics).",
+      "engines": ["vireo", "llama", "mlx"],
+      "models": "all",
+      "suites": {"S10": "all"},
+      "reps": {"speed": 1, "other": 1}
+    }
+  },
+
+  "_engines_note": "vireo = vireo-server as users run it (drafting on where the model has it). vireo-plain = drafting off (--mtp off --lookup 0); it only runs in S3, so the ladder shows both. S1 is drafting-off on every engine by construction (one token at a time)."
+}

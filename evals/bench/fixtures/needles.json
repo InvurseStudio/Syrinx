@@ -1,0 +1,11 @@
+{
+  "_about": "S3: five made-up facts planted at 5/25/50/75/95% depth of the context-ladder prompts, all asked for at the end. A fact counts when any of its 'expect' strings is in the reply (case-insensitive, thousands commas removed).",
+  "facts": [
+    {"at": 0.05, "text": "The harbour depot's spare-parts code word is OSPREY-41.", "expect": ["OSPREY-41", "OSPREY 41"]},
+    {"at": 0.25, "text": "Marisol Quint signed the cold-store lease for 14 months.", "expect": ["14 months", "fourteen months"]},
+    {"at": 0.50, "text": "The test rig in bay 3 is calibrated to 2.375 newton-metres.", "expect": ["2.375"]},
+    {"at": 0.75, "text": "The fallback ferry to Skerra leaves at 06:50 on weekdays.", "expect": ["06:50", "6:50"]},
+    {"at": 0.95, "text": "Invoice batch 7731 was approved by Dagny Vell.", "expect": ["Dagny Vell"]}
+  ],
+  "question": "Above is a dump of a software repository. Five notes marked NOTE are hidden in it. Answer these five questions, one short line each, using only those notes:\n1. What is the harbour depot's spare-parts code word?\n2. For how long did Marisol Quint sign the cold-store lease?\n3. What is the test rig in bay 3 calibrated to?\n4. When does the fallback ferry to Skerra leave on weekdays?\n5. Who approved invoice batch 7731?\nThen, in about 200 words, describe what the repository's server program does."
+}
