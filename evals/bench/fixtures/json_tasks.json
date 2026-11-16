@@ -1,0 +1,26 @@
+{
+  "_about": "S6 grammar: 20 requests for strict JSON, no tools, temperature 0, 256 tokens at most. 'strict' = the reply alone parses; 'parses' = it parses once a ```json fence is taken off; 'right' = it parses and every key in 'expect' has that value (numbers compared to 2 decimals, strings case-insensitive).",
+  "suffix": "\n\nReply with only the JSON object: no code fence, no other text.",
+  "tasks": [
+    {"q": "Give a JSON object with keys \"name\" (string) and \"age\" (integer) for: Leif is 34.", "expect": {"name": "Leif", "age": 34}},
+    {"q": "Give a JSON object with keys \"city\" and \"country\" for Oslo.", "expect": {"city": "Oslo", "country": "Norway"}},
+    {"q": "Order: 3 tubes at $7.50 each. Give a JSON object with keys \"item\", \"units\" (integer), \"unit_price\" (number), \"total\" (number).", "expect": {"item": "tube", "units": 3, "unit_price": 7.5, "total": 22.5}},
+    {"q": "Give a JSON object with key \"primes\": the first five prime numbers as an array.", "expect": {"primes": [2, 3, 5, 7, 11]}},
+    {"q": "Give a JSON object with keys \"ok\" (boolean, true) and \"code\" (integer, 200).", "expect": {"ok": true, "code": 200}},
+    {"q": "Text: 'Meeting with Ines on 2026-11-20 at 14:00 in room B.' Give a JSON object with keys \"who\", \"date\", \"time\", \"room\".", "expect": {"who": "Ines", "date": "2026-11-20", "time": "14:00", "room": "B"}},
+    {"q": "Give a JSON object with key \"colors\": an array of the three primary colours of light, lower case, in the order red, green, blue.", "expect": {"colors": ["red", "green", "blue"]}},
+    {"q": "Give a JSON object describing a rectangle 4 wide and 6 high with keys \"width\", \"height\", \"area\".", "expect": {"width": 4, "height": 6, "area": 24}},
+    {"q": "Give a JSON object with key \"user\" holding an object with keys \"id\" (integer 7) and \"role\" (\"admin\").", "expect": {"user": {"id": 7, "role": "admin"}}},
+    {"q": "Text: 'Bram worked 8 hours, Yuki 3.' Give a JSON object mapping each name to their hours (integers).", "expect": {"Bram": 8, "Yuki": 3}},
+    {"q": "Give a JSON object with key \"empty\" holding an empty array, and key \"none\" holding null.", "expect": {"empty": [], "none": null}},
+    {"q": "Give a JSON object with key \"quote\" holding this exact text: She said \"hi\".", "expect": {"quote": "She said \"hi\"."}},
+    {"q": "Give a JSON object with key \"path\" holding this exact Windows path: C:\\Users\\bench\\notes.txt", "expect": {"path": "C:\\Users\\bench\\notes.txt"}},
+    {"q": "Give a JSON object with keys \"celsius\" (0) and \"fahrenheit\" for the freezing point of water.", "expect": {"celsius": 0, "fahrenheit": 32}},
+    {"q": "Give a JSON object with key \"weekdays\": an array of the five weekday names, Monday first.", "expect": {"weekdays": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]}},
+    {"q": "Text: 'Invoice 7731, approved, total 1,284.37 dollars.' Give a JSON object with keys \"invoice\" (integer), \"approved\" (boolean), \"total\" (number).", "expect": {"invoice": 7731, "approved": true, "total": 1284.37}},
+    {"q": "Give a JSON object with keys \"lat\" and \"lon\", both 0, for the point where the equator meets the prime meridian.", "expect": {"lat": 0, "lon": 0}},
+    {"q": "Give a JSON object with key \"word\" holding the word 'bicycle' and key \"letters\" holding how many letters it has.", "expect": {"word": "bicycle", "letters": 7}},
+    {"q": "Give a JSON object with key \"items\": an array of two objects, each with \"sku\" and \"qty\": A1 qty 2, B7 qty 5.", "expect": {"items": [{"sku": "A1", "qty": 2}, {"sku": "B7", "qty": 5}]}},
+    {"q": "Give a JSON object with key \"unicode\" holding the text: café", "expect": {"unicode": "café"}}
+  ]
+}

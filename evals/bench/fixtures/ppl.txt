@@ -1,0 +1,784 @@
+# Vireo's own engine: plan
+
+Written 2026-11-10. A prototype plan, not a commitment: each phase ends in a decision
+point, and the work continues only if the numbers hold up.
+
+**The first version runs on Windows with NVIDIA GPUs (CUDA), tested with small models.**
+The Mac (Metal) and other Windows GPUs (Vulkan) come later.
+
+## The idea
+
+Replace the Python server (`server/`) and the inference servers it starts (mlx_vlm,
+llama-server) with one Rust program that Vireo owns from top to bottom: the agent,
+the tools, and the inference engine that runs the model.
+
+Language alone won't make Vireo faster. A turn's time is spent in the model, and
+mlx_vlm and llama.cpp already run near the hardware's limit. The gains come from three
+other places:
+
+- **Doing less work.** An engine built only for Vireo can cache, schedule and constrain
+  generation in ways a general-purpose server, reached over an OpenAI-style HTTP API,
+  can't.
+- **Shipping less.** One binary of roughly 2040 MB instead of a bundled CPython with
+  its packages. It starts in about a second, uses less memory, and there's less to sign
+  and notarize. Because the kernels are our own, there's no cuBLAS or other large CUDA
+  library to ship: the NVIDIA driver is enough.
+- **One server on Mac and Windows.** This makes the "This PC" plan possible
+  (`docs/dev/windows-native-plan.md`) without bundling Python a second time. Starting on
+  Windows means "This PC" is the first thing the prototype delivers.
+
+## Decisions so far
+
+| Decision | Choice | Why |
+|---|---|---|
+| Language | Rust | One cross-platform binary, no garbage collector, errors caught by the compiler |
+| Model format | **GGUF only**, read natively, never converted | One format on every platform, GGUF builds exist for nearly every open model, and the format is simple and documented |
+| How much to own | **As much as possible.** Borrow only the commodity layers (below) | The engine, tools and skills designed together are what set Vireo apart |
+| First platform | **Windows, NVIDIA GPUs** | The development PC has one, CUDA's tools are the most mature, and llama.cpp's CUDA build is a strong reference |
+| First GPU backend | **CUDA**, through our own kernels | Fastest on NVIDIA; Vulkan (other Windows GPUs) and Metal (Mac) follow |
+| Test models | **Small models (about 0.54B)** | Fast to iterate on, fit easily in 8 GB of VRAM, and cheap enough to run in CI |
+| Client contract | Keep today's HTTP + SSE API unchanged | The Mac, Windows and iPhone apps keep working, and the existing tests can check the new server |
+| Unsupported models | llama-server stays as a permanent fallback | Users can run any model on day one, and the engine grows only where it wins |
+
+### What this means for MLX
+
+MLX models leave the main path. Featured models and **Discover** point to GGUF
+repositories instead of `mlx-community`. For people who already have MLX models
+downloaded, Vireo offers the matching GGUF build. Whether mlx_vlm stays as a temporary
+fallback on the Mac is still open (see Open questions). This doesn't affect the
+Windows-first work.
+
+## The Mac (Metal)
+
+The Mac's own record: the Metal backend (`crates/vireo-engine/src/metal`,
+`kernels/*.metal`), its tuning and its measurements. Since 2026-11-11 the Mac builds the
+same workspace as Windows (it had its own copy under `Mac/Engine/` for a day); only the
+backend and its tuning are the Mac's, everything else is shared.
+
+**Machine:** MacBook Pro, Apple M5 Max (40 GPU cores, neural accelerators in the GPU),
+128 GB, macOS 27. Rust 1.99.1 (Homebrew's `rustup`). Reference: llama.cpp b12228's macOS
+arm64 build (Metal, with Metal 4 tensor operations on the M5) in `reference/`.
+
+**How it's built.** `src/metal/` is a Metal backend with the CUDA backend's types and
+methods; on macOS `crate::cuda` is that module (see `lib.rs`), so the models' GPU passes,
+the CLI, the server and the tests are the same code as on Windows. The kernels are
+`kernels/vireo.metal` (a port of `vireo.cu`, plus SIMD-group-matrix kernels) and
+`kernels/vireo_tensor.metal` (matrix products on the neural accelerators, compiled only
+where Metal has them), compiled from source when the GPU opens (~0.4 s), with precise
+math. Kernels take raw GPU addresses as on CUDA (buffers resident through a residency
+set); dispatches run concurrently, with a barrier only where one touches what an earlier
+one wrote (each kernel's written arguments are listed). `VIREO_METAL_PROFILE=1` adds up
+GPU time by kernel; `VIREO_METAL_TIMING=1` reports command-buffer GPU time.
+
+**Modes.** Apple GPUs have no dp4a or CUDA tensor cores, so there are no 8-bit kernels.
+The default mode's counterpart is f16: a prompt's activations are rounded to f16 and its
+matrix products run on the neural accelerators with f16 weights (f32 sums), and prompt
+attention runs on SIMD-group matrices over the f16 cache. Exact mode is f32 throughout,
+the CPU's numbers. Generating is the same in both (matrix-vector products in f32 on the
+exact weights).
+
+**Checked (2026-11-11):** all 95 engine tests pass (each kernel against the CPU; Llama,
+Qwen 3.5 and Gemma 4 against llama.cpp; batches against token by token; saved sessions).
+Perplexity on 4  2,048 tokens (PLAN.md and gguf.rs as text), default / exact /
+llama.cpp: Llama 33.636 / 33.635 / 33.558, Qwen 18.297 / 18.297 / 18.316, Gemma 35.369 /
+35.378 / 35.385. `vireo-server` runs all three, streaming replies to the app's API.
+
+**Speed** (tokens/s, default mode, against `llama-bench -p 2048 -n 128 -ngl 99`, and
+`-d 2048` for generating with a context, run back to back with Vireo; Vireo generating
+128 tokens from a short prompt and after a prompt of 2,6002,700 tokens, and reading
+that prompt; 2026-11-11, fourth tuning pass). Llama is no longer tuned or measured (the
+Windows side dropped it from its tests as an old model); its code and tests remain.
+
+| Model | Generating: Vireo / llama.cpp |  with ~2,600 tokens before it | Reading a prompt: Vireo / llama.cpp | Vireo CPU |
+|---|---|---|---|---|
+| Qwen 3.5 0.8B Q4_K_M | ~412 / 353 (117%) | ~383 / 341 (112%) | ~19,700 / 16,700 (118%) | ~40 |
+| Gemma 4 E2B Q4_0 | ~204 / 181 (113%) | ~194 / 174 (111%) | ~21,050 / 20,660 (102%) | ~22 |
+
+Runs move by 3% (the laptop warms up: compare within a sitting). Exact mode generates at
+the same speed and reads prompts at ~7,400 / 6,800.
+
+How prompt reading got there (Qwen / Gemma): the straight port 3,750 / 3,850;
+SIMD-group matrices for the products and tiled attention over the f16 cache 5,100 /
+6,500; the matrix products on the neural accelerators 7,600 / 11,300; flash attention on
+SIMD-group matrices and the chunked DeltaNet (chunks of 32, so it fits Metal's 32 KB of
+threadgroup memory) 11,600 / 11,900; f16 activations 12,600 / 12,700; concurrent
+dispatch ~12,900 / 12,800; tiles of 32 rows  128 tokens (searched 16128  64256,
+28 SIMD groups) and batches of 1,024 ~15,100 / 14,400; attention on the neural
+accelerators (`attention_tc`) ~16,700 / 19,600; the DeltaNet scan on SIMD-group matrices
+(`delta_chunk_scan_sg`) ~19,100 / ; 128 columns a step in the products ~19,100 / ~19,300;
+committing every 128 dispatches (the GPU starting while the CPU encodes the rest)
+~19,450 / ~20,300; decoding the weights 32 at a time (`decode32`: a Q4_0 block or a
+K-quant sub-block, its scale worked out once and its bits read 16 bytes at a time)
+~19,700 / ~21,050. Scoring a text (every token's logits, `vireo-cli perplexity`) also got
+faster with it: Qwen 4  2,048 tokens in 3.4  2.6 s.
+
+And generating (short prompt): the port 338 / 169; concurrent dispatch 351 / 166; one
+token's attention in one dispatch (`attention_decode`) 364 / 176; matrix-vector rows
+split over 4 SIMD groups (`matvec_split_*`) 380 / 180; gate, up and the activation in
+one dispatch (`matvec_glu_*`) ~+1% each; `residual_norm` on 512 threads ~+2% / +4.5%;
+wide heads with a SIMD group a position (`attention_decode_wide`) ~394 / ~197;
+committing every 128 dispatches ~407 / ~202; Qwen's one-token DeltaNet with 8 threads
+to a column (`delta_net_p<8>`) ~412 / ~204.
+
+Tried and left out (slower on the M5 Max): `residual_norm` with the row in registers;
+the o and down projections adding into the residual and finishing the norm in the same
+dispatch (the last threadgroup's norm plus every threadgroup's extra barriers cost more
+than the step saved); one token's attention for a key/value head's whole query group at
+once (28 heads; the repeated reads come from the cache); bigger query tiles for flash
+attention at 64- and 256-wide heads (kept for 512 where there are no neural
+accelerators); the DeltaNet scan with 16 or 32 state columns a threadgroup; the tensor
+products' weight tile double-buffered (13% faster reading prompts, but scoring a text
+~30% slower, probably fewer threadgroups a core with 16 KB each, and Gemma's perplexity
+not the same to the digit); 32-bit loads for Q6_K's words in the matrix-vector kernels
+(kept, no measurable change).
+
+A bug found on the way: the first version of `delta_chunk_scan_sg` zeroed its diagonal
+matrix and wrote  on it without a barrier between, so some first chunks scaled rows of
+the state by 0; the model tests caught it (logits off by up to 1.5 in batches of 7), a
+new test (`delta_net_in_chunks_matches_token_by_token`) checks the chunked DeltaNet on
+its own.
+
+**Fifth pass: agent work (2026-11-12).** Timing a reply in the server showed reading,
+not writing, is 80-90% of an eval case: the scoring questions (the change question and
+one per skill, ~280 tokens each) were read from empty every time, a new chat read its
+whole system prompt again on Qwen, and a batch of 2-128 tokens cost about as much as 128.
+Changes, each checked case by case against main (same scores to two decimals, same
+choices, same pass or fail):
+
+- `matvec_few` (Metal): 1-4 tokens' products with each weight decoded once for all of
+  them, any type, 2 rows a threadgroup split over its 4 SIMD groups; 5-8 tokens as two
+  side by side. Used for every 2-8-token input (Q6_K's own kernel stays for 2-3 tokens,
+  where it's faster). Per matrix, 2 / 4 tokens against the prompt kernels: Qwen 3.5 4B's
+  Q4_K ffn_gate 38 / 51 s against 123, Gemma 4 E4B's Q4_0 ffn_down 31 / 42 against 197,
+  its 32-row ssm_alpha 4 against 38. A whole batch (ms, before  after): E2B 2 tokens
+  8.4  4.6, 8 tokens 8.6  6.4; E4B 19.8  7.9, 20.0  13.4; Qwen 4B 25.3  12.5,
+  33.4  23.1. Tried: 8 tokens in one dispatch (slower than two of 4 at any row count:
+  each SIMD group reads the 8 tokens' activations, ~14 the weights' bytes); 1, 4 and 8
+  rows a threadgroup.
+- The server (both platforms): up to 3 picker sessions, one a kind of question, each
+  going on from the start its last question shares with the next (Gemma rewinds; Qwen
+  restores a DeltaNet checkpoint saved where the last two parted), so a skill question
+  reads ~50 tokens, not ~280. And a second Qwen checkpoint where a prompt parts from the
+  one before (a new chat: the end of the system prompt and tools it shares with the
+  last), so a new chat no longer reads ~1,600 tokens again (330 ms on 4B).
+- The sampler (both): one pass for the likeliest candidates, the repetition penalty
+  applied to the recent tokens alone. A pick over 262K tokens: Gemma's settings 315 
+  35 s, Qwen's 293  24, greedy 243  19, with a repetition penalty 2,700  41.
+- Smaller, Metal: the per-layer input's GELU gate in its matrix product
+  (`matvec_split_gelu_*`, Gemma one token, +1-1.5%); `residual_norm`'s two sums with one
+  barrier each (6.9  6.4 s, same bits); the first command buffer committed after 16
+  dispatches when the GPU is idle (+0.5-1%). `vireo-cli generate`'s argmax was a scalar
+  pass slow enough to show in its numbers (~0.3 ms a token).
+
+Six eval cases (datetime, read, list, no-tool-writing, find-then-read, git), main 
+now, seconds a case, all 6/6 both: Gemma 4 E2B 0.46  0.37, E4B 1.06  0.72, Qwen 3.5 4B
+1.95  1.05, 9B 3.35  1.72. Generating, 256 tokens from a short prompt (`vireo-cli`):
+Qwen 0.8B ~479, E2B ~223, E4B ~128 (llama.cpp 115), Qwen 4B ~145 (128), 9B ~90 (81).
+Reading prompts once warm is ahead of llama.cpp at every length measured (E2B 256 tokens
+~20K tokens/s against 13.6K; Qwen 4B ~4.8K against 3.4K); a fresh process's first read
+costs ~20-35 ms more (first use of the buffers). Kept out: fewer attention parts at short
+contexts (+0.5% there, much slower at 7K tokens); 4 or 8 rows a threadgroup in the
+one-token kernels (2 is fastest). Not measured yet: Gemma 4 31B, and anything on CUDA
+(the server changes are shared; the kernel changes are Metal's).
+
+**Sixth pass: generating (2026-11-12).** Where a token's time goes: E2B reads 1.41 GB a
+token (a floor of ~391 tokens/s at ~550 GB/s), E4B 2.82 GB (~195), Qwen 3.5 4B 2.73 GB
+(~201), 9B 5.67 GB (~97): they ran at 57%, 66%, 72% and 92% of that. With every barrier
+dropped (wrong numbers, real timing) E2B ran at 354 tokens/s, E4B 183, Qwen 4B 175: the
+dependent steps cost 37%, 30% and 17%. A dependent dispatch costs ~2.2 s against ~0.4
+for an independent one; the rest of a step is the GPU draining one kernel and filling
+the next. Skipping one kind of barrier at a time bounds what fusing it could give (E2B):
+the three norms of a layer +7%, qkv_prep  attention +4.5%, the products  qkv_prep
++3.5%, the GELU gate +2.3%; on Qwen, none. Tried and left out: a serial encoder (E2B +1%,
+Qwen -3%); grid-stride matrix-vector kernels (no change, Qwen slower with fewer
+threadgroups); the plain layout for E2B's short rows (+10% on one matrix, -5% on
+others).
+
+So, rather than shave steps, make tokens cheaper to check and guess more of them:
+
+- `--lookup <n>` (server, on by default, 3): with no draft model, guesses from the chat
+  itself, what followed the latest earlier place its last 4 (3, 2) tokens appeared, 3 (2,
+  1) of them, checked as a draft model's are, so every token is still the model's own
+  pick. Gemma 4 and Llama (Qwen's DeltaNet can't go back). Through the server, 200-400-
+  token replies, tokens/s off  on (guesses taken): E2B rewriting a document as a list 217
+   342-358 (78-80%), returning an edited code file 217  445 (94%), a summary 217  212-216,
+  a new story 219  216-217 (6-11%); E4B 125  165-196, 125  209-269, 125  128-131,
+  125  122-124.
+- One token's attention kernels take up to 8 tokens (a grid layer each, its own causal
+  length and scratch), not the prompt kernels: a 2-token check on E2B at 500 tokens 6.6
+   4.9 ms (one token 4.5), E4B 10.2  8.2 (7.9); Gemma 4 31B 61  53 ms (one 51).
+- Qwen's DeltaNet steps through up to 8 tokens with the one-token kernel rather than the
+  chunked prompt kernels (~13 s a layer against ~77): Qwen 4B's 2-token batch 12.2 
+  10.8 ms. Its numbers are now exactly token by token's for short batches.
+- `matvec_few` for 3 tokens (they were padded to 4): E2B's 3-token check 6.1  5.6 ms.
+  Tried and removed: gate, up and the activation in one few-token kernel (level on Q4_0,
+  slower on Q4_K, and on Q6_K 31B's 2-token check 53  71 ms).
+
+Eight eval cases (the six, three-steps, skill-summarize, skill-review), main  now,
+seconds for all eight, the same pass or fail and the same tokens in every case: E2B 6.00
+ 5.34, E4B 12.76  11.10, Qwen 4B 18.31  16.29, 9B 30.12  26.92 (11-13% less; Qwen
+from the short batches alone). Next: the K-quants' few-token products (Qwen's are
+slower than Q4_0's: decode8 reads a byte at a time), a way back for Qwen so it can
+draft (a checkpoint a round), and the per-layer fusions above for Gemma.
+
+**Seventh pass: the large models (2026-11-11).** Gemma 4 31B (Q6_K, 25.2 GB) on the M5
+Max. Writing is at the memory's speed (~20 tokens/s is ~500 GB/s) and a long prompt's
+products run at 50-55 TFLOPS, against ~62 for F16 weights read straight from device
+memory (the accelerators' ceiling here; F16 through the same tile is no faster than
+Q6_K, so decoding isn't the limit). Where an agent case's time goes (`VIREO_TIME_LOG`,
+nine eval cases): writing 37%, checking lookup guesses 20%, reads of 9-64 tokens 19%
+and 65-256 tokens 16% (tool results, new turns, scoring questions), at 2.8-4.7 ms a
+token against 1.8 for long prompts: a 42-token read paid for a 128-token tile. Built:
+
+- 32- and 64-token tiles (`SMALL_TILES`) for batches of up to 32 and 64 tokens, the
+  same sums to the bit: Q6_K ffn_up at 16 / 42 / 64 tokens 0.59  ~0.40 / 0.60  0.46 /
+  0.62  0.51 ms.
+- Short batches (up to 128 tokens) split along the columns until there are ~1,280
+  threadgroups (`SPLIT_TARGET`, `sum_parts` adds the parts in order): ffn_down and
+  attn_output have few rows and long ones, 168 threadgroups for 40 cores; ffn_down at
+  20 / 64 / 100 tokens 0.77  0.33 / 0.91  0.45 / 1.02  0.63 ms. The numbers move by
+  f32 rounding (31B: one of nine replies worded differently, same passes; the small
+  models' replies all the same).
+- `tests/big_matmul.rs` (ignored; `VIREO_BIG_MODEL`): a large model's products against
+  F16 of the same shape, and 1-8 tokens' products.
+
+Nine cases on 31B, 9/9 both: 9.0  8.4 s a case, 9-64-token reads 15.5  10.4 s; a
+31-token prompt 322  274 ms; long prompts and writing unchanged. Eight cases on the
+small models, the same replies: 9-64-token reads E2B 0.69  0.51 s, E4B 1.57  1.12,
+Qwen 4B 1.22  0.97. Tried and left out: two weight tiles in turn, the next step's bytes
+loaded ahead, 16-128 rows and 4-8 SIMD groups a tile (all within 3%: the product alone
+takes 0.22 of a 32-token tile's 0.42 ms); Q6_K's own few-token kernel for 4-8 tokens,
+reordered to hold fewer registers (checks ~4% cheaper, ~1% of a case); more parts for
+one token's 512-wide attention (level at 8.5K tokens). Next for the large models:
+writing (drafting with E2B for long answers, and tool calls), and running Qwen 3.8 27B
+and Muse Glimmer 30B, whose Q6_K GGUFs are now in the app's model folder (see
+`evals/gemma-4-31B.md`).
+
+**Eighth pass: Qwen 3.8 27B (2026-11-12, night).** Its Q6_K GGUF (bartowski, 23.9 GB,
+mostly Q6_K and Q8_0) is the Qwen 3.5 design with 48 DeltaNet and 16 attention layers,
+3 value heads a key head, 6 query heads a key/value head, untied output, and one
+multi-token-prediction layer (`blk.64.nextn.*`) counted in `block_count`, now left out.
+`vireo-cli perplexity` put BOS on every chunk whenever a model names one; llama.cpp only
+when the model adds one (this model names it and doesn't), which made 27B look wrong
+(14.30 against 10.39). Fixed: 10.3902 against llama.cpp's 10.3898 (PLAN.md, 8 chunks of
+512), chunk by chunk; the other models' numbers unchanged. Speed, M5 Max, against
+llama.cpp b12228 (llama-bench): reading an 8.5K prompt 700-714 tokens/s (llama.cpp
+561 at 8,192), writing 19.1-20.4 tokens/s (19.7), a 43-token prompt 159-161 tokens/s.
+Nine eval cases: 9/9.
+
+- A batch of 5-8 tokens on a matrix of 64M+ weights takes the short batches' tile
+  (`Gpu::tile_beats_few`): matvec_few reads its weights twice for 5-8 (two dispatches
+  of up to 4), and the tile costs the same from 2 to 32 tokens. Qwen 27B's reads of
+  5 / 6 / 8 tokens in the eval: 118  82, 128  90, 155  91 ms.
+- Qwen can go back now, so it drafts from the chat (`--lookup`) as Gemma does: the
+  few-token DeltaNet kernel (`delta_net_8`) writes the state before a batch of up to 8
+  and after each of its tokens but the last, and the session keeps each layer's
+  convolution history and the batch's inputs (`Qwen35Cuda::keep_steps`, ~1.2 GB for
+  27B); `rewind` copies back the step wanted and drops the attention layers' later
+  positions. A GPU test reads 5 guesses, keeps 0, 2, 4 or 5, and goes on as a session
+  that read only those (exact: to 8e-6, 0 for 0 and 5). The CUDA kernel doesn't keep
+  steps yet (`can_rewind` is false there). Nine cases, the same replies to the token:
+  writing 1,210 tokens 58.4  52.9 s (20.7  22.9 tokens/s; a check of up to 4 tokens
+  56 ms against 48 for one), 10.5  9.9 s a case.
+
+Seen, not yet looked into: the first read in each of the first two cases took ~2 s
+(7 tokens; a new session's buffers touched for the first time?), and the chat's read
+right after the scoring questions costs twice a plain read of its size. Next for Qwen:
+its own multi-token-prediction layer as a draft (one layer and the output head a guess,
+~1.3 GB against 23.9), which guesses prose too, where the chat's text doesn't.
+
+**Ninth pass: Muse Glimmer 30B on the engine (2026-11-12, night).** Its Q6_K GGUF
+(bartowski, 23.4 GB; `muse-glimmer`) runs as a variant of Gemma 4's GPU path
+(`Config::muse`), since in GGUF form it is Gemma 4's layer with other choices: the
+converter folds the centered norms' 1 + w into the weights and the 3.87 query scale
+into `attn_q_norm` (k_norm is all 1s). What differs from Gemma: the embedding
+RMS-normed (no weight) rather than scaled; values not normed; attention scaled by
+1/sqrt(128); RoPE on the sliding-window layers only (every 4th layer global, NoPE), on
+neighbouring pairs (the converter permuted q and k as for Llama; rotating halves gave
+perplexity 496); SiLU; a sigmoid gate on each head's output from its own projection
+(`attn_gate`, new Metal kernel `sigmoid_mul`, so CUDA refuses Muse for now); a separate
+output matrix; logits times `logit_scale` 0.196 (folded into the final norm's weight)
+before the softcap of 20. 52 layers, 6,656 wide, 32 query heads to 2 key/value heads,
+128-wide heads, a 2,048-token window. Its tokenizer splits words at case changes
+(`llama4`, GPT-4o style): a new pre-tokenizer, and tables of upper/titlecase and
+lowercase letters (`unicode_case_tables.rs`, `gen_unicode_tables.py --case`; from
+Unicode 14, Python 3.11's: letters added since count as caseless).
+
+Checked: `tools/compare_tokenizer.py` (now finds the Mac's binaries) 6,453 of 6,458
+runs identical to llama.cpp; of the 5, two are llama-tokenize failing (error -10) and
+three are llama.cpp reading `<|start|>` as its control token in raw mode, which it does
+for this vocabulary's control tokens even with --no-parse-special (Qwen's and Gemma's
+it doesn't); ours reads them as text there, kept. Perplexity (PLAN.md, 8 chunks of 512):
+16.913 against llama.cpp's 16.862 on Metal, the same in exact mode, so not our
+rounding; llama.cpp's CPU gives 10.81 / 12.84 on the first two chunks against its
+Metal's 10.89 / 12.93 (its CPU rounds activations to 8 bits for Q6_K), ours 10.94 /
+12.98. Gemma 4 31B, checked before, is 0.3% from llama.cpp's Metal the same way (6,057
+against 6,039). It answers a question sensibly, reasoning first (`to=self`) as its
+template has it. Speed against llama.cpp b12228: reading a 7.8K prompt 766-855 tokens/s
+(llama.cpp 635 at 8,192), writing 22.2-22.8 tokens/s (21.4). Not in vireo-server yet:
+its chat format (`<|start|>role<|message|><|eot|>`, recipients `to=user` / `to=self`)
+and tool calls (`<atem:function_calls>` XML) need a family of their own there.
+
+| Q6_K, M5 Max | Read 8K prompt (ours / llama.cpp) | Write (ours / llama.cpp) |
+|---|---|---|
+| Gemma 4 31B | 652-675 / 519 | 19.7-20.0 / 19.3 |
+| Qwen 3.8 27B | 700-714 / 561 | 19.1-20.4 / 19.7 |
+| Muse Glimmer 30B | 766-855 / 635 | 22.2-22.8 / 21.4 |
+
+**Tenth pass: Qwen 3.8 27B drafts with its own multi-token-prediction layer
+(2026-11-12, night).** Writing on all three large models runs at 90-95% of what the
+matrix kernels reach from memory (Gemma ~476 GB/s, Qwen ~475, Muse ~507, against
+~530): one token at a time is at its ceiling, so the way on is guessing. Qwen 3.8 27B
+carries a guesser: `blk.64.nextn.*`, mlx-vlm's `qwen3_5_mtp`. Entry i pairs the model's
+final normed hidden state after token i with token i + 1, as `fc([RMSNorm(embed) 
+enorm, RMSNorm(h)  hnorm])` (eh_proj split by columns at load, a byte copy, so no
+concatenation), then one full-attention layer of the model's kind with its own cache,
+`shared_head_norm` and the model's output matrix: a guess at token i + 2.
+
+- The session keeps the layer's cache up with every token it reads (`use_mtp`): after
+  each batch, each hidden state pairs with the next token and the last waits for the
+  token picked next (the last layer then runs for every token of a batch; about one
+  layer more a token). `mtp_draft` pairs the waiting state with the pick (the first
+  guess, from the model's own state), then chains the layer's output for the rest;
+  the model checks them in one pass as it does the chat's guesses, and `rewind` (the
+  DeltaNet steps) cuts both back. Checkpoints keep the layer's count and waiting state;
+  an imported chat starts its cache again.
+- Measured on its own (`tests/mtp.rs`, three prompts, greedy, 354 rounds of 3): the
+  first guess right 86% of the time, 1.93 of 3 taken a round, 8.3 ms drafting a round.
+- Nine eval cases, 9/9, every reply the same to the token: 10.5 s a case with no
+  drafting (9.9 with the chat's guesses)  8.3; writing 1,210 tokens ~58.4 s  ~38.4
+  (20.7  ~31.5 tokens/s with the drafting). `--mtp off` turns it off.
+- The chat's guesses (`--lookup`) for Qwen only on a large model (5,120 wide or more):
+  on Qwen 3.5 4B a few-token check costs 1.5 times a token and writing went 5.5  5.9 s
+  over eight cases.
+
+**Eleventh pass: tiles for 65-192 tokens, fewer guesses (2026-11-12, early
+morning).** Reads of 65-256 tokens (tool results, new turns) were the largest reading
+share left on the large models. A 96-token tile for 65-96 tokens and a 192-token one
+for 129-192 (two 128-token tiles before), and column splits up to 256 tokens (128
+before, so ffn_down kept its 168 threadgroups at 150 tokens): Q6_K ffn_up at 80 tokens
+0.64  0.56 ms, at 150 1.13  0.89; ffn_down at 150 1.19  0.89. Nine cases: Gemma
+31B's 65-256-token reads 13.7  11.0 s (7.7 s a case); Qwen 27B's, alternating with
+the old tiles, 21.1  19.3 and 21.8  20.6 s; small models level or a little faster,
+the same passes. Qwen's multi-token-prediction drafting at 2 guesses a round, not 3: a
+check of 4 tokens costs 1.8 times one, so the third guess (right 43% of the time)
+didn't pay: 8.6 / 8.9 s a case against 9.1 / 9.3, alternating. Gemma 31B with Gemma 4
+E2B as its draft (`--draft`) instead of the chat's guesses: 7.9 s a case against 7.8 /
+8.4 for two plain runs, every reply the same; long answers a little faster, short ones
+a little slower, 3.3 GB more: left off.
+
+Measuring at night: after hours of steady GPU work this Mac ran 5-10% slower than at
+the start (every setting, single tokens 47.8  50 ms on Qwen 27B), so the numbers above
+compare runs made side by side, alternating.
+
+Where the three large models stand (Q6_K, M5 Max; tokens/s; ours against llama.cpp
+b12228's llama-bench):
+
+| | Read an 8K prompt | Write, one at a time | Nine eval cases, a case |
+|---|---|---|---|
+| Gemma 4 31B | 652-675 / 519 | 19.7-20.0 / 19.3 | 9.0  7.7 s (lookup drafting) |
+| Qwen 3.8 27B | 700-714 / 561 | 19.1-20.4 / 19.7 | 10.5  8.6 s (its own drafting layer) |
+| Muse Glimmer 30B | 766-855 / 635 | 22.2-22.8 / 21.4 | 10.6 s (five other cases, lookup drafting; see below) |
+
+Writing one token at a time is within 5-10% of what the matrix kernels reach from
+memory on all three; long prompts' products run at ~85% of the accelerators' F16
+ceiling. What's left is in guessing (a cheaper 4-token check would let Qwen take a
+third guess and help Gemma's chat guesses), and the short reads' fixed costs.
+
+**Twelfth pass: attention for a group of heads, a few tokens at once, longer guesses
+(2026-11-12, afternoon).** Where a 30K prompt's time went on Gemma 4 31B
+(`VIREO_METAL_PROFILE`): the matrix products 59%, the ten global layers' attention 25%
+(49 ms a batch, growing with the context), the sliding layers' 5%. The products run at
+51-57 TFLOPS on their own (`big_matmul_speed`; Q6_K a little ahead of F16 through the same
+tile), so they are at this design's ceiling; attention ran at ~20.
+
+- `attention_tcg` (vireo_tensor.metal): a prompt's attention with a key/value head's query
+  heads together. A threadgroup takes one key/value head and 16-32 rows of its queries
+  (several tokens of the group's heads), read as f16 from device memory (`qkv_prep` writes
+  them there too, regrouped; `q_group_half` for other callers), and each key and value
+  chunk once for the group, 128 or 256 positions at a time (64 a head before). Tiles
+  searched: 16-64 rows, 64-256 positions, 4 or 8 SIMD groups; the quickest leave a thread 32
+  of the output's numbers (512-wide heads 16  256  8, 256-wide 32  128  8, 128-wide
+  32  128  4). A batch of 1,024 at 30K positions, ms a layer: Gemma 31B's global layers
+  91  58, Qwen 3.8 27B 39  26, Muse 30B's global 30.4  13.7; sliding layers Gemma
+  1.86  1.44, Muse 2.14  1.11 (`tests/prompt_attention_speed.rs`). Rings are rounded to
+  256 positions for it. With the old chunk of 64 its sums are the old kernel's to the bit.
+- A short batch has few threadgroups, so its context is split into parts (about three
+  threadgroups a GPU core) that `attention_tcg_merge` adds up: 40 tokens at 30K, Qwen 27B
+  3.87  1.32 ms a layer, Muse 2.74  0.69.
+- 1 to 8 tokens the same way where it's quicker (`Gpu::grouped_few`): the one-token
+  kernels walk the context once a token and head, this reads it once. Gemma 31B's global
+  layers at 30K, 2 / 4 / 8 tokens: 1.09  0.58, 2.29  0.62, 4.98  0.80 ms. One token
+  only for Muse's global layers (0.26  0.08 ms at 30K); Gemma's and Qwen's read their
+  cache at memory speed already.
+- 8- and 16-token tiles for the matrix products (`matmul_tc_t8`, `_t16`, 256 columns a
+  step), and `Gpu::tile_beats_few` by weight type: the tile from 4 tokens for K-quants and
+  5 for the others, on any matrix over 4M weights (64M and 5 before). Gemma 31B's ffn_up,
+  s at 3 / 4 / 5 / 8 tokens: few-token kernels 221 / 296 / 437 / 583, the 32-token tile
+  ~330, the 8-token one 250-260 (one token 194); ffn_down at 4: 400  252
+  (`big_few_or_tile`). 256 columns a step did nothing for whole batches (4.69  4.63 ms).
+  A slip found on the way: a tile whose step doesn't divide the columns dropped the last
+  columns (none of the old tiles' did).
+- `VIREO_METAL_ERRORS=1` says why the tensor kernels didn't compile: the backend falls
+  back to the kernels without them silently, as it must before the M5.
+
+A batch of n tokens after a chat of that length, ms, main  now (`tests/check_speed.rs`):
+
+| | 1 | 3 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| Gemma 4 31B at 2K | 52.5 | 67.6  67.0 | 96.6  71.7 | 120.4  74.3 | 101.0  80.0 |
+| Gemma 4 31B at 27K | 56.4 | 82.0  71.5 | 111.1  80.4 | 146.2  86.9 | 130.1  95.4 |
+| Qwen 3.8 27B at 2K | 46.5 | 52.4  52.5 | 67.5  57.7 | 96.7  69.0 | 96.4  73.8 |
+| Qwen 3.8 27B at 27K | 50.0 | 63.8  61.9 | 87.7  68.0 | 137.9  83.3 | 150.6  94.3 |
+| Muse 30B at 2K | 46.7  44.8 | 64.5  51.7 | 97.8  59.3 | 108.6  70.5 | 103.3  79.2 |
+| Muse 30B at 27K | 51.5  49.0 | 73.5  61.7 | 107.5  66.5 | 143.5  76.3 | 128.4  79.7 |
+
+Eight tokens now cost what four do, so the guessing takes more (vireo-server): guesses
+from the chat run up to 7 after a match of 8 tokens (3 after 4 before; the Mac only, a
+longer match guessing further), and Qwen's multi-token-prediction layer gives 3 a round
+(2 / 3 / 4 guesses: a copied document at 44 / 53 / 59 tokens/s, a new story at 30.1 / 29.6
+/ 26.5). Three replies through the server, tokens/s, main  now, every reply's text the
+same: Gemma 31B rewriting a document as a list 28-33  43, returning an edited code file
+30-35  62, a new story 18-19  18.4; Qwen 27B 42.5  53.2, 43.4  53.2, 29.5  29.6;
+Muse 30B 31.9  42.0, 32.2  45.3, 20.4  20.3.
+
+Whole reads and writes (`vireo-cli`, the speed report's prompts; the Mac ran hot and busy
+all afternoon, runs moving by 10-15%, so these are alternating runs): Muse 30K read 593 
+662 tokens/s and writing after it 19.2  20.5; Gemma 31B's 30K read by kernel 63.8 / 65.1 s
+of GPU time  59.6 / 61.7 (attention 19.7-20.5  14.0-14.4 s; the products ran 3-5% slower
+beside it, the GPU's heat budget); Qwen 27B 592  597 at 30K, 698-722  718-722 at 8K.
+Perplexity old / new attention: Qwen 27B 10.3910 / 10.3902, Muse 16.9149 / 16.9134. Nine
+eval cases on Gemma 4 E4B, Qwen 3.5 4B, Gemma 31B and Qwen 27B, main and now alternating:
+every reply the same to the token, and the time level (13.3-15.0 / 18.7-18.8 / 80.5-90.8 /
+82.5-93.6 s against 13.4-13.8 / 18.6-19.5 / 81.2-85.3 / 83.0-85.0): at the eval's ~2K
+contexts these changes cost and save little. Muse's reasoning on the rewrite ran 406
+tokens, not main's 41, with the same answer: exact mode gives 406 too, so main's was the
+f16 rounding's path. One test's limit moved: re-reading 10 tokens after a rewind differs
+by 0.02 in the logits in the default mode (1e-3 before), a short batch's parts each
+rounding probabilities to f16 against their own largest.
+
+`VIREO_TCG=off` and `VIREO_TCG_FEW=off` keep the old attention kernels, to compare. Not
+done: the CUDA side of any of it; the speed report's page (its numbers are the morning's).
+
+**Muse Glimmer 30B in vireo-server (2026-11-12).** A chat family of its own (`Family::Muse`,
+`muse-glimmer`), run by Gemma 4's model code. Its format is the template's: turns are
+`<|start|>role<|message|><|eot|>`; the system turn carries Vireo's system prompt (with the
+Mac's note: knowledge cutoff, keep the reply short), `Reasoning strength: low.` (the Mac's
+setting for thinking off), the tools' declarations and the valid recipients; results come
+back as `<|start|>tool NAME<|message|><tool_output name="NAME"></tool_output><|eot|>`. Each
+assistant message names its recipient first, so the reply loop has the model choose there,
+under the call grammar, each option scored whole: `to=user` (plain text from there),
+`to=self` (its reasoning, not shown), or a tool and its `<atem:function_calls>` block.
+`<|eom|>` opens another message. Muse can't do without reasoning: held to the user (no
+`to=self`), it wanted `self` at every turn and called no tool on any case (0 of 5). Given
+`self` it reasons briefly (18-144 tokens a reply) and passes all five. Reasoning is capped
+at 2,048 tokens a reply, then ended for it. Eval, `--cases datetime,read,list,git,three-steps
+--server-arg --context --server-arg 32768`: **5/5**, 10.6 s a case, 10 tool calls (three-steps
+read all three READMEs, then the right project's Git). Reading the 1,878-token first prompt
+849 tokens/s; writing 26.5-35.2 tokens/s with lookup drafting (53-72% of guesses taken),
+against 22-23 one at a time; each call takes ~0.9-1.4 s to write. Results:
+`evals/muse-glimmer-30B.json`.
+The other two large models on the same five cases and build, side by side: all three 5/5;
+a case Gemma 4 31B 5.9 s, Qwen 3.8 27B 6.8 s, Muse 10.6 s. Muse's extra time is length, not
+speed: 1.4-2.2x the tokens a reply (its answers restate the file or list more; reasoning is
+18-144 of them), six calls on three-steps where the others made three (it read every
+README), and a longer system turn (1,878 tokens against 1,292 and 1,655). Writing: Gemma
+19.5-22.2 tokens/s (lookup), Qwen 27.2-39.5 (its drafting layer, 80-100% taken), Muse
+26.5-35.2 (lookup). Results: `evals/large-models-five-cases.json`.
+The twelve hard cases on all three: Gemma 4 31B 12/12 (6.6 s a case), Qwen 3.8 27B 12/12
+(6.2 s), Muse 11/12 (10.2 s, 20 calls against the others' 15). Muse's miss, three runs of
+three: `follow-up-file` ("And what does plan.md in the same folder say?", after an earlier
+turn that answered from notes.txt with no call in the history) goes straight `to=user`
+without reasoning and makes the file's contents up. `Reasoning strength: medium` doesn't
+change that and slows every other case (it reasons 2-3x longer), so it stays `low`. Muse
+is thorough where the others are quick: `recover` 4 calls in 18.7 s (the others 2 in ~6),
+`three-steps` reads every README. Results: `evals/large-models-hard-cases.json`.
+
+Where a Muse call's ~1 s goes (`VIREO_TIME_LOG`, `read`): the call's scaffolding is fed in
+one ~100 ms read; the path is written a token at a time at 46 ms. Lookup guesses inside the
+call (tried, the calls the same in all 15 cases) saved nothing: a path in the request is
+tokenized after a space (" C") and in the call without, so the chat's runs rarely match.
+Left out. The same log shows ~3.6 s a case in the skill-picking questions before every
+reply, on every model (11 skills, ~330 ms each): the shared start of those questions kept
+in the picker's session is the larger win, for all three.
+
+**What limits speed now, and what's next:**
+
+- **Generating** reads the big matrices at memory speed, but a token is still a chain of
+  ~8 dependent steps a layer at ~23 s each (a dependent dispatch costs 23 s, an
+  independent one 0.20.6), and the small matrices (a layer's q, k and o) are bound by
+  the latency of their few steps. Next: q, k and v in one dispatch, and the norms folded
+  into the projections' inputs.
+- **Reading prompts:** Gemma's Q4_0 matrix products are ~60% of its prompt time; its
+  small matrices (256 rows: k, v and the per-layer projections) leave the GPU part idle
+  and might want a smaller tile of their own. Qwen's DeltaNet is ~28% (the scan 18%, the
+  prep 10%, the prep's forward substitution a 32-step chain in each column).
+- **Measuring:** compare within a sitting, alternating A and B (`VIREO_*` switches
+  removed once settled), and time scoring a text too: it reads every token's logits, a
+  prompt-sized product over the whole vocabulary, which a prompt benchmark misses.
+- On Macs without neural accelerators (before the M5) the default mode uses the
+  SIMD-group kernels (`matmul_sg`, `attention_flash`, `attention_flash2`), untested here.
+
+## Development machine
+
+The PC this starts on (checked 2026-11-10):
+
+| Part | What it is | Used for |
+|---|---|---|
+| GPU | NVIDIA GeForce RTX 5060 Laptop, 8 GB, compute capability 12.0 (Blackwell), driver 621.14 | The CUDA backend: phase 1 onward |
+| Integrated GPU | AMD Radeon 880M | Testing the Vulkan backend later, without a second PC |
+| NPU | AMD XDNA (Ryzen AI 9 465) | NPU experiments (see NPUs) |
+| Memory | 31 GB | Room for llama.cpp, our engine and the reference tools side by side |
+
+All three kinds of accelerator Vireo might use are on one machine.
+
+**Installed 2026-11-10:**
+
+- Rust stable (`rustup`, the MSVC toolchain)
+- CUDA Toolkit 13.5. A test kernel built for compute capability 12.0 (`sm_120`) runs
+  correctly on the RTX 5060.
+- Visual Studio 2026's **Desktop development with C++** workload and the Windows SDK
+  10.0.26100 (Rust and `nvcc` both need them)
+
+**Reference:** llama.cpp b12262's Windows CUDA 13.5 build, in `reference/` (not in
+git), for checking our output and speed.
+
+## Progress
+
+| Done | What | Checked by |
+|---|---|---|
+| 2026-11-10 | GGUF reader (our own memory-mapping, all 32 tensor types) | Unit tests; Llama 3.2 1B Q4_K_M: every tensor lines up with the file |
+| 2026-11-10 | Tokenizer: byte-level BPE, Llama 3 pre-tokenizer, our own Unicode tables | `tools/compare_tokenizer.py`: identical ids to llama.cpp on all 3,484 runs (every text file in the repo plus 400 random texts, as prompts and raw) |
+| 2026-11-10 | CPU reference: F16/BF16/Q8_0/Q4_K/Q6_K decoding, our own thread pool, the Llama forward pass, `vireo-cli generate` and `perplexity` | Llama 3.2 1B: perplexity 38.3242, the same as llama.cpp to every digit (F32 copy of the model, CPU, f32 cache); next-token probabilities equal to 4 decimals. ~25 tokens/s on the CPU |
+| 2026-11-10 | CUDA backend: our own driver bindings (loads `nvcuda.dll` at runtime; no CUDA library linked or shipped), kernels in `kernels/vireo.cu` built to PTX by `build.rs`, the whole Llama forward pass on the GPU (`--gpu`) | Matrix-vector kernels equal the CPU reference to f32 rounding (~1e-6) on Llama's real Q4_K and Q6_K weights; perplexity 38.3242 on the GPU, the same as the CPU and llama.cpp |
+| 2026-11-10 | Qwen 3.5 on the CPU: the `qwen35` pre-tokenizer (combining marks in words; our own Unicode marks table), Q5_K and Q4_0 decoding, Gated DeltaNet layers (causal conv1d, L2-normalized q/k, the delta-rule state update, gated RMSNorm), gated attention with partial RoPE in halves | Tokenizer: identical ids to llama.cpp on all 4,310 runs. Qwen 3.5 0.8B: perplexity 25.1818 against llama.cpp's exact 25.1817 (llama.cpp runs a prompt's DeltaNet in chunks: the same arithmetic in another order); next-token probabilities within 0.0005 points |
+| 2026-11-10 | Gemma 4 on the CPU: its tokenizer (UTF-8 BPE with "" spaces, newline-only splits, `<0xXX>` byte fallback; end-of-turn tokens made control tokens as llama.cpp does), per-layer embeddings, keys and values shared from earlier layers, sliding-window and global layers with their own head sizes and RoPE bases, the extra norms, layer output scale and logit softcap | Tokenizer: identical ids to llama.cpp on all 4,312 runs (and Llama's and Qwen's re-checked after the end-of-turn change). Gemma 4 E2B: next-token probabilities within 0.0002 points; perplexity 30.8273 against llama.cpp's 30.8287 (0.005%) |
+| 2026-11-10 | Qwen 3.5 and Gemma 4 on the GPU: Q4_0 and Q5_K matrix-vector kernels, RMSNorm per head (with or without a weight), RoPE in halves and on part of a head, sliding-window attention, the DeltaNet convolution, L2 norm and a whole DeltaNet head step in one kernel, gated attention, GELU, softcap. Gemma's two embedding tables stay in system memory (looked up per token) | Every quantized kernel equals the CPU to f32 rounding on real Llama, Qwen and Gemma weights. Perplexity on the GPU: Qwen 25.1818 and Gemma 30.8273, the CPU's numbers to every digit; GPU tests check llama.cpp's probabilities and the answer for all three models |
+| 2026-11-10 | First round of GPU speed work: prompts in batches (matrix-matrix kernels, tiled attention, batched DeltaNet), one CUDA graph per generated token, fused residual/norm and query/key/value steps, faster matrix-vector kernels (see "Speed so far") | Perplexity identical to every digit before and after on all three models; the matrix-matrix kernels equal the CPU to f32 rounding; a prompt read in batches of 7 gives every token's logits within 210 of their range of reading it token by token, the same next token every time (Gemma across its sliding window); llama.cpp's probabilities still match with batched prompts. 72 engine tests pass |
+| 2026-11-10 | 8-bit activations on the GPU by default (`Precision::Int8`; `--exact` keeps f32): dp4a matrix-vector and tensor-core matrix-matrix kernels for Q4_0, Q8_0, Q4_K, Q5_K and Q6_K, a second PTX for compute 8.0, Q4_0 repacked on upload (see "Second round") | Perplexity within 0.1% of exact on all three models; tensor-core and dp4a kernels agree to ~1e-6 and stay within the rounding of x of the CPU; the France answers unchanged; exact-mode tests still match llama.cpp's exact numbers. 74 engine tests pass |
+| 2026-11-10 | An f16 key/value cache in 8-bit mode, prompt attention on the tensor cores, one token's attention split along the context (see "Third round") | Tensor-core and per-token attention over an f16 cache against f64 for head sizes 64512 and a sliding window; perplexity within 0.13% of exact; exact mode unchanged (still llama.cpp's exact numbers); batches and token-by-token pick the same next token (Gemma: 553 of 554). 75 engine tests pass |
+| 2026-11-10 | Prompt speed: deeper tensor-core matrix steps with scales read once, Qwen's DeltaNet split into parallel norms and a column-split state update, the convolution over every token at once (see "Fourth round") | Exact perplexity unchanged to every digit (Qwen 25.0418); 8-bit perplexity within 0.13% of exact; the tensor-core and dp4a kernels still agree to ~1e-6. 75 engine tests pass |
+| 2026-11-11 | Prompt speed again: m16n8k32 products, unpacking Q4_K/Q5_K by sub-block pairs and Q6_K by run pairs, Q6_K padded to aligned 224-byte blocks (see "Fifth round") | Perplexity unchanged to every digit, exact and 8-bit; the exact Q6_K kernels still equal the CPU on the padded layout; tensor-core and dp4a kernels agree to ~1e-6. 75 engine tests pass |
+| 2026-11-11 | Nsight Compute profiling; `__vsubss4` replaced by cheap sign extension everywhere; Gemma's shared-KV layers run only for tokens whose logits are wanted (see "Sixth round") | Perplexity unchanged to every digit, exact and 8-bit (scoring runs every layer); the Gemma GPU test still matches llama.cpp's exact probabilities with a prompt read through the new path. 75 engine tests pass |
+| 2026-11-11 | Where a prompt's time goes (Nsight Systems), then prompt attention rewritten: cp.async loads overlapping the arithmetic, values read with `ldmatrix.trans`, S worked out once for 512-wide heads (see "Seventh round" and "Eighth round") | The f16-cache attention test against f64 for every head size and a window; 8-bit perplexity unchanged to every digit on Llama and Qwen; Gemma's moves by up to 0.1% per chunk either way (the 512-wide scores are added in two halves), the same 0.27% from exact on average. 75 engine tests pass |
+| 2026-11-11 | The tensor-core matrix kernels read the next step's bytes ahead into registers (one block per SM, all but Q6_K); Llama's and Qwen's last layer runs past its keys and values only for the token whose logits are wanted (see "Ninth round") | 8-bit perplexity unchanged to every digit on all three (the same integer sums; scoring runs every layer); the same generated tokens. 75 engine tests pass |
+| 2026-11-11 | The small kernels: Qwen's convolution in registers (it had gone to local memory), `qkv_prep` with a thread per number and 8 tokens a block, Gemma's F16 per-layer projection as Q8_0 in 8-bit mode (see "Tenth round") | Llama and Qwen: 8-bit perplexity and generated tokens unchanged to every digit. Gemma: the same tokens; perplexity per chunk within 0.3% of before and nearer exact on average (0.14% from it, 0.27% before); next-token probabilities nearer exact too (20.04% against exact 20.67%, before 22.12%). 75 engine tests pass |
+| 2026-11-11 | Qwen's DeltaNet for a prompt in chunks of 64 tokens, the WY form (`delta_chunk_prep`, `delta_chunk_scan`; see "Eleventh round") | Exact perplexity the same as token by token to every digit at 2,048 tokens (chunk 1: 16.2601 against 16.2602 on the first build, then identical); 8-bit within 0.25% per chunk, nearer exact on average. A new test case reads Qwen in batches of 200 (across chunks, ending in part of one) against one token at a time: logits within 1e-4 of 31 exact. 75 engine tests pass |
+| 2026-11-11 | Phase 2 begins: vireo-server keeps one session between replies and reads only what's new. Llama and Gemma cut their cache back to the start a new prompt shares with it (`truncate`); Qwen's DeltaNet can't be cut back, so its state is saved where each prompt's history ends (`Qwen35Cuda::save`, `restore`, `reset`), and the next turn goes on from there | A new GPU test: a next turn read on top of a cut-back or restored session gives a fresh read's logits (exact: within 3e-5; 8-bit: the same next token, within the batches' rounding). A five-turn chat about a 4,000-token document: the first word in 0.05-0.1 s from turn 2 on, against 1.0-1.5 s reading the whole chat again (Llama 1.52  0.07 s, Qwen 1.33  0.10 s, Gemma 1.06  0.05 s at turn 5). 76 engine tests pass |
+| 2026-11-11 | A saved cache per chat: a session's keys and values (and Qwen's DeltaNet at its checkpoint) copied to system memory and back (`export`, `import`, `SavedState`); vireo-server saves the chat in use when a prompt would throw much of it away, or when the app closes, to `%LOCALAPPDATA%\VireoPrototype\chat-cache\<model>\` (a file per chat, written on a thread of its own; 4 GB per model, the oldest go first), and loads the saved chat that shares the most of a new prompt. Llama and Gemma can load part of one (a shared start); Qwen's loads whole | A new GPU test: an imported session goes on to the bit as the one it came from, whole and in part, exact and 8-bit. Two chats about 3,500- and 4,400-token documents taking turns, then a restart: going back to a chat or reopening it loads its cache in 17-66 ms, the first word in 0.06-0.13 s, against 0.8-1.4 s reading it again, on all three models. 77 engine tests pass |
+| 2026-11-11 | Tools, step 1: our own grammar matcher (`grammar`: a schema to a byte-level matcher, the vocabulary's tokens in a byte trie for the tokens that may come next, forced text written ahead) | Unit tests, and on all three vocabularies the trie's tokens equal trying each of 128K-262K tokens at every byte of a call; 0.04-0.06 ms a step on average, 0.5 ms at most. On the GPU each model asked about a file writes the expected `read_file` call: 23-30 tokens in 10-12 passes (forced text saves over half). Llama 3.2 1B also filled the optional `max_lines` with 1: a valid call, a poor choice, which the grammar can't catch. 80 engine tests pass |
+| 2026-11-11 | Tools, step 2: vireo-server's tool loop. Each family's own form, from its template: declarations in the system turn, Qwen's `<tool_call><function=...><parameter=...>`, Llama's JSON (opened with `<|python_tag|>` or `{`), Gemma 4's `<|tool_call>call:name{key:<|"|>value<|"|>}`; the grammar gained raw text up to an end mark and other punctuation for objects. The model writes freely until a call starts, the grammar writes the call, the app runs the PC's tools (`client_tool_request`, `/api/agent/client-tool-result`) and the server its own (the date), and the result goes back in the family's form, all in the kept cache. A repeated call isn't run again; used-up calls leave the model only an answer. Read-only tools so far | Unit tests for each family's calls and declarations. A first baseline, five chats (read a file, list a folder, the date, 17  23 with no tool, find then read): Gemma 4 E2B 4/5, Qwen 3.5 0.8B 2/5, Llama 3.2 1B 1/5. Every call parses and reaches its tool; what's left is the small models choosing the tool (Qwen reaches for `git_*` when unsure, Llama calls one more than needed). In the installed app, Gemma reads a README through the app's own `read_file` and sums it up |
+| 2026-11-11 | Tools, step 3: `vireo-eval`, our own eval. It starts vireo-server with each model and stands in for the app: a PC of a few files, folders and a Git project in memory (`pc.rs`), answering the app's tools as `PcTools` does, so any sensible route gets real answers and every run the same ones. Twelve cases (`cases.rs`): the date, reading, listing, finding then reading, whether a file is there, Git status, two without tools, a missing file, adding up a file's numbers, two files, and an instruction planted in a file; each checks the tools, their arguments and the answer. `--server-arg` compares a server feature on and off. Baseline in `evals/baseline.json` | Gemma 4 E2B 12/12 (one call per step needed), Qwen 3.5 0.8B 8/12 (it reaches for `git_diff` when unsure: the date, listing, finding), Llama 3.2 1B 1/12 (24 calls for 12 cases: extra and wrong ones, and answers that drop what the tool said). 0.8 s a case on average. The fake PC's own tests pass |
+| 2026-11-11 | Tools, step 4, first round, both behind switches and measured: `--score-choices on` scores each tool's whole name (the grammar offers a branch's options; each is read and rolled back, Qwen through a scratch DeltaNet checkpoint) instead of a token at a time; `--tools-shown scored` asks the model, in a small session of its own, which groups a request needs (files, Git, the date, none: a multiple-choice question with eight worked examples, its letters scored in one pass) and declares only those (no tools only when "none" is 0.7 likely or more) | Eval (baseline / names scored / fewer tools): Gemma 4 E2B 12 / 12 / 12, Qwen 3.5 0.8B 8 / 8 / 8, Llama 3.2 1B 1 / 2 / 4. Scored names change nothing for Qwen: it really does rank `git_status` above `get_current_datetime` for the date (log-probability -0.44 against -2.26), so the tool's name isn't the problem; scoring costs 0.4-0.6 s a case. The picker is sharp on Gemma (0.99-1.00, all right, after the examples: without them it took "What does minutes.txt say?" as needing nothing) and near chance on Qwen 0.8B and Llama 1B, yet Llama gains from the shorter menu. Both stay off by default; fewer tools is the first per-model setting worth having (Llama 3.2 1B) |
+| 2026-11-11 | More test models, and token healing. Added Gemma 4 E4B (Google's Q4_0), Qwen 3.5 4B and 9B (Q4_K_M); Llama 3.2 1B left the eval's default set (2024, superseded; still the engine tests' reference). Qwen 3.5 9B scored 4/12, worse than the 0.8B, calling `git_diff` to read a file: forced text was written as its own tokens, so Qwen saw `\n<function=` end in a lone `=`, where its training merges `=` with the name (`=read`). Token healing (on by default, `--heal off`): forced text's last token is left to the model, under the grammar | Perplexity against llama.cpp, 2,048 tokens: E4B 22.81 / 22.85, 4B 11.274 / 11.272, 9B 9.948 / 9.947. The 9B's score for `read_file` went from -2.66 to -0.000 (`git_diff` -12). Eval (healing off / on / + names scored / + fewer tools): Gemma E2B 12/12/12/12, E4B 11/11/11/12, Qwen 0.8B 8/10/10/9, 4B 8/11/11/12, 9B 4/12/12/12 (and 11.7 to 5.0 s a case). Most of what looked like small models choosing badly was this. Scored names help nowhere and stay off; fewer tools is +1 on E4B and 4B, -1 on 0.8B, so a per-model setting, off for now |
+| 2026-11-11 | Twelve harder cases for `vireo-eval` (`hard_cases.rs`), counted apart from the easy twelve: three steps (find the project whose README mentions invoices, then its Git status), one line in a 6,000-character log, which of eight logs holds a code, "my 2026 report" beside 2025's, a path relative to home, counting PDFs among other files, two follow-ups on an earlier turn (one needs a file, one needs nothing), explaining `git status` without running it, recovering from a wrong path, a deadline against today's date, and what a diff changed. Cases can carry earlier turns now. Reading every failure by hand found three that were the eval's: the stand-in PC searched for the whole search text in a name where the app's `SearchFiles` looks for each word ("*.pdf" found nothing; it now searches as the app does, matching lines included), `find-then-read` insisted on opening the file though a search's line shows the code word, and `long-log` didn't take "the disk on drive D: was full" | Eval, all 24 (easy / hard), after the fixes: Gemma 4 E2B 20 (12 / 8), E4B 22 (11 / 11), Qwen 3.5 0.8B 16 (10 / 6), 4B 23 (11 / 12), 9B 23 (12 / 11). `recover` fails on four of five: told a path that's wrong, each says the file is missing and stops, never looking around; `which-report` fails on two, which guess a path instead of listing the folder. Scored names (20 / 22 / 16 / 23 / 23) and fewer tools (20 / 22 / 15 / 23 / 22) help nowhere and stay off. A report of every case and score: `evals/eval-report.pdf` |
+| 2026-11-11 | A missing path's error says what is there (the app's `PcTools.NotFound`, and the eval's stand-in PC, which gives the same text): the nearest folder above it the chat can reach, what that holds (folders first, the first 30), up to three names there sharing the most words with the missing part (letters and digits apart, the extension left out: "2026_report.pdf" finds report-2026.txt before report-2025.txt), as full paths, and files of the same name a few folders down. Facts only: a last line telling the model to go on with one of them was tried two ways and scored lower | Eval, all 24, four versions against a fresh baseline (20 / 22 / 16 / 23 / 23, the same as before): names alone 21 / 22 / 17 / 23 / 23; full paths and "use it and say so; if not, tell the user what's there" 20 / 22 / 17 / 23 / 23; **full paths alone 21 / 22 / 18 / 23 / 23, kept**; full paths and "Go on with the one that fits the request" 21 / 22 / 17 / 23 / 23. `which-report` now passes on all five (3 before), and in two calls where 4B and 9B took three; `recover` on two (one before: Qwen 0.8B joins 4B). No other case moved, `missing` included. The three still failing `recover` (both Gemmas, Qwen 9B) now name meeting-notes.txt and ask the user whether to read it: a choice to stop, not a wrong path. Results: `evals/not-found-hints.json`. App tests 258 pass |
+| 2026-11-11 | Tools, step 2 finished: the tools that change files, with approvals. vireo-server offers `write_file`, `rename_file`, `move_file` and `delete_file` (the app's PcTools runs them, its undo journal recording each reply's changes), and before one runs it asks the user as the Mac's server does: `confirm_required` with a one-line preview ("Create ", "Move  to "), answered at `/api/agent/confirm`; "Don't ask again" kept in `%LOCALAPPDATA%\VireoPrototype\approvals.txt` (deleting always asks); declined or unanswered in two minutes, the model is told it wasn't done and not to try another way. Before asking, the app checks the change could be made (`check_change`, not a tool the model sees: the file is there, the name free, the folder there), so nobody approves a guess; an app without it is asked as before. One scored question (worked examples, " yes"/" no") decides whether a request asks for a change; only then are the change tools declared and callable (`--changes declared`). `vireo-eval` gained six change cases (`change_cases.rs`: write a note, add a line keeping the rest, rename, find then move, a declined delete, advice without a change), a stand-in PC that changes and a stand-in user who approves or declines, and a rule for the other 24: a reply that changes a file fails | All 30 (older 24 / changes 6), against the older 24's last run (21 / 22 / 18 / 23 / 23): changes always offered (`offered`) Gemma 4 E2B 20 / 4, E4B 21 / 5, Qwen 3.5 0.8B 15 / 3, 4B 23 / 6, 9B 23 / 5; declared always but callable only when asked (`scored`) the same; **declared only when asked (`declared`, kept) 21 / 5, 22 / 5, 16 / 4, 23 / 6, 23 / 5**. The longer tool list was the cost on the older cases (Qwen 0.8B saved a poem to a file, and with `scored` was pushed into `git_status` instead); `declared` keeps those prompts as they were. The check works: on the guessed "Downloads\Acme invoice" no model was asked to approve anything. Still failing: `move-found` on four models (each guesses the name, is told the real one, then asks the user instead of moving it, as in `recover`), and Qwen 0.8B saying a declined file was deleted. Cost: a chat whose next request asks for a change reads its history again once (the declarations change). Results: `evals/changes.json` (`changes-offered.json`, `changes-scored.json` scored `advice-only` before its check took a name without ".docx"). App tests 259 pass |
+| 2026-11-11 | Skills, first round. vireo-server reads SKILL.md files as the Mac's `skill_library.py` does (`skills.rs`: the Mac's ten built-in skills from `server/builtin-skills`, the user's from %APPDATA%\InvurseChat\Skills, a user's replacing a built-in of the same name), and offers one when the first tool it names is one the PC has: `summarize-document`, `translate-document` and `code-review` (the calendar, web and spreadsheet skills wait for those tools). `/api/skill-library/commands` lists them, so the app's slash commands appear. A skill is picked by its slash command ("Use the X skill for this:") or by scoring: one short yes/no question per skill, with worked examples of made-up skills. The pick is written into the reply as the model's own `use_skill` call and its result (the skill's text, as the Mac's `use_skill` returns it), after the request: the model reads it just as on the Mac, and the chat's cached history is kept (a skill in the system prompt would change the whole prompt). Qwen 3.5 0.8B said yes to nearly every skill for every request (a skill on 25 of 30 other cases), so each skill is also scored once per model against a request that fits nothing ("What is 17 times 23?") and is picked only 0.4 above that: a model whose yes means nothing picks none, as before skills. `vireo-eval` gained five skill cases (`skill_cases.rs`: summarizing minutes, translating a file into a new one, reviewing a diff with a bug, a slash command, and a plain question about a file that takes no skill) and shows the scores behind each choice with `VIREO_DEBUG_CALLS` | All 35. Older 30, before and after: Gemma 4 E2B 26 / 26, E4B 27 / 27, Qwen 3.5 0.8B 20 / 20, 4B 29 / 29, 9B 28 / 29. Skill cases: 3, 5, 2, 5, 4 of 5. Skills taken on other cases: 2, 3, 0, 5, 4, all fitting ones (`summarize-document` for "sum up this email") and none failing. Misses: Gemma 4 E2B scores summarizing low (0.04 for "Can you summarize board-minutes.txt?", after an example that names a file and fits was added; it was lower before) and misses the review's bug; Qwen 0.8B picks no skill (its slash command still works); Qwen 9B takes `summarize-document` for "how long does the bread bake, going by bread.txt". Cost: 1.03 to 1.26 s a case on Gemma 4 E2B, 6.7 to 9.1 s on Qwen 9B, mostly the scoring passes (a change question and three skill questions of ~350 tokens each, read from scratch every time), with longer answers where a skill applies. Next: the questions' shared start kept in the picker's session, so each reads only its request. Results: `evals/skills.json` |
+| 2026-11-11 | The Mac gets the tools: vireo-server's tool loop (`tools.rs`, each family's own call format, token healing), the grammar's scored names, and `vireo-eval` with its 24 cases, ported from the Windows engine (PR #118). On the Mac the server reports `macOS` and answers `get_current_datetime` in local time (`localtime_r`), not UTC | 107 engine tests pass. Eval on the M-series GPU (f16), all five models' checksums as in `evals/MODELS.md` (easy / hard, against the Windows baseline): Gemma 4 E2B 19 (11 / 8; Windows 20), E4B 22 (11 / 11; 22), Qwen 3.5 0.8B 15 (9 / 6; 16), 4B 23 (11 / 12; 23), 9B 23 (12 / 11; 23); the same tool calls in 115 of 120 cases. The two lost points are both `find-then-read`, a close first choice (Windows E4B fails it too) that also fails here in `--exact`, so not the f16 rounding. 0.3-1.3 s a case, against 0.9-5.8 s on the RTX 5060 Laptop. Results in `evals/baseline.json` and `run-baseline.txt` |
+| 2026-11-11 | One workspace for both platforms: the Mac's copy of the engine (`Mac/Engine/`, a day apart) folded back in. The Metal backend comes in as the GPU backend on macOS (`src/metal`, standing in for `cuda` there; its kernels in `kernels/*.metal`), with the Mac's fused gate-up-activation for one token and its prompt batch of 1,024 (512 stays on CUDA) behind `cfg(target_os = "macos")`. vireo-server gains the Mac's server-run file and Git tools (`files.rs`, used when an app doesn't run them itself) and attachments (`attach/`), and keeps approvals, the change tools (app-run only until `files.rs` makes changes), the change check and skills. The Mac app builds and finds `vireo-server` here (`target/release`); `Mac/Engine/` is gone. See HANDOFF.md for where things stand | On Windows: every test passes (engine 70, GPU 11 on the RTX 5060, server 54, eval 9; `files.rs`'s three macOS-only tests run on the Mac), and all 35 eval cases pass or fail exactly as before on every model (Gemma 4 E2B 29, E4B 32, Qwen 3.5 4B 34, 9B 33; `evals/one-engine.json`). Qwen 3.5 0.8B leaves the eval's default models, too small to use the tools well (22 of 35; on request still). Not run here: the Metal build, the Mac's tests and the app's Swift tests |
+| 2026-11-11 | More tools, the first ones the gauntlet needs. `calculate`: the Mac's calculator ported to Rust (`calc.rs`: exact decimals, "$1,234.50", "18%", round/abs/min/max/sum, several a line; the Mac's own answers, 12 places cut). The Windows app's `read_spreadsheet`, `create_docx` (asks for approval, checked first; the server words its result) and `run_tests`, `run_build`, `run_linter` offered when the app runs them; the server runs only what `files.rs` has, so the Mac app doesn't get them yet. With `read_spreadsheet` and `create_docx` the PC can follow two more skills, `analyze-data` and `write-document`. The skills' control request became "What's the capital of France?" (Gemma 4 E2B said yes to `analyze-data` for "What is 17 times 23?"). After a tool's result the model must say something: Gemma 4 E4B, with the longer tool list, ended its turn on the result three times, answering nothing, so the end-of-turn tokens wait for its first token. `files.rs` runs on Windows too: drive letters and `\\`, the home folder from USERPROFILE without AppData, Git on the PATH, PDFs and Word read with `attach/`'s readers off the Mac (Windows tests of their own; the Mac's run there). `vireo-eval`: four cases for the new tools (`more_cases.rs`: a tip, a spreadsheet with its skill, a memo saved as Word with its skill, a failing test named); `no-tool` takes `calculate` as well; a plain run is two models (Gemma 4 E2B, Qwen 3.5 4B), `--full` all four; `--cases` takes a category (easy, hard, changes, skills, more). The gauntlet's generator (`docs/dev/test-gauntlet/make_aurelia.py`) wraps table cells in their columns: text ran over the next column in two invoices and the prospectus, which PDF readers then gave the models garbled on 2026-11-10 | All 39, four models, against `evals/one-engine.json`: older 35 Gemma 4 E2B 29 / 29, E4B 32 / 32, Qwen 3.5 4B 34 / 35, 9B 33 / 34; the four new cases pass on all four. Time a case 1.65 to 1.82 s (E2B), 10.6 to 13.5 s (9B): five more tool declarations read at every new chat. The regenerated Aurelia files were checked against the answer key (identical key; every invoice, conversion, tracker, guest list, nomination and email as the key has it) and all 15 PDF and Word files read cleanly with the Rust readers. Results: `evals/more-tools.json` |
+| 2026-11-11 | What the quick gauntlet still needed. **Lists and objects as tool arguments:** the grammar gained lists in any punctuation (Gemma 4's `[a,b]`, and objects with keys the model names) and values of several kinds told apart by their first byte (a spreadsheet's cell: text, a number, true/false, null); each family writes them as its template does (read from the GGUF files): Gemma 4's `format_argument` (bare keys in alphabetical order, `<|"|>` strings), Qwen 3.5's `tojson` inside `<parameter=...>`, Llama's JSON. That unlocks the app's `write_spreadsheet` (rows, with `start_cell` "append"), `fill_docx_template` (values) and `create_pptx` (slides), each approved and checked first (`check_change`). **Memory:** `remember` and `forget`, run by the server (`memory.rs`, one fact a line in `memories.txt`), the facts added to each chat's instructions in the Mac's words; offered in every chat, apart from the change question (remembering isn't a change to a file). **Chat search:** `search_chats`, run by the app over its own chats (`ChatSearch`, the asking chat left out). **Skills:** `fill-template`, `apply-policy` and `process-invoices` in `server/builtin-skills`, general procedures. A reply may make 20 calls (6 before), and `max_tokens` counts the model's writing, not its calls. **Scripted gauntlet:** `run-gauntlet.ps1` and the app's `--gauntlet` mode (`GauntletRunner`): each prompt a new chat through the app's own ChatStore and PcTools, approvals answered by the script's rule, a report with the answer key's hints after each prompt; the answer key's folder locked in every checkout for the run | Server 55 tests, grammar 11, app 295 (the runner end to end against a stand-in server, chat search, the new checks). Eval, plain run, against `evals/more-tools.json`: memory tools offered everywhere Gemma 4 E2B 33/39 and Qwen 3.5 4B 39/39 (the same), Qwen 8.0 to 8.9 s a case; with the three skills too, 33 and 39 again, 2.2 and 9.6 s a case (three more scoring passes), the new skills taken on three other cases, all still passing (`evals/gauntlet-tools.json`). In the installed app: a model started from Settings  Models, a note written after its approval and undone, a PDF read. Found there: a second copy of the app can start and stops the first one's engine; the Installed tab lists no model kept outside its folders |
+| 2026-11-11 | **The quick Aurelia gauntlet through the Windows app on Vireo's own engine**, small models against the Mac's large ones (write-up: `docs/dev/test-gauntlet/runs/Aurelia-Quick-2026-11-11-small-models-notes.md`). Qwen 3.5 4B and 9B ran 12 of its 13 prompts (Q11 left out: no folder tasks yet), one model at a time, with fixes between runs, each measured with `vireo-eval` and its four new office cases (`office_cases.rs`). Fixed: a line after a skill's text to start on step 1 (Gemma 4 E2B described the steps instead); a second control request for skills (E2B took `fill-template` for an introduction); the tools preamble says to remember what people say about themselves; a repeated call refused on its own instead of ending all calls (Qwen 4B's Q5); `fill-template` only for a named template; each run's own chats, memory and approvals (`VIREO_CHATS_DIR` and the like: Claude's packaged app sees a layered `%LOCALAPPDATA%`) | Pass / Partial / Fail on the same 12 tasks: Qwen 3.5 4B 1 / 5 / 6 in 17.6 min, 9B 0 / 7 / 5 in 25.8 min, against the Nov 10 full run's Qwen 3.8 27B 11 / 1 / 0, Gemma 4 31B 9 / 3 / 0, Muse Glimmer 30B 9 / 3 / 0. Every tool call was well formed and reached its tool (memory, PDFs, register rows, Word templates filled with exact values, approvals; up to 21 calls a reply); 9B's card form matched Gemma 31B's. What the small models lack is judgment: both named the contractor the safety winner, and on approving over the limit 4B claimed it had approved and 9B tried to remember the approval. 9B's Q2 analysis was right throughout but ran out of the 2,048-token writing budget before the register. Eval after the fixes: Gemma 4 E2B 33/43, Qwen 3.5 4B 43/43; office cases E2B 0  2/4, Qwen 4B 3  4/4. Next: thinking in the engine, a per-model writing budget, skill picks on mixed requests |
+| 2026-11-12 | Windows tuning for the larger models (Qwen 3.5 4B and 9B, Gemma 4 E4B; see "Twelfth round"): the tensor-core matrix kernels' scales laid out by group so a warp reads them in pairs, their scaling as two fused multiply-adds, and a prompt batch of 1,024 on CUDA as on the Mac | Reading a prompt, against `main` (~2,000 / ~9,000 tokens): Qwen 4B +13% / +15%, 9B +11% / +8%, Gemma E4B +1.5% / +1.5%; generating unchanged. Perplexity (2  2,048 tokens of PLAN.md, 8-bit): Gemma E4B the same to every digit; Qwen 4B 11.7149  11.7239 and 9B 9.6416  9.6389 (exact 11.6965 and 9.6339: the fused sums round differently, within 8-bit mode's spread). Engine tests 70 and GPU 11 pass |
+| 2026-11-12 | Windows tuning, second pass (see "Thirteenth round"): one token's attention over an f16 cache rewritten (`attention_part_kv_*`: a block per key/value head and its query heads, a warp per position with the lanes splitting the head, parts sized from the kernel's real occupancy), and `residual_norm` reading a row into registers at once | Generating ~30K tokens deep, against `main`: Qwen 3.5 4B 19.4  32.9, 9B 14.5  20.8, Gemma 4 E4B 22.3  39.9 tokens/s overnight (llama.cpp 21.9, 16.4, 30.1); at full clocks the next morning 46.2  62.4, 33.5  43.0, 44.6  59.2 (llama.cpp 63.8, 41.9, 61.7: level); short chats +112%. `residual_norm` gives the same numbers; the new attention is within 1e-8 of f64 (the f16 test gains two cases 6,000 positions deep). Engine 70, GPU 11, server and eval tests pass; the full eval scores as `evals/more-tools.json` but for one borderline case on one model (`find-then-read`, failing as in earlier runs; `evals/windows-tuning.json`), 12.2 s a case against 14.0 |
+| 2026-11-12 | Windows tuning, third pass (see "Fourteenth round"): the Mac's fifth to twelfth passes measured on CUDA, and their CUDA side built. Few-token product kernels (`matvec8_few<2-8>_*`: the weights read once for 2 to 8 tokens), one token's attention for up to 8 tokens (`attention_part_kv`, a grid layer each), the convolution and DeltaNet stepping through their one-token kernels with the states kept (`Qwen35Cuda::can_rewind` on CUDA), a recorded graph for every batch of 1 to 64 tokens, tiles of 16 and 32 tokens for the tensor-core products. In the server: 7 guesses a round from the chat on CUDA too, Qwen guessing there on every size where the GPU has room for its steps, and picker sessions read in batches of 256 on CUDA | In 8-bit mode a batch of up to 8 tokens gives the logits of the same tokens read one at a time to the bit (Llama, Qwen 3.5, Gemma 4: difference 0.0), so guesses can't change a reply; the small tiles give the 64-token tile's numbers to the bit; rewinding Qwen after 0, 2, 4 or 5 of 5 guesses goes on to the bit. Against `main`, back to back: a 4-token check Gemma 4 E4B 21.9  13.1 ms, Qwen 3.5 4B 26.1  14.7; the full eval (43 cases) scores the same on all four models with no case changed, in 70  44, 98  73, 107  101 and 179  172 s (`evals/windows-short-batches.json`); copied replies 2-3 times as fast. Engine 73, GPU 14, server 60 tests pass. Not compiled on the Mac |
+| 2026-11-12 | The chat cache, three ways a chat's whole history was read again for nothing (vireo-server's `reply`; shared code, measured on the Mac). **The tools that change files** (`--changes declared`): once a chat's cache declares them they stay declared in that chat, callable only when a request asks (as `scored`), so the system turn changes once in a chat, not at every turn that does or doesn't ask for a change. **Long chats:** a chat too long for the context starts at a fixed cut (`chat::cut_points`: the first user message with a third of the context before it, then two thirds, and so on, counted in bytes), not one turn further on at every reply, so it reads everything again once in about a third of the context. **Remembered facts:** a chat keeps the facts its instructions began with (the list only grows between forgets, so that's the first few of today's), and the ones remembered since are told at the end of the request (`memory::since`), after the point the next turn's prompt shares (and Qwen's DeltaNet is saved); a new chat has every fact in its instructions as before, and a forgotten fact that was in a chat's instructions has it read again. How the prompt is chosen: written the usual way first; only if no cached chat (the session's or a saved one) starts as it does through its first message are the other ways tried, the first that a cache holds taken (up to 8 facts back) | Unit tests for the cut points, the closing text of each family's messages and the facts' two parts (server 74 pass). Scripted chats over HTTP, Gemma 4 E2B and Qwen 3.5 4B, from the "Reply:" log: question, change, question, change, question reads the chat again once (at the first change; before, at each of the four switches), 2445 tokens a turn after; 16 turns of ~300 tokens in a 4,096-token context read everything again once in the four turns past the limit (before, at each of them); the turn after a `remember` reads 4765 tokens of a 1,6002,300-token chat (before, all of it), a new chat answers from both facts, the chat loads from its saved file the same way, and forgetting a fact its instructions held reads it again (Qwen; Gemma E2B didn't call `forget`). Eval, 14 cases (changes, memory, skills, follow-ups) on both models, against `main` built apart: every result, call and answer the same (11/14 and 14/14). Not measured: the large models, Windows, the app |
+| 2026-11-12 | Mixture of experts: Gemma 4 26B-A4B (128 experts a layer, 8 used a token, beside a dense network). On the CPU reference first (`gemma4.rs`, the formula in its header, from llama.cpp's `gemma4.cpp` and mlx_vlm), then on Metal: four kernels (`moe_pick`: a token's 8 highest-scored experts and their shares; `moe_matvec_q6_k` / `_q8_0`: the matrix-vector kernels with the matrix found through the picked index, a threadgroup row a slot; `moe_geglu`; `moe_sum`), the same for one token and for a batch. CUDA still refuses the model | CPU against llama.cpp b12228 on an F32 copy (llama.cpp rounds activations on quantized files: ~4% of this model's perplexity): top token 74.29% against 74.15% (the dense 31B the same way: 0.03 points; E2B 0.0002). GPU exact against the CPU: every probability within 2e-4, the same tokens. All 43 eval cases pass through vireo-server, 4.6 s a case. Speed, first version, untuned: writing 60-70 tokens/s, reading ~500 tokens/s (llama.cpp: 96 and 3,326 at 2K). Reading is memory-bound: a batch reads each chosen expert's matrix once a token (8  5.3 MB a token a layer); grouping a batch's tokens by expert, so each matrix is read once a batch, is next. Writing spends 11 more dispatches a layer than a dense model |
+| 2026-11-12 | Excel workbooks read in Rust (`attach/xlsx.rs`: sheets, shared strings, date styles, cells as Excel shows them, a sheet written as the Windows app's `Spreadsheet.cs` writes it), so the server runs `read_spreadsheet` itself where it runs the file tools (the Mac app), `read_file` gives a workbook's sheets and a workbook can be attached. More skills are then offered on the Mac, each a scoring question a turn, so skills are shortlisted first: one question lists every skill by letter (read once and kept), its letters are scored, and only the two likeliest get their own yes-or-no question (`--skill-shortlist`, on by default). `vireo-eval` now gives the server an empty skills folder: it had been reading the machine's own skills | Against openpyxl on the 13 workbooks in the Mac's test folders: 4,097 cells, none different. Eval, 43 cases, shortlist off / on: Gemma 4 E2B 33 / 33, E4B 39 / 40, Qwen 3.5 4B 43 / 43, 9B 39 / 39 (no case lost; 9B 2.7  2.5 s a case, the others level). Gemma 4 31B, a turn's time before its prompt is read: 1.65  1.28 s (what's left: the change question, the shortlist and two skill questions, ~0.29 s each). Server tests 80 pass. Not run on Windows: a fourth picker session there takes ~0.1 GB more of the GPU |
+| 2026-11-12 | Gemma 4 26B-A4B, a batch's experts grouped by expert: `moe_group` sorts a batch's slots by their expert and cuts them into tiles of up to 32, and `moe_matmul` (the SIMD-group matrix kernel, its matrix and tokens found through the tiles) reads each expert's rows once for all the tokens that chose it, from 80 tokens up (below that a slot at a time is quicker) | The grouped path against one token at a time on the GPU: every probability within 5e-4. Reading ~800 new tokens 1.6  0.43 s, a cold ~2,800 tokens ~500  1,822 tokens/s (llama.cpp 3,326), the eval 4.6  2.6 s a case, still 43 of 43. The experts' products are ~15 TFLOPS and two thirds of a prompt's GPU time; the tensor kernels reach 50 |
+| 2026-11-12 | The skill shortlist scores names, not letters. As merged it lettered the skills and scored " B", " C"...: fine on the four small models it was measured on, but Gemma 4 26B-A4B and 31B then lost two of five skill cases (the right skill outside the first two). Now the skills are listed by name and, after "Skill:" in the model's turn, each name's first token is scored | Skill cases back to 5 of 5 on both: 26B-A4B 43 of 43, 31B 19 of 19 (skills, changes, more tools). Small models as with the shortlist off: E2B 33, E4B 39, Qwen 3.5 4B 43, 9B 39. Lesson: a change to what the server asks the model is measured on the large models too before it merges |
+| 2026-11-12 | The Mac server makes changes itself (HANDOFF to-do 1): `files.rs` writes, renames, moves and deletes files as the Windows app's PcTools does, with the same answers and the same check before the user is asked (`Files::check`, so nobody approves a change to a file that isn't there). Nothing is deleted for good: a deleted file, and the old version of one that's replaced, go to the Trash (NSFileManager). And `write_spreadsheet` in Rust (`attach/xlsx_write.rs`): rows from a cell or after the last row; an existing workbook keeps every other part as it is, a cell written over keeps its style and a new one takes the style of the cell above; a new workbook is made when there's none. The chat cache's disk budget is sized to the model (room for four full chats, 4-32 GB: 16 GB for Gemma 4 31B). No undo yet on the Mac (the Windows app has its journal) | Server tests 85 pass. A row added to copies of the 13 real workbooks in the Mac's test folders, read back with openpyxl: every original value, number format, fill and column width unchanged, the new row right. Not opened in Excel itself. Through the server: Gemma 4 26B-A4B wrote, renamed and deleted in a scratch folder (a missing file refused before any approval), and 31B added a correct row to a copy of the Aurelia invoice register. Eval unchanged: E2B 33, E4B 39, Qwen 3.5 4B 43, 9B 39, Gemma 4 26B-A4B 43 of 43, 31B 11 of 11 (changes, skills) |
+| 2026-11-12 | Word and PowerPoint written in Rust, so the Mac server runs `create_docx`, `fill_docx_template` and `create_pptx` itself: `attach/markdown.rs` (the model's Markdown as blocks and styled runs, as the Windows app's `MarkdownBlocks`), `attach/docx_write.rs` (a document from a title and Markdown: headings, lists that restart, tables, quotes, code, links, a memo's header lines kept as lines; and a template's `{{placeholders}}` filled where they sit, each keeping its run's formatting, in the body, headers, footers and text boxes), `attach/pptx_write.rs` (a title slide and a slide an entry, in Vireo's theme). All as ZIPs without compression | Server tests 91 pass. Opened with python-docx, python-pptx and macOS's textutil and Quick Look; the Harbor Lane invoice and policy templates filled with no placeholder left and every paragraph style kept. Not opened in Word or PowerPoint themselves. Through the server, Gemma 4 31B filled the invoice template (40  25.00 as 1,000.00), wrote a memo and made a deck from it (the memo dated "October 24, 2023": the model didn't ask the date). Eval unchanged: E2B 33, E4B 39, Qwen 3.5 4B 43, 9B 39, Gemma 4 26B-A4B 43 of 43, 31B 19 of 19 (changes, skills, more tools) |
+| 2026-11-13 | The Aurelia gauntlet on the prototype: `tools/aurelia_run.py` plays the 32 prompts in the Mac app (so a run can be watched) and grades each with the suite's own checks, ported from `docs/dev/test-gauntlet/run_full.py`. For it the app's test scripts gained file access for their chats (`access`, `folders`), an approval answered by what it names (`approveIf`), a pause after each step for a grader (`gate`), and each step's tool steps and approvals in its record. A run deletes the app's chats and chat cache first and keeps everything else of its own in a scratch folder (test files, memory, approvals, an empty skills folder). Nothing in the server was changed | Gemma 4 31B, one run, `docs/dev/test-gauntlet/runs/Aurelia-Proto-Run-2026-11-12-Gemma4-31B-notes.md` (every prompt, with the likely cause where worse). 5 prompts not runnable (calendar, tasks and triggers). On the other 27, by the hints alone: 9 pass, 11 partial, 7 fail, 100 of 147 hints, 24.5 min; Vireo 0.9's after-fixes run by the same rule: 16 / 11 / 0, 128 of 148, 44 min (by hand it was 23 pass, 4 partial). 15 prompts the same, 12 worse, none better. Likely causes, in order: thinking is off and there is no check pass (a careful step skipped: 2.1's sum error, 4.1's second file, 7.1's row count, 12.4's cap); earlier turns' tool results are not kept (7.3, 8.2, 9.2); 20 calls a reply (in a five-prompt trial 2.1 hit it and ended with no answer). App tests for the script's new parts pass (4) |
+| 2026-11-13 | After the gauntlet's first run on the prototype, what it found wanting. **Thinking** (a request's `thinking`, else `--thinking`; the Mac app's Settings, Chats, on by default): Gemma 4's system turn opens with `<|think|>` and Qwen's reply with `<think>`, as their templates write them, and a thought is opened after each tool's result; at most 2,000 tokens a thought and 8,000 a reply, closed for the model past that; sent to the app as `thinking` events apart from the answer (Muse reasons at high strength). No check pass: it was off in the 0.9 runs. **Earlier turns' tool results kept**: a reply's calls and results go to the app as a `turn_record`, which it keeps with the reply and sends back; `chat::history` writes them where they were made, in the family's own form, read as plain text (`chat::encode`); whole while the chat fits, then the first 1,200 characters of each, then none, before the chat's start moves on. **Fewer calls**: `read_file` takes several paths, one a line (up to 10, sharing three results' room); `calculate` says to put every sum in one call; 30 calls a reply, and the last one's result says it was the last (a thought no longer counts as the answer that's due, which is how a reply ended with nothing said). **Rules**: the tools' preamble says to check a change someone waved through against the user's own rules and to name the rule; a request with tools ends with today's date. **New on the Mac**: `search_chats` over the app's chat files (`chats.rs`); `list_events`, `create_event`, `create_reminder` run by the app through EventKit (pretended in a test script unless it says `"calendar": "real"`); `schedule_task` (`tasks.rs`: a time of day, once, a folder's new files, a link) kept by the server and run by the app as a chat of its own (`TaskRunner`, Settings, Tasks). `aurelia_run.py` plays all 32 prompts now | Unit tests only: server 103 (thinking and kept results in each family's form, a record to the app and back, task schedules and what is due, chat search), Mac app 144 (reasoning apart from the answer, records saved with a reply, dates read, a dry calendar run). **Not run:** the eval, the gauntlet, or any model at all: every prompt changed (the preamble, the date, two tool descriptions, three more tools declared when the app offers them), so the eval needs running on the small and the large models before this is merged, with thinking on and off. **Not built:** the Windows app's side (it ignores the new events; it would have to keep and send back `record`, and say `run_tasks` to get tasks) |
+| 2026-11-13 | The Mac against mlx-vlm after the 8-model benchmark (`evals/speed/bench-2026-11-13`). **Gemma 4 26B-A4B's experts**: `moe_pick` on a threadgroup (each thread places its experts among the scores; one thread picking a best at a time took 0.2 ms a token, a third of the GPU's time writing), `moe_group` on 1,024 threads (an expert and a part of the slots each; 1.4  0.2 ms for 8,192 slots), and a batch's products on the neural accelerators (`moe_matmul_tc`, vireo_tensor.metal): the slots' inputs gathered in their experts' order in f16 (`moe_gather_half`), the products left in that order and added up through `place` (`moe_sum`); the default mode only, exact mode keeps `moe_matmul`. **A model's file let go after loading** (`Mmap::release`, the file mapped again over its own mapping; `GgufFile::release_pages` after the model and a draft model load): its pages no longer sit beside the GPU's copy. **Qwen's first chat** saves its DeltaNet at the system turn's end (`continue_with`'s `head`), so the second chat no longer reads that turn again. **Prompt attention** (`attention_tcg`): the output rescaled only where a row's maximum moved, each thread's rows found once, 8-17% less time at 30K positions (`prompt_attention_speed`), the same numbers. | 26B-A4B (UD-Q6_K, M5 Max, one run through vireo-server, before  after, mlx-vlm 6-bit / llama.cpp b12228): short reply 61  95 tok/s (108 / 94); reading 3K 1,730  3,160 (4,210 / 2,960), 32K 1,670  2,940 (3,040 / 2,010), 96K 1,270  1,830 (1,850 / 1,270); writing after 96K 78 (49 / 48); peak memory 53  31 GB (34 / 38). Qwen 3.5 9B Q6_K: writing 63-68 (mlx 66-71), reading 3K / 32K / 96K 2,790 / 2,240 / 1,670 (3,180 / 2,520 / 1,890); a new chat's first reply keeps 1,477 of 1,563 tokens (Qwen 3.5 4B). Perplexity, 26B, 6  1,024 tokens: 27.44 (27.56 before, exact 28.04). Engine tests (75 + GPU 17, with the 26B's default-mode batch against exact mode's next token), server 110. Writing on the dense models is bound by reading the weights (Qwen 9B: 7.5 GB a token at 70 tok/s). Open: prompts read 10-25% behind mlx-vlm on Qwen and at 3K on the 26B; the 26B's default mode on a repeating text (next token 0.95 exact, 0.71 with the f16 cache alone); E2B and E4B write their reasoning as the answer with thinking off under the agent's system prompt |
+| 2026-11-14 | What the all-Q6 comparison of Nov 13 found (eight models, three engines; HANDOFF.md's item 7). **Tool calls drafted** (`write_call`): where the model is free to write (a path, a sum, a file's text) the token is read with the draft layer's guesses, or the chat's, and each the model would have picked itself under the grammar is taken; where the grammar writes the text or scores a choice it goes on as before. Calls were 70% of the writing in Gemma 4 31B's tool task, a token at a time (54 ms); 95% of the guesses are taken there. The small Qwens, which don't guess from the chat in a reply's text on the Mac, do inside calls (`text_drafts`). **A skill that names a tool that changes files makes those tools callable** (the 31B was kept from `write_file` by the request's own words and read and summed in circles). **The same call again** is caught wherever it was made earlier in the reply, until something is changed, and counted once a round. **A call past its limit** (4,096 tokens; 768 for `calculate`) is taken back (`take_back`) and the model answers without more calls, instead of the reply failing. **Gemma with thinking off** is told so in its system turn (`GEMMA_NO_THINKING`). **Q6_K's blocks on the GPU** are 212 bytes, not 224 (`decode32` reads them as packed words). | One run each through vireo-server (M5 Max, Q6, before  after; mlx-vlm): tool task, Gemma 4 31B 56.2  28.5 s (57.9), Qwen 3.8 27B 56.0  30.4 (57.7), Muse 66.1  50.3 (145), 26B 11.6  9.2 (13.1), E4B 14.1  7.3 (14.8), Qwen 3.5 4B 9.5  6.5 (12.9), 9B 16.0  10.9 (18.6); skill task, 31B 113  27.1 (60.6) and right, Qwen 27B 59.5  28.7 (55.3), Muse 92.1  64.8 (193), E4B 15.8  7.4 (11.5), Qwen 4B 11.1  7.3 (11.5). Scored tasks right of 6: E4B 1  6, E2B 0  4. Qwen 27B's long tool task 365 s and an error  209 s and right. Q6_K at 212 bytes: Qwen 3.5 9B writing 63  66 tokens/s, perplexity the same to every digit on Qwen 3.5 9B and Gemma 4 E4B, both modes. Server tests 111, engine 75 + GPU 17. Not run: vireo-eval, the gauntlet |
+| 2026-11-15 | Windows, fourth pass (see "Fifteenth round"): Google's draft models for Gemma 4 E2B and E4B on CUDA. Their centroid head (2,048 clusters, the 32 best scored: `gemma4_assistant.rs`'s `Centroids`, on the CPU), 4 query heads of their own, a guess's layers replayed from a graph, guesses stopped where the draft gives under 0.7 (`mtp_draft_sure`; CUDA), and the chat's long runs still taken beside the draft's. `vireo-eval` saves each case's reading, writing and tool times; `tools/reply_speed.py` times four kinds of reply one way against another | Greedy in the engine the same text as one token at a time, 1.25 (E2B) and 1.41 (E4B) as fast; first guess right 63% and 69% with no floor. Through the server against the chat's guesses alone (`--mtp off`), 400-token replies: E2B a list 85  105 tokens/s, an explanation 78  97, a story 79  86, an edited code file 170  179; E4B 46  66, 46  62, 42  53, 104  109; much the same at the models' own sampling (`evals/speed/windows-2026-11-15/`). The full eval, draft off  on: E2B 34 and 34, E4B 39 and 39, all 43 answers identical on both, writing 76.5  85.0 and 46.1  53.3 tokens/s (`evals/windows-small-gemma-draft.json`, with each case's speeds). Qwen 3.5 4B 38 for 13 November's 39 on `main` too. Engine 77, GPU 14, server 98, eval 12 tests pass. The GPU was held to ~33 W (a token about twice 12 November's time): ratios, not absolutes. Not compiled on the Mac |
+| 2026-11-15 | Windows against llama.cpp again, the Mac benchmark's way (`evals/speed/bench_windows.py`, after `prompts-mac/bench_mac.py`, with its three prompt files; `bench_report.py` builds the page): read and write speeds with no drafting at 33-34, ~2,300 and 29,166-33,915 tokens for Qwen 3.5 0.8B, 4B and 9B and Gemma 4 E2B and E4B, whole replies through both servers for the four chat models, GPU memory. `tools/reply_speed.py` now refuses an approval at once (Qwen 3.5 9B asked to remember something and the reply waited two minutes) | RTX 5060 Laptop at full speed (Turbo plan, after a restart; that morning it ran at a third to a half), llama.cpp b12262, two rounds, Vireo as a share of llama.cpp: writing 95-111% in a short chat and 93-103% after the long prompt; reading ~2,300 tokens 105% (0.8B), 109% (E2B), 102% (E4B), 87% (4B), 79% (9B); reading the long prompt 78-84%. Replies as shipped, tokens/s against llama.cpp's: E2B a list 265 / 154, an edited code file 500 / 154, a story 191 / 155, an explanation 226 / 156; E4B 169, 336, 118, 160 / 90; Qwen 3.5 4B 95, 98, 87, 87 / 91 (it called a tool for the code request instead of returning the file); 9B 104 and 175 / 57 when it has the memory to guess, 57 when not, 54 on new text. `evals/speed/windows-rtx5060-2026-11-15-llama.html` and `.pdf`, raw in `bench-2026-11-15-windows/` |
+| 2026-11-15 | Windows against llama.cpp, the Mac's 14 November benchmark rebuilt from its report (`evals/speed/bench_tasks.py`; the Mac's harness was never pushed): both servers, Gemma 4 E2B and E4B and Qwen 3.5 4B and 9B at Q4, one run each, a ~40-token question, ~3K, and a long prompt as large as the GPU holds (26,306 tokens for the Gemmas, 24,736 and 15,310 for the Qwens) with two facts planted, a three-turn chat, tool, skill and long-log tool tasks, GPU memory, answers scored (5, the Mac's 6 less its 96K prompt). The harness fixed on the way: llama.cpp's first-token time had been its whole first request's, and the log was sized at 3.2 characters a token (it is ~1.9), too long for Qwen 3.5 9B's 21,504-token context; it now keeps vireo-server's log, stream errors and tool arguments. `bench_tasks_report.py` builds the page | RTX 5060 Laptop at full speed (Turbo plan), llama.cpp b12262, Vireo's difference (speeds Vireo  llama.cpp  1, times and memory the other way): writing a short reply +28% and +33% on the Gemmas (the server's guesses and draft models), 1% on both Qwens; after the long prompt +42%, +45%, 8%, +2%; reading ~3K +4%, +1%, 18%, 22%; reading the long prompt 12% to 25% (median 19%), first token after it 11% to 25%; tool task +17%, +41%, 42%, 34%; skill task 31% to +2%; long tool task 0% and +8% (Gemmas only); GPU memory 8% to 29%. Scored right: Vireo 15 of 20, llama.cpp 18. Both Qwens' long tool task ends on Vireo in "A tool call ran too long" (a `calculate` call counting the log's errors as `sum([1, 2, 3, `; llama.cpp's Qwen 3.5 4B the same, cut off as an HTTP 500); Gemma 4 E2B on Vireo also missed the tool sum and never wrote the skill's file. `evals/speed/windows-rtx5060-2026-11-15-tasks.html` and `.pdf`, raw in `bench-2026-11-15-windows-tasks/` |
+| 2026-11-15 | Windows against llama.cpp with the Mac's own harness (`evals/speed/bench-2026-11-13/bench.py`, merged in PR #167), on the merged build (7e00a19): Gemma 4 E2B and E4B and Qwen 3.5 4B and 9B at Q4, both servers, one run each, the Mac's prompts whole (a ~32K repository dump with two hidden facts, an eight-turn chat, the harbor-bikes tool and skill tasks, a ~56K-token log then tool calls), scored by its `aggregate.py`. The harness runs on Windows with changes behind `os.name == "nt"`: the Q4 files and llama.cpp b12262, no large or xlarge rows, the whole GPU's memory from `nvidia-smi` between workloads, the folder's path written with forward slashes (a backslashed path in a tool call lost llama.cpp's skill task five reads), contexts measured to fit: 65,536 for three models, 32,768 for Qwen 3.5 9B (at 59,392 its caches spilled into the PC's memory and it read at 145 tokens/s) with its long log cut to the first half. `bench_tasks.py` run again on the merged build for a before and after. `bench_mac_harness_report.py` builds the page | RTX 5060 Laptop at full speed (Turbo plan), llama.cpp b12262. Vireo's difference: tool task +5% to +125% (faster on all four), skill task 25% to +71% (three ahead; Qwen 3.5 9B made 17 calls to 8), long tool task 26% to 2%; reading ~32K 15% to 21% and the first token after it the same; writing after it +12%, +4%, 13%, 5%; short reply 10%, +27%, 8%, 10% (E2B's one reply; re-checked 190-198 tokens/s, ahead); GPU memory 15% to 42% (Vireo sets aside the whole context's caches: 7.5 GB on E4B at 65,536). The Mac's same four models are ahead on all of these but memory (reading ~32K +35% to +60%). Scored right: Vireo 16 of 20, llama.cpp 15; Vireo's misses are the Mac's exactly. Vireo's Gemmas and Qwen 3.5 9B answered the long tool task without a tool call, as on the Mac. The merge, on `bench_tasks.py`'s identical workloads: both Qwens' long tool task now finishes, right (26.9 s and 32.2 s; before, "A tool call ran too long"); Gemma tool task 25% and 11% faster, skill task 40% and 43%; Gemma 4 E2B's skill task now right; Vireo 15  18 of 20; llama.cpp unchanged (18, times within 3%). `evals/speed/windows-rtx5060-2026-11-15-mac-harness.html` and `.pdf`, raw in `bench-2026-11-15-windows-mac-harness/` and `bench-2026-11-15-windows-tasks-after-merge/` |
+| 2026-11-15 | Windows, three changes after the Mac-harness run (uncommitted on 7e00a19): (1) Qwen keeps a second saved state of its DeltaNet layers a few tokens before the end of the system turn it reads (`Kept::turn` in vireo-server), so the next chat with the same instructions and tools reads none of them (the one saved state before was where the first two chats parted); (2) on CUDA a Gemma sliding-window layer keeps only its window and a batch's new positions, position p at row p mod ring (`ring_row` in vireo.cu, `attention_ring`), as the Mac did; (3) the prompt attention kernel turns a batch's queries to f16 where they lie (`q_rows_to_half`) instead of copying them into each block's shared memory, and uses larger blocks for batches over 64 tokens (a `_short` set for the rest). Measured with the Mac's harness exactly as that morning, the eval on both builds, and the Gemmas at 131,072 tokens | RTX 5060 Laptop at full speed (Turbo), one run each. GPU memory, highest: Gemma 4 E2B 3.5  2.7 GB, E4B 7.5  5.0 GB at 65,536 tokens (loaded 3.3  2.5, 7.2  4.7); Qwens unchanged. Reading ~32K: +10% (E2B, 9,447  10,431 tokens/s), +6% (E4B), +3% (Qwen 3.5 4B), +2% (9B); first token after it 2-6% sooner; long tool task 1-6% quicker. llama.cpp, unchanged, moved 0.8% (median) and 3.4% at most on its speeds. Against llama.cpp Vireo still reads ~32K 9-19% slower and uses 14-22% more GPU memory (was 15-42%); tool task faster on three. Cost of the rings, as on the Mac: after a prompt longer than a ring the next chat reads its ~1,300 tokens of instructions and tools again. Eval: 149  151 of 172 (E2B 30  32, E4B 39  38, Qwen 3.5 4B 39  40, 9B 41  41); four cases tipped on close choices, none a wrong answer (E4B's calc-tip gave the right sum without calling calculate); 110 of 172 answers identical. Qwen read 55% and 61% fewer tokens over the eval and took 20% and 18% less time (128  103 s, 196  161 s); the Gemmas read 79-90% more and E4B took 51  54 s. At 131,072 tokens with the ~95K prompt both Gemmas fit on both engines without spilling: Vireo read 5,371 (E2B) and 2,992 (E4B) tokens/s, llama.cpp 6,662 and 3,429. `evals/speed/windows-rtx5060-2026-11-15-after-changes.html` and `.pdf` |
+| 2026-11-15 | Windows, evening: two more small gains and where the rest of the gap is (Nsight Systems, a kernel's time over a ~3K-token read). **The feed-forward's activation and its rounding in one pass** (`swiglu_q8`, `geglu_q8`, `Gpu::gated_quantize`, `GpuMatrix::mul_gated`; CUDA's 8-bit mode): the middle of a feed-forward is only ever the next product's input, so it is rounded to 8 bits as it is worked out and never written as f32. **Guesses from the chat need a run of 3 on CUDA** (`draft::LEAST_RUN`; a run of 2's one guess was seldom taken). `tools/reply_speed.py` loads one server at a time (two copies of Qwen 3.5 4B on 8 GB spilled, and a list read 51 tokens/s for 97). | `vireo-cli` on `prompts-mac/medium.txt`, before  after: Gemma 4 E4B 6,238  6,475 tokens/s, Qwen 3.5 4B 3,438  3,540, Gemma 4 E2B 17,450  17,830, Qwen 3.5 9B level. Qwen 3.5 4B's 400-token replies through the server, runs of 2  3 (no guesses): a list 96.9  98.4 (89.6), a code request 90.4  92.9 (90.2), a story 86.9  89.6 (89.8), an explanation 90.9  93.0 (89.7). Where a ~3K read's time goes: Qwen 3.5 9B's matrix products 79% (Q4_K 52%, Q5_K 14%, Q6_K 13%), DeltaNet 8%; Qwen 3.5 4B's 69% and 16%; Gemma 4 E4B's Q4_0 products 67%, at about twice the K-quants' rate a weight. The K-quants' minimum term (a fused multiply-add for every result and group of 32) is 8% of the 4B's read and 12% of the 9B's (timed without it: 652  598 ms, 1.19  1.05 s): **Tried and dropped:** that term on the tensor cores in f16 (the 6-bit minimums as whole numbers, a token's sums as shares of its largest, one f16 product 8 deep a tile and step, then one multiply-add a result): slower, 652  723 ms and 1.19  1.28 s, and off the dp4a kernels by 1.4e-4 of the largest value. The tensor cores are what the kernel is short of: 8 more products a step on top of its 32 cost more than the 128 multiply-adds they replaced. Once every 4 steps would be about level, not worth the rounding. A token's logits are 1.7 ms of Gemma 4 E4B's 11 (the Q6_K output matrix, 550 MB, read at ~320 GB/s). Engine 77, GPU 15, server 98, eval 12 tests pass. No full eval or benchmark run on these two changes yet |
+| 2026-11-15 | Windows, night (branch `windows/speed-hunt`, uncommitted): the prompt attention kernel under Nsight Compute, and two changes to it. What `attention_mma_512` waits on at ~33K tokens (one block an SM, 8 warps, 218 registers a thread, 83 of the 100 KB of shared memory a block may have): the tensor cores 47% busy, an instruction issued every 6th cycle; stalls 30% the tensor pipe, 24% reads from global memory, 20% fixed waits, 12% the shared-memory queue. Timed with a phase taken out (`tests/prompt_attention_speed_cuda.rs`, a 1,024-token batch at 30,000 positions, 28.0 ms 512 wide): no key and value loads 21.2 ms, neither product nor the exponentials 19.3, none of those 10.7, the queries as constants 22.0. **The queries were the find**: read from global memory since that afternoon, a block's 64 KB of them don't fit what is left of the L1 cache (32% of reads found there), so each chunk read them from L2 again and every warp waited for each read. **Kept: (1) the queries read two steps ahead** (`attention_mma`: `q_rows_to_half` lays each 32 numbers out as a thread takes them, one 16-byte read for two steps of S = Q K, asked for two steps before their products and carried over a chunk's end; the keys' fragments by `ldmatrix`), the same numbers to the last bit. **(2) A batch of 9 to 64 tokens with no window has its context in parts** (`attention_mma_*_part`, `PART` in the template): a block takes sets of 16 tokens of the query heads that share a key/value head (not 16  rows tokens of one head, most past the batch's end), the context split into as many parts as give every SM a block, merged by `attention_combine` as one token's are. A draft's 2 to 8 tokens keep the one-token kernel (its numbers are one token's exactly). | RTX 5060 Laptop at full speed (Turbo). The kernel, 30,000 positions: 512 wide 28.0  24.6 ms, 256 wide 21.1  18.9 ms, the sliding layers' 0.315  0.305 ms (one step ahead about half of that; three or four no better). `vireo-cli` on `prompts-mac/long.txt`, before  after: Gemma 4 E2B 10,559  11,277 tokens/s (+6.8%), E4B 4,812  4,952 (+2.9%), Qwen 3.5 4B 2,761  2,795 (+1.2%), 9B 1,740  1,754 (+0.8%); `medium.txt` and writing level (E2B 17,900, E4B 6,498 and 88 written, Qwen 3.5 4B 3,521 and 88, 9B 1,950), the text written the same, GPU memory the same. A batch 27,000 tokens deep (`check_speed`), ms, before  after: Qwen 3.5 4B 12 tokens 40.8  23.7, 16: 40.7  24.0, 32: 44.0  30.7; Gemma 4 E2B 18.9  10.5, 18.8  10.6, 21.8  13.4; E4B 29.9  18.5, 29.7  18.7, 34.6  23.1; 64 tokens and over, and 2,000 tokens deep, level (4-6% quicker at 12-32 tokens). **Tried and dropped:** fewer and wider loads alone (the 16-byte query read and `ldmatrix` for the keys without reading ahead: 28.2  28.1 ms; loads cost latency, not instructions); two sets of sums in S = Q K so a product doesn't wait for the one before (level: the tensor pipe is the limit there, not the chain); other block shapes with the queries in global memory (512 wide 4216 31.4 ms, 6216 53, 8216 86, 4416 43; 256 wide 8148 21.5, 8132 23.6, 12132 32.9, 6164 30.8: more warps spill registers, smaller chunks cost more per position); the softmax without its masks where a whole chunk is seen, and a ring's row worked out once a chunk (together 5% slower, the second alone 1.5%: this kernel's speed hangs on how its registers fall). **Not worth building:** the queries back in shared memory (64 KB beside 66 KB of keys and values and 16 KB of sums, 100 KB allowed); the K-quant products in f16 on the tensor cores (the 8-bit kernel uses 27% of the integer tensor pipe and does twice the multiply-adds an instruction; in f16 the pipe would be the limit). `matmul8_q4_k` under Nsight Compute: 2 instructions a cycle an SM, stalls 31-36% the shared-memory queue, 26% fixed waits, 9-14% global reads, 6% the tensor pipe. Where a ~34K read goes now: Gemma 4 E2B `attention_mma_512` 51%, `matmul8_q4_0` 32%; E4B 30% and 55%; Qwen 3.5 4B the K-quant products 55%, `attention_mma_256` 22%, DeltaNet 12%. Engine 77, GPU 15 (attention's test has six short-batch cases more), server 98, eval 12 tests pass. No full eval or benchmark run |
+| 2026-11-15 | Windows, later that night (same branch, uncommitted): the 8-bit matrix product with a phase taken out, and the Gemmas' instructions after a long prompt. Qwen 3.5 4B's ~2.3K read, 653 ms, of which the products are ~450: without the tensor-core products 633, without the scaling ~600 (the minimum's term alone 598), without the reads from global memory 574, without those and the unpacking 499, without all four 436. So the products themselves are 5% of the kernel, the scaling 12%, reading and unpacking 17% each, and half is what is left: reading the fragments and scales back out of shared memory (Nsight Compute's 31-36% of stalls on the shared-memory queue). **Kept: (1) one side's fragments by `ldmatrix`** in `matmul8` (four reads in one: the weights' for Q4_0 and Q8_0, x's for Q4_K and Q5_K; the same numbers). **(2) Gemma's state saved at the system turn's end** (vireo-server, `Kept::head`, shared code): where the sliding-window layers keep rings, a prompt longer than a ring wrote over the window after the instructions and the next chat read all ~1,300 tokens again (`truncate` gave 0). The session's state there is now exported once when a system turn is read (`Gemma4CudaSession::has_rings`, `export`) and imported when the rings can't go back. | `vireo-cli`, start of the night  now, tokens/s: `medium.txt` Gemma 4 E2B 17,950  18,800 (+4.7%), E4B 6,498  6,848 (+5.4%), Qwen 3.5 4B 3,537  3,605 (+1.9%), 9B 1,986  2,028 (+2.1%); `long.txt` E2B 10,559  11,322 (+7.2%), E4B 4,812  5,148 (+7.0%), Qwen 3.5 4B 2,761  2,843 (+3.0%), 9B 1,740  1,788 (+2.8%); writing level (171, 87, 88, 55). Through vireo-server at 16,384 tokens, a one-line question in a new chat right after a ~2,400-token one: Gemma 4 E4B 0  1,267 of 1,307 tokens kept, first token 225  59 ms; E2B the same tokens, ~110  23-43 ms; the same answers; a system turn's first read 20-30 ms longer (the copy); Qwen 3.5 4B as before. **Tried and dropped:** both sides' fragments by `ldmatrix` (Gemma 4 E4B 366 ms for 357 with one side, Qwen 3.5 4B 675 for 638: slower than neither on the K-quants); the tokens' scales and sums by `ldmatrix` (633 for 638, E2B worse: noise); `ldmatrix` in Q6_K's products, either side or both (1-2% slower). Engine 77, GPU 15, server 98, eval 12 tests pass. Not compiled on a Mac. No full eval or benchmark run |
+
+There's no small Qwen 3.8, but Qwen3.8-27B is the same `qwen3_5` architecture as Qwen 3.5
+0.8B, so the 0.8B tests the code the 27B runs.
+
+**Open question, Gemma 4:** a 0.005% perplexity difference from llama.cpp remains
+(Llama matches to every digit, Qwen 3.5 to 0.0001); our CPU and GPU agree with each other
+exactly. GELU is part of it but not all: exact GELU gives 30.8273, GELU through an f16
+table 30.8275, llama.cpp 30.8287. Worth tracking down with a per-layer comparison
+(llama.cpp's `llama-eval-callback`-style tensor dumps).
+
+**Speed so far** (RTX 5060 Laptop on mains power, tokens/s, Vireo in 8-bit mode against
+llama.cpp b12262 by `llama-bench`, measured back to back on 2026-11-11; generating 128
+tokens from a short prompt, reading a prompt of 1,6001,800 tokens). The laptop's clocks
+drift with temperature and power state (both engines moved ~10% between runs that day),
+so compare within a row:
+
+| Model | Generating: Vireo / llama.cpp | Reading a prompt: Vireo / llama.cpp | Vireo CPU |
+|---|---|---|---|
+| Llama 3.2 1B Q4_K_M | ~103 / 83 (125%) | ~2,110 / 3,590 (59%) | ~25 |
+| Qwen 3.5 0.8B Q4_K_M | ~127 / 106 (119%) | ~2,600 / 4,100 (63%) | ~28 |
+| Gemma 4 E2B Q4_0 | ~67 / 55 (122%) | ~3,040 / 4,710 (65%) | ~6.5 |
+
+After the eighth round (prompt attention; prompts of 1,9002,200 tokens against
+`llama-bench -p 2048`, same day): Llama ~2,350 / 3,860 (61%), Qwen ~2,880 / 4,320 (67%),
+Gemma ~3,920 / 4,930 (79%). Generating is unchanged (it uses the per-token kernels).
+
+**Against Ollama too (2026-11-11):** Ollama 0.40.16 (its `llamacpp` runner, 100% on the
+GPU, default settings) with the same GGUF files imported by `ollama create` from a
+`FROM <file>` Modelfile, timed from its API's own `prompt_eval_duration` and
+`eval_duration`. Each request starts with a different number, so its prompt cache can't
+reuse the last one. Run back to back with Vireo and `llama-bench -p 2048 -n 128`, one
+model loaded at a time, while the GPU ran faster than earlier that day (tokens/s):
+
+| Model | Reading ~2,000 tokens: Vireo / Ollama / llama.cpp | Generating 128: Vireo / Ollama / llama.cpp |
+|---|---|---|
+| Llama 3.2 1B Q4_K_M | ~2,480 / ~2,600 / ~4,240 | ~131 / ~71 / ~99 |
+| Qwen 3.5 0.8B Q4_K_M | ~3,050 / ~2,880 / ~4,770 | ~146 / ~88 / ~123 |
+| Gemma 4 E2B Q4_0 | ~4,060 / ~2,930 / ~5,470 | ~77 / ~46 / ~63 |
+
+- Generating, Vireo is ~1.71.85 Ollama on all three; Ollama is ~2530% behind the
+  llama.cpp it runs (per-token overhead outside the kernels).
+- Reading a prompt, Vireo is ~5% behind Ollama on Llama, ~6% ahead on Qwen and ~39%
+  ahead on Gemma. Ollama reads prompts at ~5560% of `llama-bench` (its default batch of
+  512 tokens, and its server around the runner).
+- Not quite like for like: prompts are raw text with no chat template on all three, but
+  Ollama tokenized Gemma's prompt to 2,076 tokens against 2,168 for Vireo and llama.cpp.
+  Gemma's generation was timed from a raw story opening on Ollama and from the chat
+  template on Vireo (Vireo's raw run ended after one token); both are short prompts.
+
+Exact mode (`--exact`) is ~20% slower generating and ~23 slower reading prompts.
+Before the speed work below it was ~40 / 53 / 23 generating and ~40 / 53 / 17 reading a
+prompt. Exact perplexity on the GPU is unchanged to every digit.
+
+**First round of speed work (2026-11-10):**
+
+- **Prompts in batches** (`forward_batch`): matrix-matrix kernels (`matmul_*`, tiles of
+  128 rows  64 tokens, weights decoded once per tile in f32), a tiled attention kernel
+  per head size (`attention_tiled_64` to `_512`: a block of queries shares each chunk of
+  keys and values, online softmax), Qwen's convolution and DeltaNet running a whole batch
+  per launch with each head's state in registers. `vireo-cli perplexity` and `generate`
+  use it. 412 faster prompts; scoring a text is 512 faster.
+- **One graph per token**: kernels read the position from GPU memory, so one token's
+  launches (300600) are recorded once per session as a CUDA graph and replayed. Fused
+  steps: the residual add with the next RMSNorm (`residual_norm`, Gemma's extra norms and
+  layer scale included), and each head's norm, RoPE and cache write (`qkv_prep`).
+- **Matrix-vector kernels**: several bytes per lane per load instead of one, two rows per
+  warp, Q4_K's scales read as words, and small whole numbers made into floats without
+  I2F. 3560 GB/s became 90120 GB/s.
+
+**Second round: 8-bit activations (2026-11-10, decided: 8-bit by default, exact kept):**
+
+- `Precision::Int8` (the default; `--exact` or `Precision::Exact` for f32): before a matrix
+  product, the activations are rounded to 8 bits per block of 32 (`quantize_q8`: a scale
+  `max|x| / 127`, plus the scaled sum of each 16 for the K-quants' minimums), once per input
+  and shared by the products that read it (q/k/v, gate/up). Generating uses dp4a kernels
+  (`matvec8_*`, 4 multiply-adds per instruction); prompts the tensor cores
+  (`matmul8_*`: `mma.m16n8k16` on 8-bit numbers, 32-bit sums scaled into f32 per 32 or, for
+  Q6_K, per 16). The tensor-core kernels need compute capability 8.0 (RTX 30 series on), so
+  `build.rs` makes a second PTX for `compute_80`; older GPUs run the dp4a kernel per token.
+  F16 and F32 weights, attention, norms and DeltaNet stay f32.
+- Q4_0 is repacked when uploaded (`Gpu::upload_weights`): each row's 16-byte runs of 4-bit
+  numbers, then its scales, so the kernels read 8 and 16 bytes at a time instead of 2.
+- Accuracy: perplexity 48.45 against exact 48.42 (Llama), 25.07 against 25.04 (Qwen), 46.25
+  against 46.23 (Gemma), all within 0.1% (llama.cpp's own 8-bit gap on Llama is 0.26%); the
+  France prompt keeps its answer and likeliest first token on all three (Qwen's near-tie
+  moves 3 points). The tensor-core and dp4a kernels agree to ~1e-6. Reading a prompt in
+  batches or token by token picks the same next token every time; logits drift by up to 8%
+  of their range on Gemma, as small differences tip numbers across 8-bit steps.
+
+**Third round: attention (2026-11-10):**
+
+- In 8-bit mode the key/value cache is f16 (half the memory: a 32K-token context of
+  Llama 3.2 1B takes 1 GB, not 2; it matters most for the large models), written by
+  `qkv_prep`. Exact mode keeps f32.
+- A prompt's attention runs on the tensor cores (`attention_mma_64` to `_512`, compute 8.0
+  on; flash attention: S = Q K and O += P V as f16 products with f32 sums, the online
+  softmax in f32 between them, P passed from one product to the next in registers;
+  Gemma's 512-wide heads in two halves of the output). Dynamic shared memory (up to ~87 KB)
+  through `cuFuncSetAttribute`. Attention went from 36% of Llama's prompt time to 6%.
+  Checked against f64 for every head size and a sliding window: within 0.060.08% of the
+  output's size (the queries and softmax weights rounded to f16, as llama.cpp's flash
+  attention does); perplexity 48.48 / 25.07 / 46.28 against exact 48.42 / 25.04 / 46.23.
+- One generated token's attention is split along the context (`attention_part_*`, then
+  `attention_combine`): about four blocks per SM instead of one per head, the split worked
+  out on the GPU from the position so the recorded graph fits every length. Generating
+  after a long prompt went from ~78 to ~107 tokens/s on Llama and ~33 to ~57 on Gemma.
+
+**Fourth round: prompts (2026-11-10):**
+
+- The tensor-core matrix kernels take 128 columns per step (64 tensor-core products per
+  warp between syncs, not 16) and read each group's scales once; two blocks per SM for
+  Q4_0, Q8_0 and Q6_K (Q4_K and Q5_K would spill registers). ~5.5  ~66.7 TOPS on
+  Q4_K at 8192  2048  512 tokens. Measured by switching parts off in a standalone
+  benchmark: the per-32 scaling is about half the time (each result needs about as many
+  float operations to scale as multiply-adds on the tensor cores: inherent to a scale per
+  32 columns on both sides, which llama.cpp uses too), unpacking the weights most of the
+  rest. Neither I2F nor shared-memory loads were the limit.
+- Qwen's DeltaNet for a prompt in three steps (`delta_l2`, `delta_scan`, `delta_out`):
+  the q/k norms and the gated output norm, which don't depend on the state, run for every
+  token at once; the state update is split over blocks of 16 columns (the columns are
+  independent), with 16 tokens of q and k staged in shared memory at a time and no
+  block-wide sums left in the loop. 5 ms  2 ms per layer for 512 tokens; the same
+  arithmetic (exact perplexity 25.0418, unchanged). The convolution runs over every
+  token at once too (`conv_silu_parallel`, then `conv_history`).
+- Prompts: Llama ~1,900  ~2,130, Qwen ~2,000  ~2,690, Gemma ~1,030  ~1,200 tokens/s.
+
+**Fifth round: prompts again (2026-11-11):**
+
+- The tensor-core products take a whole group of 32 columns at once (`mma.m16n8k32`),
+  halving the products and fragment loads for every type but Q6_K (scales per 16).
+- Unpacking by bigger units: Q4_K and Q5_K a pair of sub-blocks per thread (two 16-byte
+  loads and one scale header for 64 numbers, instead of four headers); Q6_K a pair of runs
+  that share their bytes. Q6_K's 210-byte blocks are padded to 224 when uploaded so they
+  start 16-byte aligned (`Q6K_BYTES`), which all Q6_K kernels use. Q4_K 6.3  7.9 TOPS at
+  8192  2048  512 tokens; Q5_K and Q6_K +1340%.
+- Tried and dropped: `ldmatrix` for the fragments (2% slower than plain loads here);
+  f16 tensor-core products with the scales folded into f16 weights (no per-group scaling,
+  but f16 products top out at ~8.3 TOPS here against ~12.6 for int8); folding Q4_K's
+  integer sub-block scales into the sums (3% at most).
+- Measured, not adopted: activation scales per 128 or 256 numbers instead of 32 would
+  let the sums stay integers across groups (about half the tensor-core kernels' time is
+  the per-32 scaling), at 25 the perplexity cost of 8-bit mode today: +0.270.74% from
+  exact against +0.030.13%. A quality decision, left open.
+- Prompts: Llama ~2,130  ~2,540, Qwen ~2,690  ~3,020, Gemma ~1,200  ~1,250 tokens/s.
+  Exact and 8-bit perplexity unchanged to every digit (the same integer sums).
+- The GPU ran at ~2.8 GHz this round (~1.5 GHz in earlier ones: a power setting); llama.cpp
+  was re-measured under the same conditions.
+
+**Sixth round: Nsight Compute, and Gemma's shared layers (2026-11-11):**
+
+- With the GPU's performance counters open (an NVIDIA Control Panel setting), Nsight
+  Compute on the Q4_0 tensor-core kernel at Gemma's shape: the tensor cores busy ~30% of
+  the time, ~28 instructions issued per tensor-core instruction (12 of them the per-32
+  scaling, ~5 unpacking, the rest addresses, loops and zeroing), issue half busy with ~1
+  eligible warp per scheduler (127 registers: 4 warps each). The SM clock fell to ~700 MHz
+  under this load, so fewer instructions also means less power.
+- `__vsubss4` (a byte-wise saturating subtract) has no instruction on this GPU and
+  compiles to ~8; replaced everywhere by a 3-instruction sign extension (`sext4`,
+  `sext6`), the same bytes. Q4_0's dp4a generation kernel went from ~135 to ~200 GB/s
+  (Gemma generates ~10% faster).
+- Tried in a standalone benchmark: cp.async double buffering with Q4_0's raw 4-bit
+  numbers read straight into the fragments (+6% with the cheaper sign extension, not yet
+  in the engine); 128-token tiles (too much shared memory and registers).
+- The big one came from profiling llama.cpp itself: it runs Gemma's shared-KV layers
+  (1534 of 35 in E2B) only for the tokens whose logits are wanted. Those layers keep no
+  keys or values, so a token's pass through them only makes its own logits. Vireo now
+  does the same in `forward_batch`: a prompt runs layers 014 for every token and 1534
+  for the last token alone (none at all for chunks without logits; every layer for
+  every token when all logits are asked for, as in scoring). Gemma reads prompts 2.6
+  faster (~1,185  ~3,100 tokens/s); its llama.cpp test still matches.
+
+**Seventh round: where a prompt's time goes now (2026-11-11, Nsight Systems):**
+
+Reading a ~1,9002,200-token prompt (the first 7,000 characters of this file) with
+`vireo-cli generate --gpu -n 1`, kernel time by kind:
+
+| Model (tokens/s) | Matrix products | Attention | Other |
+|---|---|---|---|
+| Llama 3.2 1B (~2,300) | 81% (`matmul8_q4_k` 70%, `_q6_k` 12%) | 8% (`attention_mma_64`) | `quantize_q8` 4%, `qkv_prep` 3%, `swiglu` 2% |
+| Qwen 3.5 0.8B (~2,750) | 53% | 11% (`attention_mma_256`) | `delta_scan` 24%, other DeltaNet 6%, `quantize_q
