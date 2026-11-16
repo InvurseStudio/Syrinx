@@ -819,9 +819,10 @@ impl Gpu {
     }
 
     /// A weight matrix of `rows` × `cols` numbers of type `kind` (GGUF's layout) in GPU
-    /// memory, in the layout the kernels read: as it is, except Q4_0, whose 18-byte blocks
-    /// are split into each row's 4-bit numbers (16-byte aligned) and then its scales, and
-    /// Q6_K, whose 210-byte blocks are padded to 224 (16-byte aligned).
+    /// memory, in the layout the kernels read: as it is, except Q4_0 and Q8_0, whose 18- and
+    /// 34-byte blocks are split into each row's numbers (16-byte aligned) and then its scales, and
+    /// Q6_K, whose 210-byte blocks go up as each row's blocks without their scale d (208
+    /// bytes, 16-byte aligned) and then the row's d's.
     pub fn upload_weights(
         &self,
         kind: TensorType,
@@ -830,32 +831,43 @@ impl Gpu {
         cols: usize,
     ) -> Result<Buffer> {
         if kind == TensorType::Q6_K {
-            // Q6_K: each 210-byte block padded to 224, so blocks start 16-byte aligned.
-            let mut out = vec![0u8; data.len() / 210 * 224];
+            // Q6_K: a row's blocks, 208 bytes each (ql, qh and the 16 scales, so blocks start
+            // 16-byte aligned), then its blocks' f16 d's, padded to 16 bytes (the kernels'
+            // q6_k_row_bytes). Padding each block to 224 bytes instead was 6% more for a
+            // token's pass to read.
+            let blocks = cols / 256;
+            let row_bytes = blocks * 208 + (blocks * 2).next_multiple_of(16);
+            let mut out = vec![0u8; rows * row_bytes];
             for (src, dst) in data
-                .as_chunks::<210>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<224>().0)
+                .chunks_exact(blocks * 210)
+                .zip(out.chunks_exact_mut(row_bytes))
             {
-                dst[..210].copy_from_slice(src);
+                let (numbers, scales) = dst.split_at_mut(blocks * 208);
+                for (b, block) in src.as_chunks::<210>().0.iter().enumerate() {
+                    numbers[b * 208..(b + 1) * 208].copy_from_slice(&block[..208]);
+                    scales[b * 2..b * 2 + 2].copy_from_slice(&block[208..]);
+                }
             }
             return self.upload(&out);
         }
-        if kind != TensorType::Q4_0 {
-            return self.upload(data);
-        }
+        // Q4_0 and Q8_0: a row's numbers (16 or 32 bytes a block), then its f16 scales,
+        // padded to 16 bytes (the kernels' q4_0_row_bytes and q8_0_row_bytes).
+        let n = match kind {
+            TensorType::Q4_0 => 16,
+            TensorType::Q8_0 => 32,
+            _ => return self.upload(data),
+        };
         let blocks = cols / 32;
-        let row_bytes = blocks * 16 + (blocks * 2).next_multiple_of(16);
+        let row_bytes = blocks * n + (blocks * 2).next_multiple_of(16);
         let mut out = vec![0u8; rows * row_bytes];
         for (src, dst) in data
-            .chunks_exact(blocks * 18)
+            .chunks_exact(blocks * (n + 2))
             .zip(out.chunks_exact_mut(row_bytes))
         {
-            let (numbers, scales) = dst.split_at_mut(blocks * 16);
-            for (b, block) in src.as_chunks::<18>().0.iter().enumerate() {
+            let (numbers, scales) = dst.split_at_mut(blocks * n);
+            for (b, block) in src.chunks_exact(n + 2).enumerate() {
                 scales[b * 2..b * 2 + 2].copy_from_slice(&block[..2]);
-                numbers[b * 16..b * 16 + 16].copy_from_slice(&block[2..]);
+                numbers[b * n..(b + 1) * n].copy_from_slice(&block[2..]);
             }
         }
         self.upload(&out)
