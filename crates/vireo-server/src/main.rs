@@ -1896,6 +1896,12 @@ fn engine(
     } else {
         "8-bit"
     };
+    // Have the weights made resident before the first chat, not during its first prompt.
+    match &model {
+        Model::Llama(m) => m.gpu().settle(),
+        Model::Qwen35(m) => m.gpu().settle(),
+        Model::Gemma4(m) => m.gpu().settle(),
+    }
     // The weights are in GPU memory now: let go of the file's pages read on the way.
     file.release_pages();
     eprintln!("Loaded {name} in {:.1?}.", started.elapsed());
