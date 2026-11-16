@@ -42,12 +42,15 @@ __device__ __forceinline__ float half_at(const u8* p) {
     return __half2float(*reinterpret_cast<const __half*>(p));
 }
 
-// Four bytes from an address that's only 2-byte aligned (Q4_0, Q8_0 and Q6_K blocks
-// have odd sizes, so their contents are only 2-byte aligned).
+// Four bytes from an address that's only 2-byte aligned (Q8_0's blocks have an odd size,
+// so their contents are only 2-byte aligned).
 __device__ __forceinline__ u32 u32_at2(const u8* p) {
     const u16* h = reinterpret_cast<const u16*>(p);
     return (u32)h[0] | ((u32)h[1] << 16);
 }
+
+// Four bytes from a 4-byte-aligned address: Q6_K's words (its blocks start 16-byte aligned).
+__device__ __forceinline__ u32 u32_at4(const u8* p) { return *reinterpret_cast<const u32*>(p); }
 
 __device__ __forceinline__ float4 f4(const float* p) { return *reinterpret_cast<const float4*>(p); }
 
@@ -117,9 +120,53 @@ __device__ __forceinline__ float q4_0_scale(const u8* row, int blocks, int b) {
     return half_at(row + (size_t)blocks * 16 + b * 2);
 }
 
-// Q6_K on the GPU: GGUF's 210-byte blocks padded to 224, so each starts 16-byte aligned
-// (Gpu::upload_weights). The contents are as in GGUF.
-#define Q6K_BYTES 224
+// Q8_0 on the GPU, as Q4_0: each row's numbers first (32 bytes a block, so any 4 or 16 of
+// them are one aligned load), then its f16 scales, padded to 16 bytes
+// (Gpu::upload_weights repacks GGUF's 34-byte blocks so). A word of a 34-byte block was
+// two loads of a half, and a token's pass waited on the loads.
+__device__ __forceinline__ size_t q8_0_row_bytes(int cols) {
+    const int blocks = cols / 32;
+    return (size_t)blocks * 32 + ((blocks * 2 + 15) & ~15);
+}
+
+__device__ __forceinline__ float q8_0_scale(const u8* row, int blocks, int b) {
+    return half_at(row + (size_t)blocks * 32 + b * 2);
+}
+
+// Q6_K on the GPU: each row's blocks without their f16 scale d (208 bytes: ql 128, qh 64,
+// 16 int8 scales, as in GGUF), so every block starts 16-byte aligned, then the row's d's,
+// padded to 16 bytes (Gpu::upload_weights). 210 bytes a block and a few a row, where
+// padding each block to 224 was 6% more to read for every token written (the Mac pads to
+// 212 and reads words; here the tensor-core products read 16 bytes at a time).
+#define Q6K_BYTES 208
+
+__device__ __forceinline__ size_t q6_k_row_bytes(int cols) {
+    const int blocks = cols / 256;
+    return (size_t)blocks * Q6K_BYTES + ((blocks * 2 + 15) & ~15);
+}
+
+// Block b's d, as its 16 bits.
+__device__ __forceinline__ u32 q6_k_d_bits(const u8* row, int blocks, int b) {
+    return *reinterpret_cast<const u16*>(row + (size_t)blocks * Q6K_BYTES + b * 2);
+}
+
+// A lane's four scales (one a run of 32: the 16 its 4 numbers of that run are in) from one
+// 8-byte load of its half's 8, not four loads of a byte. l is the lane's place in a run.
+struct Q6Scales {
+    uint2 w;
+    int shift;
+    __device__ __forceinline__ int at(int k) const {
+        return (int)(signed char)(((k < 2 ? w.x : w.y) >> (shift + (k & 1) * 16)) & 0xFF);
+    }
+};
+
+__device__ __forceinline__ Q6Scales q6_k_scales(const u8* block, int half, int l) {
+    return {*reinterpret_cast<const uint2*>(block + 192 + half * 8), (l / 16) * 8};
+}
+
+__device__ __forceinline__ float q6_k_d(const u8* row, int blocks, int b) {
+    return half_at(row + (size_t)blocks * Q6K_BYTES + b * 2);
+}
 
 // ---- Matrix-vector products: y = W x, one warp per row of W -------------------------
 //
@@ -213,23 +260,23 @@ __device__ __forceinline__ float bit_dot8(uint2 q, int shift, float4 a, float4 b
            small_int((hi >> 16) & 1, 0.0f) * b.z + small_int(hi >> 24, 0.0f) * b.w;
 }
 
-// Q8_0: blocks of 32 in 34 bytes (f16 scale, 32 int8s). 8 lanes per block, 4 numbers
-// each; a warp takes 4 blocks per step.
+// Q8_0 (the GPU layout, see q8_0_row_bytes). 8 lanes per block, 4 numbers each; a warp
+// takes 4 blocks per step.
 extern "C" __global__ void matvec_q8_0(const u8* w, const float* x, float* y, int rows, int cols) {
     MATVEC_ROWS
     const int blocks = cols / 32;
-    const size_t row_bytes = (size_t)blocks * 34;
+    const size_t row_bytes = q8_0_row_bytes(cols);
     const int sub = lane >> 3, j = (lane & 7) * 4;
     for (int b = sub; b < blocks; b += 4) {
         const float4 xv = f4(x + b * 32 + j);
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 34;
-            const u32 q = u32_at2(block + 2 + j);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const u32 q = u32_at4(row + b * 32 + j);
             const float dot = small_int((q & 0xFF) ^ 0x80, 128.0f) * xv.x + small_int(((q >> 8) & 0xFF) ^ 0x80, 128.0f) * xv.y +
                               small_int(((q >> 16) & 0xFF) ^ 0x80, 128.0f) * xv.z + small_int((q >> 24) ^ 0x80, 128.0f) * xv.w;
-            sum[r] += half_at(block) * dot;
+            sum[r] += q8_0_scale(row, blocks, b) * dot;
         }
     }
     MATVEC_STORE
@@ -335,14 +382,13 @@ extern "C" __global__ void matvec_q5_k(const u8* w, const float* x, float* y, in
     MATVEC_STORE
 }
 
-// Q6_K: blocks of 256 in 210 bytes (ql 128, qh 64, 16 int8 scales, f16 d), padded to
-// Q6K_BYTES on the GPU so they start 16-byte aligned (Gpu::upload_weights). Each half
-// of a block is 4 runs of 32 numbers. 16 lanes per block: lane j takes 4 positions of
+// Q6_K: blocks of 256 in 210 bytes (ql 128, qh 64, 16 int8 scales, f16 d), laid out on
+// the GPU as Q6K_BYTES above says. Each half of a block is 4 runs of 32 numbers. 16 lanes per block: lane j takes 4 positions of
 // one half (16 numbers, one from each run). A warp takes 2 blocks per step.
 extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, int rows, int cols) {
     MATVEC_ROWS
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
+    const size_t row_bytes = q6_k_row_bytes(cols);
     const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
     for (int b = sub; b < blocks; b += 2) {
         const float* xb = x + b * 256 + half * 128 + l;
@@ -352,11 +398,12 @@ extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, in
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
-            const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + half * 64 + l), ql1 = u32_at2(block + half * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + half * 32 + l);
-            const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const u8* block = row + b * Q6K_BYTES;
+            const float d = q6_k_d(row, blocks, b);
+            const u32 ql0 = u32_at4(block + half * 64 + l), ql1 = u32_at4(block + half * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + half * 32 + l);
+            const Q6Scales sc = q6_k_scales(block, half, l);
             float block_sum = 0.0f;
 #pragma unroll
             for (int k = 0; k < 4; k++) {
@@ -365,7 +412,7 @@ extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, in
                 const float q1 = small_int(((low >> 8) & 0xF) | (((qh >> (8 + 2 * k)) & 3) << 4), 32.0f);
                 const float q2 = small_int(((low >> 16) & 0xF) | (((qh >> (16 + 2 * k)) & 3) << 4), 32.0f);
                 const float q3 = small_int(((low >> 24) & 0xF) | (((qh >> (24 + 2 * k)) & 3) << 4), 32.0f);
-                block_sum += (float)sc[2 * k] * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
+                block_sum += (float)sc.at(k) * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
             }
             sum[r] += d * block_sum;
         }
@@ -409,10 +456,15 @@ __device__ __forceinline__ void decode8<K_Q4_0>(const u8* row, int k, float* v) 
 
 template <>
 __device__ __forceinline__ void decode8<K_Q8_0>(const u8* row, int k, float* v) {
-    const u8* block = row + (k / 32) * 34;
-    const float d = half_at(block);
-    const int j = k % 32;
-    for (int i = 0; i < 8; i++) v[i] = d * (float)(signed char)block[2 + j + i];
+    // As Q4_0: the row's scales are past its numbers, so decode8_q8_0 takes the block count.
+    (void)row;
+    (void)k;
+    (void)v;
+}
+
+__device__ __forceinline__ void decode8_q8_0(const u8* row, int blocks, int k, float* v) {
+    const float d = q8_0_scale(row, blocks, k / 32);
+    for (int i = 0; i < 8; i++) v[i] = d * (float)(signed char)row[k + i];
 }
 
 template <>
@@ -445,9 +497,16 @@ __device__ __forceinline__ void decode8<K_Q5_K>(const u8* row, int k, float* v) 
 
 template <>
 __device__ __forceinline__ void decode8<K_Q6_K>(const u8* row, int k, float* v) {
+    // As Q4_0: the row's d's are past its blocks, so decode8_q6_k takes the block count.
+    (void)row;
+    (void)k;
+    (void)v;
+}
+
+__device__ __forceinline__ void decode8_q6_k(const u8* row, int blocks, int k, float* v) {
     const u8* block = row + (k / 256) * Q6K_BYTES;
     const int n = k % 256, half = n / 128, run = (n % 128) / 32, l = n % 32;
-    const float d = half_at(block + 208);
+    const float d = q6_k_d(row, blocks, k / 256);
     const u8* ql = block + half * 64 + (run & 1) * 32 + l;
     const u8* qh = block + 128 + half * 32 + l;
     const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16 + 2 * run);
@@ -494,6 +553,10 @@ __device__ void matmul(const u8* w, size_t row_bytes, const float* x, float* y, 
             if (r < rows) {
                 if (KIND == K_Q4_0)
                     decode8_q4_0(w + (size_t)r * row_bytes, cols / 32, k0 + load_k, v);
+                else if (KIND == K_Q8_0)
+                    decode8_q8_0(w + (size_t)r * row_bytes, cols / 32, k0 + load_k, v);
+                else if (KIND == K_Q6_K)
+                    decode8_q6_k(w + (size_t)r * row_bytes, cols / 256, k0 + load_k, v);
                 else
                     decode8<KIND>(w + (size_t)r * row_bytes, k0 + load_k, v);
             } else {
@@ -555,10 +618,10 @@ __device__ void matmul(const u8* w, size_t row_bytes, const float* x, float* y, 
 MATMUL(matmul_f32, K_F32, cols * 4)
 MATMUL(matmul_f16, K_F16, cols * 2)
 MATMUL(matmul_q4_0, K_Q4_0, q4_0_row_bytes(cols))
-MATMUL(matmul_q8_0, K_Q8_0, cols / 32 * 34)
+MATMUL(matmul_q8_0, K_Q8_0, q8_0_row_bytes(cols))
 MATMUL(matmul_q4_k, K_Q4_K, cols / 256 * 144)
 MATMUL(matmul_q5_k, K_Q5_K, cols / 256 * 176)
-MATMUL(matmul_q6_k, K_Q6_K, cols / 256 * Q6K_BYTES)
+MATMUL(matmul_q6_k, K_Q6_K, q6_k_row_bytes(cols))
 
 // ---- 8-bit activations: faster, not exact ---------------------------------------------
 //
@@ -568,6 +631,33 @@ MATMUL(matmul_q6_k, K_Q6_K, cols / 256 * Q6K_BYTES)
 // of 32 numbers of x gets a scale d = max|x| / 127 and q = round(x / d); `xs` keeps
 // d × Σq for each 16, for the weights' minimums. Rows of x are `cols` long: xq holds cols
 // bytes per row, xd cols / 32 floats and xs cols / 16.
+
+// A batch's layout (the tensor-core kernels read it, matmul8): the bytes as above (a
+// token's 128 for a step of the product on one 128-byte line), and in place of xd and xs
+// a head of X8_HEAD floats for each token and 128 numbers: its four scales, then the four
+// sums d × Σq of its 32s (the two 16s' sums added, as that kernel adds them). A step
+// reads a token's scales and sums in one place, and half the sums. For models of
+// K-quants (matmul8's HEAD): a ~2.3K-token read, Qwen 3.5 9B +5% and 4B +3%; Gemma 4
+// E4B's Q4_0 products were 3% slower so, and Q4_0 models keep xd and xs. (All of it in one
+// block of 160 bytes, bytes after head, cost Q4_0 9%: the bytes off their 128-byte line.)
+#define X8_HEAD 8
+__device__ __forceinline__ size_t x8_heads(int cols) { return (size_t)((cols + 127) / 128); }
+
+// A warp's block of 32 (number g of token t's row of `cols`) into that layout: lane
+// `lane`'s byte q, the scale d, and the sum of q over the lane's 16.
+__device__ __forceinline__ void x8_store(signed char* xq, float* head, int cols, int t, int g, int lane, int q,
+                                         float d, int sum16) {
+    xq[(size_t)t * cols + g * 32 + lane] = (signed char)q;
+    // Each 16's sum times d, then the two added: neither contracted, so the same f32 as
+    // the one-token layout's two numbers added.
+    const float part = __fmul_rn(d, (float)sum16);
+    const float other = __shfl_xor_sync(0xffffffffu, part, 16);
+    if (lane == 0) {
+        float* h = head + ((size_t)t * x8_heads(cols) + g / 4) * X8_HEAD;
+        h[g % 4] = d;
+        h[4 + g % 4] = __fadd_rn(part, other);
+    }
+}
 
 // One warp per block of 32: rounds `x` to 8 bits.
 extern "C" __global__ void quantize_q8(const float* x, signed char* xq, float* xd, float* xs, int blocks) {
@@ -615,6 +705,42 @@ __device__ __forceinline__ void gated_q8(const float* gate, const float* up, int
     if (lane == 0) xd[block] = d;
     if (lane == 0 || lane == 16) xs[(size_t)block * 2 + lane / 16] = d * (float)sum;
 }
+// quantize_q8 and the gated kernels below, into a batch's layout: a block of 8 warps takes
+// 8 of a token's 32s, the token is blockIdx.y (no dividing to find where a 32 goes).
+extern "C" __global__ void quantize_q8_tile(const float* x, signed char* xq, float* head, int cols) {
+    const int t = blockIdx.y, g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (g >= cols / 32) return;
+    const float v = x[(size_t)t * cols + g * 32 + lane];
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    int sum = q;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    x8_store(xq, head, cols, t, g, lane, q, d, sum);
+}
+template <bool GELU>
+__device__ __forceinline__ void gated_q8_tile(const float* gate, const float* up, int n, int up_stride,
+                                              signed char* xq, float* head) {
+    const int t = blockIdx.y, g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (g >= n / 32) return;
+    const float v = gated_value<GELU>(gate[(size_t)t * n + g * 32 + lane], up[(size_t)t * up_stride + g * 32 + lane]);
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    int sum = q;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    x8_store(xq, head, n, t, g, lane, q, d, sum);
+}
+extern "C" __global__ void swiglu_q8_tile(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                          float* head) {
+    gated_q8_tile<false>(gate, up, n, up_stride, xq, head);
+}
+extern "C" __global__ void geglu_q8_tile(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                         float* head) {
+    gated_q8_tile<true>(gate, up, n, up_stride, xq, head);
+}
 extern "C" __global__ void swiglu_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
                                      float* xd, float* xs, int blocks) {
     gated_q8<false>(gate, up, n, up_stride, xq, xd, xs, blocks);
@@ -629,21 +755,30 @@ __device__ __forceinline__ int i32_at(const signed char* p) { return *reinterpre
 // The dp4a matrix-vector kernels: as the f32 ones (MV_ROWS rows a warp, lanes laid out
 // the same), with x as 8-bit numbers.
 
-// Q8_0: d × dx × Σ q qx per block of 32.
+// Q8_0: d × dx × Σ q qx per block of 32. 2 lanes per block, 16 bytes each in one load; a
+// warp takes 16 blocks (512 bytes of a row) per step. With 8 lanes of 4 bytes a block a
+// step was 128 bytes of a row, and the reads' latency, not memory, set the pace
+// (Qwen 3.5 4B's ssm_out 49 us for 11 MB; its 32-row ssm_alpha 15 us).
+#define Q8_STEP 16
+__device__ __forceinline__ int dot16(uint4 q, uint4 x) {
+    return __dp4a((int)q.w, (int)x.w, __dp4a((int)q.z, (int)x.z, __dp4a((int)q.y, (int)x.y, __dp4a((int)q.x, (int)x.x, 0))));
+}
+
 extern "C" __global__ void matvec8_q8_0(const u8* w, const signed char* xq, const float* xd, float* y, int rows,
                                         int cols) {
     MATVEC_ROWS
     const int blocks = cols / 32;
-    const size_t row_bytes = (size_t)blocks * 34;
-    const int sub = lane >> 3, j = (lane & 7) * 4;
-    for (int b = sub; b < blocks; b += 4) {
-        const int xv = i32_at(xq + b * 32 + j);
+    const size_t row_bytes = q8_0_row_bytes(cols);
+    const int sub = lane >> 1, j = (lane & 1) * 16;
+    for (int b = sub; b < blocks; b += Q8_STEP) {
+        const uint4 xv = *reinterpret_cast<const uint4*>(xq + b * 32 + j);
         const float dx = xd[b];
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 34;
-            sum[r] += half_at(block) * dx * (float)__dp4a((int)u32_at2(block + 2 + j), xv, 0);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const uint4 q = *reinterpret_cast<const uint4*>(row + b * 32 + j);
+            sum[r] += q8_0_scale(row, blocks, b) * dx * (float)dot16(q, xv);
         }
     }
     MATVEC_STORE
@@ -749,37 +884,67 @@ extern "C" __global__ void matvec8_q5_k(const u8* w, const signed char* xq, cons
 }
 
 // Q6_K: d × scale × dx × Σ (q − 32) qx over each lane's 4 numbers of a run. Lanes as in
-// matvec_q6_k.
+// matvec_q6_k. A row and step is 5 loads a lane (three words, the half's scales, d) where
+// it was 11 (each word as two halves, each scale a byte), and x's four scales one: the
+// loads were what a token's pass waited on.
+// W words (1, 2 or 4) from a 4W-byte-aligned address, in one load.
+template <int W>
+__device__ __forceinline__ void words_at(const void* p, u32* out) {
+    if constexpr (W == 1) {
+        out[0] = *reinterpret_cast<const u32*>(p);
+    } else if constexpr (W == 2) {
+        const uint2 v = *reinterpret_cast<const uint2*>(p);
+        out[0] = v.x, out[1] = v.y;
+    } else {
+        const uint4 v = *reinterpret_cast<const uint4*>(p);
+        out[0] = v.x, out[1] = v.y, out[2] = v.z, out[3] = v.w;
+    }
+}
+
+// Words a lane: 1. With 2 (8 bytes of each run a lane, 4 blocks a step) writing was 6-9%
+// faster while the laptop's GPU was held to 45 W and level to 2% slower at full power, and
+// the sums are added in another order (Gemma 4 E4B's second token changed).
+#define Q6_W 1
 extern "C" __global__ void matvec8_q6_k(const u8* w, const signed char* xq, const float* xd, float* y, int rows,
                                         int cols) {
     MATVEC_ROWS
+    // A lane takes W words of each run of a half (4W numbers of each of its 4 runs), so
+    // 16 / W lanes a block and 2W blocks a step.
+    constexpr int W = Q6_W, LB = 16 / W;
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
-    const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
-    for (int b = sub; b < blocks; b += 2) {
+    const size_t row_bytes = q6_k_row_bytes(cols);
+    const int sub = lane / LB, half = (lane % LB) / (LB / 2), l = (lane % (LB / 2)) * 4 * W;
+    for (int b = sub; b < blocks; b += 32 / LB) {
         const signed char* xb = xq + b * 256 + half * 128 + l;
-        int xv[4];
+        u32 xv[4][W];
         float dx[4];
 #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            xv[k] = i32_at(xb + k * 32);
-            dx[k] = xd[b * 8 + half * 4 + k];
-        }
+        for (int k = 0; k < 4; k++) words_at<W>(xb + k * 32, xv[k]);
+        // The half's four scales of x in one load (xd is 16-byte aligned, 8 a block).
+        const float4 dxv = f4(xd + b * 8 + half * 4);
+        dx[0] = dxv.x, dx[1] = dxv.y, dx[2] = dxv.z, dx[3] = dxv.w;
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
-            const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + half * 64 + l), ql1 = u32_at2(block + half * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + half * 32 + l);
-            const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const u8* block = row + b * Q6K_BYTES;
+            const float d = q6_k_d(row, blocks, b);
+            u32 ql0[W], ql1[W], qh[W];
+            words_at<W>(block + half * 64 + l, ql0);
+            words_at<W>(block + half * 64 + 32 + l, ql1);
+            words_at<W>(block + 128 + half * 32 + l, qh);
+            const Q6Scales sc = q6_k_scales(block, half, l);
             float block_sum = 0.0f;
 #pragma unroll
             for (int k = 0; k < 4; k++) {
-                const u32 low = (((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
-                const u32 q = low | (((qh >> (2 * k)) & 0x03030303u) << 4);
-                const int dot = __dp4a((int)sext6(q), xv[k], 0);
-                block_sum += (float)sc[2 * k] * dx[k] * (float)dot;
+                int dot = 0;
+#pragma unroll
+                for (int i = 0; i < W; i++) {
+                    const u32 low = (((k & 1) ? ql1[i] : ql0[i]) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
+                    const u32 q = low | (((qh[i] >> (2 * k)) & 0x03030303u) << 4);
+                    dot = __dp4a((int)sext6(q), (int)xv[k][i], dot);
+                }
+                block_sum += (float)sc.at(k) * dx[k] * (float)dot;
             }
             sum[r] += d * block_sum;
         }
@@ -819,25 +984,26 @@ __device__ __forceinline__ void matvec8_few_q8_0(const u8* w, const signed char*
                                                  int rows, int cols, int tokens) {
     FEW_ROWS(T)
     const int blocks = cols / 32;
-    const size_t row_bytes = (size_t)blocks * 34;
-    const int sub = lane >> 3, j = (lane & 7) * 4;
-    for (int b = sub; b < blocks; b += 4) {
-        int xv[T];
+    const size_t row_bytes = q8_0_row_bytes(cols);
+    // Lanes as in matvec8_q8_0, so the sums are its sums.
+    const int sub = lane >> 1, j = (lane & 1) * 16;
+    for (int b = sub; b < blocks; b += Q8_STEP) {
+        uint4 xv[T];
         float dx[T];
 #pragma unroll
         for (int t = 0; t < T; t++) {
             const bool on = t < tokens;
-            xv[t] = on ? i32_at(xq + (size_t)t * cols + b * 32 + j) : 0;
+            xv[t] = on ? *reinterpret_cast<const uint4*>(xq + (size_t)t * cols + b * 32 + j) : make_uint4(0, 0, 0, 0);
             dx[t] = on ? xd[(size_t)t * xd_cols + b] : 0.0f;
         }
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 34;
-            const float d = half_at(block);
-            const int q = (int)u32_at2(block + 2 + j);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const float d = q8_0_scale(row, blocks, b);
+            const uint4 q = *reinterpret_cast<const uint4*>(row + b * 32 + j);
 #pragma unroll
-            for (int t = 0; t < T; t++) sum[r][t] += d * dx[t] * (float)__dp4a(q, xv[t], 0);
+            for (int t = 0; t < T; t++) sum[r][t] += d * dx[t] * (float)dot16(q, xv[t]);
         }
     }
     FEW_STORE(T)
@@ -971,24 +1137,26 @@ template <int T>
 __device__ __forceinline__ void matvec8_few_q6_k(const u8* w, const signed char* xq, const float* xd, float* y,
                                                  int rows, int cols, int tokens) {
     FEW_ROWS(T)
+    // Lanes as in matvec8_q6_k (W words of each run a lane), so the sums are its sums.
+    constexpr int W = Q6_W, LB = 16 / W, STEP = 32 / LB;
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
-    const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
+    const size_t row_bytes = q6_k_row_bytes(cols);
+    const int sub = lane / LB, half = (lane % LB) / (LB / 2), l = (lane % (LB / 2)) * 4 * W;
     // A step's weight words: the low bits of two runs' bytes, the high bits, d, and the
-    // 16-bit words holding the 4 scales (2-byte aligned).
+    // half's 8 scales.
     struct Words {
-        u32 ql0, ql1, qh, d, sc[4];
+        u32 ql0[W], ql1[W], qh[W], d;
+        Q6Scales sc;
     };
     auto fetch = [&](int r, int b) {
-        const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
+        const u8* row = w + (row0 + r) * row_bytes;
+        const u8* block = row + b * Q6K_BYTES;
         Words v;
-        v.ql0 = u32_at2(block + half * 64 + l);
-        v.ql1 = u32_at2(block + half * 64 + 32 + l);
-        v.qh = u32_at2(block + 128 + half * 32 + l);
-        v.d = *reinterpret_cast<const u16*>(block + 208);
-        const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16);
-#pragma unroll
-        for (int k = 0; k < 4; k++) v.sc[k] = (u32)(int)sc[2 * k];
+        words_at<W>(block + half * 64 + l, v.ql0);
+        words_at<W>(block + half * 64 + 32 + l, v.ql1);
+        words_at<W>(block + 128 + half * 32 + l, v.qh);
+        v.d = q6_k_d_bits(row, blocks, b);
+        v.sc = q6_k_scales(block, half, l);
         return v;
     };
     Words ahead[MV_ROWS] = {};
@@ -997,8 +1165,8 @@ __device__ __forceinline__ void matvec8_few_q6_k(const u8* w, const signed char*
         for (int r = 0; r < MV_ROWS; r++)
             if (r < nrows) ahead[r] = fetch(r, sub);
     }
-    for (int b = sub; b < blocks; b += 2) {
-        int xv[T][4];
+    for (int b = sub; b < blocks; b += STEP) {
+        u32 xv[T][4][W];
         float dx[T][4];
 #pragma unroll
         for (int t = 0; t < T; t++) {
@@ -1006,37 +1174,47 @@ __device__ __forceinline__ void matvec8_few_q6_k(const u8* w, const signed char*
             const signed char* xb = xq + (size_t)t * cols + b * 256 + half * 128 + l;
 #pragma unroll
             for (int k = 0; k < 4; k++) {
-                xv[t][k] = on ? i32_at(xb + k * 32) : 0;
-                dx[t][k] = on ? xd[(size_t)t * xd_cols + b * 8 + half * 4 + k] : 0.0f;
+#pragma unroll
+                for (int i = 0; i < W; i++) xv[t][k][i] = 0;
+                if (on) words_at<W>(xb + k * 32, xv[t][k]);
             }
+            const float4 dxv = on ? f4(xd + (size_t)t * xd_cols + b * 8 + half * 4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            dx[t][0] = dxv.x, dx[t][1] = dxv.y, dx[t][2] = dxv.z, dx[t][3] = dxv.w;
         }
         // The next step's weights before this step's arithmetic (see Q4_K's).
         Words now[MV_ROWS];
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) now[r] = ahead[r];
-        if (b + 2 < blocks) {
+        if (b + STEP < blocks) {
 #pragma unroll
             for (int r = 0; r < MV_ROWS; r++)
-                if (r < nrows) ahead[r] = fetch(r, b + 2);
+                if (r < nrows) ahead[r] = fetch(r, b + STEP);
         }
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
             const float d = __half2float(__ushort_as_half((unsigned short)now[r].d));
-            const u32 ql0 = now[r].ql0, ql1 = now[r].ql1, qh = now[r].qh;
-            int q[4];
+            int q[4][W];
             float scale[4];
 #pragma unroll
             for (int k = 0; k < 4; k++) {
-                const u32 low = (((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
-                q[k] = (int)sext6(low | (((qh >> (2 * k)) & 0x03030303u) << 4));
-                scale[k] = (float)(int)now[r].sc[k];
+#pragma unroll
+                for (int i = 0; i < W; i++) {
+                    const u32 low = (((k & 1) ? now[r].ql1[i] : now[r].ql0[i]) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
+                    q[k][i] = (int)sext6(low | (((now[r].qh[i] >> (2 * k)) & 0x03030303u) << 4));
+                }
+                scale[k] = (float)now[r].sc.at(k);
             }
 #pragma unroll
             for (int t = 0; t < T; t++) {
                 float block_sum = 0.0f;
 #pragma unroll
-                for (int k = 0; k < 4; k++) block_sum += scale[k] * dx[t][k] * (float)__dp4a(q[k], xv[t][k], 0);
+                for (int k = 0; k < 4; k++) {
+                    int dot = 0;
+#pragma unroll
+                    for (int i = 0; i < W; i++) dot = __dp4a(q[k][i], (int)xv[t][k][i], dot);
+                    block_sum += scale[k] * dx[t][k] * (float)dot;
+                }
                 sum[r][t] += d * block_sum;
             }
         }
@@ -1097,16 +1275,6 @@ template <int KIND>
 __device__ __forceinline__ void unpack16(const u8* row, int k, uint4& q, float& scale, float& min);
 
 template <>
-__device__ __forceinline__ void unpack16<K_Q8_0>(const u8* row, int k, uint4& q, float& scale, float& min) {
-    const u8* block = row + (k / 32) * 34;
-    const u8* p = block + 2 + (k % 32);
-    q = make_uint4(u32_at2(p), u32_at2(p + 4), u32_at2(p + 8), u32_at2(p + 12));
-    scale = half_at(block);
-    min = 0.0f;
-}
-
-
-template <>
 __device__ __forceinline__ void unpack16<K_Q4_K>(const u8* row, int k, uint4& q, float& scale, float& min) {
     const u8* block = row + (k / 256) * 144;
     const int n = k % 256, j = n / 32, l = n % 32;
@@ -1137,24 +1305,6 @@ __device__ __forceinline__ void unpack16<K_Q5_K>(const u8* row, int k, uint4& q,
                    ((w.w >> shift) & 0x0F0F0F0Fu) | (((h.w >> j) & 0x01010101u) << 4));
     scale = half_lo(head.x) * sc;
     min = half_hi(head.x) * m;
-}
-
-template <>
-__device__ __forceinline__ void unpack16<K_Q6_K>(const u8* row, int k, uint4& q, float& scale, float& min) {
-    const u8* block = row + (k / 256) * Q6K_BYTES;
-    const int n = k % 256, half = n / 128, run = (n % 128) / 32, l = n % 32;
-    const u8* ql = block + half * 64 + (run & 1) * 32 + l;
-    const u8* qh = block + 128 + half * 32 + l;
-    const int shift = run < 2 ? 0 : 4;
-    u32 out[4];
-    for (int i = 0; i < 4; i++) {
-        const u32 low = (u32_at2(ql + 4 * i) >> shift) & 0x0F0F0F0Fu;
-        const u32 high = ((u32_at2(qh + 4 * i) >> (2 * run)) & 0x03030303u) << 4;
-        out[i] = sext6(low | high);
-    }
-    q = make_uint4(out[0], out[1], out[2], out[3]);
-    scale = half_at(block + 208) * (float)reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16 + 2 * run)[0];
-    min = 0.0f;
 }
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], u32 a0, u32 a1, u32 b0) {
@@ -1194,9 +1344,12 @@ __device__ __forceinline__ void ldmatrix_x4_bytes(u32 (&r)[4], const u8* p) {
 // writes is act(gate) x up rounded to 8 bits as quantize_q8 would round it (oq, od, os):
 // the next product's input. Neither product is written as f32 (rows x tokens x 8 bytes a
 // layer, read back once by the activation). Tiles of 64 or 128 tokens; rows in 64s.
-template <int KIND, int GROUP, int NT, int GLU = 0>
-__device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signed char* xq, const float* xd,
-                        const float* xs, float* y, signed char* oq, float* od, float* os, int rows, int cols,
+//
+// HEAD is how x's scales and sums come (and how GLU writes them): false, xa is xd and xb
+// xs; true, xa is a batch's heads (X8_HEAD) and xb isn't read. oa and ob likewise.
+template <int KIND, int GROUP, int NT, int GLU = 0, bool HEAD = false>
+__device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signed char* xq, const float* xa,
+                        const float* xb, float* y, signed char* oq, float* oa, float* ob, int rows, int cols,
                         int tokens) {
     static_assert(GLU == 0 || NT >= 64, "the gated kernel needs a warp's two tiles of 16 rows");
     // 128 columns a step: 64 tensor-core products per warp between syncs. Rows of 128
@@ -1221,15 +1374,15 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
     const int wr = NT >= 64 ? (warp & 3) * 32 : warp * 16, wt = NT >= 64 ? (warp >> 2) * (NT / 2) : 0;
     constexpr bool has_min = KIND == K_Q4_K || KIND == K_Q5_K;
     float acc[MI][NI][4] = {};
+    const size_t x_heads = x8_heads(cols);
     const int xd_cols = cols / 32, xs_cols = cols / 16;
 
     // The next step's raw bytes are read into registers before this step's products, and
     // unpacked into shared memory after them, so the reads' wait overlaps the arithmetic.
-    // (Q8_0's 2-byte-aligned words are put together as they're read.)
     struct Raw {
         uint4 head, v[2], h[2];  // Q4_K, Q5_K: a pair of sub-blocks; Q6_K: v low, h high bits
         uint4 q[4];              // Q4_0, Q8_0: 4 runs of 16
-        u32 sc[4];               // their scales (Q4_0: f16 bits; Q8_0: f32 bits); Q6_K: d, scales
+        u32 sc[4];               // their scales (f16 bits); Q6_K: d, scales
         bool ok[4];
         uint4 xq[XI];
         float xsum[XI], xscale[XI];
@@ -1252,9 +1405,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             const int r = tid >> 1, p = tid & 1;
             raw.ok[0] = tile_row(r) < rows && k0 < cols;
             if (raw.ok[0]) {
-                const u8* block = tile_w(r) + (size_t)tile_row(r) * row_bytes + (k0 / 256) * Q6K_BYTES;
+                const u8* row = tile_w(r) + (size_t)tile_row(r) * row_bytes;
+                const u8* block = row + (k0 / 256) * Q6K_BYTES;
                 const int half = (k0 % 256) / 128;
-                raw.sc[0] = *reinterpret_cast<const u16*>(block + 208);
+                raw.sc[0] = q6_k_d_bits(row, cols / 256, k0 / 256);
                 raw.sc[1] = *reinterpret_cast<const u16*>(block + 192 + half * 8 + 2 * p);
                 raw.sc[2] = *reinterpret_cast<const u16*>(block + 192 + half * 8 + 2 * (p + 2));
                 for (int i = 0; i < 2; i++) {
@@ -1274,9 +1428,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                         raw.q[i] = *reinterpret_cast<const uint4*>(row + b * 16);
                         raw.sc[i] = *reinterpret_cast<const u16*>(row + (size_t)blocks * 16 + b * 2);
                     } else {
-                        float scale, min;
-                        unpack16<KIND>(row, k, raw.q[i], scale, min);
-                        raw.sc[i] = __float_as_uint(scale);
+                        // Q8_0: a run of 16 is 16 bytes of the row.
+                        const int blocks = cols / 32, b = k / 32;
+                        raw.q[i] = *reinterpret_cast<const uint4*>(row + k);
+                        raw.sc[i] = *reinterpret_cast<const u16*>(row + (size_t)blocks * 32 + b * 2);
                     }
                 }
             }
@@ -1288,8 +1443,15 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             raw.xsum[i] = raw.xscale[i] = 0.0f;
             if (t < NT && tok0 + t < tokens && k < cols) {
                 raw.xq[i] = *reinterpret_cast<const uint4*>(xq + (size_t)(tok0 + t) * cols + k);
-                raw.xsum[i] = xs[(size_t)(tok0 + t) * xs_cols + k / 16];
-                raw.xscale[i] = xd[(size_t)(tok0 + t) * xd_cols + k / 32];
+                if constexpr (HEAD) {
+                    // The scale and the sum of this thread's 32, from the step's head.
+                    const float* head = xa + ((size_t)(tok0 + t) * x_heads + k0 / K) * X8_HEAD;
+                    raw.xscale[i] = head[h / 2];
+                    if constexpr (has_min) raw.xsum[i] = head[4 + h / 2];
+                } else {
+                    raw.xsum[i] = xb[(size_t)(tok0 + t) * xs_cols + k / 16];
+                    raw.xscale[i] = xa[(size_t)(tok0 + t) * xd_cols + k / 32];
+                }
             }
         }
     };
@@ -1341,13 +1503,14 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             // nibbles) and all the high bits.
             const int r = tid >> 1, p = tid & 1;
             uint4 lo[2] = {}, hi[2] = {};
-            float sc[4] = {};
+            // A run of 32's two scales stay whole numbers (as two 16-bit halves of a word) and
+            // the block's d a float: the products scale a 32's two sums together (below).
+            float d = 0.0f;
+            int sc[2] = {};
             if (raw.ok[0]) {
-                const float d = __half2float(__ushort_as_half((unsigned short)raw.sc[0]));
-                sc[0] = d * (float)(signed char)(raw.sc[1] & 0xFF);
-                sc[1] = d * (float)(signed char)(raw.sc[1] >> 8);
-                sc[2] = d * (float)(signed char)(raw.sc[2] & 0xFF);
-                sc[3] = d * (float)(signed char)(raw.sc[2] >> 8);
+                d = __half2float(__ushort_as_half((unsigned short)raw.sc[0]));
+                sc[0] = ((int)(signed char)(raw.sc[1] & 0xFF) & 0xFFFF) | ((int)(signed char)(raw.sc[1] >> 8) << 16);
+                sc[1] = ((int)(signed char)(raw.sc[2] & 0xFF) & 0xFFFF) | ((int)(signed char)(raw.sc[2] >> 8) << 16);
                 for (int i = 0; i < 2; i++) {
                     const uint4 l = raw.v[i], h = raw.h[i];
                     const u32 lw[4] = {l.x, l.y, l.z, l.w}, hw[4] = {h.x, h.y, h.z, h.w};
@@ -1364,10 +1527,8 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             *reinterpret_cast<uint4*>(&wq[r][p * 32 + 16]) = lo[1];
             *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32]) = hi[0];
             *reinterpret_cast<uint4*>(&wq[r][(p + 2) * 32 + 16]) = hi[1];
-            w_sm[2 * p][r].x = sc[0];
-            w_sm[2 * p + 1][r].x = sc[1];
-            w_sm[2 * (p + 2)][r].x = sc[2];
-            w_sm[2 * (p + 2) + 1][r].x = sc[3];
+            w_sm[p][r] = make_float2(d, __int_as_float(sc[0]));
+            w_sm[p + 2][r] = make_float2(d, __int_as_float(sc[1]));
         } else {
             // The weights: 128 rows × 8 runs of 16, 4 runs a thread.
 #pragma unroll
@@ -1384,7 +1545,7 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                         scale = __half2float(__ushort_as_half((unsigned short)raw.sc[i]));
                     } else {
                         q = raw.q[i];
-                        scale = __uint_as_float(raw.sc[i]);
+                        scale = __half2float(__ushort_as_half((unsigned short)raw.sc[i]));
                     }
                 }
                 *reinterpret_cast<uint4*>(&wq[r][h * 16]) = q;
@@ -1395,8 +1556,8 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
 #pragma unroll
         for (int i = 0; i < XI; i++) {
             const int c = tid + i * 256, t = c >> 3, h = c & 7;
-            // The runs h and h + 1 of a group are on neighbouring lanes.
-            const float sum32 = raw.xsum[i] + __shfl_xor_sync(0xFFFFFFFFu, raw.xsum[i], 1);
+            // A head has a 32's sum; else the runs h and h + 1 of a 32 are on neighbouring lanes.
+            const float sum32 = HEAD ? raw.xsum[i] : raw.xsum[i] + __shfl_xor_sync(0xFFFFFFFFu, raw.xsum[i], 1);
             if (t >= NT) continue;
             *reinterpret_cast<uint4*>(&xqs[t][h * 16]) = raw.xq[i];
             if ((h & 1) == 0) {
@@ -1419,6 +1580,64 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
         if constexpr (prefetch)
             if (k0 + K < cols) fetch(k0 + K);
 
+        if constexpr (KIND == K_Q6_K) {
+            // Q6_K has a scale every 16 numbers, a whole number, and x one every 32. A 32's
+            // two sums are put together as whole numbers, each times its scale (under 2^24,
+            // so exact in f32 too), and scaled into the results once: half the float work
+            // of scaling each 16 (which was 15% of a read: a row's scale read, a multiply
+            // and a multiply-add for every result and 16). Four token tiles at a time, so
+            // both 16s' sums are in registers together.
+            constexpr int NB = 1;
+#pragma unroll
+            for (int g = 0; g < K / 32; g++) {
+                const int kk = g * 32;
+                u32 a[MI][2][2];
+                float wd[MI][2];
+                int s1[MI][2], s2[MI][2];
+#pragma unroll
+                for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int r = wr + mi * 16 + gid + h * 8;
+                        a[mi][0][h] = *reinterpret_cast<const u32*>(&wq[r][kk + tig * 4]);
+                        a[mi][1][h] = *reinterpret_cast<const u32*>(&wq[r][kk + 16 + tig * 4]);
+                        const float2 sm = w_sm[g][r];
+                        const int both = __float_as_int(sm.y);
+                        wd[mi][h] = sm.x;
+                        s1[mi][h] = (short)(both & 0xFFFF);
+                        s2[mi][h] = both >> 16;
+                    }
+#pragma unroll
+                for (int nh = 0; nh < NI; nh += NB) {
+                    int c1[MI][NB][4] = {}, c2[MI][NB][4] = {};
+                    float xsc[NB][2];
+#pragma unroll
+                    for (int x = 0; x < NB; x++) {
+                        const u8* row = &xqs[wt + (nh + x) * 8 + gid][kk + tig * 4];
+                        const u32 b1 = *reinterpret_cast<const u32*>(row);
+                        const u32 b2 = *reinterpret_cast<const u32*>(row + 16);
+#pragma unroll
+                        for (int mi = 0; mi < MI; mi++) {
+                            mma_s8(c1[mi][x], a[mi][0][0], a[mi][0][1], b1);
+                            mma_s8(c2[mi][x], a[mi][1][0], a[mi][1][1], b2);
+                        }
+                        const float2 s = *reinterpret_cast<const float2*>(&x_scale[g][wt + (nh + x) * 8 + tig * 2]);
+                        xsc[x][0] = s.x;
+                        xsc[x][1] = s.y;
+                    }
+#pragma unroll
+                    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                        for (int x = 0; x < NB; x++)
+#pragma unroll
+                            for (int i = 0; i < 4; i++) {
+                                const int h = i >> 1, j = i & 1;
+                                const int both = c1[mi][x][i] * s1[mi][h] + c2[mi][x][i] * s2[mi][h];
+                                acc[mi][nh + x][i] = fmaf((float)both, wd[mi][h] * xsc[x][j], acc[mi][nh + x][i]);
+                            }
+                }
+            }
+        } else {
 #pragma unroll
         for (int g = 0; g < NG; g++) {
             int c[MI][NI][4] = {};
@@ -1527,6 +1746,7 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                         if (has_min) acc[mi][ni][i] = fmaf(wm[mi][h], xsm[ni][j], acc[mi][ni][i]);
                     }
         }
+        }
         __syncthreads();
     }
     if constexpr (GLU != 0) {
@@ -1535,7 +1755,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
         // warp's 16 and the next warp's (warp ^ 1), so each leaves its largest in shared
         // memory for the other; a token's sum of 16 is the warp's own.
         __shared__ float largest[8][NT / 2];
+        __shared__ float sums[8][NT / 2];
         const int orow = row0 + (warp & 3) * 16;
+        const size_t o_heads = x8_heads(rows);
+        float scale[NI][2];
         float v[NI][4];
 #pragma unroll
         for (int ni = 0; ni < NI; ni++) {
@@ -1560,16 +1783,33 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                 const int q1 = amax == 0.0f ? 0 : __float2int_rn(v[ni][2 + j] / d);
                 int sum = q0 + q1;
                 for (int o = 4; o < 32; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                scale[ni][j] = d;
+                if (HEAD && gid == 0) sums[warp][at] = __fmul_rn(d, (float)sum);
                 if (orow < rows && t < tokens) {
                     signed char* out = oq + (size_t)t * rows + orow + gid;
                     out[0] = (signed char)q0;
                     out[8] = (signed char)q1;
-                    if (gid == 0) {
-                        os[(size_t)t * (rows / 16) + orow / 16] = d * (float)sum;
-                        if ((warp & 1) == 0) od[(size_t)t * (rows / 32) + orow / 32] = d;
+                    if (!HEAD && gid == 0) {
+                        ob[(size_t)t * (rows / 16) + orow / 16] = d * (float)sum;
+                        if ((warp & 1) == 0) oa[(size_t)t * (rows / 32) + orow / 32] = d;
                     }
                 }
             }
+        if constexpr (HEAD) __syncthreads();
+        // A head: a 32's scale, and its sum from the two warps' 16s, by its first warp.
+        if (HEAD && gid == 0 && (warp & 1) == 0 && orow < rows) {
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++)
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int at = ni * 8 + tig * 2 + j, t = tok0 + wt + at;
+                    if (t >= tokens) continue;
+                    float* head = oa + ((size_t)t * o_heads + orow / 128) * X8_HEAD;
+                    const int g = (orow % 128) / 32;
+                    head[g] = scale[ni][j];
+                    head[4 + g] = __fadd_rn(sums[warp][at], sums[warp ^ 1][at]);
+                }
+        }
     } else {
 #pragma unroll
         for (int mi = 0; mi < MI; mi++)
@@ -1583,58 +1823,50 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
     }
 }
 
-#define MATMUL8(name, KIND, GROUP, NT, ROW_BYTES, BLOCKS)                                                  \
+#define MATMUL8(name, KIND, GROUP, NT, ROW_BYTES, BLOCKS, HEAD)                                            \
     extern "C" __global__ void __launch_bounds__(256, BLOCKS)                                            \
-        name(const u8* w, const signed char* xq, const float* xd, const float* xs, float* y, int rows,   \
+        name(const u8* w, const signed char* xq, const float* xa, const float* xb, float* y, int rows,   \
              int cols, int tokens) {                                                                     \
-        matmul8<KIND, GROUP, NT>(w, nullptr, (size_t)(ROW_BYTES), xq, xd, xs, y, nullptr, nullptr,       \
-                                 nullptr, rows, cols, tokens);                                           \
+        matmul8<KIND, GROUP, NT, 0, HEAD>(w, nullptr, (size_t)(ROW_BYTES), xq, xa, xb, y, nullptr,       \
+                                          nullptr, nullptr, rows, cols, tokens);                         \
+    }
+// A feed-forward's gate and up products with its activation, rounded for the next product
+// (matmul8's GLU): `rows` of each matrix, a block an SM.
+#define MATMUL8_GLU(name, KIND, GROUP, NT, ROW_BYTES, GLU, HEAD)                                           \
+    extern "C" __global__ void __launch_bounds__(256, 1)                                                 \
+        name(const u8* gate, const u8* up, const signed char* xq, const float* xa, const float* xb,      \
+             signed char* oq, float* oa, float* ob, int rows, int cols, int tokens) {                    \
+        matmul8<KIND, GROUP, NT, GLU, HEAD>(gate, up, (size_t)(ROW_BYTES), xq, xa, xb, nullptr, oq, oa,  \
+                                            ob, rows, cols, tokens);                                     \
     }
 
 // One block per SM, with the next step's bytes read ahead into registers (fetch): faster
 // than two blocks without (Q4_0 -6%, Q8_0 -25%), and Q4_K and Q5_K would spill with two.
 // Q6_K keeps two blocks and no read-ahead.
-MATMUL8(matmul8_q4_0, K_Q4_0, 32, 64, q4_0_row_bytes(cols), 1)
-MATMUL8(matmul8_q8_0, K_Q8_0, 32, 64, cols / 32 * 34, 1)
-MATMUL8(matmul8_q4_k, K_Q4_K, 32, 64, cols / 256 * 144, 1)
-MATMUL8(matmul8_q5_k, K_Q5_K, 32, 64, cols / 256 * 176, 1)
-MATMUL8(matmul8_q6_k, K_Q6_K, 16, 64, cols / 256 * Q6K_BYTES, 2)
-// Tiles of 32 and 16 tokens, for batches of up to that many. (Two blocks an SM, which
-// their fewer registers allow, measured slower for Q4_0, 74 -> 86 us, and level for the rest.)
-#define MATMUL8_SMALL(NT)                                                                \
-    MATMUL8(matmul8_t##NT##_q4_0, K_Q4_0, 32, NT, q4_0_row_bytes(cols), 1)    \
-    MATMUL8(matmul8_t##NT##_q8_0, K_Q8_0, 32, NT, cols / 32 * 34, 1)          \
-    MATMUL8(matmul8_t##NT##_q4_k, K_Q4_K, 32, NT, cols / 256 * 144, 1)        \
-    MATMUL8(matmul8_t##NT##_q5_k, K_Q5_K, 32, NT, cols / 256 * 176, 1)        \
-    MATMUL8(matmul8_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, 2)
-MATMUL8_SMALL(32)
-MATMUL8_SMALL(16)
-// Tiles of 128 tokens, one block an SM (Q6_K's as well: the sums take twice the registers).
-MATMUL8(matmul8_t128_q4_0, K_Q4_0, 32, 128, q4_0_row_bytes(cols), 1)
-MATMUL8(matmul8_t128_q8_0, K_Q8_0, 32, 128, cols / 32 * 34, 1)
-MATMUL8(matmul8_t128_q4_k, K_Q4_K, 32, 128, cols / 256 * 144, 1)
-MATMUL8(matmul8_t128_q5_k, K_Q5_K, 32, 128, cols / 256 * 176, 1)
-MATMUL8(matmul8_t128_q6_k, K_Q6_K, 16, 128, cols / 256 * Q6K_BYTES, 1)
-
-// A feed-forward's gate and up products with its activation, rounded for the next product
-// (matmul8's GLU): `rows` of each matrix, a block an SM.
-#define MATMUL8_GLU(name, KIND, GROUP, NT, ROW_BYTES, GLU)                                                 \
-    extern "C" __global__ void __launch_bounds__(256, 1)                                                 \
-        name(const u8* gate, const u8* up, const signed char* xq, const float* xd, const float* xs,      \
-             signed char* oq, float* od, float* os, int rows, int cols, int tokens) {                    \
-        matmul8<KIND, GROUP, NT, GLU>(gate, up, (size_t)(ROW_BYTES), xq, xd, xs, nullptr, oq, od, os,    \
-                                      rows, cols, tokens);                                               \
-    }
-#define MATMUL8_GLUS(act, GLU, NT)                                                         \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_0, K_Q4_0, 32, NT, q4_0_row_bytes(cols), GLU)   \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q8_0, K_Q8_0, 32, NT, cols / 32 * 34, GLU)         \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_k, K_Q4_K, 32, NT, cols / 256 * 144, GLU)       \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q5_k, K_Q5_K, 32, NT, cols / 256 * 176, GLU)       \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, GLU)
-MATMUL8_GLUS(swiglu, 1, 64)
-MATMUL8_GLUS(swiglu, 1, 128)
-MATMUL8_GLUS(geglu, 2, 64)
-MATMUL8_GLUS(geglu, 2, 128)
+// Tiles of 32 and 16 tokens are for batches of up to that many (two blocks an SM, which
+// their fewer registers allow, measured slower for Q4_0, 74 -> 86 us, and level for the
+// rest); tiles of 128 run one block an SM, Q6_K's as well (the sums take twice the
+// registers).
+//
+// A type's kernels at every tile, plain and gated. The K-quants read a batch's heads
+// (HEAD); Q4_0 and Q8_0 come both ways, the heads' kernels named `_h`, for what little a
+// K-quant model keeps in them (Qwen's ssm_alpha and ssm_beta).
+#define MATMUL8_ALL(q, sfx, KIND, GROUP, ROW_BYTES, B64, HEAD)                                  \
+    MATMUL8(matmul8_##q##sfx, KIND, GROUP, 64, ROW_BYTES, B64, HEAD)                            \
+    MATMUL8(matmul8_t32_##q##sfx, KIND, GROUP, 32, ROW_BYTES, B64, HEAD)                        \
+    MATMUL8(matmul8_t16_##q##sfx, KIND, GROUP, 16, ROW_BYTES, B64, HEAD)                        \
+    MATMUL8(matmul8_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 1, HEAD)                        \
+    MATMUL8_GLU(matmul8_swiglu_t64_##q##sfx, KIND, GROUP, 64, ROW_BYTES, 1, HEAD)               \
+    MATMUL8_GLU(matmul8_swiglu_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 1, HEAD)             \
+    MATMUL8_GLU(matmul8_geglu_t64_##q##sfx, KIND, GROUP, 64, ROW_BYTES, 2, HEAD)                \
+    MATMUL8_GLU(matmul8_geglu_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 2, HEAD)
+MATMUL8_ALL(q4_0, , K_Q4_0, 32, q4_0_row_bytes(cols), 1, false)
+MATMUL8_ALL(q8_0, , K_Q8_0, 32, q8_0_row_bytes(cols), 1, false)
+MATMUL8_ALL(q4_0, _h, K_Q4_0, 32, q4_0_row_bytes(cols), 1, true)
+MATMUL8_ALL(q8_0, _h, K_Q8_0, 32, q8_0_row_bytes(cols), 1, true)
+MATMUL8_ALL(q4_k, , K_Q4_K, 32, cols / 256 * 144, 1, true)
+MATMUL8_ALL(q5_k, , K_Q5_K, 32, cols / 256 * 176, 1, true)
+MATMUL8_ALL(q6_k, , K_Q6_K, 16, q6_k_row_bytes(cols), 2, true)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //

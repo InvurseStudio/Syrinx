@@ -26,9 +26,11 @@ sampled every 2 s).
   ENGINES=vireo,vireo-plain,llama,mlx MODELS=e2b,e4b REPS=2 python3 -I bench.py
 Results: $OUT (default ./results.jsonl); server logs in $LOGS (default $TMPDIR).
 
-On Windows (an 8 GB NVIDIA GPU; 15 Nov) the same script runs the four small models' Q4
-GGUFs against reference/llama.cpp-b12262 (CUDA), in the contexts in WIN_MODELS (CONTEXT=
-overrides them all), with no large or xlarge rows and no mlx-vlm. Memory is the whole
+On Windows (an 8 GB NVIDIA GPU; 15 Nov) the same script runs the small models' GGUFs
+against reference/llama.cpp-b12262 (CUDA), in the contexts in WIN_MODELS (CONTEXT=
+overrides them all), with no large or xlarge rows and no mlx-vlm. From 16 Nov they are
+the Q6_K files, as on the Mac (three: there is no Qwen 3.5 9B at Q6_K here); QUANT=q4
+runs the four Q4 files of the runs up to "after PR 178". Memory is the whole
 GPU's in use (nvidia-smi), read between workloads, in place of the process's peak. Run it
 in Python's UTF-8 mode, as the Mac reads the prompts:
   ENGINES=vireo,llama MODELS=e4b REPS=1 python -X utf8 -I bench.py   (Git Bash)
@@ -78,11 +80,15 @@ MODELS = [
     ("Muse Glimmer 30B", "muse", GG / "Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-Q6_K.gguf", GG / "Muse-Glimmer-30B-6bit", 131072, True),
 ]
 if WIN:
-    # The Q4 files on this PC, no MLX folder, no large or xlarge workload (an 8 GB GPU).
+    # The files on this PC, no MLX folder, no large or xlarge workload (an 8 GB GPU).
     # Contexts: what each model holds on the GPU without spilling into the PC's memory,
-    # measured 15 Nov; the same for both engines.
-    WIN_MODELS = {"e2b": ("gemma-4-E2B_q4_0-it.gguf", 65536), "e4b": ("gemma-4-E4B_q4_0-it.gguf", 65536),
-                  "q4b": ("Qwen3.5-4B-Q4_K_M.gguf", 65536), "q9b": ("Qwen3.5-9B-Q4_K_M.gguf", 32768)}
+    # measured 15 Nov (Q4) and 16 Nov (Q6_K); the same for both engines.
+    if os.environ.get("QUANT", "q6").lower() == "q4":
+        WIN_MODELS = {"e2b": ("gemma-4-E2B_q4_0-it.gguf", 65536), "e4b": ("gemma-4-E4B_q4_0-it.gguf", 65536),
+                      "q4b": ("Qwen3.5-4B-Q4_K_M.gguf", 65536), "q9b": ("Qwen3.5-9B-Q4_K_M.gguf", 32768)}
+    else:
+        WIN_MODELS = {"e2b": ("gemma-4-E2B-it-Q6_K.gguf", 65536), "e4b": ("gemma-4-E4B-it-Q6_K.gguf", 65536),
+                      "q4b": ("Qwen3.5-4B-Q6_K.gguf", 65536)}
     # Qwen 3.5 9B's caches past 32,768 spill into the PC's memory on Vireo (it read 145 tokens/s,
     # not 1,650), so its longtools log is cut to its first half, at a line's end, for both
     # engines (inventory-sync still logs the most ERROR lines there: 24, card-reader 13).

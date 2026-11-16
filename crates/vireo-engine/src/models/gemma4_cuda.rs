@@ -36,6 +36,13 @@ struct Layer {
     post_ffw_norm: Buffer,
     /// The per-layer input's gate, projection and norm (models with them).
     per_layer: Option<(GpuMatrix, GpuMatrix, Buffer)>,
+    /// For 8-bit mode, where a file keeps the gate and projection unquantized (the Q6_K
+    /// files: f32, 2.6 MB each on E4B, so a token read 220 MB of them at the memory's speed
+    /// and a prompt took the f32 tile kernel for both): the gate rounded to Q8_0 and the
+    /// projection to f16. The projection in Q8_0 too read prompts 2.5% faster again but
+    /// moved the logits half as far again from exact (E4B: rms change in log p 0.100 ->
+    /// 0.138, the same top token 98.1% -> 97.4%); the gate alone leaves them where they were.
+    per_layer_q8: Option<(GpuMatrix, GpuMatrix)>,
     output_scale: f32,
     /// Muse Glimmer: the gate on each head's output, sigmoid(attn_gate h).
     attn_gate: Option<GpuMatrix>,
@@ -330,6 +337,13 @@ impl<'a> Gemma4Cuda<'a> {
                 } else {
                     None
                 },
+                per_layer_q8: if pl > 0 && cfg!(not(target_os = "macos")) {
+                    let gate = GpuMatrix::upload_q8_0(&gpu, &matrix(file, &name("inp_gate"), dim, pl)?)?;
+                    let proj = GpuMatrix::upload_f16(&gpu, &matrix(file, &name("proj"), pl, dim)?)?;
+                    gate.zip(proj)
+                } else {
+                    None
+                },
                 output_scale: vector(file, &name("layer_output_scale"), 1).map_or(1.0, |v| v[0]),
                 experts: match c.experts {
                     Some(x) => {
@@ -554,7 +568,7 @@ impl<'a> Gemma4Cuda<'a> {
             q8_ffn: if cfg!(target_os = "macos") {
                 None
             } else {
-                q8_room(&self.gpu, self.precision, batch, widest_ffn)?
+                q8_room(&self.gpu, self.precision, batch, widest_ffn, &self.layers[0].gate)?
             },
             q8: q8_room(
                 &self.gpu,
@@ -564,6 +578,7 @@ impl<'a> Gemma4Cuda<'a> {
                     .max(c.heads * widest_head)
                     .max(widest_ffn)
                     .max(c.per_layer_dim),
+                &self.layers[0].gate,
             )?,
             half_cache: self.precision == Precision::Int8,
             graph: None,
@@ -1003,6 +1018,11 @@ impl<'a> Gemma4Cuda<'a> {
                 eps,
             )
             .map_err(e)?;
+            // 8-bit mode takes the rounded copies where there are any.
+            let (inp_gate, proj) = match (&layer.per_layer_q8, s.q8.as_ref()) {
+                (Some((gate, proj)), Some(_)) => (gate, proj),
+                _ => (inp_gate, proj),
+            };
 
             // One token on the Mac: the product and the GELU gate in one dispatch.
             #[cfg(target_os = "macos")]
