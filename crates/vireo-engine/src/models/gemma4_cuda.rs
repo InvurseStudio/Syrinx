@@ -152,6 +152,9 @@ pub struct Gemma4CudaSession {
     logits: Vec<f32>,
     /// The batch's activations in 8 bits, unless the model is exact.
     q8: Option<Q8>,
+    /// A feed-forward's middle in 8 bits, written by the kernel that runs its first two
+    /// products (`GpuMatrix::mul_ffn`; CUDA).
+    q8_ffn: Option<Q8>,
     /// Keys and values in f16 (8-bit mode) rather than f32.
     half_cache: bool,
     graph: Option<Graph>,
@@ -548,6 +551,11 @@ impl<'a> Gemma4Cuda<'a> {
             },
             logits_gpu: LogitsBuffer::new(&self.gpu, c.vocab)?,
             logits: vec![0.0; c.vocab],
+            q8_ffn: if cfg!(target_os = "macos") {
+                None
+            } else {
+                q8_room(&self.gpu, self.precision, batch, widest_ffn)?
+            },
             q8: q8_room(
                 &self.gpu,
                 self.precision,
@@ -744,18 +752,28 @@ impl<'a> Gemma4Cuda<'a> {
             let fused = false;
             if !fused {
                 let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
-                layer.gate.mul(&h, s.gate.ptr())?;
-                layer.up.mul(&h, s.up.ptr())?;
-                debug_assert_eq!(f, layer.down.cols);
-                layer.down.mul_gated(
-                    g,
-                    s.gate.ptr(),
-                    s.up.ptr(),
-                    t,
-                    s.q8.as_ref(),
+                // A batch on CUDA: the two products and the activation in one kernel.
+                if !layer.down.mul_ffn(
+                    &layer.gate,
+                    &layer.up,
+                    &h,
+                    s.q8_ffn.as_ref(),
                     !c.muse,
                     s.projected.ptr(),
-                )?;
+                )? {
+                    layer.gate.mul(&h, s.gate.ptr())?;
+                    layer.up.mul(&h, s.up.ptr())?;
+                    debug_assert_eq!(f, layer.down.cols);
+                    layer.down.mul_gated(
+                        g,
+                        s.gate.ptr(),
+                        s.up.ptr(),
+                        t,
+                        s.q8.as_ref(),
+                        !c.muse,
+                        s.projected.ptr(),
+                    )?;
+                }
             } else {
                 layer.down.mul(
                     &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
