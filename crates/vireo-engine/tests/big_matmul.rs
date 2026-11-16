@@ -74,6 +74,8 @@ fn big_matmul_speed() {
         gpu.quantize(x_gpu.ptr(), &q8, most, cols).unwrap();
         let y_gpu = gpu.alloc(rows * most * 4).unwrap();
         let product = |n: usize| {
+            // The rounded copy is laid out for its batch's tokens.
+            gpu.quantize(x_gpu.ptr(), &q8, n, cols).unwrap();
             gpu.matmul_8bit(kind, w.ptr(), &q8, y_gpu.ptr(), rows, cols, n)
                 .unwrap();
             let mut out = vec![0.0f32; rows * n];
@@ -90,11 +92,27 @@ fn big_matmul_speed() {
         let scale = wide[..n].iter().fold(0f32, |m, v| m.max(v.abs()));
         // The same sums, but for f32 rounding where one of the two is split along the
         // columns (batches of up to 128 tokens) and the other isn't.
+        // The 8-bit kernel (long batches of Q6_K and Q8_0) rounds both sides: its sums
+        // are near the f16 kernel's, and how near is printed.
+        let whole = Gpu::whole_number_products(kind, cols, tokens);
         assert!(
-            worst <= scale * 1e-5,
+            worst <= scale * if whole { 3e-2 } else { 1e-5 },
             "{name}: {tokens} tokens' tile differs by {worst} of {scale}"
         );
+        if whole {
+            let (mut err, mut all) = (0f64, 0f64);
+            for (a, b) in mine[..n].iter().zip(&wide[..n]) {
+                err += ((a - b) as f64).powi(2);
+                all += (*b as f64).powi(2);
+            }
+            eprintln!(
+                "{name:24} 8-bit against f16: {:.3}% of the sums' size (rms), worst {:.3}%",
+                (err / all).sqrt() * 100.0,
+                worst / scale * 100.0
+            );
+        }
 
+        gpu.quantize(x_gpu.ptr(), &q8, tokens, cols).unwrap();
         let s = time(&gpu, || {
             gpu.matmul_8bit(kind, w.ptr(), &q8, y_gpu.ptr(), rows, cols, tokens)
                 .unwrap()
