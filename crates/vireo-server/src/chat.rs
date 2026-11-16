@@ -428,6 +428,20 @@ pub fn opening(family: Family, thinking: bool) -> &'static str {
     }
 }
 
+/// The reply's turn opened where the server writes a call in before the model writes (the
+/// skill it picked): no thought comes before that call. For Gemma 4 with thinking on that
+/// is the bare turn, as its template writes a turn that starts with a call. The empty
+/// thought is the template's sign that thinking is off, and written here it switched
+/// thinking off for the whole reply: in the Nov 15 test gauntlet (Gemma 4 31B, thinking
+/// on) 8 of 21 replies that followed a skill had no reasoning at all, against none of the
+/// 11 without a skill, and 7 of those 8 were graded partial or fail.
+pub fn opening_for_call(family: Family, thinking: bool) -> &'static str {
+    match family {
+        Family::Gemma4 if thinking => "<|turn>model\n",
+        other => opening(other, false),
+    }
+}
+
 /// What ends a message in `history`: its last message's text stops this far from the
 /// end, which is where a note for this turn only can go (`memory::since`).
 pub fn closing(family: Family) -> &'static str {
@@ -698,6 +712,17 @@ pub fn today() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_a_call_is_written_into_opens_without_the_thinking_off_sign() {
+        // Thinking on: the bare turn, so the thoughts after the call are still the model's.
+        assert_eq!(opening_for_call(Family::Gemma4, true), "<|turn>model\n");
+        // Thinking off, and the other families: as a turn with no thought opens.
+        for family in [Family::Gemma4, Family::Qwen35, Family::Llama, Family::Muse] {
+            assert_eq!(opening_for_call(family, false), opening(family, false));
+        }
+        assert_eq!(opening_for_call(Family::Qwen35, true), opening(Family::Qwen35, false));
+    }
 
     fn said(role: &str, bytes: usize) -> Message {
         Message::new(role, "x".repeat(bytes))

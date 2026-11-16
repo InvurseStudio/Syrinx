@@ -9,6 +9,14 @@ waits; this script grades it against the files as that prompt left them, then le
 next one start.
 
     python3 tools/aurelia_run.py --model <file.gguf> [--label gemma4-31b] [--only 2.1,2.2]
+    python3 tools/aurelia_run.py --model <file.gguf> --set smoke     (or quick, invoices, safety...)
+    python3 tools/aurelia_run.py --sets                              (lists the short runs)
+
+Short runs: --set picks a named slice of the 32 prompts from
+docs/dev/test-gauntlet/aurelia_sets.json (smoke is 7 prompts, about 6 minutes on Gemma 4 31B).
+--set and --only can be combined. Either way, a prompt that leans on an earlier one (the same
+chat, or a file or chat it made: 2.3 on 2.1, 9.2 on 9.1...) brings that one along, unless
+--no-needs is given.
     python3 tools/aurelia_run.py --compare <new run folder> <old run folder> [--grades gemma]
 
 What a run touches:
@@ -72,6 +80,7 @@ PROTO = HERE.parent
 REPO = PROTO.parent
 GAUNTLET = REPO / 'docs/dev/test-gauntlet'
 SUITE = GAUNTLET / 'aurelia_full.json'
+SETS = GAUNTLET / 'aurelia_sets.json'
 APP = PROTO / 'Mac/App/release/Vireo-Proto.app'
 BUNDLE_ID = 'com.invurseai.vireo.prototype'
 APP_DATA = Path.home() / 'Library/Application Support/VireoPrototype'
@@ -454,8 +463,12 @@ def record_from(step: dict, item: dict, folder: Path) -> dict:
         'id': item['id'], 'title': item['title'], 'chatId': step.get('chat'),
         'prompt': step.get('prompt', ''), 'tools': [], 'approvals': [], 'events': tool_steps,
         'answer': step.get('reply', ''), 'error': 'the reply ended in an error' if step.get('error') else None,
+        # How much the model reasoned, in characters: with thinking on, 0 on a prompt that
+        # needed working out is the first thing to look at (Nov 15: 8 replies had none).
+        'reasoning': step.get('reasoning') or '',
         'stats': {'tokens': step.get('tokens'), 'tokensPerSecond': step.get('tokensPerSecond'),
-                  'firstWordSeconds': step.get('firstWordSeconds')},
+                  'firstWordSeconds': step.get('firstWordSeconds'),
+                  'reasoningChars': len(step.get('reasoning') or '')},
         'seconds': round(step.get('seconds', 0), 1),
     }
     if record['prompt'] != item['prompt']:
@@ -491,6 +504,7 @@ def summary_rows(records: list) -> list[dict]:
         passed, counted = hint_counts(r.get('checks', []))
         rows.append({'id': r['id'], 'title': r['title'], 'grade': r['grade'], 'hints_passed': passed,
                      'hints': counted, 'seconds': r['seconds'], 'tools': len(r['tools']),
+                     'reasoning': len(r.get('reasoning') or ''),
                      'approvals': len(r['approvals']),
                      'approved': sum(1 for a in r['approvals'] if a['approved']),
                      **({'not_runnable': r['not_runnable']} if r.get('not_runnable') else {})})
@@ -498,11 +512,12 @@ def summary_rows(records: list) -> list[dict]:
 
 
 def table(rows: list) -> str:
-    lines = ['| # | Title | Grade (hints) | Hints | Seconds | Tools | Approvals |', '|---|---|---|---|---|---|---|']
+    lines = ['| # | Title | Grade (hints) | Hints | Seconds | Tools | Reasoning (chars) | Approvals |',
+             '|---|---|---|---|---|---|---|---|']
     for r in rows:
         asked = f'{r["approvals"]}' + (f' ({r["approvals"] - r["approved"]} declined)' if r['approvals'] != r['approved'] else '')
         lines.append(f'| {r["id"]} | {r["title"]} | {r["grade"]} | {r["hints_passed"]}/{r["hints"]} '
-                     f'| {r["seconds"]:.0f} | {r["tools"]} | {asked} |')
+                     f'| {r["seconds"]:.0f} | {r["tools"]} | {r.get("reasoning", 0)} | {asked} |')
     return '\n'.join(lines)
 
 
@@ -511,21 +526,26 @@ def totals(rows: list) -> dict:
     ran = [r for r in rows if r['grade'] != 'not runnable']
     return {**count, 'prompts': len(rows),
             'hints_passed': sum(r['hints_passed'] for r in ran), 'hints': sum(r['hints'] for r in ran),
-            'minutes': round(sum(r['seconds'] for r in rows) / 60, 1), 'tool_calls': sum(r['tools'] for r in rows)}
+            'minutes': round(sum(r['seconds'] for r in rows) / 60, 1), 'tool_calls': sum(r['tools'] for r in rows),
+            'reasoning_chars': sum(r.get('reasoning', 0) for r in rows),
+            'no_reasoning': [r['id'] for r in ran if not r.get('reasoning')]}
 
 
 def report(out: Path, suite: dict, meta: dict, records: list) -> None:
     rows = summary_rows(records)
     total = totals(rows)
     (out / 'summary.json').write_text(json.dumps({'meta': meta, 'totals': total, 'prompts': rows}, indent=1, default=str))
-    lines = [f'# {suite["name"]} on the prototype, {meta["started"]}, {meta["label"]}', '',
+    run_of = '' if meta.get('set') in (None, 'all 32') else f' ({meta["set"]})'
+    lines = [f'# {suite["name"]}{run_of} on the prototype, {meta["started"]}, {meta["label"]}', '',
              'Played in the prototype Mac app (vireo-server) by `VireoPrototype/tools/aurelia_run.py`. '
              'The grade is worked out from the hints alone; see that script for what it does and does not show.', '',
              '## Setup', '', '```json', json.dumps(meta, indent=2, default=str), '```', '',
              '## Summary', '', table(rows), '',
              f'Pass {total["pass"]}, partial {total["partial"]}, fail {total["fail"]}, not runnable {total["not runnable"]} '
              f'of {total["prompts"]} · hints {total["hints_passed"]}/{total["hints"]} on the prompts that ran · '
-             f'{total["minutes"]} min · {total["tool_calls"]} tool calls', '']
+             f'{total["minutes"]} min · {total["tool_calls"]} tool calls', '',
+             f'Reasoning: {total["reasoning_chars"]} characters in all'
+             + (f'; none on {", ".join(total["no_reasoning"])}' if total['no_reasoning'] else '') + '.', '']
     for r in records:
         item = next(p for p in suite['prompts'] if p['id'] == r['id'])
         lines += [f'## {r["id"]} {item["title"]}' + (' (same chat)' if item.get('chat') == 'same' else ''), '',
@@ -549,6 +569,44 @@ def report(out: Path, suite: dict, meta: dict, records: list) -> None:
 
 
 # ─── A run ───────────────────────────────────────────────────────────────────
+def pick_prompts(suite: dict, set_name: str | None, only: str | None, with_needs: bool) -> tuple[list, list]:
+    """The prompts a run plays, in the suite's order: those of --set and --only (all of them
+    when neither is given), plus what they lean on. Returns them and the ids added for that."""
+    known = {p['id'] for p in suite['prompts']}
+    chosen: set[str] = set()
+    if set_name or with_needs:
+        sets = json.loads(SETS.read_text())
+    if set_name:
+        if set_name not in sets['sets']:
+            raise SystemExit(f'No set called {set_name}; there are {", ".join(sets["sets"])}')
+        chosen |= set(sets['sets'][set_name]['prompts'])
+    if only:
+        chosen |= {part.strip() for part in only.split(',') if part.strip()}
+    if not chosen:
+        return list(suite['prompts']), []
+    unknown = sorted(chosen - known)
+    if unknown:
+        raise SystemExit(f'No prompt has the id {", ".join(unknown)}.')
+    picked = set(chosen)
+    if with_needs:
+        todo = list(chosen)
+        while todo:
+            for need in sets['needs'].get(todo.pop(), []):
+                if need not in picked:
+                    picked.add(need)
+                    todo.append(need)
+    order = [p['id'] for p in suite['prompts']]
+    added = sorted(picked - chosen, key=order.index)
+    return [p for p in suite['prompts'] if p['id'] in picked], added
+
+
+def list_sets() -> None:
+    sets = json.loads(SETS.read_text())['sets']
+    for name, entry in sets.items():
+        print(f'{name:<11} {len(entry["prompts"]):>2} prompts, ~{entry["minutes"]} min   {", ".join(entry["prompts"])}')
+        print(f'{"":<11} {entry["about"]}')
+
+
 def run(args) -> None:
     model = Path(args.model).expanduser()
     if not model.is_file():
@@ -557,14 +615,14 @@ def run(args) -> None:
     if not binary.is_file():
         raise SystemExit(f'No app at {args.app}; build it with Mac/App/build-test-app.sh')
     suite = json.loads(SUITE.read_text())
-    only = set(args.only.split(',')) if args.only else None
-    prompts = [p for p in suite['prompts'] if not only or p['id'] in only]
-    if not prompts:
-        raise SystemExit('No prompt has those ids.')
+    prompts, added = pick_prompts(suite, args.set, args.only, not args.no_needs)
+    if added:
+        log(f'Also running {", ".join(added)}, which the chosen prompts lean on (--no-needs to leave them out)')
 
     stamp = dt.datetime.now().strftime('%Y-%m-%d-%H%M')
     label = args.label or re.sub(r'[^a-z0-9.]+', '-', model.stem.lower()).strip('-')
-    out = Path(args.out).expanduser() if args.out else GAUNTLET / 'runs' / f'proto-{stamp}-{label}'
+    name = f'proto-{stamp}-{label}' + (f'-{args.set}' if args.set else '')
+    out = Path(args.out).expanduser() if args.out else GAUNTLET / 'runs' / name
     work = Path(os.path.realpath(tempfile.mkdtemp(prefix='vireo-aurelia-', dir=args.work)))
     folder, gate = work / 'Aurelia Minerals', work / 'gate'
     memory_file, skills = work / 'memories.txt', work / 'skills'
@@ -603,7 +661,8 @@ def run(args) -> None:
         'chats_deleted_before_run': deleted, 'memory_file': str(memory_file),
         'user_skills': args.skills or 'none (an empty folder)',
         'builtin_skills': str(built_in) if args.builtin_skills == 'on' else 'none',
-        'file_readers': readers(), 'prompts': [p['id'] for p in prompts],
+        'file_readers': readers(), 'set': args.set or ('--only' if args.only else 'all 32'),
+        'prompts': [p['id'] for p in prompts],
         'grading': 'pass = every hint that applies passed; partial = at least half; fail = fewer, or the reply ended in an error',
         'seconds_note': 'as the app times a reply; each approval card is left up 1.5 s before it is answered',
     }
@@ -747,6 +806,10 @@ def main() -> None:
     parser.add_argument('--model', help='the GGUF file the app should run')
     parser.add_argument('--label', help='the model\'s name in the run folder (default: from the file name)')
     parser.add_argument('--only', help='comma-separated prompt ids, e.g. 2.1,2.2,7.1,12.3')
+    parser.add_argument('--set', help='a short run from aurelia_sets.json, e.g. smoke, quick, invoices (--sets lists them)')
+    parser.add_argument('--sets', action='store_true', help='list the short runs and stop')
+    parser.add_argument('--no-needs', action='store_true',
+                        help="don't add the earlier prompts that --set/--only prompts lean on")
     parser.add_argument('--out', help='the run folder (default: docs/dev/test-gauntlet/runs/proto-<date>-<label>)')
     parser.add_argument('--app', default=str(APP), help='Vireo-Proto.app (default: Mac/App/release)')
     parser.add_argument('--work', help='where the run\'s scratch folder is made (default: the temporary folder)')
@@ -763,6 +826,9 @@ def main() -> None:
     parser.add_argument('--compare', nargs=2, metavar=('NEW', 'OLD'), help='compare two run folders and stop')
     parser.add_argument('--grades', help='with --compare: the old run\'s grades by hand, by model key in grades_after.py (gemma, muse, qwen)')
     args = parser.parse_args()
+    if args.sets:
+        list_sets()
+        return
     if args.compare:
         compare(Path(args.compare[0]), Path(args.compare[1]), args.grades)
         return
