@@ -1,0 +1,5 @@
+{"engine": "vireo", "model": "Gemma 4 E4B", "rep": 0, "work": "load", "load_s": 2.85, "idle_rss": 0, "idle_fp": 0, "idle_total": 6511656960, "time": "2026-11-16 10:46:56"}
+{"engine": "vireo", "model": "Gemma 4 E4B", "rep": 0, "work": "medium", "wall": 5.81, "peak_rss": 0, "peak_fp": 0, "peak_total": 6527385600, "rows": [{"ttft": 0.6178984642028809, "total": 3.4352784156799316, "text": "Here is the summary of the engineering plan for a product manager:\n\n*   **Core Shift:** We are replacing the current Python/inference server stack with a single, custom-built Rust p
+{"engine": "vireo", "model": "Gemma 4 E4B", "rep": 0, "work": "load", "load_s": 2.9, "idle_rss": 0, "idle_fp": 0, "idle_total": 6504316928, "time": "2026-11-16 10:47:11"}
+{"engine": "vireo", "model": "Gemma 4 E4B", "rep": 0, "work": "medium", "wall": 5.72, "peak_rss": 0, "peak_fp": 0, "peak_total": 6527385600, "rows": [{"ttft": 0.6143040657043457, "total": 3.3347489833831787, "text": "Here is the summary of the engineering plan for a product manager:\n\n*   **Core Shift:** We are replacing the current Python/inference server stack with a single, custom-built Rust p
+DONE
