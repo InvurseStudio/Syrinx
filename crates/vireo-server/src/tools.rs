@@ -153,6 +153,92 @@ pub fn change_question(request: &str) -> String {
     )
 }
 
+/// The middle of a long request, which `for_scoring` leaves out of the server's questions;
+/// `None` for a request they hold whole.
+pub fn unscored(request: &str) -> Option<String> {
+    let request = request.trim().replace('\n', " ");
+    let count = request.chars().count();
+    (count > SCORED_START + SCORED_END).then(|| {
+        request
+            .chars()
+            .skip(SCORED_START)
+            .take(count - SCORED_START - SCORED_END)
+            .collect()
+    })
+}
+
+/// Whether text says in so many words to change a file: a tool that does, or the usual
+/// ways of asking. Wide on purpose: it only ever shows the tools that change files, each
+/// of which still asks the user before it runs.
+pub fn names_a_change(text: &str) -> bool {
+    const WORDS: [&str; 30] = [
+        "append", "add a row", "add row", "add it to", "add them to", "add each", "add one row",
+        "write to", "write it to", "write the", "save ", "update the", "update it", "log it",
+        "log the", "log each", "log them", "record it", "record the", "record each", "rename",
+        "move the", "move it", "delete", "fill in", "fill out", "create a file", "create the file",
+        "write_", "create_",
+    ];
+    let text = text.to_lowercase();
+    WORDS.iter().any(|w| text.contains(w)) || text.contains("fill_docx_template")
+}
+
+/// The files and folders a message names, as the user writes them ("Invoices/November",
+/// "Policies/AP-Guide.md", "budget.xlsx"), in order, without repeats: for reading ahead.
+/// Not web addresses, nor words joined by a slash ("and/or", "24/7"). A name with a space
+/// in it isn't found; the model reads that one itself.
+pub fn named_paths(message: &str) -> Vec<String> {
+    const TYPES: [&str; 9] = ["md", "txt", "csv", "pdf", "docx", "xlsx", "pptx", "json", "eml"];
+    const MOST: usize = 8;
+    let mut found: Vec<String> = Vec::new();
+    for word in message.split_whitespace() {
+        const AROUND: &str = "\"'`()[]{}<>*,;:!?";
+        let word = word
+            .trim_start_matches(|c: char| AROUND.contains(c))
+            .trim_end_matches(|c: char| AROUND.contains(c) || c == '.' || c == '/')
+            .trim_start_matches("./");
+        if word.is_empty() || word.contains("://") || word.contains('@') || word.starts_with('~') {
+            continue;
+        }
+        let parts: Vec<&str> = word.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == "..") {
+            continue;
+        }
+        let typed = parts
+            .last()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(stem, ext)| !stem.is_empty() && TYPES.contains(&ext.to_lowercase().as_str()));
+        // Words joined by a slash, fractions and dates aren't paths.
+        let joined = !typed
+            && parts
+                .iter()
+                .all(|p| p.chars().count() <= 3 || p.chars().all(|c| c.is_ascii_digit()));
+        if !(typed || word.contains('/')) || joined {
+            continue;
+        }
+        if !found.iter().any(|f| f == word) {
+            found.push(word.to_string());
+        }
+        if found.len() == MOST {
+            break;
+        }
+    }
+    found
+}
+
+/// `use_skill` as a tool the model calls itself (a model that thinks: see `reply`). The
+/// skills are listed in its instructions (`skills::listing`), so this stays the same
+/// whatever skills there are.
+pub fn use_skill_tool() -> Tool {
+    Tool {
+        name: "use_skill",
+        description: "Load a skill's saved instructions for one kind of task, then follow them. The skills are listed in your instructions.",
+        params: vec![text("name", "The skill's name, as the Skills list gives it.")],
+        runs: Runs::Server,
+        group: Group::Memory,
+        asks: None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tool {
     pub name: &'static str,
@@ -551,7 +637,7 @@ fn catalog() -> Vec<Tool> {
         },
         Tool {
             name: "create_event",
-            description: "Add an event to the user's calendar. Times are this computer's local time: for something in another time zone, work out the local time here and say the time there in the notes. One event a call. Asks the user for approval.",
+            description: "Add an event to the user's calendar. Times are this computer's local time: for something in another time zone, work out the local time here and say the time there in the notes. One event a call: for a trip or a programme, an event for each part its sources give (every flight and drive, each session), not the main event alone, and none for a part marked cancelled. Asks the user for approval.",
             params: vec![
                 text("title", "The event's title."),
                 text(
@@ -1868,18 +1954,49 @@ pub fn read_one(path: &str) -> Call {
     }
 }
 
+/// The most of one tool's result the model reads on a small context, in characters (about
+/// 2,000 tokens), and on any context.
+pub const MIN_RESULT: usize = 8000;
+const MAX_ONE_RESULT: usize = 48_000;
+
+/// What `result_chars` gives for the chats this server keeps (`set_context`).
+static ONE_RESULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MIN_RESULT);
+
+/// How much of one tool's result the model reads in a chat of `context` tokens, in
+/// characters: three quarters of a character a token (a fifth to a third of the chat),
+/// between `MIN_RESULT` and `MAX_ONE_RESULT`. It was 8,000 on every context, so of a
+/// 20-page policy or a long sheet the model read the first four pages and answered from
+/// those; 0.9 gave a result a third of the context.
+pub fn result_chars(context: usize) -> usize {
+    (context / 4 * 3).clamp(MIN_RESULT, MAX_ONE_RESULT)
+}
+
+/// Sizes results for chats of `context` tokens.
+pub fn set_context(context: usize) {
+    ONE_RESULT.store(result_chars(context), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The most of one result the model reads, in characters, on this server's context.
+pub fn one_result() -> usize {
+    ONE_RESULT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How much of a tool's result the model reads, in characters: `one` for a call that
-/// reads one thing, and for several files up to three times that between them.
+/// reads one thing, and for several files at least three times `MIN_RESULT` between them.
 pub fn result_limit(call: &Call, one: usize) -> usize {
-    several_paths(call).map_or(one, |paths| one * paths.len().min(3))
+    several_paths(call).map_or(one, |paths| several_limit(paths.len(), one))
+}
+
+/// What `n` files read in one call may take between them.
+fn several_limit(n: usize, one: usize) -> usize {
+    one.max(MIN_RESULT * n.min(3))
 }
 
 /// Several files read by `read` in one result, each under its path, sharing what one
 /// result may hold (`result_limit`): a file too long for its share is cut, and says so.
 pub fn read_several(paths: &[String], read: impl Fn(&str) -> Result<String, String>) -> String {
-    const ONE: usize = 8000;
     let read_now = &paths[..paths.len().min(MAX_FILES_A_CALL)];
-    let share = (ONE * read_now.len().min(3) / read_now.len()).saturating_sub(120);
+    let share = (several_limit(read_now.len(), one_result()) / read_now.len()).saturating_sub(120);
     let mut out = String::new();
     for path in read_now {
         let text = read(path).unwrap_or_else(|e| format!("Error: {e}"));
@@ -2050,6 +2167,45 @@ pub fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_names_its_files_and_folders() {
+        assert_eq!(
+            named_paths("Process the invoices in Invoices/November following `Policies/AP-and-Coding-Guide.md`, then update (budget.xlsx)."),
+            ["Invoices/November", "Policies/AP-and-Coding-Guide.md", "budget.xlsx"]
+        );
+        assert_eq!(named_paths("Using Events/Gala-2026, who hasn't replied? See Events/Gala-2026/."), ["Events/Gala-2026"]);
+        // Not paths: words joined by a slash, dates, web addresses, mail, a way out.
+        assert!(named_paths("Yes and/or no, 24/7, on 11/15/2026 at https://example.com/a/b.pdf, from a@b.example, ../x.md, e.g. v2.").is_empty());
+        assert_eq!(named_paths("Read /Users/sam/Work/notes.md"), ["/Users/sam/Work/notes.md"]);
+    }
+
+    #[test]
+    fn a_long_requests_middle_can_ask_for_a_change() {
+        assert_eq!(unscored("Short one."), None);
+        let long = format!("{}5. Append a row to the tracker.{}", "a".repeat(SCORED_START), "b".repeat(SCORED_END));
+        let middle = unscored(&long).unwrap();
+        assert_eq!(middle, "5. Append a row to the tracker.");
+        assert!(!for_scoring(&long).contains("Append"));
+        assert!(names_a_change(&middle));
+        assert!(names_a_change("then call write_spreadsheet with the totals"));
+        assert!(!names_a_change("Organization: Fire Brigade. Amount: CLP 4,000,000. Purpose: breathing apparatus."));
+    }
+
+    #[test]
+    fn a_result_is_sized_to_the_context() {
+        // A small context reads what it always did; a large one more, up to a limit.
+        assert_eq!(result_chars(4096), 8000);
+        assert_eq!(result_chars(8192), 8000);
+        assert_eq!(result_chars(32768), 24576);
+        assert_eq!(result_chars(262_144), 48_000);
+        // Several files share at least what they did (three results' worth from three up),
+        // and never less than one result on a large context.
+        assert_eq!(several_limit(2, 8000), 16_000);
+        assert_eq!(several_limit(6, 8000), 24_000);
+        assert_eq!(several_limit(6, 24_576), 24_576);
+        assert_eq!(several_limit(2, 48_000), 48_000);
+    }
 
     #[test]
     fn a_long_request_is_scored_by_its_start_and_end() {
