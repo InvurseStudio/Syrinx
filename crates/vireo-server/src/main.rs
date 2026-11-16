@@ -2625,6 +2625,14 @@ fn reply(
             tokenizer.token_id("<channel|>"),
         )
     };
+    // Qwen with thinking off: its turn opens with the empty thought, already closed, yet
+    // Qwen 3.8 now and then writes `</think>` after its answer and then the answer over
+    // again (about 1 first reply in 24, at temperature 0 too; 2026-11-15). The token has
+    // no place in such a reply: before any answer it can't be picked, and after one the
+    // reply ends there, as at the end-of-turn token.
+    let stray_close = (family == Family::Qwen35 && !thinking_on)
+        .then(|| tokenizer.token_id("</think>"))
+        .flatten();
     let mut in_channel = false;
     let mut generated: Vec<u32> = Vec::new();
     let mut shown = Shown::default();
@@ -2866,6 +2874,13 @@ fn reply(
                 logits[t as usize] = f32::NEG_INFINITY;
             }
         }
+        // (No answer yet: the reply's first token, a turn's first after a tool's result,
+        // or an answer still owed.)
+        if (answer_due || turn_start || generated.is_empty())
+            && let Some(close) = stray_close
+        {
+            logits[close as usize] = f32::NEG_INFINITY;
+        }
         let mut next = sampler.pick(&logits, &generated);
         // A thought ends with its closing token, here even when the model would end its
         // turn inside it, or has thought as long as one thought may: its answer is still
@@ -2885,6 +2900,9 @@ fn reply(
             next = eom;
         }
         if tokenizer.is_end_of_generation(next) && !muse_turn {
+            break;
+        }
+        if Some(next) == stray_close {
             break;
         }
         // A thought isn't the answer that's due, shown (thinking on) or left out (Gemma's

@@ -313,6 +313,9 @@ struct Kernels {
     /// A prompt's DeltaNet in chunks: with its dynamic shared memory for n = 128.
     delta_chunk_prep: (CuFunction, u32),
     delta_chunk_scan: CuFunction,
+    /// The same on the tensor cores (compute capability 8.0 on), after `delta_chunk_prep`
+    /// with its numbers in two bf16 parts.
+    delta_chunk_scan_mma: Option<CuFunction>,
     delta_out: CuFunction,
     quantize_q8: CuFunction,
     /// 8-bit activations, in the order of `KINDS_8`.
@@ -326,6 +329,10 @@ struct Kernels {
     /// The same with tiles of 128 tokens, for the K-quants in batches of at least that
     /// many (`WIDE_TOKENS`).
     matmul8_wide: Option<[CuFunction; 5]>,
+    /// A feed-forward's gate and up products with its activation, rounded for the next
+    /// product: by activation (SiLU, tanh-GELU), then tile (64 tokens, 128), then
+    /// `KINDS_8`.
+    matmul8_glu: Option<[[[CuFunction; 5]; 2]; 2]>,
 }
 
 /// The weight types with 8-bit-activation kernels, in the order of `Kernels::matvec8`.
@@ -391,6 +398,11 @@ const MAX_PARTS_KV: u32 = 64;
 const TILE_TOKENS: u32 = 64;
 /// The K-quants' wider tile, in tokens.
 const WIDE_TOKENS: usize = 128;
+/// The gated feed-forward kernels (`Gpu::glu_8bit`) take batches of more tokens than this:
+/// their smallest tile is 64 tokens, and costs the same for 9 as for 64.
+const GLU_LEAST_TOKENS: usize = 32;
+/// The weight types whose gated kernel takes tiles of `WIDE_TOKENS`.
+const GLU_WIDE: [TensorType; 3] = [TensorType::Q4_K, TensorType::Q5_K, TensorType::Q6_K];
 
 /// A parameter for the kernels, which take raw addresses: 0 stands for "none".
 fn or_null(buffer: Option<&Buffer>) -> CuDevicePtr {
@@ -654,6 +666,11 @@ impl Gpu {
                     (f, bytes)
                 },
                 delta_chunk_scan: function("delta_chunk_scan")?,
+                delta_chunk_scan_mma: if tensor_cores {
+                    Some(function("delta_chunk_scan_mma")?)
+                } else {
+                    None
+                },
                 delta_out: function("delta_out")?,
                 quantize_q8: function("quantize_q8")?,
                 matvec8: {
@@ -687,6 +704,21 @@ impl Gpu {
                     let mut out = [std::ptr::null_mut(); 5];
                     for (slot, kind) in out.iter_mut().zip(KINDS_8) {
                         *slot = function(&format!("matmul8_t128_{}", kind.name().to_lowercase()))?;
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                matmul8_glu: if tensor_cores {
+                    let mut out = [[[std::ptr::null_mut(); 5]; 2]; 2];
+                    for (tiles, act) in out.iter_mut().zip(["swiglu", "geglu"]) {
+                        for (row, tile) in tiles.iter_mut().zip([64, 128]) {
+                            for (slot, kind) in row.iter_mut().zip(KINDS_8) {
+                                let name =
+                                    format!("matmul8_{act}_t{tile}_{}", kind.name().to_lowercase());
+                                *slot = function(&name)?;
+                            }
+                        }
                     }
                     Some(out)
                 } else {
@@ -1551,6 +1583,12 @@ impl Gpu {
         if prompt && n <= 128 && n.is_multiple_of(32) && d.scratch != 0 {
             // A prompt in chunks of 64 tokens (delta_chunk_prep and delta_chunk_scan in
             // vireo.cu), between the norms for every token at once.
+            // On the tensor cores where there are any, for states of 128 (`VIREO_DELTA=f32`
+            // keeps the f32 kernel, for comparing the two).
+            let mma = self
+                .kernels
+                .delta_chunk_scan_mma
+                .filter(|_| n == 128 && std::env::var_os("VIREO_DELTA").is_none_or(|v| v != "f32"));
             let rows = (tokens * 2 * d.k_heads) as u32;
             let l2 = [
                 Arg::Ptr(d.conv),
@@ -1572,6 +1610,7 @@ impl Gpu {
                 Arg::I32(n as i32),
                 Arg::I32(d.k_heads as i32),
                 Arg::I32(tokens as i32),
+                Arg::I32(mma.is_some() as i32),
             ];
             let chunks = tokens.div_ceil(DELTA_CHUNK) as u32;
             let (prep_kernel, _) = self.kernels.delta_chunk_prep;
@@ -1589,9 +1628,25 @@ impl Gpu {
                 Arg::I32(n as i32),
                 Arg::I32(tokens as i32),
             ];
-            // 16 columns of the state a block (DSC_COLS in vireo.cu).
-            let grid = (d.v_heads as u32, (n / 16) as u32);
-            self.run(self.kernels.delta_chunk_scan, grid, 64, &scan)?;
+            match mma {
+                // 32 columns of the state a block (DM_COLS in vireo.cu), 4 warps. It reads
+                // q and k where they are.
+                Some(kernel) => {
+                    let mut with = scan.to_vec();
+                    with.extend([
+                        Arg::Ptr(d.conv),
+                        Arg::I32(d.channels as i32),
+                        Arg::I32(d.key_dim as i32),
+                        Arg::I32(d.k_heads as i32),
+                    ]);
+                    self.run(kernel, (d.v_heads as u32, (n / 32) as u32), 128, &with)?
+                }
+                // 16 columns a block (DSC_COLS).
+                None => {
+                    let grid = (d.v_heads as u32, (n / 16) as u32);
+                    self.run(self.kernels.delta_chunk_scan, grid, 64, &scan)?
+                }
+            }
             let out = [
                 Arg::Ptr(d.out),
                 Arg::Ptr(d.z),
@@ -1865,6 +1920,81 @@ impl Gpu {
         }
     }
 
+    /// A feed-forward's first half in one pass over its two matrices: `act(gate x) × (up
+    /// x)` (SiLU, or tanh-GELU with `gelu`) for each of `tokens` rows of `x`, already
+    /// rounded into `q8`, rounded to 8 bits into `out` as [`Gpu::gated_quantize`] would
+    /// round the two products, neither of which is written. `gate` and `up` are `rows` ×
+    /// `cols` of one type. False, having done nothing, where there is no such kernel (no
+    /// tensor cores, a batch of 32 tokens or fewer, rows not in 64s): the caller then runs
+    /// the two products and [`Gpu::gated_quantize`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn glu_8bit(
+        &self,
+        kind: TensorType,
+        gate: CuDevicePtr,
+        up: CuDevicePtr,
+        q8: &Q8,
+        out: &Q8,
+        rows: usize,
+        cols: usize,
+        tokens: usize,
+        gelu: bool,
+    ) -> Result<bool> {
+        let (Some(kernels), Some(index)) = (
+            self.kernels.matmul8_glu,
+            KINDS_8.iter().position(|&k| k == kind),
+        ) else {
+            return Ok(false);
+        };
+        if tokens <= GLU_LEAST_TOKENS
+            || !rows.is_multiple_of(TILE_ROWS as usize / 2)
+            || !cols.is_multiple_of(32)
+        {
+            return Ok(false);
+        }
+        assert!(tokens * rows <= out.q.len_bytes(), "the 8-bit buffer is too small");
+        let kernels = kernels[gelu as usize];
+        // `n` tokens from token `from` on, in tiles of `tile`.
+        let run = |kernel: CuFunction, tile: u32, from: usize, n: usize| {
+            let args = [
+                Arg::Ptr(gate),
+                Arg::Ptr(up),
+                Arg::Ptr(q8.q.ptr() + (from * cols) as u64),
+                Arg::Ptr(q8.scales.ptr() + (from * cols / 32 * 4) as u64),
+                Arg::Ptr(q8.sums.ptr() + (from * cols / 16 * 4) as u64),
+                Arg::Ptr(out.q.ptr() + (from * rows) as u64),
+                Arg::Ptr(out.scales.ptr() + (from * rows / 32 * 4) as u64),
+                Arg::Ptr(out.sums.ptr() + (from * rows / 16 * 4) as u64),
+                Arg::I32(rows as i32),
+                Arg::I32(cols as i32),
+                Arg::I32(n as i32),
+            ];
+            let grid = (
+                (rows as u32).div_ceil(TILE_ROWS / 2),
+                (n as u32).div_ceil(tile),
+            );
+            self.run(kernel, grid, 256, &args)
+        };
+        // Tiles of 128 tokens as `matmul_8bit` takes them, and of 64 for the rest.
+        let wide = if GLU_WIDE.contains(&kind) {
+            let whole = tokens / WIDE_TOKENS * WIDE_TOKENS;
+            if whole > 0 && tokens - whole > TILE_TOKENS as usize {
+                tokens
+            } else {
+                whole
+            }
+        } else {
+            0
+        };
+        if wide > 0 {
+            run(kernels[1][index], WIDE_TOKENS as u32, 0, wide)?;
+        }
+        if wide < tokens {
+            run(kernels[0][index], TILE_TOKENS, wide, tokens - wide)?;
+        }
+        Ok(true)
+    }
+
     /// Fills a buffer with zeros.
     pub fn zero(&self, buffer: &Buffer) -> Result<()> {
         let zeros = vec![0f32; buffer.len_bytes() / 4];
@@ -1948,6 +2078,20 @@ pub struct Q8 {
     q: Buffer,
     scales: Buffer,
     sums: Buffer,
+}
+
+impl Q8 {
+    /// `tokens` rows of `cols` numbers as they were rounded: the bytes, each 32's scale
+    /// and each 16's sum. For tests.
+    pub fn read(&self, tokens: usize, cols: usize) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
+        let mut q = vec![0u8; tokens * cols];
+        let mut scales = vec![0f32; tokens * cols / 32];
+        let mut sums = vec![0f32; tokens * cols / 16];
+        self.q.read_bytes_at(0, &mut q)?;
+        self.scales.read_f32(&mut scales)?;
+        self.sums.read_f32(&mut sums)?;
+        Ok((q, scales, sums))
+    }
 }
 
 /// A kernel argument, by type.
