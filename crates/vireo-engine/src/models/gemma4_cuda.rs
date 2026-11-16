@@ -554,7 +554,7 @@ impl<'a> Gemma4Cuda<'a> {
             q8_ffn: if cfg!(target_os = "macos") {
                 None
             } else {
-                q8_room(&self.gpu, self.precision, batch, widest_ffn)?
+                q8_room(&self.gpu, self.precision, batch, widest_ffn, &self.layers[0].gate)?
             },
             q8: q8_room(
                 &self.gpu,
@@ -564,6 +564,7 @@ impl<'a> Gemma4Cuda<'a> {
                     .max(c.heads * widest_head)
                     .max(widest_ffn)
                     .max(c.per_layer_dim),
+                &self.layers[0].gate,
             )?,
             half_cache: self.precision == Precision::Int8,
             graph: None,

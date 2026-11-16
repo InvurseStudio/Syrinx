@@ -494,7 +494,7 @@ impl<'a> Qwen35Cuda<'a> {
             q8_ffn: if cfg!(target_os = "macos") {
                 None
             } else {
-                q8_room(&self.gpu, self.precision, batch, c.ffn_dim)?
+                q8_room(&self.gpu, self.precision, batch, c.ffn_dim, &self.layers[0].gate)?
             },
             q8: q8_room(
                 &self.gpu,
@@ -504,6 +504,7 @@ impl<'a> Qwen35Cuda<'a> {
                     .max(c.heads * c.head_dim)
                     .max(value_dim)
                     .max(c.ffn_dim),
+                &self.layers[0].gate,
             )?,
             half_cache: self.precision == Precision::Int8,
             graph: None,

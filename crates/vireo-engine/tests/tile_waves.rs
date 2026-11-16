@@ -59,6 +59,7 @@ fn rows_and_waves() {
             .collect();
         let x_gpu = gpu.upload_f32(&x).unwrap();
         let q8 = gpu.alloc_q8(tokens, cols).unwrap();
+        let q8 = if Gpu::wants_heads(kind) { q8.with_heads() } else { q8 };
         gpu.quantize(x_gpu.ptr(), &q8, tokens, cols).unwrap();
         let y_gpu = gpu.alloc(all * tokens * 4).unwrap();
         let counts: Vec<usize> = match std::env::var("VIREO_WAVES_ROWS") {
