@@ -313,6 +313,9 @@ struct Kernels {
     /// A prompt's DeltaNet in chunks: with its dynamic shared memory for n = 128.
     delta_chunk_prep: (CuFunction, u32),
     delta_chunk_scan: CuFunction,
+    /// The same on the tensor cores (compute capability 8.0 on), after `delta_chunk_prep`
+    /// with its numbers in two bf16 parts.
+    delta_chunk_scan_mma: Option<CuFunction>,
     delta_out: CuFunction,
     quantize_q8: CuFunction,
     /// 8-bit activations, in the order of `KINDS_8`.
@@ -663,6 +666,11 @@ impl Gpu {
                     (f, bytes)
                 },
                 delta_chunk_scan: function("delta_chunk_scan")?,
+                delta_chunk_scan_mma: if tensor_cores {
+                    Some(function("delta_chunk_scan_mma")?)
+                } else {
+                    None
+                },
                 delta_out: function("delta_out")?,
                 quantize_q8: function("quantize_q8")?,
                 matvec8: {
@@ -1575,6 +1583,12 @@ impl Gpu {
         if prompt && n <= 128 && n.is_multiple_of(32) && d.scratch != 0 {
             // A prompt in chunks of 64 tokens (delta_chunk_prep and delta_chunk_scan in
             // vireo.cu), between the norms for every token at once.
+            // On the tensor cores where there are any, for states of 128 (`VIREO_DELTA=f32`
+            // keeps the f32 kernel, for comparing the two).
+            let mma = self
+                .kernels
+                .delta_chunk_scan_mma
+                .filter(|_| n == 128 && std::env::var_os("VIREO_DELTA").is_none_or(|v| v != "f32"));
             let rows = (tokens * 2 * d.k_heads) as u32;
             let l2 = [
                 Arg::Ptr(d.conv),
@@ -1596,6 +1610,7 @@ impl Gpu {
                 Arg::I32(n as i32),
                 Arg::I32(d.k_heads as i32),
                 Arg::I32(tokens as i32),
+                Arg::I32(mma.is_some() as i32),
             ];
             let chunks = tokens.div_ceil(DELTA_CHUNK) as u32;
             let (prep_kernel, _) = self.kernels.delta_chunk_prep;
@@ -1613,9 +1628,25 @@ impl Gpu {
                 Arg::I32(n as i32),
                 Arg::I32(tokens as i32),
             ];
-            // 16 columns of the state a block (DSC_COLS in vireo.cu).
-            let grid = (d.v_heads as u32, (n / 16) as u32);
-            self.run(self.kernels.delta_chunk_scan, grid, 64, &scan)?;
+            match mma {
+                // 32 columns of the state a block (DM_COLS in vireo.cu), 4 warps. It reads
+                // q and k where they are.
+                Some(kernel) => {
+                    let mut with = scan.to_vec();
+                    with.extend([
+                        Arg::Ptr(d.conv),
+                        Arg::I32(d.channels as i32),
+                        Arg::I32(d.key_dim as i32),
+                        Arg::I32(d.k_heads as i32),
+                    ]);
+                    self.run(kernel, (d.v_heads as u32, (n / 32) as u32), 128, &with)?
+                }
+                // 16 columns a block (DSC_COLS).
+                None => {
+                    let grid = (d.v_heads as u32, (n / 16) as u32);
+                    self.run(self.kernels.delta_chunk_scan, grid, 64, &scan)?
+                }
+            }
             let out = [
                 Arg::Ptr(d.out),
                 Arg::Ptr(d.z),
