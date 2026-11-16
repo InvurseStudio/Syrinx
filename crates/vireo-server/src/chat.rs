@@ -44,15 +44,26 @@ impl Family {
         }
     }
 
-    /// Recommended sampling (model_profiles.py: Qwen 0.6 / 0.95 / top-k 20, Gemma 4 and
-    /// Muse 1.0 / 0.95 / 64, others 0.7 / 0.9). Muse's generation_config.json asks for
-    /// greedy decoding; its model card's settings are these.
-    pub fn sampling(self) -> Settings {
+    /// Recommended sampling: Gemma 4 and Muse 1.0 / 0.95 / 64, others 0.7 / 0.9. Muse's
+    /// generation_config.json asks for greedy decoding; its model card's settings are
+    /// these. Qwen's cards (3.5 and 3.8 alike) give a set for each mode: thinking 1.0 /
+    /// 0.95 / top-k 20, thinking off ("instruct") 0.7 / 0.8 / top-k 20. (0.6 / 0.95, used
+    /// for both until 2026-11-15, is Qwen 3.5's set for precise coding with thinking on;
+    /// 3.8's card has none.) Qwen 3.8 also gets its card's presence penalty with thinking
+    /// off, 1.5 (0 with it on); Qwen 3.5's, 1.5 in both modes, isn't applied.
+    pub fn sampling(self, thinking: bool) -> Settings {
         match self {
-            Family::Qwen35 => Settings {
-                temperature: 0.6,
+            Family::Qwen35 if thinking => Settings {
+                temperature: 1.0,
                 top_p: 0.95,
                 top_k: 20,
+                ..Settings::default()
+            },
+            Family::Qwen35 => Settings {
+                temperature: 0.7,
+                top_p: 0.8,
+                top_k: 20,
+                presence_penalty: if qwen_keeps_thought() { 1.5 } else { 0.0 },
                 ..Settings::default()
             },
             Family::Gemma4 | Family::Muse => Settings {
@@ -305,10 +316,13 @@ fn with_calls(family: Family, content: &str, record: &Record) -> String {
         }
         let (before, body, after) =
             crate::tools::after_call(family, &step.tool, &step.result, false);
-        // A past turn has no thought in it, not even Qwen's empty one.
-        let after = after
-            .strip_suffix("<think>\n\n</think>\n\n")
-            .unwrap_or(&after);
+        // A past turn has no thought in it, not even Qwen's empty one, unless the
+        // template keeps them (Qwen 3.8).
+        let after = if qwen_keeps_thought() {
+            &after[..]
+        } else {
+            after.strip_suffix(QWEN_EMPTY_THOUGHT).unwrap_or(&after)
+        };
         out.push_str(&step.call);
         out.push_str(&before);
         out.push(PLAIN_OPEN);
@@ -336,6 +350,33 @@ fn with_calls(family: Family, content: &str, record: &Record) -> String {
 /// Whether a Gemma 4's turn opens with the empty thought when thinking is off: set from
 /// the model's chat template when it's loaded (`follow_template`).
 static GEMMA_EMPTY_THOUGHT: AtomicBool = AtomicBool::new(true);
+
+/// Whether a Qwen's template keeps the thought in a past reply's turn (Qwen 3.8's does
+/// unless told otherwise, `preserve_thinking`; Qwen 3.5's leaves past thoughts out). The
+/// app keeps a reply's answer, not its thinking, so a past turn is written with the
+/// empty thought, as the template writes one whose thinking wasn't sent back. With
+/// thinking off that is the turn as the model wrote it, token for token: the next prompt
+/// goes on from the end of the chat's cache and the last reply isn't read again.
+static QWEN_KEEPS_THOUGHT: AtomicBool = AtomicBool::new(false);
+const QWEN_EMPTY_THOUGHT: &str = "<think>\n\n</think>\n\n";
+
+/// Notes what the loaded Qwen's chat template does with past thoughts.
+pub fn note_qwen_template(template: Option<&str>) {
+    QWEN_KEEPS_THOUGHT.store(
+        template.is_some_and(|t| t.contains("preserve_thinking")),
+        Ordering::Relaxed,
+    );
+}
+
+/// What Qwen 3.8's template opens the system turn with when thinking is on and no
+/// `reasoning_effort` is given (its default, xhigh; medium has no line, low another).
+const QWEN_EFFORT: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
+/// Whether the loaded Qwen is one whose template keeps past thoughts, names a reasoning
+/// effort and whose card asks for a presence penalty: Qwen 3.8.
+pub fn qwen_keeps_thought() -> bool {
+    QWEN_KEEPS_THOUGHT.load(Ordering::Relaxed)
+}
 
 /// Follows the loaded model's chat template on the one thing it decides here: whether a
 /// Gemma 4's turn, thinking off, opens with the empty thought. Gemma 4 31B's template
@@ -475,8 +516,14 @@ pub fn history(
             }
         }
         Family::Qwen35 => {
+            // Qwen 3.8, thinking on: the system turn opens with the reasoning effort.
+            let effort = thinking && qwen_keeps_thought();
             if !tools.is_empty() {
                 out.push_str("<|im_start|>system\n");
+                if effort {
+                    out.push_str(QWEN_EFFORT);
+                    out.push_str("\n\n");
+                }
                 out.push_str(tools);
                 if let Some(s) = system {
                     out.push_str("\n\n");
@@ -485,13 +532,24 @@ pub fn history(
                 out.push_str("<|im_end|>\n");
             } else if let Some(s) = system {
                 out.push_str("<|im_start|>system\n");
+                if effort {
+                    out.push_str(QWEN_EFFORT);
+                    out.push_str("\n\n");
+                }
                 out.push_str(s);
+                out.push_str("<|im_end|>\n");
+            } else if effort {
+                out.push_str("<|im_start|>system\n");
+                out.push_str(QWEN_EFFORT);
                 out.push_str("<|im_end|>\n");
             }
             for m in messages {
                 out.push_str("<|im_start|>");
                 out.push_str(&m.role);
                 out.push('\n');
+                if m.role == "assistant" && qwen_keeps_thought() {
+                    out.push_str(QWEN_EMPTY_THOUGHT);
+                }
                 out.push_str(&said(family, m));
                 out.push_str("<|im_end|>\n");
             }
@@ -761,6 +819,16 @@ mod tests {
         assert_eq!(answer_opening(Family::Gemma4), opening(Family::Gemma4, false));
         assert_eq!(Family::of(Some("muse-glimmer")), Some(Family::Muse));
         assert_eq!(iso_date("05 Jan 2027"), "2027-01-05");
+    }
+
+    #[test]
+    fn qwen_sampling_follows_the_mode() {
+        let (on, off) = (Family::Qwen35.sampling(true), Family::Qwen35.sampling(false));
+        assert_eq!((on.temperature, on.top_p, on.top_k), (1.0, 0.95, 20));
+        assert_eq!((off.temperature, off.top_p, off.top_k), (0.7, 0.8, 20));
+        // The others have one set.
+        let g = Family::Gemma4;
+        assert_eq!(g.sampling(true).temperature, g.sampling(false).temperature);
     }
 
     #[test]
