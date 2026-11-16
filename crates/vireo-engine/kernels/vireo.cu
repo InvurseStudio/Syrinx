@@ -592,14 +592,19 @@ extern "C" __global__ void quantize_q8(const float* x, signed char* xq, float* x
 // (a 2,400-token prompt: Gemma 4 E4B's geglu 20 ms and about half of quantize_q8's 23).
 // Rows of n (a multiple of 32); up's rows are `up_stride` apart.
 template <bool GELU>
+__device__ __forceinline__ float gated_value(float x, float u) {
+    return GELU ? 0.5f * x * (1.0f + tanhf(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u
+                : x / (1.0f + expf(-x)) * u;
+}
+
+template <bool GELU>
 __device__ __forceinline__ void gated_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
                                          float* xd, float* xs, int blocks) {
     const int block = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (block >= blocks) return;
     const size_t i = (size_t)block * 32 + lane;
     const float x = gate[i], u = up[(i / n) * up_stride + i % n];
-    const float v = GELU ? 0.5f * x * (1.0f + tanhf(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u
-                         : x / (1.0f + expf(-x)) * u;
+    const float v = gated_value<GELU>(x, u);
     float amax = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     const float d = amax / 127.0f;
@@ -1182,9 +1187,18 @@ __device__ __forceinline__ void ldmatrix_x4_bytes(u32 (&r)[4], const u8* p) {
 // 64 costs the same for 9 tokens as for 64. Or 128, a warp taking 32 rows by 64 tokens:
 // the rows' weights are then read and unpacked once for twice the tokens, which pays for
 // the K-quants (the host's WIDE_TOKENS).
-template <int KIND, int GROUP, int NT>
-__device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, const float* xd, const float* xs,
-                        float* y, int rows, int cols, int tokens) {
+//
+// GLU (1 SiLU, 2 Gemma's tanh-GELU) is a feed-forward's first half in one kernel: w is
+// its gate matrix and w2 its up matrix, a block takes 64 rows of each (16 of one, then the
+// same 16 of the other, so a thread holds both sums of a row and token), and what it
+// writes is act(gate) x up rounded to 8 bits as quantize_q8 would round it (oq, od, os):
+// the next product's input. Neither product is written as f32 (rows x tokens x 8 bytes a
+// layer, read back once by the activation). Tiles of 64 or 128 tokens; rows in 64s.
+template <int KIND, int GROUP, int NT, int GLU = 0>
+__device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signed char* xq, const float* xd,
+                        const float* xs, float* y, signed char* oq, float* od, float* os, int rows, int cols,
+                        int tokens) {
+    static_assert(GLU == 0 || NT >= 64, "the gated kernel needs a warp's two tiles of 16 rows");
     // 128 columns a step: 64 tensor-core products per warp between syncs. Rows of 128
     // bytes padded to 144 in shared memory, so reading fragments has no bank conflicts.
     constexpr int K = 128, KS = K + 16, NG = K / GROUP, NX = K / 32;
@@ -1199,7 +1213,10 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     __shared__ __align__(16) float x_scale[NX][NT], x_sum[NX][NT];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, tig = lane & 3;
-    const int row0 = blockIdx.x * M8_ROWS, tok0 = blockIdx.y * NT;
+    const int row0 = blockIdx.x * (GLU ? M8_ROWS / 2 : M8_ROWS), tok0 = blockIdx.y * NT;
+    // The matrix's row at the tile's row r, and which matrix.
+    auto tile_row = [&](int r) -> int { return GLU ? row0 + (r >> 5) * 16 + (r & 15) : row0 + r; };
+    auto tile_w = [&](int r) -> const u8* { return GLU && (r & 16) ? w2 : w; };
     // This warp's rows and tokens in the tile.
     const int wr = NT >= 64 ? (warp & 3) * 32 : warp * 16, wt = NT >= 64 ? (warp >> 2) * (NT / 2) : 0;
     constexpr bool has_min = KIND == K_Q4_K || KIND == K_Q5_K;
@@ -1220,10 +1237,10 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     auto fetch = [&](int k0) {
         if constexpr (KIND == K_Q4_K || KIND == K_Q5_K) {
             const int r = tid >> 1, p = tid & 1, k = k0 + p * 64;
-            raw.ok[0] = row0 + r < rows && k < cols;
+            raw.ok[0] = tile_row(r) < rows && k < cols;
             if (raw.ok[0]) {
                 constexpr int bytes = KIND == K_Q4_K ? 144 : 176, qs = KIND == K_Q4_K ? 16 : 48;
-                const u8* block = w + (size_t)(row0 + r) * row_bytes + (k / 256) * bytes;
+                const u8* block = tile_w(r) + (size_t)tile_row(r) * row_bytes + (k / 256) * bytes;
                 const int j = (k % 256) / 32;
                 raw.head = *reinterpret_cast<const uint4*>(block);
                 for (int i = 0; i < 2; i++) {
@@ -1233,9 +1250,9 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
             }
         } else if constexpr (KIND == K_Q6_K) {
             const int r = tid >> 1, p = tid & 1;
-            raw.ok[0] = row0 + r < rows && k0 < cols;
+            raw.ok[0] = tile_row(r) < rows && k0 < cols;
             if (raw.ok[0]) {
-                const u8* block = w + (size_t)(row0 + r) * row_bytes + (k0 / 256) * Q6K_BYTES;
+                const u8* block = tile_w(r) + (size_t)tile_row(r) * row_bytes + (k0 / 256) * Q6K_BYTES;
                 const int half = (k0 % 256) / 128;
                 raw.sc[0] = *reinterpret_cast<const u16*>(block + 208);
                 raw.sc[1] = *reinterpret_cast<const u16*>(block + 192 + half * 8 + 2 * p);
@@ -1249,9 +1266,9 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const int c = tid + i * 256, r = c >> 3, h = c & 7, k = k0 + h * 16;
-                raw.ok[i] = row0 + r < rows && k < cols;
+                raw.ok[i] = tile_row(r) < rows && k < cols;
                 if (raw.ok[i]) {
-                    const u8* row = w + (size_t)(row0 + r) * row_bytes;
+                    const u8* row = tile_w(r) + (size_t)tile_row(r) * row_bytes;
                     if constexpr (KIND == K_Q4_0) {
                         const int blocks = cols / 32, b = k / 32;
                         raw.q[i] = *reinterpret_cast<const uint4*>(row + b * 16);
@@ -1389,9 +1406,11 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
         }
     };
 
-    // Not for Q6_K: it runs two blocks per SM, and the raw bytes would spill there (one
-    // block with the read ahead measured 3% slower than two without).
-    constexpr bool prefetch = KIND != K_Q6_K;
+    // Not for Q6_K's tiles of 64 tokens and under: they run two blocks per SM, and the raw
+    // bytes would spill there (one block with the read ahead measured 3% slower than two
+    // without). Its tile of 128, one block an SM, reads ahead (Qwen 3.5 9B's ffn_down,
+    // 1,024 tokens: 3.50 -> 3.14 ms).
+    constexpr bool prefetch = KIND != K_Q6_K || NT == 128 || GLU != 0;
     if constexpr (prefetch) fetch(0);
     for (int k0 = 0; k0 < cols; k0 += K) {
         if constexpr (!prefetch) fetch(k0);
@@ -1510,22 +1529,66 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
         }
         __syncthreads();
     }
+    if constexpr (GLU != 0) {
+        // This thread's rows gid and gid + 8 of the warp's 16, for two tokens a token tile:
+        // acc[0] is gate's sums and acc[1] up's. A token's 32 rows (one scale) are this
+        // warp's 16 and the next warp's (warp ^ 1), so each leaves its largest in shared
+        // memory for the other; a token's sum of 16 is the warp's own.
+        __shared__ float largest[8][NT / 2];
+        const int orow = row0 + (warp & 3) * 16;
+        float v[NI][4];
 #pragma unroll
-    for (int mi = 0; mi < MI; mi++)
+        for (int ni = 0; ni < NI; ni++) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) v[ni][i] = gated_value<GLU == 2>(acc[0][ni][i], acc[1][ni][i]);
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                float m = fmaxf(fabsf(v[ni][j]), fabsf(v[ni][2 + j]));
+                for (int o = 4; o < 32; o <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+                if (gid == 0) largest[warp][ni * 8 + tig * 2 + j] = m;
+            }
+        }
+        __syncthreads();
 #pragma unroll
         for (int ni = 0; ni < NI; ni++)
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const int r = row0 + wr + mi * 16 + gid + (i >> 1) * 8, t = tok0 + wt + ni * 8 + tig * 2 + (i & 1);
-                if (r < rows && t < tokens) y[(size_t)t * rows + r] = acc[mi][ni][i];
+            for (int j = 0; j < 2; j++) {
+                const int at = ni * 8 + tig * 2 + j, t = tok0 + wt + at;
+                const float amax = fmaxf(largest[warp][at], largest[warp ^ 1][at]);
+                const float d = amax / 127.0f;
+                const int q0 = amax == 0.0f ? 0 : __float2int_rn(v[ni][j] / d);
+                const int q1 = amax == 0.0f ? 0 : __float2int_rn(v[ni][2 + j] / d);
+                int sum = q0 + q1;
+                for (int o = 4; o < 32; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                if (orow < rows && t < tokens) {
+                    signed char* out = oq + (size_t)t * rows + orow + gid;
+                    out[0] = (signed char)q0;
+                    out[8] = (signed char)q1;
+                    if (gid == 0) {
+                        os[(size_t)t * (rows / 16) + orow / 16] = d * (float)sum;
+                        if ((warp & 1) == 0) od[(size_t)t * (rows / 32) + orow / 32] = d;
+                    }
+                }
             }
+    } else {
+#pragma unroll
+        for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const int r = row0 + wr + mi * 16 + gid + (i >> 1) * 8, t = tok0 + wt + ni * 8 + tig * 2 + (i & 1);
+                    if (r < rows && t < tokens) y[(size_t)t * rows + r] = acc[mi][ni][i];
+                }
+    }
 }
 
 #define MATMUL8(name, KIND, GROUP, NT, ROW_BYTES, BLOCKS)                                                  \
     extern "C" __global__ void __launch_bounds__(256, BLOCKS)                                            \
         name(const u8* w, const signed char* xq, const float* xd, const float* xs, float* y, int rows,   \
              int cols, int tokens) {                                                                     \
-        matmul8<KIND, GROUP, NT>(w, (size_t)(ROW_BYTES), xq, xd, xs, y, rows, cols, tokens);             \
+        matmul8<KIND, GROUP, NT>(w, nullptr, (size_t)(ROW_BYTES), xq, xd, xs, y, nullptr, nullptr,       \
+                                 nullptr, rows, cols, tokens);                                           \
     }
 
 // One block per SM, with the next step's bytes read ahead into registers (fetch): faster
@@ -1552,6 +1615,26 @@ MATMUL8(matmul8_t128_q8_0, K_Q8_0, 32, 128, cols / 32 * 34, 1)
 MATMUL8(matmul8_t128_q4_k, K_Q4_K, 32, 128, cols / 256 * 144, 1)
 MATMUL8(matmul8_t128_q5_k, K_Q5_K, 32, 128, cols / 256 * 176, 1)
 MATMUL8(matmul8_t128_q6_k, K_Q6_K, 16, 128, cols / 256 * Q6K_BYTES, 1)
+
+// A feed-forward's gate and up products with its activation, rounded for the next product
+// (matmul8's GLU): `rows` of each matrix, a block an SM.
+#define MATMUL8_GLU(name, KIND, GROUP, NT, ROW_BYTES, GLU)                                                 \
+    extern "C" __global__ void __launch_bounds__(256, 1)                                                 \
+        name(const u8* gate, const u8* up, const signed char* xq, const float* xd, const float* xs,      \
+             signed char* oq, float* od, float* os, int rows, int cols, int tokens) {                    \
+        matmul8<KIND, GROUP, NT, GLU>(gate, up, (size_t)(ROW_BYTES), xq, xd, xs, nullptr, oq, od, os,    \
+                                      rows, cols, tokens);                                               \
+    }
+#define MATMUL8_GLUS(act, GLU, NT)                                                         \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_0, K_Q4_0, 32, NT, q4_0_row_bytes(cols), GLU)   \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q8_0, K_Q8_0, 32, NT, cols / 32 * 34, GLU)         \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_k, K_Q4_K, 32, NT, cols / 256 * 144, GLU)       \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q5_k, K_Q5_K, 32, NT, cols / 256 * 176, GLU)       \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, GLU)
+MATMUL8_GLUS(swiglu, 1, 64)
+MATMUL8_GLUS(swiglu, 1, 128)
+MATMUL8_GLUS(geglu, 2, 64)
+MATMUL8_GLUS(geglu, 2, 128)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //
@@ -3024,6 +3107,19 @@ extern "C" __global__ void delta_out(float* out, const float* z, const float* no
 
 __device__ __forceinline__ size_t delta_chunk_stride(int n) { return (size_t)4 * DC * n + DC * DC + 4; }
 
+// An f32 as two bf16 numbers in one word, for the tensor cores (delta_chunk_scan_mma): the
+// nearest bf16 in the low half and, in the high half, the nearest bf16 to what that left
+// over. A product of two such numbers as hi x hi + hi x lo + lo x hi is the f32 product
+// to about 2^-16 of itself (only lo x lo is dropped), where one bf16 each would give 2^-8.
+__device__ __forceinline__ u32 bf16_bits(float x) {
+    const u32 b = __float_as_uint(x);
+    return (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16;  // to nearest, ties to even
+}
+__device__ __forceinline__ u32 split_bf16(float x) {
+    const u32 hi = bf16_bits(x);
+    return hi | (bf16_bits(x - __uint_as_float(hi << 16)) << 16);
+}
+
 // One block of 256 threads per value head (blockIdx.x) and chunk (blockIdx.y); n ≤ 128.
 // Dynamic shared memory (delta_chunk_prep_bytes on the host): the chunk's k, which A
 // takes the place of once k·k is worked out, then the cumulative log decays and β. q is
@@ -3031,8 +3127,21 @@ __device__ __forceinline__ size_t delta_chunk_stride(int n) { return (size_t)4 *
 // SM.
 extern "C" __global__ void __launch_bounds__(256)
     delta_chunk_prep(const float* conv, int channels, int key_dim, const float* beta_raw, const float* alpha_raw,
-                     const float* dt_bias, const float* a, float* scratch, int n, int k_heads, int tokens) {
+                     const float* dt_bias, const float* a, float* scratch, int n, int k_heads, int tokens,
+                     int split) {
+    // With `split`, for delta_chunk_scan_mma: W and P are written as split_bf16 words in
+    // the same places and U stays f32. Q̂ and K̂ are not written: they are q and k scaled a
+    // row, which that scan reads where they are, and Q̂'s place holds the scales (γ_i, then
+    // γ_DC / γ_i, a number a row). The scratch is what both kernels wait on, written here
+    // and read back there, and those two were 64 of its 147 KB a chunk and head.
     extern __shared__ __align__(16) float sm[];
+    u32* const scratch_bits = reinterpret_cast<u32*>(scratch);
+    auto put = [&](float* at, float x) {
+        if (split)
+            scratch_bits[at - scratch] = split_bf16(x);
+        else
+            *at = x;
+    };
     const int NS = n + 4;  // padded rows
     float* ks = sm;
     float* As = sm;  // DC × (DC + 1), over ks once A is worked out
@@ -3092,10 +3201,17 @@ extern "C" __global__ void __launch_bounds__(256)
     }
     // Q̂ and K̂, and γ_DC (the decay over the chunk's real tokens: later rows add 0).
     const float g_last = G[DC - 1];
-    for (int idx = tid; idx < DC * n; idx += blockDim.x) {
-        const int i = idx / n, d = idx % n;
-        Qh[idx] = i < len ? expf(G[i]) * q_row(i)[d] : 0.0f;
-        Kh[idx] = i < len ? expf(g_last - G[i]) * ks[i * NS + d] : 0.0f;
+    if (split) {
+        if (tid < DC) {
+            Qh[tid] = expf(G[tid]);
+            Qh[DC + tid] = expf(g_last - G[tid]);
+        }
+    } else {
+        for (int idx = tid; idx < DC * n; idx += blockDim.x) {
+            const int i = idx / n, d = idx % n;
+            Qh[idx] = i < len ? expf(G[i]) * q_row(i)[d] : 0.0f;
+            Kh[idx] = i < len ? expf(g_last - G[i]) * ks[i * NS + d] : 0.0f;
+        }
     }
     if (tid == 0) P[DC * DC] = expf(g_last);
     __syncthreads();  // done with ks: A goes in its place
@@ -3106,7 +3222,7 @@ extern "C" __global__ void __launch_bounds__(256)
             const int i = 4 * ti + x, j = tj + 16 * y;
             const float decay = j <= i ? expf(G[i] - G[j]) : 0.0f;
             As[i * (DC + 1) + j] = j < i ? bs[i] * decay * kk[x][y] : 0.0f;
-            P[i * DC + j] = j <= i && i < len ? decay * qk[x][y] : 0.0f;
+            put(&P[i * DC + j], j <= i && i < len ? decay * qk[x][y] : 0.0f);
         }
     __syncthreads();
 
@@ -3131,7 +3247,10 @@ extern "C" __global__ void __launch_bounds__(256)
             for (int m = 0; m < i; m++) part[m & 3] += As[i * (DC + 1) + m] * x[m];
             b -= (part[0] + part[1]) + (part[2] + part[3]);
             x[i] = b;
-            X[i * n + d] = b;
+            if (is_w)
+                put(&X[i * n + d], b);
+            else
+                X[i * n + d] = b;
         }
     }
 }
@@ -3253,3 +3372,203 @@ extern "C" __global__ void __launch_bounds__(64)
         state[((size_t)h * n + j0 + c) * n + r] = Ss[r][c];
     }
 }
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+// ---- The chunks' scan on the tensor cores (RTX 30 series on) ---------------------------
+//
+// delta_chunk_scan's products as f32 sums of bf16 products (mma.m16n8k16), each number in
+// two bf16 parts (split_bf16) and each product in three, as llama.cpp's
+// gated-delta-net-mma does: the state stays f32, in registers, and what is multiplied is
+// right to about 2^-16. After delta_chunk_prep with `split`. n = 128.
+//
+// A block of 4 warps per value head (blockIdx.x) and 32 columns of its state (blockIdx.y):
+// the columns are independent. Warp w keeps the state's rows 16 w.. and 64 + 16 w.. (two
+// tiles of 16 rows by 4 of 8 columns, laid out as the products' results are), and takes
+// rows 16 w.. of the chunk's δ and O. A chunk: the state into shared memory in two parts,
+// D1 = W S0 and D2 = Q̂ S0, δ = U − D1 into shared memory, then O = D2 + P δ and
+// S = γ S0 + K̂ᵀ δ. W and P are read from the scratch as the products take them; Q̂ and K̂ᵀ
+// are made here from q and k (normalized by delta_l2) and the scratch's scale a row.
+#define DM_COLS 32
+#define DM_S (128 + 8)  // the state's columns in shared memory, padded
+#define DM_D (DC + 8)   // δ's
+
+__device__ __forceinline__ void mma_bf16(float (&c)[4], const u32 (&a)[4], const u32 (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Two neighbouring split words as a register of their first parts and one of their second.
+__device__ __forceinline__ void split_pair(const u32* p, u32& hi, u32& lo) {
+    const uint2 w = *reinterpret_cast<const uint2*>(p);
+    hi = (w.x & 0xFFFFu) | (w.y << 16);
+    lo = (w.x >> 16) | (w.y & 0xFFFF0000u);
+}
+
+// c += a b with both in two parts: the three products that matter.
+__device__ __forceinline__ void mma_split(float (&c)[4], const u32 (&ah)[4], const u32 (&al)[4],
+                                          const u32 (&bh)[2], const u32 (&bl)[2]) {
+    mma_bf16(c, al, bh);
+    mma_bf16(c, ah, bl);
+    mma_bf16(c, ah, bh);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    delta_chunk_scan_mma(const float* scratch, float* state, float* out, int n, int tokens, const float* conv,
+                         int channels, int key_dim, int k_heads) {
+    __shared__ __align__(16) u32 Sb[DM_COLS][DM_S];  // S0[r][c] split, a column's rows together
+    __shared__ __align__(16) u32 Db[DM_COLS][DM_D];  // δ[m][c] split, likewise
+    const int h = blockIdx.x, v_heads = gridDim.x, j0 = blockIdx.y * DM_COLS;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const float inv_sqrt_n = 1.0f / sqrtf((float)n);
+    // A result's 4 numbers a thread: rows gid and gid + 8 of its 16, columns 2 tig and 2 tig + 1 of its 8.
+    auto row_of = [&](int e) { return gid + (e >> 1) * 8; };
+    auto col_of = [&](int ct, int e) { return ct * 8 + tig * 2 + (e & 1); };
+    // A's registers for rows gid and gid + 8 of 16 from `rows` (rows of `stride` split
+    // words), columns k.. of 16; B's for 8 columns from ct of rows k.. of `from`.
+    auto load_a = [&](u32 (&ah)[4], u32 (&al)[4], const u32* rows, int stride, int k) {
+        const u32* r0 = rows + (size_t)gid * stride + k + tig * 2;
+        const u32* r1 = r0 + (size_t)8 * stride;
+        split_pair(r0, ah[0], al[0]);
+        split_pair(r1, ah[1], al[1]);
+        split_pair(r0 + 8, ah[2], al[2]);
+        split_pair(r1 + 8, ah[3], al[3]);
+    };
+
+    float s[2][4][4];
+#pragma unroll
+    for (int x = 0; x < 2; x++)
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++)
+                s[x][ct][e] = state[((size_t)h * n + j0 + col_of(ct, e)) * n + (warp + 4 * x) * 16 + row_of(e)];
+
+    const int chunks = (tokens + DC - 1) / DC;
+    for (int ch = 0; ch < chunks; ch++) {
+        const float* base = scratch + ((size_t)ch * v_heads + h) * delta_chunk_stride(n);
+        const u32* W = reinterpret_cast<const u32*>(base);
+        const float* U = base + DC * n;
+        const float* up = U + DC * n;  // γ_i
+        const float* down = up + DC;   // γ_DC / γ_i
+        const u32* P = reinterpret_cast<const u32*>(base + (size_t)4 * DC * n);
+        const float gamma = base[(size_t)4 * DC * n + DC * DC];
+        // The chunk's q and k, a row a token, and how many tokens it has.
+        const int len = min(DC, tokens - ch * DC);
+        const float* q0 = conv + (size_t)ch * DC * channels + (h % k_heads) * n;
+        const float* k0 = q0 + key_dim;
+        // Rows 16 warp + gid and + 8 of Q̂ from column k: q scaled and split.
+        auto load_q = [&](u32 (&ah)[4], u32 (&al)[4], int k) {
+#pragma unroll
+            for (int x = 0; x < 4; x++) {
+                const int i = warp * 16 + gid + (x & 1) * 8;
+                float2 q = make_float2(0.0f, 0.0f);
+                if (i < len) {
+                    q = *reinterpret_cast<const float2*>(q0 + (size_t)i * channels + k + (x >> 1) * 8 + tig * 2);
+                    const float g = up[i];
+                    q.x *= g, q.y *= g;
+                }
+                const u32 w0 = split_bf16(q.x), w1 = split_bf16(q.y);
+                ah[x] = (w0 & 0xFFFFu) | (w1 << 16);
+                al[x] = (w0 >> 16) | (w1 & 0xFFFF0000u);
+            }
+        };
+        // Rows r0 + gid and + 8 of K̂ᵀ from column m: tokens m and m + 1's k at a row.
+        auto load_kt = [&](u32 (&ah)[4], u32 (&al)[4], int r0, int k) {
+#pragma unroll
+            for (int x = 0; x < 4; x++) {
+                const int r = r0 + gid + (x & 1) * 8, m = k + (x >> 1) * 8 + tig * 2;
+                float e0 = 0.0f, e1 = 0.0f;
+                if (m < len) e0 = down[m] * k0[(size_t)m * channels + r];
+                if (m + 1 < len) e1 = down[m + 1] * k0[(size_t)(m + 1) * channels + r];
+                const u32 w0 = split_bf16(e0), w1 = split_bf16(e1);
+                ah[x] = (w0 & 0xFFFFu) | (w1 << 16);
+                al[x] = (w0 >> 16) | (w1 & 0xFFFF0000u);
+            }
+        };
+
+#pragma unroll
+        for (int x = 0; x < 2; x++)
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    Sb[col_of(ct, e)][(warp + 4 * x) * 16 + row_of(e)] = split_bf16(s[x][ct][e]);
+        __syncthreads();
+
+        // D1 = W S0 (acc[0]) and D2 = Q̂ S0 (acc[1]) for rows 16 warp.. of the chunk.
+        float acc[2][4][4] = {};
+#pragma unroll 2
+        for (int k = 0; k < 128; k += 16) {
+            u32 ah[2][4], al[2][4], bh[4][2], bl[4][2];
+            load_a(ah[0], al[0], W + (size_t)warp * 16 * n, n, k);
+            load_q(ah[1], al[1], k);
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                const u32* b = &Sb[ct * 8 + gid][k + tig * 2];
+                split_pair(b, bh[ct][0], bl[ct][0]);
+                split_pair(b + 8, bh[ct][1], bl[ct][1]);
+            }
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                mma_split(acc[0][ct], ah[0], al[0], bh[ct], bl[ct]);
+                mma_split(acc[1][ct], ah[1], al[1], bh[ct], bl[ct]);
+            }
+        }
+        // δ = U − D1
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int i = warp * 16 + row_of(e), c = col_of(ct, e);
+                Db[c][i] = split_bf16(U[(size_t)i * n + j0 + c] - acc[0][ct][e]);
+            }
+        __syncthreads();
+
+        // O = D2 + P δ and S = γ S0 + K̂ᵀ δ, a step's δ read once for both.
+#pragma unroll
+        for (int x = 0; x < 2; x++)
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) s[x][ct][e] *= gamma;
+#pragma unroll 2
+        for (int k = 0; k < DC; k += 16) {
+            u32 ph[4], pl[4], kh[2][4], kl[2][4], bh[4][2], bl[4][2];
+            load_a(ph, pl, P + (size_t)warp * 16 * DC, DC, k);
+            load_kt(kh[0], kl[0], warp * 16, k);
+            load_kt(kh[1], kl[1], (warp + 4) * 16, k);
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                const u32* b = &Db[ct * 8 + gid][k + tig * 2];
+                split_pair(b, bh[ct][0], bl[ct][0]);
+                split_pair(b + 8, bh[ct][1], bl[ct][1]);
+            }
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                mma_split(acc[1][ct], ph, pl, bh[ct], bl[ct]);
+                mma_split(s[0][ct], kh[0], kl[0], bh[ct], bl[ct]);
+                mma_split(s[1][ct], kh[1], kl[1], bh[ct], bl[ct]);
+            }
+        }
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int t = ch * DC + warp * 16 + row_of(e);
+                if (t < tokens) out[((size_t)t * v_heads + h) * n + j0 + col_of(ct, e)] = acc[1][ct][e] * inv_sqrt_n;
+            }
+        // The next chunk's state goes into Sb, which nothing reads now; its sync comes
+        // before δ is written again.
+    }
+#pragma unroll
+    for (int x = 0; x < 2; x++)
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++)
+                state[((size_t)h * n + j0 + col_of(ct, e)) * n + (warp + 4 * x) * 16 + row_of(e)] = s[x][ct][e];
+}
+#endif

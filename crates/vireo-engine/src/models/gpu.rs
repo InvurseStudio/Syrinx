@@ -160,6 +160,69 @@ impl GpuMatrix {
     }
 }
 
+impl GpuMatrix {
+    /// A whole feed-forward for a batch, `y = self (act(gate x) × (up x))`, with the gate
+    /// and up products and the activation in one kernel (`Gpu::glu_8bit`): neither
+    /// product is written, and `mid` takes their rounded result for this matrix to read.
+    /// False, having done nothing, where that kernel doesn't apply (the Mac, exact
+    /// activations, a short batch, matrices that differ in type or shape): the caller
+    /// then runs the two products and [`GpuMatrix::mul_gated`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_ffn(
+        &self,
+        gate: &GpuMatrix,
+        up: &GpuMatrix,
+        input: &Input,
+        mid: Option<&Q8>,
+        gelu: bool,
+        y: CuDevicePtr,
+    ) -> Result<bool> {
+        #[cfg(not(target_os = "macos"))]
+        if let (Some(q8), Some(mid)) = (input.q8, mid)
+            && (gate.kind, gate.rows, gate.cols) == (up.kind, up.rows, up.cols)
+            && gate.rows == self.cols
+            && Gpu::supports_8bit(gate.kind)
+            && Gpu::supports_8bit(self.kind)
+            && gate.cols.is_multiple_of(32)
+            && self.cols.is_multiple_of(32)
+        {
+            let g = input.gpu;
+            if input.rounded.get() != gate.cols {
+                g.quantize(input.x, q8, input.tokens, gate.cols)
+                    .map_err(gpu_error)?;
+                input.rounded.set(gate.cols);
+            }
+            if g.glu_8bit(
+                gate.kind,
+                gate.data.ptr(),
+                up.data.ptr(),
+                q8,
+                mid,
+                gate.rows,
+                gate.cols,
+                input.tokens,
+                gelu,
+            )
+            .map_err(gpu_error)?
+            {
+                g.matmul_8bit(
+                    self.kind,
+                    self.data.ptr(),
+                    mid,
+                    y,
+                    self.rows,
+                    self.cols,
+                    input.tokens,
+                )
+                .map_err(gpu_error)?;
+                return Ok(true);
+            }
+        }
+        let _ = (gate, up, input, mid, gelu, y);
+        Ok(false)
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl GpuMatrix {
     /// One token's `y = act(self x) × (up x)` (SiLU, or tanh-GELU with `gelu`) in one
