@@ -3129,8 +3129,11 @@ extern "C" __global__ void __launch_bounds__(256)
     delta_chunk_prep(const float* conv, int channels, int key_dim, const float* beta_raw, const float* alpha_raw,
                      const float* dt_bias, const float* a, float* scratch, int n, int k_heads, int tokens,
                      int split) {
-    // With `split`, for delta_chunk_scan_mma: W, Q̂ and P are written as split_bf16 words
-    // in the same places, and K̂ as its transpose (n rows of DC), split too. U stays f32.
+    // With `split`, for delta_chunk_scan_mma: W and P are written as split_bf16 words in
+    // the same places and U stays f32. Q̂ and K̂ are not written: they are q and k scaled a
+    // row, which that scan reads where they are, and Q̂'s place holds the scales (γ_i, then
+    // γ_DC / γ_i, a number a row). The scratch is what both kernels wait on, written here
+    // and read back there, and those two were 64 of its 147 KB a chunk and head.
     extern __shared__ __align__(16) float sm[];
     u32* const scratch_bits = reinterpret_cast<u32*>(scratch);
     auto put = [&](float* at, float x) {
@@ -3198,10 +3201,17 @@ extern "C" __global__ void __launch_bounds__(256)
     }
     // Q̂ and K̂, and γ_DC (the decay over the chunk's real tokens: later rows add 0).
     const float g_last = G[DC - 1];
-    for (int idx = tid; idx < DC * n; idx += blockDim.x) {
-        const int i = idx / n, d = idx % n;
-        put(&Qh[idx], i < len ? expf(G[i]) * q_row(i)[d] : 0.0f);
-        put(&Kh[split ? d * DC + i : idx], i < len ? expf(g_last - G[i]) * ks[i * NS + d] : 0.0f);
+    if (split) {
+        if (tid < DC) {
+            Qh[tid] = expf(G[tid]);
+            Qh[DC + tid] = expf(g_last - G[tid]);
+        }
+    } else {
+        for (int idx = tid; idx < DC * n; idx += blockDim.x) {
+            const int i = idx / n, d = idx % n;
+            Qh[idx] = i < len ? expf(G[i]) * q_row(i)[d] : 0.0f;
+            Kh[idx] = i < len ? expf(g_last - G[i]) * ks[i * NS + d] : 0.0f;
+        }
     }
     if (tid == 0) P[DC * DC] = expf(g_last);
     __syncthreads();  // done with ks: A goes in its place
@@ -3376,7 +3386,8 @@ extern "C" __global__ void __launch_bounds__(64)
 // tiles of 16 rows by 4 of 8 columns, laid out as the products' results are), and takes
 // rows 16 w.. of the chunk's δ and O. A chunk: the state into shared memory in two parts,
 // D1 = W S0 and D2 = Q̂ S0, δ = U − D1 into shared memory, then O = D2 + P δ and
-// S = γ S0 + K̂ᵀ δ. W, Q̂, P and K̂ᵀ are read from GPU memory as the products take them.
+// S = γ S0 + K̂ᵀ δ. W and P are read from the scratch as the products take them; Q̂ and K̂ᵀ
+// are made here from q and k (normalized by delta_l2) and the scratch's scale a row.
 #define DM_COLS 32
 #define DM_S (128 + 8)  // the state's columns in shared memory, padded
 #define DM_D (DC + 8)   // δ's
@@ -3405,7 +3416,8 @@ __device__ __forceinline__ void mma_split(float (&c)[4], const u32 (&ah)[4], con
 }
 
 extern "C" __global__ void __launch_bounds__(128)
-    delta_chunk_scan_mma(const float* scratch, float* state, float* out, int n, int tokens) {
+    delta_chunk_scan_mma(const float* scratch, float* state, float* out, int n, int tokens, const float* conv,
+                         int channels, int key_dim, int k_heads) {
     __shared__ __align__(16) u32 Sb[DM_COLS][DM_S];  // S0[r][c] split, a column's rows together
     __shared__ __align__(16) u32 Db[DM_COLS][DM_D];  // δ[m][c] split, likewise
     const int h = blockIdx.x, v_heads = gridDim.x, j0 = blockIdx.y * DM_COLS;
@@ -3439,10 +3451,43 @@ extern "C" __global__ void __launch_bounds__(128)
         const float* base = scratch + ((size_t)ch * v_heads + h) * delta_chunk_stride(n);
         const u32* W = reinterpret_cast<const u32*>(base);
         const float* U = base + DC * n;
-        const u32* Qh = reinterpret_cast<const u32*>(U + DC * n);
-        const u32* Kt = Qh + DC * n;  // n rows of DC
-        const u32* P = Kt + DC * n;
+        const float* up = U + DC * n;  // γ_i
+        const float* down = up + DC;   // γ_DC / γ_i
+        const u32* P = reinterpret_cast<const u32*>(base + (size_t)4 * DC * n);
         const float gamma = base[(size_t)4 * DC * n + DC * DC];
+        // The chunk's q and k, a row a token, and how many tokens it has.
+        const int len = min(DC, tokens - ch * DC);
+        const float* q0 = conv + (size_t)ch * DC * channels + (h % k_heads) * n;
+        const float* k0 = q0 + key_dim;
+        // Rows 16 warp + gid and + 8 of Q̂ from column k: q scaled and split.
+        auto load_q = [&](u32 (&ah)[4], u32 (&al)[4], int k) {
+#pragma unroll
+            for (int x = 0; x < 4; x++) {
+                const int i = warp * 16 + gid + (x & 1) * 8;
+                float2 q = make_float2(0.0f, 0.0f);
+                if (i < len) {
+                    q = *reinterpret_cast<const float2*>(q0 + (size_t)i * channels + k + (x >> 1) * 8 + tig * 2);
+                    const float g = up[i];
+                    q.x *= g, q.y *= g;
+                }
+                const u32 w0 = split_bf16(q.x), w1 = split_bf16(q.y);
+                ah[x] = (w0 & 0xFFFFu) | (w1 << 16);
+                al[x] = (w0 >> 16) | (w1 & 0xFFFF0000u);
+            }
+        };
+        // Rows r0 + gid and + 8 of K̂ᵀ from column m: tokens m and m + 1's k at a row.
+        auto load_kt = [&](u32 (&ah)[4], u32 (&al)[4], int r0, int k) {
+#pragma unroll
+            for (int x = 0; x < 4; x++) {
+                const int r = r0 + gid + (x & 1) * 8, m = k + (x >> 1) * 8 + tig * 2;
+                float e0 = 0.0f, e1 = 0.0f;
+                if (m < len) e0 = down[m] * k0[(size_t)m * channels + r];
+                if (m + 1 < len) e1 = down[m + 1] * k0[(size_t)(m + 1) * channels + r];
+                const u32 w0 = split_bf16(e0), w1 = split_bf16(e1);
+                ah[x] = (w0 & 0xFFFFu) | (w1 << 16);
+                al[x] = (w0 >> 16) | (w1 & 0xFFFF0000u);
+            }
+        };
 
 #pragma unroll
         for (int x = 0; x < 2; x++)
@@ -3459,7 +3504,7 @@ extern "C" __global__ void __launch_bounds__(128)
         for (int k = 0; k < 128; k += 16) {
             u32 ah[2][4], al[2][4], bh[4][2], bl[4][2];
             load_a(ah[0], al[0], W + (size_t)warp * 16 * n, n, k);
-            load_a(ah[1], al[1], Qh + (size_t)warp * 16 * n, n, k);
+            load_q(ah[1], al[1], k);
 #pragma unroll
             for (int ct = 0; ct < 4; ct++) {
                 const u32* b = &Sb[ct * 8 + gid][k + tig * 2];
@@ -3493,8 +3538,8 @@ extern "C" __global__ void __launch_bounds__(128)
         for (int k = 0; k < DC; k += 16) {
             u32 ph[4], pl[4], kh[2][4], kl[2][4], bh[4][2], bl[4][2];
             load_a(ph, pl, P + (size_t)warp * 16 * DC, DC, k);
-            load_a(kh[0], kl[0], Kt + (size_t)warp * 16 * DC, DC, k);
-            load_a(kh[1], kl[1], Kt + (size_t)(warp + 4) * 16 * DC, DC, k);
+            load_kt(kh[0], kl[0], warp * 16, k);
+            load_kt(kh[1], kl[1], (warp + 4) * 16, k);
 #pragma unroll
             for (int ct = 0; ct < 4; ct++) {
                 const u32* b = &Db[ct * 8 + gid][k + tig * 2];
