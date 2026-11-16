@@ -454,8 +454,12 @@ def record_from(step: dict, item: dict, folder: Path) -> dict:
         'id': item['id'], 'title': item['title'], 'chatId': step.get('chat'),
         'prompt': step.get('prompt', ''), 'tools': [], 'approvals': [], 'events': tool_steps,
         'answer': step.get('reply', ''), 'error': 'the reply ended in an error' if step.get('error') else None,
+        # How much the model reasoned, in characters: with thinking on, 0 on a prompt that
+        # needed working out is the first thing to look at (Nov 15: 8 replies had none).
+        'reasoning': step.get('reasoning') or '',
         'stats': {'tokens': step.get('tokens'), 'tokensPerSecond': step.get('tokensPerSecond'),
-                  'firstWordSeconds': step.get('firstWordSeconds')},
+                  'firstWordSeconds': step.get('firstWordSeconds'),
+                  'reasoningChars': len(step.get('reasoning') or '')},
         'seconds': round(step.get('seconds', 0), 1),
     }
     if record['prompt'] != item['prompt']:
@@ -491,6 +495,7 @@ def summary_rows(records: list) -> list[dict]:
         passed, counted = hint_counts(r.get('checks', []))
         rows.append({'id': r['id'], 'title': r['title'], 'grade': r['grade'], 'hints_passed': passed,
                      'hints': counted, 'seconds': r['seconds'], 'tools': len(r['tools']),
+                     'reasoning': len(r.get('reasoning') or ''),
                      'approvals': len(r['approvals']),
                      'approved': sum(1 for a in r['approvals'] if a['approved']),
                      **({'not_runnable': r['not_runnable']} if r.get('not_runnable') else {})})
@@ -498,11 +503,12 @@ def summary_rows(records: list) -> list[dict]:
 
 
 def table(rows: list) -> str:
-    lines = ['| # | Title | Grade (hints) | Hints | Seconds | Tools | Approvals |', '|---|---|---|---|---|---|---|']
+    lines = ['| # | Title | Grade (hints) | Hints | Seconds | Tools | Reasoning (chars) | Approvals |',
+             '|---|---|---|---|---|---|---|---|']
     for r in rows:
         asked = f'{r["approvals"]}' + (f' ({r["approvals"] - r["approved"]} declined)' if r['approvals'] != r['approved'] else '')
         lines.append(f'| {r["id"]} | {r["title"]} | {r["grade"]} | {r["hints_passed"]}/{r["hints"]} '
-                     f'| {r["seconds"]:.0f} | {r["tools"]} | {asked} |')
+                     f'| {r["seconds"]:.0f} | {r["tools"]} | {r.get("reasoning", 0)} | {asked} |')
     return '\n'.join(lines)
 
 
@@ -511,7 +517,9 @@ def totals(rows: list) -> dict:
     ran = [r for r in rows if r['grade'] != 'not runnable']
     return {**count, 'prompts': len(rows),
             'hints_passed': sum(r['hints_passed'] for r in ran), 'hints': sum(r['hints'] for r in ran),
-            'minutes': round(sum(r['seconds'] for r in rows) / 60, 1), 'tool_calls': sum(r['tools'] for r in rows)}
+            'minutes': round(sum(r['seconds'] for r in rows) / 60, 1), 'tool_calls': sum(r['tools'] for r in rows),
+            'reasoning_chars': sum(r.get('reasoning', 0) for r in rows),
+            'no_reasoning': [r['id'] for r in ran if not r.get('reasoning')]}
 
 
 def report(out: Path, suite: dict, meta: dict, records: list) -> None:
@@ -525,7 +533,9 @@ def report(out: Path, suite: dict, meta: dict, records: list) -> None:
              '## Summary', '', table(rows), '',
              f'Pass {total["pass"]}, partial {total["partial"]}, fail {total["fail"]}, not runnable {total["not runnable"]} '
              f'of {total["prompts"]} · hints {total["hints_passed"]}/{total["hints"]} on the prompts that ran · '
-             f'{total["minutes"]} min · {total["tool_calls"]} tool calls', '']
+             f'{total["minutes"]} min · {total["tool_calls"]} tool calls', '',
+             f'Reasoning: {total["reasoning_chars"]} characters in all'
+             + (f'; none on {", ".join(total["no_reasoning"])}' if total['no_reasoning'] else '') + '.', '']
     for r in records:
         item = next(p for p in suite['prompts'] if p['id'] == r['id'])
         lines += [f'## {r["id"]} {item["title"]}' + (' (same chat)' if item.get('chat') == 'same' else ''), '',

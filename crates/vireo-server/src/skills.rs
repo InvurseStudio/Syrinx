@@ -364,18 +364,79 @@ pub fn fit_question(skill: &Skill, request: &str) -> String {
 /// The `use_skill` result the model reads, as the Mac's `SkillLibrary.read` gives it.
 /// The skill's text is followed by a line saying to start: written into the reply by the
 /// server (the model didn't ask for it), a small model otherwise describes the steps it
-/// would take and asks whether to go on (Gemma 4 E2B in the test gauntlet).
-pub fn instructions(skill: &Skill) -> String {
+/// would take and asks whether to go on (Gemma 4 E2B in the test gauntlet). With thinking
+/// on the line is `START_THINKING`: the model plans first, and the request stays the job.
+pub fn instructions(skill: &Skill, thinking: bool) -> String {
     format!(
-        "Skill \"{}\":\n\n{}\n\n{START}",
+        "Skill \"{}\":\n\n{}\n\n{}",
         skill.name,
-        skill.instructions.trim_end()
+        skill.instructions.trim_end(),
+        if thinking { START_THINKING } else { START }
     )
 }
 
-/// What follows a skill's text in its `use_skill` result.
+/// The skills as a model that may call `use_skill` itself is told of them, after the
+/// rest of its instructions (0.9's `SkillLibrary.prompt`).
+pub fn listing(skills: &[Skill]) -> String {
+    let mut text = String::from(
+        "Skills: instructions saved for particular kinds of tasks. The one that fits a request \
+         best may already be loaded when your reply starts. When another part of the request \
+         matches a skill below (a message to draft once the figures are worked out, a document \
+         to write, a policy to apply), call use_skill with its name before you do that part, in \
+         the same step as any reading you already know the task needs, and follow what it says.",
+    );
+    for skill in skills.iter().take(SHORTLISTED) {
+        text.push_str(&format!(
+            "\n- {}: {}",
+            skill.name,
+            skill
+                .description
+                .replace('\n', " ")
+                .chars()
+                .take(SHORTLIST_DESCRIPTION)
+                .collect::<String>()
+        ));
+    }
+    text
+}
+
+/// The result of a `use_skill` call the model made itself: the skill's text (it asked, so
+/// no line saying to start), or which skills there are.
+pub fn asked_for(name: &str, skills: &[Skill]) -> Result<String, String> {
+    let name = name.trim();
+    match skills.iter().find(|s| s.name == name) {
+        Some(skill) => Ok(format!(
+            "Skill \"{}\":\n\n{}",
+            skill.name,
+            skill.instructions.trim_end()
+        )),
+        None => Err(format!(
+            "No skill called \"{name}\". Skills: {}.",
+            if skills.is_empty() {
+                "none".to_string()
+            } else {
+                skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+            }
+        )),
+    }
+}
+
+/// What follows a skill's text in its `use_skill` result, thinking off.
 pub const START: &str = "Do the task now, following these steps: start with step 1 and call \
                          the tool it names. Don't describe the steps or ask whether to go on.";
+
+/// The same with thinking on. `START` sends the model straight to step 1's tool, which a
+/// model that thinks took as leave to skip the thought, and it puts the skill's steps
+/// where the request should be: a skill covers one kind of task and a request often asks
+/// for more (Nov 15 test gauntlet: `analyze-data` picked for "how many seats, the dietary
+/// counts, who hasn't replied, and draft the caterer email", the email's details file
+/// never opened; 0.9, where the model called for skills itself, read it every run).
+pub const START_THINKING: &str = "Now do the user's whole request. These steps cover the \
+                                  part this skill is for; whatever else the request asks for \
+                                  (another file in the folder, a draft, a total) is still \
+                                  yours to do. Think the task through first, then call the \
+                                  tools it needs. Don't describe the steps or ask whether to \
+                                  go on.";
 
 #[cfg(test)]
 mod tests {
@@ -494,6 +555,33 @@ mod tests {
         assert_eq!(
             names,
             [("other", "from builtin/b"), ("same", "from user/x")]
+        );
+    }
+
+    #[test]
+    fn a_skills_text_ends_by_saying_to_start() {
+        let s = skill("x", "1. Read it.\n");
+        assert_eq!(
+            instructions(&s, false),
+            format!("Skill \"x\":\n\n1. Read it.\n\n{START}")
+        );
+        // Thinking on: the whole request, and no push to call a tool before thinking.
+        let thinking = instructions(&s, true);
+        assert!(thinking.ends_with(START_THINKING));
+        assert!(!thinking.contains("start with step 1"));
+        assert!(START_THINKING.contains("whole request"));
+    }
+
+    #[test]
+    fn a_model_is_told_the_skills_and_can_ask_for_one() {
+        let skills = [skill("draft-message", "1. Draft it."), skill("apply-policy", "1. Read it.")];
+        let list = listing(&skills);
+        assert!(list.starts_with("Skills: "));
+        assert!(list.ends_with("\n- draft-message: d\n- apply-policy: d"));
+        assert_eq!(asked_for(" draft-message ", &skills).unwrap(), "Skill \"draft-message\":\n\n1. Draft it.");
+        assert_eq!(
+            asked_for("nope", &skills).unwrap_err(),
+            "No skill called \"nope\". Skills: draft-message, apply-policy."
         );
     }
 

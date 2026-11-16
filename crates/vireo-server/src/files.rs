@@ -208,7 +208,15 @@ impl Files {
     pub fn check(&self, call: &Call) -> Result<(), String> {
         match call.tool.as_str() {
             "write_file" => self.writable(&arg(call, "path")?).map(|_| ()),
-            "write_spreadsheet" => self.office_target(&arg(call, "path")?, ".xlsx").map(|_| ()),
+            // The workbook is written out but not saved: rows it would refuse (a header
+            // written over, rows already there) are said before anyone is asked to approve.
+            "write_spreadsheet" => self
+                .spreadsheet_written(
+                    &arg(call, "path")?,
+                    &optional_arg(call, "start_cell").unwrap_or_default(),
+                    call.json("rows").or_else(|| call.text("rows")).unwrap_or(""),
+                )
+                .map(|_| ()),
             "create_docx" => self.office_target(&arg(call, "path")?, ".docx").map(|_| ()),
             "create_pptx" => self.office_target(&arg(call, "path")?, ".pptx").map(|_| ()),
             "fill_docx_template" => self
@@ -411,6 +419,18 @@ impl Files {
     /// Rows of values into a workbook's first sheet, from a cell or after its last row;
     /// the workbook is made when there's none (`attach::xlsx_write`).
     fn write_spreadsheet(&self, path: &str, start: &str, rows: &str) -> Result<String, String> {
+        let (file, bytes, message) = self.spreadsheet_written(path, start, rows)?;
+        self.replace(&file, &bytes)?;
+        Ok(message)
+    }
+
+    /// The workbook as `write_spreadsheet` would save it: its path, bytes and answer.
+    fn spreadsheet_written(
+        &self,
+        path: &str,
+        start: &str,
+        rows: &str,
+    ) -> Result<(String, Vec<u8>, String), String> {
         use crate::attach::xlsx_write;
         let file = self.office_target(path, ".xlsx")?;
         let start = xlsx_write::Start::parse(start)?;
@@ -421,8 +441,7 @@ impl Files {
             None
         };
         let (bytes, message) = xlsx_write::write(&file, existing.as_deref(), start, &rows)?;
-        self.replace(&file, &bytes)?;
-        Ok(message)
+        Ok((file, bytes, message))
     }
 
     fn rename_file(&self, path: &str, new_name: &str) -> Result<String, String> {
@@ -484,6 +503,9 @@ impl Files {
         {
             expanded = rest;
         }
+        let relative = !expanded.is_empty()
+            && !is_absolute(expanded)
+            && !expanded.starts_with(['/', '\\']);
         let full = standardized(&if is_absolute(expanded) {
             expanded.to_string()
         } else if cfg!(windows) && (expanded.starts_with('/') || expanded.starts_with('\\')) {
@@ -499,6 +521,19 @@ impl Files {
             Access::Folders(folders) => {
                 if folders.iter().any(|f| is_within(&full, f)) {
                     return Ok(full);
+                }
+                // A relative path that isn't under the home folder's own copy of a chosen
+                // folder is looked for inside the chosen folders, as the user writes one
+                // ("Admin/CCA-Form-Template.docx", from the folder they work in). 0.9
+                // resolved them so; here `list_directory Admin` failed as outside the
+                // chat's folders and the model spent a dozen calls finding its way (Nov 15
+                // test gauntlet, 6.1 and 12.3).
+                if relative {
+                    match Self::within_folders(folders, expanded) {
+                        Ok(Some(found)) => return Ok(found),
+                        Ok(None) => {}
+                        Err(several) => return Err(several),
+                    }
                 }
                 let allowed = if folders.is_empty() {
                     "none".to_string()
@@ -525,6 +560,68 @@ impl Files {
                 Ok(full)
             }
         }
+    }
+
+    /// A relative path inside the folders a chat may reach: where it exists, or failing
+    /// that where the folder it would go in exists (a file about to be written). `None`
+    /// when neither (the path stays outside the chat's folders, as before); `Err` when it
+    /// is in more than one of them.
+    fn within_folders(folders: &[String], relative: &str) -> Result<Option<String>, String> {
+        let candidates: Vec<String> = folders
+            .iter()
+            .map(|f| standardized(&join(f, relative)))
+            .filter(|c| folders.iter().any(|f| is_within(c, f)))
+            .collect();
+        let pick = |found: Vec<&String>| -> Result<Option<String>, String> {
+            match found.as_slice() {
+                [] => Ok(None),
+                [one] => Ok(Some((*one).clone())),
+                many => Err(format!(
+                    "\"{relative}\" is in more than one of this chat's folders: {}. Give the full path of the one you mean.",
+                    many.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")
+                )),
+            }
+        };
+        if let Some(found) = pick(candidates.iter().filter(|c| exists(c)).collect())? {
+            return Ok(Some(found));
+        }
+        let parent_exists = |c: &&String| {
+            std::path::Path::new(c.as_str())
+                .parent()
+                .and_then(|p| p.to_str())
+                .is_some_and(exists)
+        };
+        pick(candidates.iter().filter(parent_exists).collect())
+    }
+
+    /// The folder a file is in, and what else is in it that this chat may reach, by name
+    /// (a folder's ends with "/"), in name order, hidden things left out. `None` when the
+    /// file isn't there.
+    pub fn beside(&self, path: &str) -> Option<(String, Vec<String>)> {
+        let full = self.resolve(path).ok()?;
+        if !exists(&full) || is_dir(&full) {
+            return None;
+        }
+        let folder = parent(&full);
+        let mut names: Vec<String> = fs::read_dir(&folder)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = join(&folder, &name);
+                (!name.starts_with('.') && path != full && self.reachable(&path))
+                    .then(|| if is_dir(&path) { format!("{name}/") } else { name })
+            })
+            .collect();
+        names.sort();
+        Some((folder, names))
+    }
+
+    /// Whether a path this chat may reach is a folder (`false`: a file); `None` when it
+    /// isn't there or isn't the chat's to reach.
+    pub fn is_folder(&self, path: &str) -> Option<bool> {
+        let full = self.resolve(path).ok()?;
+        exists(&full).then(|| is_dir(&full))
     }
 
     fn reachable(&self, path: &str) -> bool {
@@ -1427,6 +1524,48 @@ mod tests {
         let chosen = tools(&h, Access::Folders(vec![format!("{home}/Documents/New")]));
         assert!(failure(&chosen, "write_file", &[("path", "Documents/Invoices/x.txt"), ("content", "x")]).contains("outside the folders"));
         assert!(failure(&chosen, "move_file", &[("source", "Documents/New/plan.md"), ("destination", "Documents/plan.md")]).contains("outside the folders"));
+    }
+
+    #[test]
+    fn a_file_knows_what_is_beside_it() {
+        let h = home();
+        let home = h.0.clone();
+        make(&h, "Trip/itinerary.eml", "flights");
+        make(&h, "Trip/agenda.eml", "agenda");
+        make(&h, "Trip/.hidden", "x");
+        make(&h, "Trip/Receipts/taxi.pdf", "pdf");
+        let t = tools(&h, Access::Folders(vec![format!("{home}/Trip")]));
+        assert_eq!(
+            t.beside("itinerary.eml"),
+            Some((format!("{home}/Trip"), vec!["Receipts/".to_string(), "agenda.eml".to_string()]))
+        );
+        assert_eq!(t.beside("Trip"), None);
+        assert_eq!(t.beside("Trip/none.eml"), None);
+    }
+
+    #[test]
+    fn a_relative_path_is_looked_for_inside_the_chosen_folders() {
+        let h = home();
+        let home = h.0.clone();
+        let work = format!("{home}/Work/Aurelia");
+        fs::create_dir_all(format!("{work}/Admin")).unwrap();
+        fs::write(format!("{work}/Admin/form.md"), "the form").unwrap();
+        let t = tools(&h, Access::Folders(vec![work.clone()]));
+        // As the user names it, from the folder they work in; the home folder's way still works.
+        assert_eq!(run(&t, "read_file", &[("path", "Admin/form.md")]), "the form");
+        assert_eq!(run(&t, "read_file", &[("path", "Work/Aurelia/Admin/form.md")]), "the form");
+        assert_eq!(run(&t, "list_directory", &[("path", "Admin")]), "[file] form.md");
+        // A new file goes where its folder is; one whose folder is nowhere stays outside.
+        assert_eq!(t.resolve("Admin/new.md"), Ok(format!("{work}/Admin/new.md")));
+        assert!(t.resolve("Elsewhere/new.md").unwrap_err().contains("outside the folders"));
+        // No way out of the chosen folder by a relative path.
+        assert!(t.resolve("Admin/../../../Documents/x.md").unwrap_err().contains("outside the folders"));
+        // In two chosen folders: the model is told, not given one of them.
+        let other = format!("{home}/Work/Other");
+        fs::create_dir_all(format!("{other}/Admin")).unwrap();
+        fs::write(format!("{other}/Admin/form.md"), "another").unwrap();
+        let both = tools(&h, Access::Folders(vec![work, other]));
+        assert!(both.resolve("Admin/form.md").unwrap_err().contains("more than one"));
     }
 
     fn call(tool: &str, args: &[(&str, &str)]) -> Call {

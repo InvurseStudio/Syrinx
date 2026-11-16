@@ -108,8 +108,42 @@ pub fn write(
         Start::Cell { column, row } => (column, row),
         Start::Append => (1, last_row.map_or(1, |r| r + 1)),
     };
+    // Added after the last row: a row the sheet already has, the same in every cell, isn't
+    // added again. A job run twice wrote its rows twice (Nov 15 test gauntlet, 10.3: six
+    // invoices put in the register a second time, an hour after the first).
+    let mut already: Vec<u32> = Vec::new();
+    let rows: Vec<&Vec<Value>> = match (start, existing) {
+        (Start::Append, Some(data)) => {
+            let book = xlsx::open(data)?;
+            let have = book.sheets.first().map_or(&[][..], |s| s.rows.as_slice());
+            rows.iter()
+                .filter(|row| match same_row(have, row) {
+                    Some(number) => {
+                        already.push(number);
+                        false
+                    }
+                    None => true,
+                })
+                .collect()
+        }
+        _ => rows.iter().collect(),
+    };
+    let left_out = match already.len() {
+        0 => String::new(),
+        n => format!(
+            "{n} row{} already in the sheet, the same in every cell (row{} {})",
+            if n == 1 { " is" } else { "s are" },
+            if n == 1 { "" } else { "s" },
+            already.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if rows.iter().all(|row| row.iter().all(blank)) {
+        return Err(format!(
+            "Nothing was added: {left_out}. Don't add them again; say they were already there."
+        ));
+    }
     if let Some(data) = existing {
-        refuse_header_overwrite(data, &sheet_name, column, row, &rows[0], last_row)?;
+        refuse_header_overwrite(data, &sheet_name, column, row, rows[0], last_row)?;
     }
 
     let (mut written, mut width) = (0usize, 0usize);
@@ -157,11 +191,44 @@ pub fn write(
         row + rows.len() as u32 - 1
     );
     let message = format!(
-        "Spreadsheet written successfully: {path}\nWrote {written} cell{} to {sheet_name}!{area}{}.",
+        "Spreadsheet written successfully: {path}\nWrote {written} cell{} to {sheet_name}!{area}{}.{}",
         if written == 1 { "" } else { "s" },
-        if existing.is_some() { "" } else { " in a new workbook" }
+        if existing.is_some() { "" } else { " in a new workbook" },
+        if left_out.is_empty() {
+            String::new()
+        } else {
+            format!("\nNot added again: {left_out}.")
+        }
     );
     Ok((stored_zip(&files), message))
+}
+
+/// The sheet's row that holds just what `row` would: the same cells filled, each with the
+/// same text or the same number (120.5 and "120.50" are one amount).
+fn same_row(have: &[(u32, Vec<(u32, String)>)], row: &[Value]) -> Option<u32> {
+    let new: Vec<(u32, String)> = row
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !blank(v))
+        .map(|(c, v)| (c as u32 + 1, shown(v)))
+        .collect();
+    if new.is_empty() {
+        return None;
+    }
+    let number = |text: &str| text.trim().replace(',', "").parse::<f64>().ok();
+    let same = |a: &str, b: &str| {
+        a.trim() == b.trim()
+            || matches!((number(a), number(b)), (Some(x), Some(y)) if (x - y).abs() <= 1e-9 * x.abs().max(y.abs()))
+    };
+    have.iter()
+        .find(|(_, cells)| {
+            let mut old: Vec<&(u32, String)> =
+                cells.iter().filter(|c| !c.1.trim().is_empty()).collect();
+            old.sort_by_key(|c| c.0);
+            old.len() == new.len()
+                && old.iter().zip(&new).all(|(o, n)| o.0 == n.0 && same(&o.1, &n.1))
+        })
+        .map(|r| r.0)
 }
 
 /// Refuses new rows written over a sheet's header row, which is almost certainly a
@@ -633,6 +700,23 @@ mod tests {
         assert!(!part("xl/_rels/workbook.xml.rels").contains("calcChain"));
         assert!(!part("[Content_Types].xml").contains("calcChain"));
         assert_eq!(part("xl/styles.xml"), "<styleSheet/>");
+
+        // Added again, a row that's already there stays one row; a new one beside it goes in.
+        let again = values(r#"[["NP-2", "80.00"], ["NP-4", 15]]"#);
+        let (once, message) = write("r.xlsx", Some(&bytes), Start::Append, &again).unwrap();
+        assert_eq!(
+            message,
+            "Spreadsheet written successfully: r.xlsx\nWrote 2 cells to Register!A5:B5.\nNot added again: 1 row is already in the sheet, the same in every cell (row 3)."
+        );
+        let zip = Zip::open(&once).unwrap();
+        let sheet = String::from_utf8(zip.read("xl/worksheets/sheet1.xml").unwrap().unwrap()).unwrap();
+        assert_eq!(text_of(&sheet).matches("NP-2").count(), 1);
+        assert_eq!(
+            write("r.xlsx", Some(&bytes), Start::Append, &values(r#"[["NP-2", 80]]"#)).unwrap_err(),
+            "Nothing was added: 1 row is already in the sheet, the same in every cell (row 3). Don't add them again; say they were already there."
+        );
+        // Written at a cell, the rows go where they're put.
+        assert!(write("r.xlsx", Some(&bytes), Start::parse("a3").unwrap(), &values(r#"[["NP-2", 80]]"#)).is_ok());
 
         // A cell written over keeps its style; a cell written between two goes between.
         let (bytes, _) = write("r.xlsx", Some(&bytes), Start::parse("b2").unwrap(), &values("[[99]]")).unwrap();
