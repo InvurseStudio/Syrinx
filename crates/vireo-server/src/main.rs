@@ -1241,6 +1241,51 @@ const STEPS_HEADROOM: usize = 384 << 20;
 
 /// How many tokens `ids` starts with that `tokens` does too, leaving at least the last of
 /// `ids` to read again (for its logits).
+/// The most tokens of a past request's date note looked for in a chat's cache.
+const NOTE_MOST: usize = 48;
+
+/// A prompt with the date notes of the chat's earlier requests put back where its cache
+/// has them, and its `mark` moved along. A request with tools ends with the date after
+/// its last message (`dated`), read apart from the history; the next turn's history
+/// doesn't have it, so the prompt parted from the cache there and the last reply was
+/// read again every turn. Where the prompt parts from `cache` at the end of a turn and
+/// the cache goes on with such a note (and nothing else: checked by its text), the
+/// note's tokens go into the prompt as the cache has them. Only while the prompt still
+/// fits `room`. For a Qwen whose past turns are written as the model wrote them (Qwen
+/// 3.8, thinking off): its chat then goes on from the end of its cache.
+fn keep_notes(
+    tokenizer: &Tokenizer,
+    cache: &[u32],
+    mut ids: Vec<u32>,
+    mut mark: usize,
+    room: usize,
+) -> (Vec<u32>, usize) {
+    let Some(end) = tokenizer.token_id("<|im_end|>") else {
+        return (ids, mark);
+    };
+    let mut from = 0;
+    while from < cache.len() && from < mark {
+        let at = from + shared_start(&cache[from..], &ids[from..]);
+        if at >= mark || at >= cache.len() || ids[at] != end {
+            break;
+        }
+        let Some(len) = cache[at..].iter().take(NOTE_MOST).position(|&t| t == end) else {
+            break;
+        };
+        let note = tokenizer.decode(&cache[at..at + len], false);
+        let dated = note.strip_prefix("\n\n(Today is ").is_some_and(|rest| {
+            rest.strip_suffix(".)").is_some_and(|date| !date.contains(['\n', '(', ')']))
+        });
+        if len == 0 || !dated || ids.len() + len > room {
+            break;
+        }
+        ids.splice(at..at, cache[at..at + len].iter().copied());
+        mark += len;
+        from = at + len;
+    }
+    (ids, mark)
+}
+
 fn shared_start(tokens: &[u32], ids: &[u32]) -> usize {
     tokens
         .iter()
@@ -1828,6 +1873,7 @@ fn engine(
         })?;
         let tokenizer = Tokenizer::from_gguf(file).map_err(|e| e.to_string())?;
         chat::follow_template(file.get_str("tokenizer.chat_template"));
+        chat::note_qwen_template(file.get_str("tokenizer.chat_template"));
         let gpu = Gpu::open().map_err(|e| format!("No GPU for the engine: {e}"))?;
         let gpu_name = gpu.info.name.clone();
         let e = |e: vireo_engine::models::Error| e.to_string();
@@ -2485,6 +2531,11 @@ fn reply(
     if let Some(store) = store {
         switch_chat(model, kept, store, &ids, context)?;
     }
+    let (ids, mark) = if family == Family::Qwen35 && chat::qwen_keeps_thought() {
+        keep_notes(tokenizer, &kept.tokens, ids, mark, context.saturating_sub(max_tokens))
+    } else {
+        (ids, mark)
+    };
     // Qwen and Gemma: where the system turn ends, for a saved start for new chats.
     let head = if matches!(family, Family::Qwen35 | Family::Gemma4) {
         let turn = chat::history(
@@ -2505,7 +2556,7 @@ fn reply(
     }
     let prompt_seconds = started.elapsed().as_secs_f64();
 
-    let settings = family.sampling().with(job.generation.as_ref());
+    let settings = family.sampling(thinking_on).with(job.generation.as_ref());
     let mut sampler = Sampler::new(settings, seed);
     // Gemma 4's thinking channel, for a thought it opens with thinking off (with it on,
     // `think` has these tokens).

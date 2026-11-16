@@ -11,6 +11,10 @@ pub struct Settings {
     pub top_k: usize,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    /// Taken from the logit of every token the reply already has (0 for none), as
+    /// OpenAI's and vLLM's `presence_penalty`. Not applied to a greedy pick
+    /// (temperature 0), which stays the model's likeliest token.
+    pub presence_penalty: f32,
 }
 
 impl Default for Settings {
@@ -21,6 +25,7 @@ impl Default for Settings {
             top_k: 0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
         }
     }
 }
@@ -45,6 +50,9 @@ impl Settings {
         if let Some(v) = g.num("repetition_penalty") {
             self.repetition_penalty = v as f32;
         }
+        if let Some(v) = g.num("presence_penalty") {
+            self.presence_penalty = v as f32;
+        }
         self
     }
 }
@@ -54,6 +62,8 @@ impl Settings {
 const MOST_CANDIDATES: usize = 1024;
 /// Tokens the repetition penalty looks back over.
 const PENALTY_WINDOW: usize = 64;
+/// Tokens the presence penalty looks back over: the reply so far, up to this many.
+const PRESENCE_WINDOW: usize = 1024;
 
 pub struct Sampler {
     settings: Settings,
@@ -94,6 +104,19 @@ impl Sampler {
                 };
                 if !penalized.iter().any(|&(p, _)| p == id) {
                     penalized.push((id, v));
+                }
+            }
+        }
+        if s.presence_penalty != 0.0 && s.temperature > 0.0 {
+            let start = recent.len().saturating_sub(PRESENCE_WINDOW);
+            let mut seen = std::collections::HashSet::new();
+            for &id in &recent[start..] {
+                if !seen.insert(id) {
+                    continue;
+                }
+                match penalized.iter_mut().find(|p| p.0 == id) {
+                    Some(p) => p.1 -= s.presence_penalty,
+                    None => penalized.push((id, logits[id as usize] - s.presence_penalty)),
                 }
             }
         }
@@ -213,6 +236,21 @@ mod tests {
             7,
         );
         assert!((0..50).all(|_| k1.pick(&logits, &[]) == 1));
+    }
+
+    #[test]
+    fn presence_penalty_pushes_used_tokens_down_but_not_a_greedy_pick() {
+        // Token 0 leads by 1.0; a presence penalty of 1.5 puts token 1 ahead once 0 is used.
+        let logits = [3.0f32, 2.0, -9.0];
+        let settings = |temperature| Settings {
+            temperature,
+            top_k: 1,
+            presence_penalty: 1.5,
+            ..Settings::default()
+        };
+        assert_eq!(Sampler::new(settings(1.0), 7).pick(&logits, &[]), 0);
+        assert_eq!(Sampler::new(settings(1.0), 7).pick(&logits, &[0, 0]), 1);
+        assert_eq!(Sampler::new(settings(0.0), 7).pick(&logits, &[0, 0]), 0);
     }
 
     #[test]
