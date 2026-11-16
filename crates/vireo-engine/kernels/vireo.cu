@@ -42,12 +42,15 @@ __device__ __forceinline__ float half_at(const u8* p) {
     return __half2float(*reinterpret_cast<const __half*>(p));
 }
 
-// Four bytes from an address that's only 2-byte aligned (Q4_0, Q8_0 and Q6_K blocks
-// have odd sizes, so their contents are only 2-byte aligned).
+// Four bytes from an address that's only 2-byte aligned (Q8_0's blocks have an odd size,
+// so their contents are only 2-byte aligned).
 __device__ __forceinline__ u32 u32_at2(const u8* p) {
     const u16* h = reinterpret_cast<const u16*>(p);
     return (u32)h[0] | ((u32)h[1] << 16);
 }
+
+// Four bytes from a 4-byte-aligned address: Q6_K's words (its blocks start 16-byte aligned).
+__device__ __forceinline__ u32 u32_at4(const u8* p) { return *reinterpret_cast<const u32*>(p); }
 
 __device__ __forceinline__ float4 f4(const float* p) { return *reinterpret_cast<const float4*>(p); }
 
@@ -117,9 +120,53 @@ __device__ __forceinline__ float q4_0_scale(const u8* row, int blocks, int b) {
     return half_at(row + (size_t)blocks * 16 + b * 2);
 }
 
-// Q6_K on the GPU: GGUF's 210-byte blocks padded to 224, so each starts 16-byte aligned
-// (Gpu::upload_weights). The contents are as in GGUF.
-#define Q6K_BYTES 224
+// Q8_0 on the GPU, as Q4_0: each row's numbers first (32 bytes a block, so any 4 or 16 of
+// them are one aligned load), then its f16 scales, padded to 16 bytes
+// (Gpu::upload_weights repacks GGUF's 34-byte blocks so). A word of a 34-byte block was
+// two loads of a half, and a token's pass waited on the loads.
+__device__ __forceinline__ size_t q8_0_row_bytes(int cols) {
+    const int blocks = cols / 32;
+    return (size_t)blocks * 32 + ((blocks * 2 + 15) & ~15);
+}
+
+__device__ __forceinline__ float q8_0_scale(const u8* row, int blocks, int b) {
+    return half_at(row + (size_t)blocks * 32 + b * 2);
+}
+
+// Q6_K on the GPU: each row's blocks without their f16 scale d (208 bytes: ql 128, qh 64,
+// 16 int8 scales, as in GGUF), so every block starts 16-byte aligned, then the row's d's,
+// padded to 16 bytes (Gpu::upload_weights). 210 bytes a block and a few a row, where
+// padding each block to 224 was 6% more to read for every token written (the Mac pads to
+// 212 and reads words; here the tensor-core products read 16 bytes at a time).
+#define Q6K_BYTES 208
+
+__device__ __forceinline__ size_t q6_k_row_bytes(int cols) {
+    const int blocks = cols / 256;
+    return (size_t)blocks * Q6K_BYTES + ((blocks * 2 + 15) & ~15);
+}
+
+// Block b's d, as its 16 bits.
+__device__ __forceinline__ u32 q6_k_d_bits(const u8* row, int blocks, int b) {
+    return *reinterpret_cast<const u16*>(row + (size_t)blocks * Q6K_BYTES + b * 2);
+}
+
+// A lane's four scales (one a run of 32: the 16 its 4 numbers of that run are in) from one
+// 8-byte load of its half's 8, not four loads of a byte. l is the lane's place in a run.
+struct Q6Scales {
+    uint2 w;
+    int shift;
+    __device__ __forceinline__ int at(int k) const {
+        return (int)(signed char)(((k < 2 ? w.x : w.y) >> (shift + (k & 1) * 16)) & 0xFF);
+    }
+};
+
+__device__ __forceinline__ Q6Scales q6_k_scales(const u8* block, int half, int l) {
+    return {*reinterpret_cast<const uint2*>(block + 192 + half * 8), (l / 16) * 8};
+}
+
+__device__ __forceinline__ float q6_k_d(const u8* row, int blocks, int b) {
+    return half_at(row + (size_t)blocks * Q6K_BYTES + b * 2);
+}
 
 // ---- Matrix-vector products: y = W x, one warp per row of W -------------------------
 //
@@ -213,23 +260,23 @@ __device__ __forceinline__ float bit_dot8(uint2 q, int shift, float4 a, float4 b
            small_int((hi >> 16) & 1, 0.0f) * b.z + small_int(hi >> 24, 0.0f) * b.w;
 }
 
-// Q8_0: blocks of 32 in 34 bytes (f16 scale, 32 int8s). 8 lanes per block, 4 numbers
-// each; a warp takes 4 blocks per step.
+// Q8_0 (the GPU layout, see q8_0_row_bytes). 8 lanes per block, 4 numbers each; a warp
+// takes 4 blocks per step.
 extern "C" __global__ void matvec_q8_0(const u8* w, const float* x, float* y, int rows, int cols) {
     MATVEC_ROWS
     const int blocks = cols / 32;
-    const size_t row_bytes = (size_t)blocks * 34;
+    const size_t row_bytes = q8_0_row_bytes(cols);
     const int sub = lane >> 3, j = (lane & 7) * 4;
     for (int b = sub; b < blocks; b += 4) {
         const float4 xv = f4(x + b * 32 + j);
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 34;
-            const u32 q = u32_at2(block + 2 + j);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const u32 q = u32_at4(row + b * 32 + j);
             const float dot = small_int((q & 0xFF) ^ 0x80, 128.0f) * xv.x + small_int(((q >> 8) & 0xFF) ^ 0x80, 128.0f) * xv.y +
                               small_int(((q >> 16) & 0xFF) ^ 0x80, 128.0f) * xv.z + small_int((q >> 24) ^ 0x80, 128.0f) * xv.w;
-            sum[r] += half_at(block) * dot;
+            sum[r] += q8_0_scale(row, blocks, b) * dot;
         }
     }
     MATVEC_STORE
@@ -335,14 +382,13 @@ extern "C" __global__ void matvec_q5_k(const u8* w, const float* x, float* y, in
     MATVEC_STORE
 }
 
-// Q6_K: blocks of 256 in 210 bytes (ql 128, qh 64, 16 int8 scales, f16 d), padded to
-// Q6K_BYTES on the GPU so they start 16-byte aligned (Gpu::upload_weights). Each half
-// of a block is 4 runs of 32 numbers. 16 lanes per block: lane j takes 4 positions of
+// Q6_K: blocks of 256 in 210 bytes (ql 128, qh 64, 16 int8 scales, f16 d), laid out on
+// the GPU as Q6K_BYTES above says. Each half of a block is 4 runs of 32 numbers. 16 lanes per block: lane j takes 4 positions of
 // one half (16 numbers, one from each run). A warp takes 2 blocks per step.
 extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, int rows, int cols) {
     MATVEC_ROWS
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
+    const size_t row_bytes = q6_k_row_bytes(cols);
     const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
     for (int b = sub; b < blocks; b += 2) {
         const float* xb = x + b * 256 + half * 128 + l;
@@ -352,11 +398,12 @@ extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, in
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
-            const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + half * 64 + l), ql1 = u32_at2(block + half * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + half * 32 + l);
-            const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const u8* block = row + b * Q6K_BYTES;
+            const float d = q6_k_d(row, blocks, b);
+            const u32 ql0 = u32_at4(block + half * 64 + l), ql1 = u32_at4(block + half * 64 + 32 + l);
+            const u32 qh = u32_at4(block + 128 + half * 32 + l);
+            const Q6Scales sc = q6_k_scales(block, half, l);
             float block_sum = 0.0f;
 #pragma unroll
             for (int k = 0; k < 4; k++) {
@@ -365,7 +412,7 @@ extern "C" __global__ void matvec_q6_k(const u8* w, const float* x, float* y, in
                 const float q1 = small_int(((low >> 8) & 0xF) | (((qh >> (8 + 2 * k)) & 3) << 4), 32.0f);
                 const float q2 = small_int(((low >> 16) & 0xF) | (((qh >> (16 + 2 * k)) & 3) << 4), 32.0f);
                 const float q3 = small_int(((low >> 24) & 0xF) | (((qh >> (24 + 2 * k)) & 3) << 4), 32.0f);
-                block_sum += (float)sc[2 * k] * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
+                block_sum += (float)sc.at(k) * (q0 * xv[k].x + q1 * xv[k].y + q2 * xv[k].z + q3 * xv[k].w);
             }
             sum[r] += d * block_sum;
         }
@@ -409,10 +456,15 @@ __device__ __forceinline__ void decode8<K_Q4_0>(const u8* row, int k, float* v) 
 
 template <>
 __device__ __forceinline__ void decode8<K_Q8_0>(const u8* row, int k, float* v) {
-    const u8* block = row + (k / 32) * 34;
-    const float d = half_at(block);
-    const int j = k % 32;
-    for (int i = 0; i < 8; i++) v[i] = d * (float)(signed char)block[2 + j + i];
+    // As Q4_0: the row's scales are past its numbers, so decode8_q8_0 takes the block count.
+    (void)row;
+    (void)k;
+    (void)v;
+}
+
+__device__ __forceinline__ void decode8_q8_0(const u8* row, int blocks, int k, float* v) {
+    const float d = q8_0_scale(row, blocks, k / 32);
+    for (int i = 0; i < 8; i++) v[i] = d * (float)(signed char)row[k + i];
 }
 
 template <>
@@ -445,9 +497,16 @@ __device__ __forceinline__ void decode8<K_Q5_K>(const u8* row, int k, float* v) 
 
 template <>
 __device__ __forceinline__ void decode8<K_Q6_K>(const u8* row, int k, float* v) {
+    // As Q4_0: the row's d's are past its blocks, so decode8_q6_k takes the block count.
+    (void)row;
+    (void)k;
+    (void)v;
+}
+
+__device__ __forceinline__ void decode8_q6_k(const u8* row, int blocks, int k, float* v) {
     const u8* block = row + (k / 256) * Q6K_BYTES;
     const int n = k % 256, half = n / 128, run = (n % 128) / 32, l = n % 32;
-    const float d = half_at(block + 208);
+    const float d = q6_k_d(row, blocks, k / 256);
     const u8* ql = block + half * 64 + (run & 1) * 32 + l;
     const u8* qh = block + 128 + half * 32 + l;
     const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16 + 2 * run);
@@ -494,6 +553,10 @@ __device__ void matmul(const u8* w, size_t row_bytes, const float* x, float* y, 
             if (r < rows) {
                 if (KIND == K_Q4_0)
                     decode8_q4_0(w + (size_t)r * row_bytes, cols / 32, k0 + load_k, v);
+                else if (KIND == K_Q8_0)
+                    decode8_q8_0(w + (size_t)r * row_bytes, cols / 32, k0 + load_k, v);
+                else if (KIND == K_Q6_K)
+                    decode8_q6_k(w + (size_t)r * row_bytes, cols / 256, k0 + load_k, v);
                 else
                     decode8<KIND>(w + (size_t)r * row_bytes, k0 + load_k, v);
             } else {
@@ -555,10 +618,10 @@ __device__ void matmul(const u8* w, size_t row_bytes, const float* x, float* y, 
 MATMUL(matmul_f32, K_F32, cols * 4)
 MATMUL(matmul_f16, K_F16, cols * 2)
 MATMUL(matmul_q4_0, K_Q4_0, q4_0_row_bytes(cols))
-MATMUL(matmul_q8_0, K_Q8_0, cols / 32 * 34)
+MATMUL(matmul_q8_0, K_Q8_0, q8_0_row_bytes(cols))
 MATMUL(matmul_q4_k, K_Q4_K, cols / 256 * 144)
 MATMUL(matmul_q5_k, K_Q5_K, cols / 256 * 176)
-MATMUL(matmul_q6_k, K_Q6_K, cols / 256 * Q6K_BYTES)
+MATMUL(matmul_q6_k, K_Q6_K, q6_k_row_bytes(cols))
 
 // ---- 8-bit activations: faster, not exact ---------------------------------------------
 //
@@ -692,21 +755,30 @@ __device__ __forceinline__ int i32_at(const signed char* p) { return *reinterpre
 // The dp4a matrix-vector kernels: as the f32 ones (MV_ROWS rows a warp, lanes laid out
 // the same), with x as 8-bit numbers.
 
-// Q8_0: d × dx × Σ q qx per block of 32.
+// Q8_0: d × dx × Σ q qx per block of 32. 2 lanes per block, 16 bytes each in one load; a
+// warp takes 16 blocks (512 bytes of a row) per step. With 8 lanes of 4 bytes a block a
+// step was 128 bytes of a row, and the reads' latency, not memory, set the pace
+// (Qwen 3.5 4B's ssm_out 49 us for 11 MB; its 32-row ssm_alpha 15 us).
+#define Q8_STEP 16
+__device__ __forceinline__ int dot16(uint4 q, uint4 x) {
+    return __dp4a((int)q.w, (int)x.w, __dp4a((int)q.z, (int)x.z, __dp4a((int)q.y, (int)x.y, __dp4a((int)q.x, (int)x.x, 0))));
+}
+
 extern "C" __global__ void matvec8_q8_0(const u8* w, const signed char* xq, const float* xd, float* y, int rows,
                                         int cols) {
     MATVEC_ROWS
     const int blocks = cols / 32;
-    const size_t row_bytes = (size_t)blocks * 34;
-    const int sub = lane >> 3, j = (lane & 7) * 4;
-    for (int b = sub; b < blocks; b += 4) {
-        const int xv = i32_at(xq + b * 32 + j);
+    const size_t row_bytes = q8_0_row_bytes(cols);
+    const int sub = lane >> 1, j = (lane & 1) * 16;
+    for (int b = sub; b < blocks; b += Q8_STEP) {
+        const uint4 xv = *reinterpret_cast<const uint4*>(xq + b * 32 + j);
         const float dx = xd[b];
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 34;
-            sum[r] += half_at(block) * dx * (float)__dp4a((int)u32_at2(block + 2 + j), xv, 0);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const uint4 q = *reinterpret_cast<const uint4*>(row + b * 32 + j);
+            sum[r] += q8_0_scale(row, blocks, b) * dx * (float)dot16(q, xv);
         }
     }
     MATVEC_STORE
@@ -812,37 +884,67 @@ extern "C" __global__ void matvec8_q5_k(const u8* w, const signed char* xq, cons
 }
 
 // Q6_K: d × scale × dx × Σ (q − 32) qx over each lane's 4 numbers of a run. Lanes as in
-// matvec_q6_k.
+// matvec_q6_k. A row and step is 5 loads a lane (three words, the half's scales, d) where
+// it was 11 (each word as two halves, each scale a byte), and x's four scales one: the
+// loads were what a token's pass waited on.
+// W words (1, 2 or 4) from a 4W-byte-aligned address, in one load.
+template <int W>
+__device__ __forceinline__ void words_at(const void* p, u32* out) {
+    if constexpr (W == 1) {
+        out[0] = *reinterpret_cast<const u32*>(p);
+    } else if constexpr (W == 2) {
+        const uint2 v = *reinterpret_cast<const uint2*>(p);
+        out[0] = v.x, out[1] = v.y;
+    } else {
+        const uint4 v = *reinterpret_cast<const uint4*>(p);
+        out[0] = v.x, out[1] = v.y, out[2] = v.z, out[3] = v.w;
+    }
+}
+
+// Words a lane: 1. With 2 (8 bytes of each run a lane, 4 blocks a step) writing was 6-9%
+// faster while the laptop's GPU was held to 45 W and level to 2% slower at full power, and
+// the sums are added in another order (Gemma 4 E4B's second token changed).
+#define Q6_W 1
 extern "C" __global__ void matvec8_q6_k(const u8* w, const signed char* xq, const float* xd, float* y, int rows,
                                         int cols) {
     MATVEC_ROWS
+    // A lane takes W words of each run of a half (4W numbers of each of its 4 runs), so
+    // 16 / W lanes a block and 2W blocks a step.
+    constexpr int W = Q6_W, LB = 16 / W;
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
-    const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
-    for (int b = sub; b < blocks; b += 2) {
+    const size_t row_bytes = q6_k_row_bytes(cols);
+    const int sub = lane / LB, half = (lane % LB) / (LB / 2), l = (lane % (LB / 2)) * 4 * W;
+    for (int b = sub; b < blocks; b += 32 / LB) {
         const signed char* xb = xq + b * 256 + half * 128 + l;
-        int xv[4];
+        u32 xv[4][W];
         float dx[4];
 #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            xv[k] = i32_at(xb + k * 32);
-            dx[k] = xd[b * 8 + half * 4 + k];
-        }
+        for (int k = 0; k < 4; k++) words_at<W>(xb + k * 32, xv[k]);
+        // The half's four scales of x in one load (xd is 16-byte aligned, 8 a block).
+        const float4 dxv = f4(xd + b * 8 + half * 4);
+        dx[0] = dxv.x, dx[1] = dxv.y, dx[2] = dxv.z, dx[3] = dxv.w;
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
-            const float d = half_at(block + 208);
-            const u32 ql0 = u32_at2(block + half * 64 + l), ql1 = u32_at2(block + half * 64 + 32 + l);
-            const u32 qh = u32_at2(block + 128 + half * 32 + l);
-            const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const u8* block = row + b * Q6K_BYTES;
+            const float d = q6_k_d(row, blocks, b);
+            u32 ql0[W], ql1[W], qh[W];
+            words_at<W>(block + half * 64 + l, ql0);
+            words_at<W>(block + half * 64 + 32 + l, ql1);
+            words_at<W>(block + 128 + half * 32 + l, qh);
+            const Q6Scales sc = q6_k_scales(block, half, l);
             float block_sum = 0.0f;
 #pragma unroll
             for (int k = 0; k < 4; k++) {
-                const u32 low = (((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
-                const u32 q = low | (((qh >> (2 * k)) & 0x03030303u) << 4);
-                const int dot = __dp4a((int)sext6(q), xv[k], 0);
-                block_sum += (float)sc[2 * k] * dx[k] * (float)dot;
+                int dot = 0;
+#pragma unroll
+                for (int i = 0; i < W; i++) {
+                    const u32 low = (((k & 1) ? ql1[i] : ql0[i]) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
+                    const u32 q = low | (((qh[i] >> (2 * k)) & 0x03030303u) << 4);
+                    dot = __dp4a((int)sext6(q), (int)xv[k][i], dot);
+                }
+                block_sum += (float)sc.at(k) * dx[k] * (float)dot;
             }
             sum[r] += d * block_sum;
         }
@@ -882,25 +984,26 @@ __device__ __forceinline__ void matvec8_few_q8_0(const u8* w, const signed char*
                                                  int rows, int cols, int tokens) {
     FEW_ROWS(T)
     const int blocks = cols / 32;
-    const size_t row_bytes = (size_t)blocks * 34;
-    const int sub = lane >> 3, j = (lane & 7) * 4;
-    for (int b = sub; b < blocks; b += 4) {
-        int xv[T];
+    const size_t row_bytes = q8_0_row_bytes(cols);
+    // Lanes as in matvec8_q8_0, so the sums are its sums.
+    const int sub = lane >> 1, j = (lane & 1) * 16;
+    for (int b = sub; b < blocks; b += Q8_STEP) {
+        uint4 xv[T];
         float dx[T];
 #pragma unroll
         for (int t = 0; t < T; t++) {
             const bool on = t < tokens;
-            xv[t] = on ? i32_at(xq + (size_t)t * cols + b * 32 + j) : 0;
+            xv[t] = on ? *reinterpret_cast<const uint4*>(xq + (size_t)t * cols + b * 32 + j) : make_uint4(0, 0, 0, 0);
             dx[t] = on ? xd[(size_t)t * xd_cols + b] : 0.0f;
         }
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
-            const u8* block = w + (row0 + r) * row_bytes + b * 34;
-            const float d = half_at(block);
-            const int q = (int)u32_at2(block + 2 + j);
+            const u8* row = w + (row0 + r) * row_bytes;
+            const float d = q8_0_scale(row, blocks, b);
+            const uint4 q = *reinterpret_cast<const uint4*>(row + b * 32 + j);
 #pragma unroll
-            for (int t = 0; t < T; t++) sum[r][t] += d * dx[t] * (float)__dp4a(q, xv[t], 0);
+            for (int t = 0; t < T; t++) sum[r][t] += d * dx[t] * (float)dot16(q, xv[t]);
         }
     }
     FEW_STORE(T)
@@ -1034,24 +1137,26 @@ template <int T>
 __device__ __forceinline__ void matvec8_few_q6_k(const u8* w, const signed char* xq, const float* xd, float* y,
                                                  int rows, int cols, int tokens) {
     FEW_ROWS(T)
+    // Lanes as in matvec8_q6_k (W words of each run a lane), so the sums are its sums.
+    constexpr int W = Q6_W, LB = 16 / W, STEP = 32 / LB;
     const int blocks = cols / 256;
-    const size_t row_bytes = (size_t)blocks * Q6K_BYTES;
-    const int sub = lane >> 4, half = (lane & 15) >> 3, l = (lane & 7) * 4;
+    const size_t row_bytes = q6_k_row_bytes(cols);
+    const int sub = lane / LB, half = (lane % LB) / (LB / 2), l = (lane % (LB / 2)) * 4 * W;
     // A step's weight words: the low bits of two runs' bytes, the high bits, d, and the
-    // 16-bit words holding the 4 scales (2-byte aligned).
+    // half's 8 scales.
     struct Words {
-        u32 ql0, ql1, qh, d, sc[4];
+        u32 ql0[W], ql1[W], qh[W], d;
+        Q6Scales sc;
     };
     auto fetch = [&](int r, int b) {
-        const u8* block = w + (row0 + r) * row_bytes + b * Q6K_BYTES;
+        const u8* row = w + (row0 + r) * row_bytes;
+        const u8* block = row + b * Q6K_BYTES;
         Words v;
-        v.ql0 = u32_at2(block + half * 64 + l);
-        v.ql1 = u32_at2(block + half * 64 + 32 + l);
-        v.qh = u32_at2(block + 128 + half * 32 + l);
-        v.d = *reinterpret_cast<const u16*>(block + 208);
-        const signed char* sc = reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16);
-#pragma unroll
-        for (int k = 0; k < 4; k++) v.sc[k] = (u32)(int)sc[2 * k];
+        words_at<W>(block + half * 64 + l, v.ql0);
+        words_at<W>(block + half * 64 + 32 + l, v.ql1);
+        words_at<W>(block + 128 + half * 32 + l, v.qh);
+        v.d = q6_k_d_bits(row, blocks, b);
+        v.sc = q6_k_scales(block, half, l);
         return v;
     };
     Words ahead[MV_ROWS] = {};
@@ -1060,8 +1165,8 @@ __device__ __forceinline__ void matvec8_few_q6_k(const u8* w, const signed char*
         for (int r = 0; r < MV_ROWS; r++)
             if (r < nrows) ahead[r] = fetch(r, sub);
     }
-    for (int b = sub; b < blocks; b += 2) {
-        int xv[T][4];
+    for (int b = sub; b < blocks; b += STEP) {
+        u32 xv[T][4][W];
         float dx[T][4];
 #pragma unroll
         for (int t = 0; t < T; t++) {
@@ -1069,37 +1174,47 @@ __device__ __forceinline__ void matvec8_few_q6_k(const u8* w, const signed char*
             const signed char* xb = xq + (size_t)t * cols + b * 256 + half * 128 + l;
 #pragma unroll
             for (int k = 0; k < 4; k++) {
-                xv[t][k] = on ? i32_at(xb + k * 32) : 0;
-                dx[t][k] = on ? xd[(size_t)t * xd_cols + b * 8 + half * 4 + k] : 0.0f;
+#pragma unroll
+                for (int i = 0; i < W; i++) xv[t][k][i] = 0;
+                if (on) words_at<W>(xb + k * 32, xv[t][k]);
             }
+            const float4 dxv = on ? f4(xd + (size_t)t * xd_cols + b * 8 + half * 4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            dx[t][0] = dxv.x, dx[t][1] = dxv.y, dx[t][2] = dxv.z, dx[t][3] = dxv.w;
         }
         // The next step's weights before this step's arithmetic (see Q4_K's).
         Words now[MV_ROWS];
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) now[r] = ahead[r];
-        if (b + 2 < blocks) {
+        if (b + STEP < blocks) {
 #pragma unroll
             for (int r = 0; r < MV_ROWS; r++)
-                if (r < nrows) ahead[r] = fetch(r, b + 2);
+                if (r < nrows) ahead[r] = fetch(r, b + STEP);
         }
 #pragma unroll
         for (int r = 0; r < MV_ROWS; r++) {
             if (r >= nrows) break;
             const float d = __half2float(__ushort_as_half((unsigned short)now[r].d));
-            const u32 ql0 = now[r].ql0, ql1 = now[r].ql1, qh = now[r].qh;
-            int q[4];
+            int q[4][W];
             float scale[4];
 #pragma unroll
             for (int k = 0; k < 4; k++) {
-                const u32 low = (((k & 1) ? ql1 : ql0) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
-                q[k] = (int)sext6(low | (((qh >> (2 * k)) & 0x03030303u) << 4));
-                scale[k] = (float)(int)now[r].sc[k];
+#pragma unroll
+                for (int i = 0; i < W; i++) {
+                    const u32 low = (((k & 1) ? now[r].ql1[i] : now[r].ql0[i]) >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu;
+                    q[k][i] = (int)sext6(low | (((now[r].qh[i] >> (2 * k)) & 0x03030303u) << 4));
+                }
+                scale[k] = (float)now[r].sc.at(k);
             }
 #pragma unroll
             for (int t = 0; t < T; t++) {
                 float block_sum = 0.0f;
 #pragma unroll
-                for (int k = 0; k < 4; k++) block_sum += scale[k] * dx[t][k] * (float)__dp4a(q[k], xv[t][k], 0);
+                for (int k = 0; k < 4; k++) {
+                    int dot = 0;
+#pragma unroll
+                    for (int i = 0; i < W; i++) dot = __dp4a(q[k][i], (int)xv[t][k][i], dot);
+                    block_sum += scale[k] * dx[t][k] * (float)dot;
+                }
                 sum[r][t] += d * block_sum;
             }
         }
@@ -1160,16 +1275,6 @@ template <int KIND>
 __device__ __forceinline__ void unpack16(const u8* row, int k, uint4& q, float& scale, float& min);
 
 template <>
-__device__ __forceinline__ void unpack16<K_Q8_0>(const u8* row, int k, uint4& q, float& scale, float& min) {
-    const u8* block = row + (k / 32) * 34;
-    const u8* p = block + 2 + (k % 32);
-    q = make_uint4(u32_at2(p), u32_at2(p + 4), u32_at2(p + 8), u32_at2(p + 12));
-    scale = half_at(block);
-    min = 0.0f;
-}
-
-
-template <>
 __device__ __forceinline__ void unpack16<K_Q4_K>(const u8* row, int k, uint4& q, float& scale, float& min) {
     const u8* block = row + (k / 256) * 144;
     const int n = k % 256, j = n / 32, l = n % 32;
@@ -1200,24 +1305,6 @@ __device__ __forceinline__ void unpack16<K_Q5_K>(const u8* row, int k, uint4& q,
                    ((w.w >> shift) & 0x0F0F0F0Fu) | (((h.w >> j) & 0x01010101u) << 4));
     scale = half_lo(head.x) * sc;
     min = half_hi(head.x) * m;
-}
-
-template <>
-__device__ __forceinline__ void unpack16<K_Q6_K>(const u8* row, int k, uint4& q, float& scale, float& min) {
-    const u8* block = row + (k / 256) * Q6K_BYTES;
-    const int n = k % 256, half = n / 128, run = (n % 128) / 32, l = n % 32;
-    const u8* ql = block + half * 64 + (run & 1) * 32 + l;
-    const u8* qh = block + 128 + half * 32 + l;
-    const int shift = run < 2 ? 0 : 4;
-    u32 out[4];
-    for (int i = 0; i < 4; i++) {
-        const u32 low = (u32_at2(ql + 4 * i) >> shift) & 0x0F0F0F0Fu;
-        const u32 high = ((u32_at2(qh + 4 * i) >> (2 * run)) & 0x03030303u) << 4;
-        out[i] = sext6(low | high);
-    }
-    q = make_uint4(out[0], out[1], out[2], out[3]);
-    scale = half_at(block + 208) * (float)reinterpret_cast<const signed char*>(block + 192 + half * 8 + l / 16 + 2 * run)[0];
-    min = 0.0f;
 }
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], u32 a0, u32 a1, u32 b0) {
@@ -1292,11 +1379,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
 
     // The next step's raw bytes are read into registers before this step's products, and
     // unpacked into shared memory after them, so the reads' wait overlaps the arithmetic.
-    // (Q8_0's 2-byte-aligned words are put together as they're read.)
     struct Raw {
         uint4 head, v[2], h[2];  // Q4_K, Q5_K: a pair of sub-blocks; Q6_K: v low, h high bits
         uint4 q[4];              // Q4_0, Q8_0: 4 runs of 16
-        u32 sc[4];               // their scales (Q4_0: f16 bits; Q8_0: f32 bits); Q6_K: d, scales
+        u32 sc[4];               // their scales (f16 bits); Q6_K: d, scales
         bool ok[4];
         uint4 xq[XI];
         float xsum[XI], xscale[XI];
@@ -1319,9 +1405,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             const int r = tid >> 1, p = tid & 1;
             raw.ok[0] = tile_row(r) < rows && k0 < cols;
             if (raw.ok[0]) {
-                const u8* block = tile_w(r) + (size_t)tile_row(r) * row_bytes + (k0 / 256) * Q6K_BYTES;
+                const u8* row = tile_w(r) + (size_t)tile_row(r) * row_bytes;
+                const u8* block = row + (k0 / 256) * Q6K_BYTES;
                 const int half = (k0 % 256) / 128;
-                raw.sc[0] = *reinterpret_cast<const u16*>(block + 208);
+                raw.sc[0] = q6_k_d_bits(row, cols / 256, k0 / 256);
                 raw.sc[1] = *reinterpret_cast<const u16*>(block + 192 + half * 8 + 2 * p);
                 raw.sc[2] = *reinterpret_cast<const u16*>(block + 192 + half * 8 + 2 * (p + 2));
                 for (int i = 0; i < 2; i++) {
@@ -1341,9 +1428,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                         raw.q[i] = *reinterpret_cast<const uint4*>(row + b * 16);
                         raw.sc[i] = *reinterpret_cast<const u16*>(row + (size_t)blocks * 16 + b * 2);
                     } else {
-                        float scale, min;
-                        unpack16<KIND>(row, k, raw.q[i], scale, min);
-                        raw.sc[i] = __float_as_uint(scale);
+                        // Q8_0: a run of 16 is 16 bytes of the row.
+                        const int blocks = cols / 32, b = k / 32;
+                        raw.q[i] = *reinterpret_cast<const uint4*>(row + k);
+                        raw.sc[i] = *reinterpret_cast<const u16*>(row + (size_t)blocks * 32 + b * 2);
                     }
                 }
             }
@@ -1457,7 +1545,7 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                         scale = __half2float(__ushort_as_half((unsigned short)raw.sc[i]));
                     } else {
                         q = raw.q[i];
-                        scale = __uint_as_float(raw.sc[i]);
+                        scale = __half2float(__ushort_as_half((unsigned short)raw.sc[i]));
                     }
                 }
                 *reinterpret_cast<uint4*>(&wq[r][h * 16]) = q;
@@ -1773,12 +1861,12 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
     MATMUL8_GLU(matmul8_geglu_t64_##q##sfx, KIND, GROUP, 64, ROW_BYTES, 2, HEAD)                \
     MATMUL8_GLU(matmul8_geglu_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 2, HEAD)
 MATMUL8_ALL(q4_0, , K_Q4_0, 32, q4_0_row_bytes(cols), 1, false)
-MATMUL8_ALL(q8_0, , K_Q8_0, 32, cols / 32 * 34, 1, false)
+MATMUL8_ALL(q8_0, , K_Q8_0, 32, q8_0_row_bytes(cols), 1, false)
 MATMUL8_ALL(q4_0, _h, K_Q4_0, 32, q4_0_row_bytes(cols), 1, true)
-MATMUL8_ALL(q8_0, _h, K_Q8_0, 32, cols / 32 * 34, 1, true)
+MATMUL8_ALL(q8_0, _h, K_Q8_0, 32, q8_0_row_bytes(cols), 1, true)
 MATMUL8_ALL(q4_k, , K_Q4_K, 32, cols / 256 * 144, 1, true)
 MATMUL8_ALL(q5_k, , K_Q5_K, 32, cols / 256 * 176, 1, true)
-MATMUL8_ALL(q6_k, , K_Q6_K, 16, cols / 256 * Q6K_BYTES, 2, true)
+MATMUL8_ALL(q6_k, , K_Q6_K, 16, q6_k_row_bytes(cols), 2, true)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //

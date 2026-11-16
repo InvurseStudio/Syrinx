@@ -80,6 +80,29 @@ impl GpuMatrix {
         Self::upload(gpu, q).map(Some)
     }
 
+    /// An f32 matrix as f16 on the way up: half the bytes for a token's pass to read, the
+    /// weights off by f16's rounding. `None` for other kinds.
+    pub fn upload_f16(gpu: &Gpu, m: &Matrix) -> Result<Option<Self>> {
+        use crate::TensorType;
+        if m.kind != TensorType::F32 {
+            return Ok(None);
+        }
+        let out: Vec<u8> = m
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|b| crate::half::f32_to_f16(f32::from_le_bytes(*b)).to_le_bytes())
+            .collect();
+        let half = Matrix {
+            kind: TensorType::F16,
+            rows: m.rows,
+            cols: m.cols,
+            data: &out,
+        };
+        Self::upload(gpu, half).map(Some)
+    }
+
     /// `y = W x` for each of the input's rows of `x` into the rows of `y`: with 8-bit
     /// activations when the input has room for them and the weights have kernels.
     pub fn mul(&self, input: &Input, y: CuDevicePtr) -> Result<()> {
