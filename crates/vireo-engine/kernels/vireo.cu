@@ -592,14 +592,19 @@ extern "C" __global__ void quantize_q8(const float* x, signed char* xq, float* x
 // (a 2,400-token prompt: Gemma 4 E4B's geglu 20 ms and about half of quantize_q8's 23).
 // Rows of n (a multiple of 32); up's rows are `up_stride` apart.
 template <bool GELU>
+__device__ __forceinline__ float gated_value(float x, float u) {
+    return GELU ? 0.5f * x * (1.0f + tanhf(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u
+                : x / (1.0f + expf(-x)) * u;
+}
+
+template <bool GELU>
 __device__ __forceinline__ void gated_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
                                          float* xd, float* xs, int blocks) {
     const int block = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (block >= blocks) return;
     const size_t i = (size_t)block * 32 + lane;
     const float x = gate[i], u = up[(i / n) * up_stride + i % n];
-    const float v = GELU ? 0.5f * x * (1.0f + tanhf(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u
-                         : x / (1.0f + expf(-x)) * u;
+    const float v = gated_value<GELU>(x, u);
     float amax = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     const float d = amax / 127.0f;
@@ -1182,9 +1187,18 @@ __device__ __forceinline__ void ldmatrix_x4_bytes(u32 (&r)[4], const u8* p) {
 // 64 costs the same for 9 tokens as for 64. Or 128, a warp taking 32 rows by 64 tokens:
 // the rows' weights are then read and unpacked once for twice the tokens, which pays for
 // the K-quants (the host's WIDE_TOKENS).
-template <int KIND, int GROUP, int NT>
-__device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, const float* xd, const float* xs,
-                        float* y, int rows, int cols, int tokens) {
+//
+// GLU (1 SiLU, 2 Gemma's tanh-GELU) is a feed-forward's first half in one kernel: w is
+// its gate matrix and w2 its up matrix, a block takes 64 rows of each (16 of one, then the
+// same 16 of the other, so a thread holds both sums of a row and token), and what it
+// writes is act(gate) x up rounded to 8 bits as quantize_q8 would round it (oq, od, os):
+// the next product's input. Neither product is written as f32 (rows x tokens x 8 bytes a
+// layer, read back once by the activation). Tiles of 64 or 128 tokens; rows in 64s.
+template <int KIND, int GROUP, int NT, int GLU = 0>
+__device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signed char* xq, const float* xd,
+                        const float* xs, float* y, signed char* oq, float* od, float* os, int rows, int cols,
+                        int tokens) {
+    static_assert(GLU == 0 || NT >= 64, "the gated kernel needs a warp's two tiles of 16 rows");
     // 128 columns a step: 64 tensor-core products per warp between syncs. Rows of 128
     // bytes padded to 144 in shared memory, so reading fragments has no bank conflicts.
     constexpr int K = 128, KS = K + 16, NG = K / GROUP, NX = K / 32;
@@ -1199,7 +1213,10 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     __shared__ __align__(16) float x_scale[NX][NT], x_sum[NX][NT];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, tig = lane & 3;
-    const int row0 = blockIdx.x * M8_ROWS, tok0 = blockIdx.y * NT;
+    const int row0 = blockIdx.x * (GLU ? M8_ROWS / 2 : M8_ROWS), tok0 = blockIdx.y * NT;
+    // The matrix's row at the tile's row r, and which matrix.
+    auto tile_row = [&](int r) -> int { return GLU ? row0 + (r >> 5) * 16 + (r & 15) : row0 + r; };
+    auto tile_w = [&](int r) -> const u8* { return GLU && (r & 16) ? w2 : w; };
     // This warp's rows and tokens in the tile.
     const int wr = NT >= 64 ? (warp & 3) * 32 : warp * 16, wt = NT >= 64 ? (warp >> 2) * (NT / 2) : 0;
     constexpr bool has_min = KIND == K_Q4_K || KIND == K_Q5_K;
@@ -1220,10 +1237,10 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
     auto fetch = [&](int k0) {
         if constexpr (KIND == K_Q4_K || KIND == K_Q5_K) {
             const int r = tid >> 1, p = tid & 1, k = k0 + p * 64;
-            raw.ok[0] = row0 + r < rows && k < cols;
+            raw.ok[0] = tile_row(r) < rows && k < cols;
             if (raw.ok[0]) {
                 constexpr int bytes = KIND == K_Q4_K ? 144 : 176, qs = KIND == K_Q4_K ? 16 : 48;
-                const u8* block = w + (size_t)(row0 + r) * row_bytes + (k / 256) * bytes;
+                const u8* block = tile_w(r) + (size_t)tile_row(r) * row_bytes + (k / 256) * bytes;
                 const int j = (k % 256) / 32;
                 raw.head = *reinterpret_cast<const uint4*>(block);
                 for (int i = 0; i < 2; i++) {
@@ -1233,9 +1250,9 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
             }
         } else if constexpr (KIND == K_Q6_K) {
             const int r = tid >> 1, p = tid & 1;
-            raw.ok[0] = row0 + r < rows && k0 < cols;
+            raw.ok[0] = tile_row(r) < rows && k0 < cols;
             if (raw.ok[0]) {
-                const u8* block = w + (size_t)(row0 + r) * row_bytes + (k0 / 256) * Q6K_BYTES;
+                const u8* block = tile_w(r) + (size_t)tile_row(r) * row_bytes + (k0 / 256) * Q6K_BYTES;
                 const int half = (k0 % 256) / 128;
                 raw.sc[0] = *reinterpret_cast<const u16*>(block + 208);
                 raw.sc[1] = *reinterpret_cast<const u16*>(block + 192 + half * 8 + 2 * p);
@@ -1249,9 +1266,9 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const int c = tid + i * 256, r = c >> 3, h = c & 7, k = k0 + h * 16;
-                raw.ok[i] = row0 + r < rows && k < cols;
+                raw.ok[i] = tile_row(r) < rows && k < cols;
                 if (raw.ok[i]) {
-                    const u8* row = w + (size_t)(row0 + r) * row_bytes;
+                    const u8* row = tile_w(r) + (size_t)tile_row(r) * row_bytes;
                     if constexpr (KIND == K_Q4_0) {
                         const int blocks = cols / 32, b = k / 32;
                         raw.q[i] = *reinterpret_cast<const uint4*>(row + b * 16);
@@ -1389,9 +1406,11 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
         }
     };
 
-    // Not for Q6_K: it runs two blocks per SM, and the raw bytes would spill there (one
-    // block with the read ahead measured 3% slower than two without).
-    constexpr bool prefetch = KIND != K_Q6_K;
+    // Not for Q6_K's tiles of 64 tokens and under: they run two blocks per SM, and the raw
+    // bytes would spill there (one block with the read ahead measured 3% slower than two
+    // without). Its tile of 128, one block an SM, reads ahead (Qwen 3.5 9B's ffn_down,
+    // 1,024 tokens: 3.50 -> 3.14 ms).
+    constexpr bool prefetch = KIND != K_Q6_K || NT == 128 || GLU != 0;
     if constexpr (prefetch) fetch(0);
     for (int k0 = 0; k0 < cols; k0 += K) {
         if constexpr (!prefetch) fetch(k0);
@@ -1510,22 +1529,66 @@ __device__ void matmul8(const u8* w, size_t row_bytes, const signed char* xq, co
         }
         __syncthreads();
     }
+    if constexpr (GLU != 0) {
+        // This thread's rows gid and gid + 8 of the warp's 16, for two tokens a token tile:
+        // acc[0] is gate's sums and acc[1] up's. A token's 32 rows (one scale) are this
+        // warp's 16 and the next warp's (warp ^ 1), so each leaves its largest in shared
+        // memory for the other; a token's sum of 16 is the warp's own.
+        __shared__ float largest[8][NT / 2];
+        const int orow = row0 + (warp & 3) * 16;
+        float v[NI][4];
 #pragma unroll
-    for (int mi = 0; mi < MI; mi++)
+        for (int ni = 0; ni < NI; ni++) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) v[ni][i] = gated_value<GLU == 2>(acc[0][ni][i], acc[1][ni][i]);
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                float m = fmaxf(fabsf(v[ni][j]), fabsf(v[ni][2 + j]));
+                for (int o = 4; o < 32; o <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+                if (gid == 0) largest[warp][ni * 8 + tig * 2 + j] = m;
+            }
+        }
+        __syncthreads();
 #pragma unroll
         for (int ni = 0; ni < NI; ni++)
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const int r = row0 + wr + mi * 16 + gid + (i >> 1) * 8, t = tok0 + wt + ni * 8 + tig * 2 + (i & 1);
-                if (r < rows && t < tokens) y[(size_t)t * rows + r] = acc[mi][ni][i];
+            for (int j = 0; j < 2; j++) {
+                const int at = ni * 8 + tig * 2 + j, t = tok0 + wt + at;
+                const float amax = fmaxf(largest[warp][at], largest[warp ^ 1][at]);
+                const float d = amax / 127.0f;
+                const int q0 = amax == 0.0f ? 0 : __float2int_rn(v[ni][j] / d);
+                const int q1 = amax == 0.0f ? 0 : __float2int_rn(v[ni][2 + j] / d);
+                int sum = q0 + q1;
+                for (int o = 4; o < 32; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                if (orow < rows && t < tokens) {
+                    signed char* out = oq + (size_t)t * rows + orow + gid;
+                    out[0] = (signed char)q0;
+                    out[8] = (signed char)q1;
+                    if (gid == 0) {
+                        os[(size_t)t * (rows / 16) + orow / 16] = d * (float)sum;
+                        if ((warp & 1) == 0) od[(size_t)t * (rows / 32) + orow / 32] = d;
+                    }
+                }
             }
+    } else {
+#pragma unroll
+        for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const int r = row0 + wr + mi * 16 + gid + (i >> 1) * 8, t = tok0 + wt + ni * 8 + tig * 2 + (i & 1);
+                    if (r < rows && t < tokens) y[(size_t)t * rows + r] = acc[mi][ni][i];
+                }
+    }
 }
 
 #define MATMUL8(name, KIND, GROUP, NT, ROW_BYTES, BLOCKS)                                                  \
     extern "C" __global__ void __launch_bounds__(256, BLOCKS)                                            \
         name(const u8* w, const signed char* xq, const float* xd, const float* xs, float* y, int rows,   \
              int cols, int tokens) {                                                                     \
-        matmul8<KIND, GROUP, NT>(w, (size_t)(ROW_BYTES), xq, xd, xs, y, rows, cols, tokens);             \
+        matmul8<KIND, GROUP, NT>(w, nullptr, (size_t)(ROW_BYTES), xq, xd, xs, y, nullptr, nullptr,       \
+                                 nullptr, rows, cols, tokens);                                           \
     }
 
 // One block per SM, with the next step's bytes read ahead into registers (fetch): faster
@@ -1552,6 +1615,26 @@ MATMUL8(matmul8_t128_q8_0, K_Q8_0, 32, 128, cols / 32 * 34, 1)
 MATMUL8(matmul8_t128_q4_k, K_Q4_K, 32, 128, cols / 256 * 144, 1)
 MATMUL8(matmul8_t128_q5_k, K_Q5_K, 32, 128, cols / 256 * 176, 1)
 MATMUL8(matmul8_t128_q6_k, K_Q6_K, 16, 128, cols / 256 * Q6K_BYTES, 1)
+
+// A feed-forward's gate and up products with its activation, rounded for the next product
+// (matmul8's GLU): `rows` of each matrix, a block an SM.
+#define MATMUL8_GLU(name, KIND, GROUP, NT, ROW_BYTES, GLU)                                                 \
+    extern "C" __global__ void __launch_bounds__(256, 1)                                                 \
+        name(const u8* gate, const u8* up, const signed char* xq, const float* xd, const float* xs,      \
+             signed char* oq, float* od, float* os, int rows, int cols, int tokens) {                    \
+        matmul8<KIND, GROUP, NT, GLU>(gate, up, (size_t)(ROW_BYTES), xq, xd, xs, nullptr, oq, od, os,    \
+                                      rows, cols, tokens);                                               \
+    }
+#define MATMUL8_GLUS(act, GLU, NT)                                                         \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_0, K_Q4_0, 32, NT, q4_0_row_bytes(cols), GLU)   \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q8_0, K_Q8_0, 32, NT, cols / 32 * 34, GLU)         \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_k, K_Q4_K, 32, NT, cols / 256 * 144, GLU)       \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q5_k, K_Q5_K, 32, NT, cols / 256 * 176, GLU)       \
+    MATMUL8_GLU(matmul8_##act##_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, GLU)
+MATMUL8_GLUS(swiglu, 1, 64)
+MATMUL8_GLUS(swiglu, 1, 128)
+MATMUL8_GLUS(geglu, 2, 64)
+MATMUL8_GLUS(geglu, 2, 128)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //
