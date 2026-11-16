@@ -400,6 +400,13 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
         Ok(m) => m,
         Err(e) => return fail("load the model", &e),
     };
+    // As vireo-server does after a load, so the first prompt's time is the prompt's.
+    match &model {
+        Engine::Gpu(m) => m.gpu().settle(),
+        Engine::Qwen35Gpu(m) => m.gpu().settle(),
+        Engine::Gemma4Gpu(m) => m.gpu().settle(),
+        _ => {}
+    }
     eprintln!("Loaded in {:.1?}: {}.", started.elapsed(), model.describe());
 
     let ids = tokenizer.encode(&prompt, !options.raw, !options.raw);
@@ -526,6 +533,9 @@ fn perplexity(
         model.describe()
     );
     let started = Instant::now();
+    let mut dump = std::env::var_os("VIREO_PPL_DUMP")
+        .and_then(|p| std::fs::File::create(p).ok())
+        .map(std::io::BufWriter::new);
     let (mut nll, mut count) = (0f64, 0usize);
     for chunk in 0..chunks {
         let tokens = &tokens[chunk * context..(chunk + 1) * context];
@@ -550,6 +560,12 @@ fn perplexity(
             let sum: f64 = logits.iter().map(|&l| (l as f64 - max).exp()).sum();
             let next = tokens[j + 1] as usize;
             nll += max + sum.ln() - logits[next] as f64;
+            // VIREO_PPL_DUMP=<file>: each scored token's -log p and likeliest token, one a
+            // line, to compare two modes token by token.
+            if let Some(d) = dump.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(d, "{} {}", max + sum.ln() - logits[next] as f64, argmax(logits));
+            }
             count += 1;
         }
         eprintln!("  [{}] {:.4}", chunk + 1, (nll / count as f64).exp());
