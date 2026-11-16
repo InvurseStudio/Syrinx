@@ -1352,9 +1352,8 @@ fn an_exported_session_goes_on_as_the_original() {
 /// A prompt's Gated DeltaNet in chunks (the WY form) gives what reading it token by token
 /// does, for prompts shorter than a chunk, of whole chunks and in between: on random
 /// inputs shaped as Qwen 3.5 0.8B's (16 value heads of 128, 16 key heads), from a state
-/// that isn't zero. Metal's (`cuda::DeltaNet` is the Metal backend's type); CUDA's chunks
-/// are checked against llama.cpp's perplexity instead.
-#[cfg(target_os = "macos")]
+/// that isn't zero. On CUDA the chunks' products are on the tensor cores, each number in
+/// two bf16 parts (`delta_chunk_scan_mma`), where the GPU has them.
 #[test]
 fn delta_net_in_chunks_matches_token_by_token() {
     use vireo_engine::cuda::DeltaNet;
@@ -1369,7 +1368,7 @@ fn delta_net_in_chunks_matches_token_by_token() {
             .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
     };
-    for tokens in [7, 32, 33, 100] {
+    for tokens in [7, 32, 33, 100, 200] {
         let conv: Vec<f32> = (0..tokens * channels).map(|_| random()).collect();
         let beta: Vec<f32> = (0..tokens * v_heads).map(|_| random()).collect();
         let alpha: Vec<f32> = (0..tokens * v_heads).map(|_| random()).collect();
