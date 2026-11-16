@@ -27,6 +27,7 @@ mod attach;
 mod calc;
 mod chat;
 mod chats;
+mod claims;
 mod draft;
 mod files;
 mod http;
@@ -2224,6 +2225,7 @@ fn reply(
     mut drafter: Option<&mut draft::Drafter>,
 ) -> Result<(), String> {
     let today = chat::today();
+    tools::set_context(context);
     let max_tokens = job.max_tokens.min(context / 2);
     // Thinking, where the request asks for it and the model has the tokens that open and
     // close a thought: Gemma 4's thought channel, Qwen's <think>.
@@ -2248,6 +2250,22 @@ fn reply(
         let groups = pick_groups(model, kept, tokenizer, family, &request.content)?;
         offered.retain(|t| groups.contains(&t.group));
     }
+    // A model that thinks may also call for a skill itself (`use_skill`, with the skills
+    // listed in its instructions), as on 0.9: the server writes in the one skill that fits
+    // the request best, and a request often has a second part with a skill of its own (the
+    // figures worked out, then a message drafted). The list is the same from turn to turn,
+    // for the chat's cache. Thinking off, the server's pick stays the only way: the small
+    // models the picker was built for called skills they didn't need.
+    let skills_note = (prompt_thinking && options().skills && !offered.is_empty())
+        .then(|| {
+            let names: Vec<&str> = offered.iter().map(|t| t.name).collect();
+            pc_skills(&names)
+        })
+        .filter(|skills| !skills.is_empty())
+        .map(|skills| skills::listing(&skills));
+    if skills_note.is_some() {
+        offered.push(tools::use_skill_tool());
+    }
     // The tools a call may name: all those offered, less the ones that change files
     // when the request doesn't ask for a change.
     let mut callable = offered.clone();
@@ -2266,9 +2284,10 @@ fn reply(
             offered.retain(|t| !t.changes_files());
         }
     }
-    // The skill the request asks for, if one fits: its instructions come in as the result
-    // of a use_skill call, written after the request, before the model writes.
-    let mut skill_ids = Vec::new();
+    // What the server writes into the reply before the model does, each as a call and its
+    // result. First the skill the request asks for, if one fits: its instructions come in
+    // as the result of a use_skill call.
+    let mut written: Vec<(tools::Call, String, bool)> = Vec::new();
     if options().skills
         && !offered.is_empty()
         && let Some(request) = job.messages.last()
@@ -2278,7 +2297,7 @@ fn reply(
             tool: "use_skill".into(),
             args: vec![("name".into(), tools::Arg::Text(skill.name.clone()))],
         };
-        let result = skills::instructions(&skill);
+        let result = skills::instructions(&skill, thinking_on);
         // A skill that names a tool that changes files asks for the change itself, whatever
         // the request's own words ("use the weekly-report skill for this" doesn't say the
         // report is saved: Gemma 4 31B, the tool kept from it, read and summed in circles
@@ -2292,20 +2311,51 @@ fn reply(
             offered = every_tool.clone();
             with_changes = None;
         }
-        let (before, body, after) = tools::after_call(family, "use_skill", &result, thinking_on);
-        skill_ids = tokenizer.encode(&tools::call_text(family, &call), false, true);
+        eprintln!("Skill: {}", skill.name);
+        written.push((call, result, false));
+    }
+    // Then the files and folders the message names, read ahead (`read_ahead`). These are
+    // kept with the reply's other steps, for the turns after it.
+    if let Some(request) = job.messages.last().filter(|m| m.role == "user") {
+        for (call, result) in read_ahead(&request.content, &offered, job) {
+            written.push((call, result, true));
+        }
+    }
+    let mut skill_ids = Vec::new();
+    let mut written_steps: Vec<chat::Step> = Vec::new();
+    let mut written_calls: Vec<tools::Call> = Vec::new();
+    let written_count = written.len();
+    for (i, (call, result, keep)) in written.into_iter().enumerate() {
+        // A thought opens after the last of them only.
+        let last = i + 1 == written_count;
+        let read = chat::plain(&result);
+        let text = tools::call_text(family, &call);
+        let (before, body, after) = tools::after_call(family, &call.tool, &read, thinking_on && last);
+        skill_ids.extend(tokenizer.encode(&text, false, true));
         skill_ids.extend(tokenizer.encode(&before, false, true));
         skill_ids.extend(tokenizer.encode(&body, false, false));
         skill_ids.extend(tokenizer.encode(&after, false, true));
         let _ = job.out.send(Out::Event(format!(
-            "{{\"type\":\"tool_call\",\"tool\":\"use_skill\",\"args\":{}}}",
+            "{{\"type\":\"tool_call\",\"tool\":{},\"args\":{}}}",
+            json::string(&call.tool),
             call.args_json()
         )));
         let _ = job.out.send(Out::Event(format!(
-            "{{\"type\":\"tool_result\",\"tool\":\"use_skill\",\"result\":{}}}",
+            "{{\"type\":\"tool_result\",\"tool\":{},\"result\":{}}}",
+            json::string(&call.tool),
             json::string(&preview(&result))
         )));
-        eprintln!("Skill: {} ({} tokens)", skill.name, skill_ids.len());
+        if keep {
+            eprintln!("Read ahead: {} {} ({} characters).", call.tool, call.args_json(), read.len());
+            written_steps.push(chat::Step {
+                at: 0,
+                tool: call.tool.clone(),
+                call: text,
+                result: read,
+                then: false,
+            });
+            written_calls.push(call);
+        }
     }
     // The prompt. A chat's cache holds its start as it was first written, and two things
     // would change that start from one turn to the next: the tools that change files
@@ -2316,8 +2366,12 @@ fn reply(
     let facts = memory::all();
     // A skill written in comes before any thought: the turn opens without one, and the
     // thought follows the skill's instructions, as it follows any tool's result.
-    let opens_thinking = thinking_on && skill_ids.is_empty();
-    let opening = tokenizer.encode(chat::opening(family, opens_thinking), false, true);
+    let opening_text = if skill_ids.is_empty() {
+        chat::opening(family, thinking_on)
+    } else {
+        chat::opening_for_call(family, thinking_on)
+    };
+    let opening = tokenizer.encode(opening_text, false, true);
     let cuts = chat::cut_points(&job.messages, context / CUT_STEP * CUT_BYTES_PER_TOKEN);
     // Earlier replies' tool results (`chat::Record`) are kept whole while the chat fits;
     // then only the start of each; then not at all, before the chat's start moves on.
@@ -2350,6 +2404,12 @@ fn reply(
             // answer itself (0 and 1 of the Nov 13 benchmark's 6 tasks right).
             if family == Family::Gemma4 && !prompt_thinking {
                 text.push_str(tools::GEMMA_NO_THINKING);
+            }
+            if let Some(note) = &skills_note
+                && tools.iter().any(|t| t.name == "use_skill")
+            {
+                text.push_str("\n\n");
+                text.push_str(note);
             }
             text
         };
@@ -2407,10 +2467,7 @@ fn reply(
                 (&text[..end], format!("{note}{}", &text[end..]))
             };
             if debug_prompt {
-                eprintln!(
-                    "[prompt] {history}{rest}{}",
-                    chat::opening(family, opens_thinking)
-                );
+                eprintln!("[prompt] {history}{rest}{opening_text}");
             }
             let mut ids = chat::encode(tokenizer, history);
             let mark = ids.len();
@@ -2592,7 +2649,10 @@ fn reply(
         shown.tag(job, THINK_OPEN, true);
     }
     // The reply's tool calls and their results, for the app to keep (`chat::Record`).
-    let mut steps: Vec<chat::Step> = Vec::new();
+    let mut steps: Vec<chat::Step> = written_steps;
+    // The changes this reply made (the tools that ask, run without an error), for the
+    // check of what its answer says it did (`claims.rs`).
+    let mut changed: Vec<String> = Vec::new();
     let started = Instant::now();
     // Tool calls: the grammar they're written under, and how one starts.
     let grammar = Grammar::new(&tools::call_grammar(family, &callable));
@@ -2616,7 +2676,9 @@ fn reply(
     let start_token = tokenizer.token_id(start.token);
     // The calls made since the reply last changed anything: the same one again would
     // get the same answer.
-    let mut seen: Vec<tools::Call> = Vec::new();
+    let mut seen: Vec<tools::Call> = written_calls;
+    // The folders whose other files a read has been told of (`beside_note`).
+    let mut noted_folders: Vec<String> = Vec::new();
     let (mut calls, mut call_tokens, mut repeats) = (0usize, 0usize, 0usize);
     let mut turn_start = true;
     // Once calls are used up (or the model repeats one), it may only answer: the tokens
@@ -3045,7 +3107,11 @@ fn reply(
                         .to_string()
                 } else {
                     match run_tool(&call, &offered, job) {
-                        Some(r) => r,
+                        // A file read: what else is in its folder, said once a folder.
+                        Some(r) => match beside_note(&call, &offered, job, &mut noted_folders) {
+                            Some(note) => format!("{r}\n\n{note}"),
+                            None => r,
+                        },
                         None => {
                             stopped = true; // stopped while the app ran it
                             break;
@@ -3056,6 +3122,9 @@ fn reply(
                     may_call = false;
                 }
                 if offered.iter().any(|t| t.name == call.tool && t.asks.is_some()) {
+                    if !result.starts_with("Error") {
+                        changed.push(call.tool.clone());
+                    }
                     // A change: what the earlier calls read may read differently now.
                     seen.clear();
                 } else if !repeated {
@@ -3078,9 +3147,14 @@ fn reply(
                     json::string(&call.tool),
                     json::string(&preview(&result))
                 )));
+                // As much as the context allows a result, and never more than the chat
+                // has room for now (at two characters a token, a table's worst case, with
+                // room kept for the answer): a result too long for the chat failed the
+                // reply.
+                let room = context.saturating_sub(kept.tokens.len() + ids.len() + ANSWER_ROOM) * 2;
                 let mut read = shaped(
                     &chat::plain(&result),
-                    tools::result_limit(&call, MAX_RESULT),
+                    tools::result_limit(&call, tools::one_result()).min(room.max(400)),
                 );
                 if calls == MAX_CALLS {
                     // Told so, the model answers from what it has; left to find its calls
@@ -3206,6 +3280,22 @@ fn reply(
     } else {
         shown.flush(job, true);
     }
+    // An answer that says it changed something no tool changed, in this reply or earlier
+    // in the chat, is told so, after it (it can't be taken back once shown).
+    if !job.stop.load(Ordering::Relaxed) && !offered.is_empty() {
+        let earlier = job
+            .messages
+            .iter()
+            .filter_map(|m| m.record.as_ref())
+            .flat_map(|r| r.steps.iter())
+            .filter(|step| !step.result.starts_with("Error"))
+            .map(|step| step.tool.clone());
+        let done: Vec<String> = changed.iter().cloned().chain(earlier).collect();
+        if let Some(what) = claims::unbacked(&shown.said, &done) {
+            eprintln!("The answer says {what} was changed; no tool changed one.");
+            shown.out(job, claims::note(what), true);
+        }
+    }
     if !steps.is_empty() {
         let record = chat::Record {
             family: family.name().into(),
@@ -3294,6 +3384,110 @@ fn reply(
 /// The tool groups a request needs, asked of the model in its picker session: one pass
 /// over a short multiple-choice question, its answer letters scored. Groups at least
 /// `GROUP_SHARE` likely are offered (the likeliest always, unless it's "none").
+/// The most other files a read's note names: past that the folder is one to list, not to
+/// be told of.
+const BESIDE_MOST: usize = 12;
+
+/// After a file's text, the other files in its folder, once a folder in a reply (0.9's
+/// found-folder note). A model that reaches a file by searching never sees its folder: in
+/// the Nov 15 smoke run (9.1, 9.2) the itinerary and agenda were found by four searches,
+/// and the travellers' list and the hotel's deposit email beside them, which the next
+/// question turned on, were never opened. Only for files the server reads itself.
+fn beside_note(
+    call: &tools::Call,
+    offered: &[tools::Tool],
+    job: &Job,
+    noted: &mut Vec<String>,
+) -> Option<String> {
+    if call.tool != "read_file"
+        || !offered
+            .iter()
+            .any(|t| t.name == "read_file" && t.runs == tools::Runs::Server)
+    {
+        return None;
+    }
+    let files = job.files.as_ref()?;
+    let paths = tools::several_paths(call).unwrap_or_else(|| {
+        call.text("path").map(|p| vec![p.to_string()]).unwrap_or_default()
+    });
+    let read: Vec<String> = paths
+        .iter()
+        .filter_map(|p| p.rsplit(['/', '\\']).next().map(str::to_string))
+        .collect();
+    let mut lines = Vec::new();
+    for path in &paths {
+        let Some((folder, names)) = files.beside(path) else {
+            continue;
+        };
+        if noted.contains(&folder) {
+            continue;
+        }
+        noted.push(folder.clone());
+        let others: Vec<String> = names.into_iter().filter(|n| !read.contains(n)).collect();
+        if others.is_empty() || others.len() > BESIDE_MOST {
+            continue;
+        }
+        lines.push(format!(
+            "[Also in {folder}, not read by this call: {}. Read the ones this task could turn on.]",
+            others.join(", ")
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The most files and folders read ahead for one message, and the longest file read that
+/// way (a longer one is left for the model to read, in the part it needs).
+const READ_AHEAD: usize = 4;
+const READ_AHEAD_CHARS: usize = 12_000;
+
+/// What a message names is fetched before the model's first step, as the calls it would
+/// have made first: a folder listed, a short file read (0.9's `_read_ahead`). The model
+/// otherwise spends its first steps listing the folder and reading the policy the user
+/// just named, and a file it never gets round to opening is a detail missing from the
+/// answer. Only what exists and this chat may reach, with the tools the server runs here
+/// (the Mac); a name that leads nowhere is left for the model. `VIREO_NO_READ_AHEAD` turns
+/// it off.
+fn read_ahead(request: &str, offered: &[tools::Tool], job: &Job) -> Vec<(tools::Call, String)> {
+    let Some(files) = job.files.as_ref() else {
+        return Vec::new();
+    };
+    if std::env::var_os("VIREO_NO_READ_AHEAD").is_some() {
+        return Vec::new();
+    }
+    let here = |name: &str| {
+        offered
+            .iter()
+            .any(|t| t.name == name && t.runs == tools::Runs::Server)
+    };
+    let mut found = Vec::new();
+    // Together, no more than one result may hold.
+    let mut room = tools::one_result();
+    for path in tools::named_paths(request) {
+        if found.len() >= READ_AHEAD {
+            break;
+        }
+        let tool = match files.is_folder(&path) {
+            Some(true) if here("list_directory") => "list_directory",
+            Some(false) if here("read_file") => "read_file",
+            _ => continue,
+        };
+        let call = tools::Call {
+            tool: tool.into(),
+            args: vec![("path".into(), tools::Arg::Text(path))],
+        };
+        let Ok(result) = tools::run_here(&call, Some(files)) else {
+            continue;
+        };
+        let chars = result.chars().count();
+        if chars > READ_AHEAD_CHARS.min(room) {
+            continue;
+        }
+        room -= chars;
+        found.push((call, result));
+    }
+    found
+}
+
 /// The skills this PC can follow with these tools (`skills::usable`).
 fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
     let built_in = skills::built_in_folder();
@@ -3432,6 +3626,16 @@ fn asks_for_change(
     request: &str,
 ) -> Result<bool, String> {
     const CHANGE_SHARE: f64 = 0.3;
+    // The question holds a long request's start and end only. Where the middle says to
+    // change a file, that settles it (a task's prompt that ended in the form's details
+    // had "Append a row to ..." as its step 5, the tools that write were kept from its
+    // run, and it said it had added the row: Nov 13 and 15 test gauntlets, 11.2).
+    if tools::unscored(request).is_some_and(|middle| tools::names_a_change(&middle)) {
+        if debug_calls() {
+            eprintln!("[calls] asks for a change: its middle says so");
+        }
+        return Ok(true);
+    }
     let share = yes_share(
         model,
         kept,
@@ -3551,8 +3755,9 @@ const MAX_CALCULATE_TOKENS: usize = 768;
 /// What `write_call` gives back for a call past its limit: the reply takes the call back
 /// and goes on without tools (`take_back`).
 const CALL_TOO_LONG: &str = "A tool call ran too long.";
-/// The most of a tool's result the model reads, in characters (about 2,000 tokens).
-const MAX_RESULT: usize = 8000;
+/// The tokens kept free for the answer when a tool's result is cut to the room a chat has
+/// left (`tools::result_limit` says how much of a result is read otherwise).
+const ANSWER_ROOM: usize = 1024;
 
 /// A reply's text on its way to the app: what's held back (only whole characters are
 /// sent as they come: a character's bytes can span tokens), and the answer sent so far,
@@ -3924,6 +4129,10 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
             chats::search(call.text("query").unwrap_or(""), job.chat_id.as_deref())
         }
         tools::Runs::Server if call.tool == "schedule_task" => schedule(call, job),
+        tools::Runs::Server if call.tool == "use_skill" => {
+            let names: Vec<&str> = offered.iter().map(|t| t.name).collect();
+            skills::asked_for(call.text("name").unwrap_or(""), &pc_skills(&names))
+        }
         tools::Runs::Server => tools::run_here(call, job.files.as_ref()),
         // Several files in one call: the app is asked for each.
         tools::Runs::App if tools::several_paths(call).is_some() => {
@@ -4108,8 +4317,8 @@ fn on_this_pc(path: &str) -> PathBuf {
     }
 }
 
-/// A tool's result as the model reads it: at most `limit` characters (`MAX_RESULT`, or
-/// more for a call that read several files), saying how much was left out.
+/// A tool's result as the model reads it: at most `limit` characters
+/// (`tools::result_limit`), saying how much was left out.
 fn shaped(result: &str, limit: usize) -> String {
     let chars = result.chars().count();
     if chars <= limit {
