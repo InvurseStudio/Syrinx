@@ -813,6 +813,10 @@ impl Gpu {
         c.check("cuMemcpyDtoDAsync", r)
     }
 
+    /// The Mac's backend has a model's buffers made resident here, after a load; CUDA's
+    /// are from the start.
+    pub fn settle(&self) {}
+
     /// Waits for all queued GPU work, and reports any error a kernel hit.
     pub fn synchronize(&self) -> Result<()> {
         let r = unsafe { (self.context.driver.cuStreamSynchronize)(self.context.stream) };

@@ -453,6 +453,16 @@ impl Context {
             if let Some(t) = state.timing.as_mut() {
                 t.0 += commands.GPUEndTime() - commands.GPUStartTime();
                 t.2 += 1;
+                // VIREO_METAL_TIMING=each: every command buffer's time in the driver, its
+                // wait for the GPU and its time on it.
+                if std::env::var("VIREO_METAL_TIMING").is_ok_and(|v| v == "each") {
+                    eprintln!(
+                        "  command buffer: {:.1} ms in the driver, {:.1} ms waiting, {:.1} ms on the GPU",
+                        (commands.kernelEndTime() - commands.kernelStartTime()) * 1e3,
+                        (commands.GPUStartTime() - commands.kernelEndTime()) * 1e3,
+                        (commands.GPUEndTime() - commands.GPUStartTime()) * 1e3,
+                    );
+                }
             }
             if commands.status() == MTLCommandBufferStatus::Error && result.is_ok() {
                 result = Err(match commands.error() {
@@ -692,6 +702,10 @@ struct Kernels {
     matmul_tc: Option<([Pso; 7], Pso)>,
     /// Adds up matmul_tc's splits (Gpu::matmul_8bit).
     sum_parts: Option<Pso>,
+    /// A long batch's products in 8-bit whole numbers on the neural accelerators
+    /// (matmul_i8 in vireo_tensor.metal): for Q6_K and Q8_0 weights, and the kernel that
+    /// rounds the activations.
+    matmul_i8: Option<(Pso, Pso, Pso)>,
     /// The same with the wide tile, for long batches (TC_WIDE).
     matmul_tc_wide: Option<[Pso; 7]>,
     /// The same with 8- to 192-token tiles, for short batches (SMALL_TILES).
@@ -899,6 +913,14 @@ const TCG_TILES: [(usize, usize, u32); 3] = [(32, 128, 128), (32, 128, 256), (16
 /// The most parts attention_tcg splits a short batch's context into (attention_tcg_merge's
 /// weights).
 const TCG_MAX_PARTS: u32 = 64;
+/// The experimental 8-bit products (matmul_i8 in vireo_tensor.metal, which says what they
+/// cost in accuracy): the fewest tokens that go to them (the tile is I8_TOKENS tokens by
+/// I8_ROWS rows, a step I8_K columns), and whether any do: only with VIREO_I8=on.
+const I8_FROM: usize = 128;
+const I8_TOKENS: u32 = 128;
+const I8_ROWS: u32 = 32;
+const I8_K: usize = 256;
+static I8_ON: AtomicBool = AtomicBool::new(false);
 /// Set to keep attention_tc for full attention too (VIREO_TCG=off, or
 /// [`Gpu::group_prompt_attention`]), to compare the two.
 static TCG_OFF: AtomicBool = AtomicBool::new(false);
@@ -1020,6 +1042,15 @@ impl Gpu {
             matmul_sg: per_kind("matmul_sg")?,
             matmul_tc: if tensor_ops {
                 Some((per_kind("matmul_tc")?, pipeline("to_half")?))
+            } else {
+                None
+            },
+            matmul_i8: if tensor_ops {
+                Some((
+                    pipeline("matmul_i8_q6_k")?,
+                    pipeline("matmul_i8_q8_0")?,
+                    pipeline("to_i8")?,
+                ))
             } else {
                 None
             },
@@ -1175,6 +1206,9 @@ impl Gpu {
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
+        if std::env::var("VIREO_I8").is_ok_and(|v| v == "on") {
+            I8_ON.store(true, Ordering::Relaxed);
+        }
         if std::env::var("VIREO_TCG").is_ok_and(|v| v == "off") {
             TCG_OFF.store(true, Ordering::Relaxed);
         }
@@ -1307,6 +1341,12 @@ impl Gpu {
                 .zip(out.as_chunks_mut::<212>().0)
             {
                 dst[..210].copy_from_slice(src);
+                // The block's largest scale, for matmul_i8's rounding.
+                dst[210] = src[192..208]
+                    .iter()
+                    .map(|&s| (s as i8).unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
             }
             return self.upload(&out);
         }
@@ -1340,6 +1380,18 @@ impl Gpu {
         }
         self.context
             .dispatch(copy_dispatch(&self.context.copy, to, from, bytes))
+    }
+
+    /// Has the buffers made so far (a model's weights, just uploaded) made resident now.
+    /// Left to itself Metal does it when the first work is queued: the first prompt after
+    /// a load then waited on it (135 ms for Gemma 4 26B-A4B's 23 GB on the M5 Max).
+    pub fn settle(&self) {
+        let mut state = self.context.lock();
+        if state.residency_dirty {
+            self.context.residency.commit();
+            state.residency_dirty = false;
+        }
+        self.context.residency.requestResidency();
     }
 
     /// Waits for all queued GPU work, and reports any error a kernel hit.
@@ -2782,10 +2834,30 @@ impl Gpu {
         } else {
             None
         };
+        let i8 = if self.kernels.matmul_i8.is_some() && tokens >= I8_FROM {
+            let n = tokens * cols.next_multiple_of(I8_K);
+            Some((self.alloc(n)?, self.alloc(n / I8_K * 4)?))
+        } else {
+            None
+        };
         Ok(Q8 {
             x: AtomicU64::new(0),
             half,
+            i8,
+            half_ready: AtomicBool::new(false),
+            i8_ready: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a batch's products with weights of this kind go to the 8-bit kernel
+    /// (`matmul_i8`): its sums are within the rounding of both sides of the f16 kernel's,
+    /// not equal to them.
+    pub fn whole_number_products(kind: TensorType, cols: usize, tokens: usize) -> bool {
+        TENSOR_OPS.load(Ordering::Relaxed)
+            && I8_ON.load(Ordering::Relaxed)
+            && tokens >= I8_FROM
+            && cols.is_multiple_of(I8_K)
+            && matches!(kind, TensorType::Q6_K | TensorType::Q8_0)
     }
 
     /// Readies `tokens` rows of `cols` activations at `x` as the input of
@@ -2796,15 +2868,11 @@ impl Gpu {
             cols.is_multiple_of(32),
             "rows of {cols} aren't whole blocks of 32"
         );
+        let _ = tokens;
+        // The rounded copies are made by the first product that reads each.
         q8.x.store(x, Ordering::Relaxed);
-        if let (Some((_, to_half)), Some(half), true) =
-            (&self.kernels.matmul_tc, &q8.half, tokens > 1)
-        {
-            let n = tokens * cols;
-            assert!(n * 2 <= half.len_bytes(), "the f16 buffer is too small");
-            let args = [Arg::Ptr(x), Arg::Ptr(half.ptr()), Arg::I32(n as i32)];
-            self.run(to_half, ((n as u32 / 4).div_ceil(256), 1), 256, &args)?;
-        }
+        q8.half_ready.store(false, Ordering::Relaxed);
+        q8.i8_ready.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2822,10 +2890,44 @@ impl Gpu {
         tokens: usize,
     ) -> Result<()> {
         let x = q8.x.load(Ordering::Relaxed);
+        if let (Some((q6_k, q8_0, to_i8)), Some((bytes, scales))) =
+            (&self.kernels.matmul_i8, &q8.i8)
+            && Self::whole_number_products(kind, cols, tokens)
+        {
+            let n = tokens * cols;
+            if !q8.i8_ready.swap(true, Ordering::Relaxed) {
+                assert!(n <= bytes.len_bytes(), "the 8-bit buffer is too small");
+                let args = [Arg::Ptr(x), Arg::Ptr(bytes.ptr()), Arg::Ptr(scales.ptr())];
+                self.run(to_i8, ((n / I8_K) as u32, 1), I8_K as u32, &args)?;
+            }
+            let kernel = if kind == TensorType::Q6_K { q6_k } else { q8_0 };
+            let grid = (
+                (rows as u32).div_ceil(I8_ROWS),
+                (tokens as u32).div_ceil(I8_TOKENS),
+            );
+            let args = [
+                Arg::Ptr(w),
+                Arg::Ptr(bytes.ptr()),
+                Arg::Ptr(y),
+                Arg::I32(rows as i32),
+                Arg::I32(cols as i32),
+                Arg::I32(tokens as i32),
+                Arg::Ptr(scales.ptr()),
+            ];
+            return self.run(kernel, grid, 32 * tensor_tile().2, &args);
+        }
         let (kernels, half) = match (&self.kernels.matmul_tc, &q8.half) {
             (Some((k, _)), Some(half)) if tokens > 1 && cols.is_multiple_of(32) => (k, half),
             _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
         };
+        if !q8.half_ready.swap(true, Ordering::Relaxed)
+            && let Some((_, to_half)) = &self.kernels.matmul_tc
+        {
+            let n = tokens * cols;
+            assert!(n * 2 <= half.len_bytes(), "the f16 buffer is too small");
+            let args = [Arg::Ptr(x), Arg::Ptr(half.ptr()), Arg::I32(n as i32)];
+            self.run(to_half, ((n as u32 / 4).div_ceil(256), 1), 256, &args)?;
+        }
         let (tc_rows, tc_tokens, tc_sg) = tensor_tile();
         let (kernels, tc_tokens) =
             match (&self.kernels.matmul_tc_wide, &self.kernels.matmul_tc_small) {
@@ -2994,6 +3096,12 @@ const DELTA_CHUNK: usize = 32;
 pub struct Q8 {
     x: AtomicU64,
     half: Option<Buffer>,
+    /// For matmul_i8: the activations in 8 bits and a scale for every I8_K of a token's.
+    i8: Option<(Buffer, Buffer)>,
+    /// Whether the f16 and the 8-bit copies are of the activations last noted: each is
+    /// made when a product first asks for it.
+    half_ready: AtomicBool,
+    i8_ready: AtomicBool,
 }
 
 /// A kernel argument, by type.
