@@ -1629,8 +1629,18 @@ impl Gpu {
                 Arg::I32(tokens as i32),
             ];
             match mma {
-                // 32 columns of the state a block (DM_COLS in vireo.cu), 4 warps.
-                Some(kernel) => self.run(kernel, (d.v_heads as u32, (n / 32) as u32), 128, &scan)?,
+                // 32 columns of the state a block (DM_COLS in vireo.cu), 4 warps. It reads
+                // q and k where they are.
+                Some(kernel) => {
+                    let mut with = scan.to_vec();
+                    with.extend([
+                        Arg::Ptr(d.conv),
+                        Arg::I32(d.channels as i32),
+                        Arg::I32(d.key_dim as i32),
+                        Arg::I32(d.k_heads as i32),
+                    ]);
+                    self.run(kernel, (d.v_heads as u32, (n / 32) as u32), 128, &with)?
+                }
                 // 16 columns a block (DSC_COLS).
                 None => {
                     let grid = (d.v_heads as u32, (n / 16) as u32);
