@@ -3107,6 +3107,19 @@ extern "C" __global__ void delta_out(float* out, const float* z, const float* no
 
 __device__ __forceinline__ size_t delta_chunk_stride(int n) { return (size_t)4 * DC * n + DC * DC + 4; }
 
+// An f32 as two bf16 numbers in one word, for the tensor cores (delta_chunk_scan_mma): the
+// nearest bf16 in the low half and, in the high half, the nearest bf16 to what that left
+// over. A product of two such numbers as hi x hi + hi x lo + lo x hi is the f32 product
+// to about 2^-16 of itself (only lo x lo is dropped), where one bf16 each would give 2^-8.
+__device__ __forceinline__ u32 bf16_bits(float x) {
+    const u32 b = __float_as_uint(x);
+    return (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16;  // to nearest, ties to even
+}
+__device__ __forceinline__ u32 split_bf16(float x) {
+    const u32 hi = bf16_bits(x);
+    return hi | (bf16_bits(x - __uint_as_float(hi << 16)) << 16);
+}
+
 // One block of 256 threads per value head (blockIdx.x) and chunk (blockIdx.y); n ≤ 128.
 // Dynamic shared memory (delta_chunk_prep_bytes on the host): the chunk's k, which A
 // takes the place of once k·k is worked out, then the cumulative log decays and β. q is
@@ -3114,8 +3127,18 @@ __device__ __forceinline__ size_t delta_chunk_stride(int n) { return (size_t)4 *
 // SM.
 extern "C" __global__ void __launch_bounds__(256)
     delta_chunk_prep(const float* conv, int channels, int key_dim, const float* beta_raw, const float* alpha_raw,
-                     const float* dt_bias, const float* a, float* scratch, int n, int k_heads, int tokens) {
+                     const float* dt_bias, const float* a, float* scratch, int n, int k_heads, int tokens,
+                     int split) {
+    // With `split`, for delta_chunk_scan_mma: W, Q̂ and P are written as split_bf16 words
+    // in the same places, and K̂ as its transpose (n rows of DC), split too. U stays f32.
     extern __shared__ __align__(16) float sm[];
+    u32* const scratch_bits = reinterpret_cast<u32*>(scratch);
+    auto put = [&](float* at, float x) {
+        if (split)
+            scratch_bits[at - scratch] = split_bf16(x);
+        else
+            *at = x;
+    };
     const int NS = n + 4;  // padded rows
     float* ks = sm;
     float* As = sm;  // DC × (DC + 1), over ks once A is worked out
@@ -3177,8 +3200,8 @@ extern "C" __global__ void __launch_bounds__(256)
     const float g_last = G[DC - 1];
     for (int idx = tid; idx < DC * n; idx += blockDim.x) {
         const int i = idx / n, d = idx % n;
-        Qh[idx] = i < len ? expf(G[i]) * q_row(i)[d] : 0.0f;
-        Kh[idx] = i < len ? expf(g_last - G[i]) * ks[i * NS + d] : 0.0f;
+        put(&Qh[idx], i < len ? expf(G[i]) * q_row(i)[d] : 0.0f);
+        put(&Kh[split ? d * DC + i : idx], i < len ? expf(g_last - G[i]) * ks[i * NS + d] : 0.0f);
     }
     if (tid == 0) P[DC * DC] = expf(g_last);
     __syncthreads();  // done with ks: A goes in its place
@@ -3189,7 +3212,7 @@ extern "C" __global__ void __launch_bounds__(256)
             const int i = 4 * ti + x, j = tj + 16 * y;
             const float decay = j <= i ? expf(G[i] - G[j]) : 0.0f;
             As[i * (DC + 1) + j] = j < i ? bs[i] * decay * kk[x][y] : 0.0f;
-            P[i * DC + j] = j <= i && i < len ? decay * qk[x][y] : 0.0f;
+            put(&P[i * DC + j], j <= i && i < len ? decay * qk[x][y] : 0.0f);
         }
     __syncthreads();
 
@@ -3214,7 +3237,10 @@ extern "C" __global__ void __launch_bounds__(256)
             for (int m = 0; m < i; m++) part[m & 3] += As[i * (DC + 1) + m] * x[m];
             b -= (part[0] + part[1]) + (part[2] + part[3]);
             x[i] = b;
-            X[i * n + d] = b;
+            if (is_w)
+                put(&X[i * n + d], b);
+            else
+                X[i * n + d] = b;
         }
     }
 }
@@ -3336,3 +3362,168 @@ extern "C" __global__ void __launch_bounds__(64)
         state[((size_t)h * n + j0 + c) * n + r] = Ss[r][c];
     }
 }
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+// ---- The chunks' scan on the tensor cores (RTX 30 series on) ---------------------------
+//
+// delta_chunk_scan's products as f32 sums of bf16 products (mma.m16n8k16), each number in
+// two bf16 parts (split_bf16) and each product in three, as llama.cpp's
+// gated-delta-net-mma does: the state stays f32, in registers, and what is multiplied is
+// right to about 2^-16. After delta_chunk_prep with `split`. n = 128.
+//
+// A block of 4 warps per value head (blockIdx.x) and 32 columns of its state (blockIdx.y):
+// the columns are independent. Warp w keeps the state's rows 16 w.. and 64 + 16 w.. (two
+// tiles of 16 rows by 4 of 8 columns, laid out as the products' results are), and takes
+// rows 16 w.. of the chunk's δ and O. A chunk: the state into shared memory in two parts,
+// D1 = W S0 and D2 = Q̂ S0, δ = U − D1 into shared memory, then O = D2 + P δ and
+// S = γ S0 + K̂ᵀ δ. W, Q̂, P and K̂ᵀ are read from GPU memory as the products take them.
+#define DM_COLS 32
+#define DM_S (128 + 8)  // the state's columns in shared memory, padded
+#define DM_D (DC + 8)   // δ's
+
+__device__ __forceinline__ void mma_bf16(float (&c)[4], const u32 (&a)[4], const u32 (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Two neighbouring split words as a register of their first parts and one of their second.
+__device__ __forceinline__ void split_pair(const u32* p, u32& hi, u32& lo) {
+    const uint2 w = *reinterpret_cast<const uint2*>(p);
+    hi = (w.x & 0xFFFFu) | (w.y << 16);
+    lo = (w.x >> 16) | (w.y & 0xFFFF0000u);
+}
+
+// c += a b with both in two parts: the three products that matter.
+__device__ __forceinline__ void mma_split(float (&c)[4], const u32 (&ah)[4], const u32 (&al)[4],
+                                          const u32 (&bh)[2], const u32 (&bl)[2]) {
+    mma_bf16(c, al, bh);
+    mma_bf16(c, ah, bl);
+    mma_bf16(c, ah, bh);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    delta_chunk_scan_mma(const float* scratch, float* state, float* out, int n, int tokens) {
+    __shared__ __align__(16) u32 Sb[DM_COLS][DM_S];  // S0[r][c] split, a column's rows together
+    __shared__ __align__(16) u32 Db[DM_COLS][DM_D];  // δ[m][c] split, likewise
+    const int h = blockIdx.x, v_heads = gridDim.x, j0 = blockIdx.y * DM_COLS;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const float inv_sqrt_n = 1.0f / sqrtf((float)n);
+    // A result's 4 numbers a thread: rows gid and gid + 8 of its 16, columns 2 tig and 2 tig + 1 of its 8.
+    auto row_of = [&](int e) { return gid + (e >> 1) * 8; };
+    auto col_of = [&](int ct, int e) { return ct * 8 + tig * 2 + (e & 1); };
+    // A's registers for rows gid and gid + 8 of 16 from `rows` (rows of `stride` split
+    // words), columns k.. of 16; B's for 8 columns from ct of rows k.. of `from`.
+    auto load_a = [&](u32 (&ah)[4], u32 (&al)[4], const u32* rows, int stride, int k) {
+        const u32* r0 = rows + (size_t)gid * stride + k + tig * 2;
+        const u32* r1 = r0 + (size_t)8 * stride;
+        split_pair(r0, ah[0], al[0]);
+        split_pair(r1, ah[1], al[1]);
+        split_pair(r0 + 8, ah[2], al[2]);
+        split_pair(r1 + 8, ah[3], al[3]);
+    };
+
+    float s[2][4][4];
+#pragma unroll
+    for (int x = 0; x < 2; x++)
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++)
+                s[x][ct][e] = state[((size_t)h * n + j0 + col_of(ct, e)) * n + (warp + 4 * x) * 16 + row_of(e)];
+
+    const int chunks = (tokens + DC - 1) / DC;
+    for (int ch = 0; ch < chunks; ch++) {
+        const float* base = scratch + ((size_t)ch * v_heads + h) * delta_chunk_stride(n);
+        const u32* W = reinterpret_cast<const u32*>(base);
+        const float* U = base + DC * n;
+        const u32* Qh = reinterpret_cast<const u32*>(U + DC * n);
+        const u32* Kt = Qh + DC * n;  // n rows of DC
+        const u32* P = Kt + DC * n;
+        const float gamma = base[(size_t)4 * DC * n + DC * DC];
+
+#pragma unroll
+        for (int x = 0; x < 2; x++)
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    Sb[col_of(ct, e)][(warp + 4 * x) * 16 + row_of(e)] = split_bf16(s[x][ct][e]);
+        __syncthreads();
+
+        // D1 = W S0 (acc[0]) and D2 = Q̂ S0 (acc[1]) for rows 16 warp.. of the chunk.
+        float acc[2][4][4] = {};
+#pragma unroll 2
+        for (int k = 0; k < 128; k += 16) {
+            u32 ah[2][4], al[2][4], bh[4][2], bl[4][2];
+            load_a(ah[0], al[0], W + (size_t)warp * 16 * n, n, k);
+            load_a(ah[1], al[1], Qh + (size_t)warp * 16 * n, n, k);
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                const u32* b = &Sb[ct * 8 + gid][k + tig * 2];
+                split_pair(b, bh[ct][0], bl[ct][0]);
+                split_pair(b + 8, bh[ct][1], bl[ct][1]);
+            }
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                mma_split(acc[0][ct], ah[0], al[0], bh[ct], bl[ct]);
+                mma_split(acc[1][ct], ah[1], al[1], bh[ct], bl[ct]);
+            }
+        }
+        // δ = U − D1
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int i = warp * 16 + row_of(e), c = col_of(ct, e);
+                Db[c][i] = split_bf16(U[(size_t)i * n + j0 + c] - acc[0][ct][e]);
+            }
+        __syncthreads();
+
+        // O = D2 + P δ and S = γ S0 + K̂ᵀ δ, a step's δ read once for both.
+#pragma unroll
+        for (int x = 0; x < 2; x++)
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) s[x][ct][e] *= gamma;
+#pragma unroll 2
+        for (int k = 0; k < DC; k += 16) {
+            u32 ph[4], pl[4], kh[2][4], kl[2][4], bh[4][2], bl[4][2];
+            load_a(ph, pl, P + (size_t)warp * 16 * DC, DC, k);
+            load_a(kh[0], kl[0], Kt + (size_t)warp * 16 * DC, DC, k);
+            load_a(kh[1], kl[1], Kt + (size_t)(warp + 4) * 16 * DC, DC, k);
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                const u32* b = &Db[ct * 8 + gid][k + tig * 2];
+                split_pair(b, bh[ct][0], bl[ct][0]);
+                split_pair(b + 8, bh[ct][1], bl[ct][1]);
+            }
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) {
+                mma_split(acc[1][ct], ph, pl, bh[ct], bl[ct]);
+                mma_split(s[0][ct], kh[0], kl[0], bh[ct], bl[ct]);
+                mma_split(s[1][ct], kh[1], kl[1], bh[ct], bl[ct]);
+            }
+        }
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int t = ch * DC + warp * 16 + row_of(e);
+                if (t < tokens) out[((size_t)t * v_heads + h) * n + j0 + col_of(ct, e)] = acc[1][ct][e] * inv_sqrt_n;
+            }
+        // The next chunk's state goes into Sb, which nothing reads now; its sync comes
+        // before δ is written again.
+    }
+#pragma unroll
+    for (int x = 0; x < 2; x++)
+#pragma unroll
+        for (int ct = 0; ct < 4; ct++)
+#pragma unroll
+            for (int e = 0; e < 4; e++)
+                state[((size_t)h * n + j0 + col_of(ct, e)) * n + (warp + 4 * x) * 16 + row_of(e)] = s[x][ct][e];
+}
+#endif
