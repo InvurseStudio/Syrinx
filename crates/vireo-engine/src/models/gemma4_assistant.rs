@@ -752,6 +752,7 @@ impl Gemma4Cuda<'_> {
                 },
                 1,
                 (2 * c.dim).max(widest_q).max(a.ffn),
+                &a.pre,
             )?,
         });
         Ok(())

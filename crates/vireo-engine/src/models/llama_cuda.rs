@@ -240,13 +240,14 @@ impl<'a> LlamaCuda<'a> {
             q8_ffn: if cfg!(target_os = "macos") {
                 None
             } else {
-                q8_room(&self.gpu, self.precision, batch, c.ffn_dim)?
+                q8_room(&self.gpu, self.precision, batch, c.ffn_dim, &self.layers[0].gate)?
             },
             q8: q8_room(
                 &self.gpu,
                 self.precision,
                 batch,
                 c.dim.max(c.heads * c.head_dim).max(c.ffn_dim),
+                &self.layers[0].gate,
             )?,
             half_cache: self.precision == Precision::Int8,
             graph: None,

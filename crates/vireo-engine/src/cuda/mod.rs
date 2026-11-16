@@ -300,6 +300,8 @@ struct Kernels {
     /// The activations with their result rounded to 8 bits in the same pass.
     swiglu_q8: CuFunction,
     geglu_q8: CuFunction,
+    /// `quantize_q8`, `swiglu_q8` and `geglu_q8` into a batch's layout (`Gpu::tiled`).
+    q8_tile: [CuFunction; 3],
     add: CuFunction,
     softcap: CuFunction,
     apply_gate: CuFunction,
@@ -322,17 +324,30 @@ struct Kernels {
     matvec8: [CuFunction; 5],
     /// The same for a few tokens at once: by `FEW_SIZES`, then `KINDS_8`.
     matvec8_few: [[CuFunction; 5]; FEW_SIZES.len()],
-    /// On the tensor cores: only on compute capability 8.0 and later.
-    matmul8: Option<[CuFunction; 5]>,
+    /// On the tensor cores: only on compute capability 8.0 and later. Each of these four
+    /// is first by the batch's layout (`Q8::with_heads`: 0 scales and sums apart, 1 a
+    /// batch's heads). The K-quants have only the heads' kernels, in both places.
+    matmul8: Option<[[CuFunction; 5]; 2]>,
     /// The same with tiles of 16 and of 32 tokens, for batches of up to that many.
-    matmul8_small: Option<[[CuFunction; 5]; 2]>,
+    matmul8_small: Option<[[[CuFunction; 5]; 2]; 2]>,
     /// The same with tiles of 128 tokens, for the K-quants in batches of at least that
     /// many (`WIDE_TOKENS`).
-    matmul8_wide: Option<[CuFunction; 5]>,
+    matmul8_wide: Option<[[CuFunction; 5]; 2]>,
     /// A feed-forward's gate and up products with its activation, rounded for the next
     /// product: by activation (SiLU, tanh-GELU), then tile (64 tokens, 128), then
     /// `KINDS_8`.
-    matmul8_glu: Option<[[[CuFunction; 5]; 2]; 2]>,
+    matmul8_glu: Option<[[[[CuFunction; 5]; 2]; 2]; 2]>,
+}
+
+/// A tile kernel's name for a weight type and layout: `matmul8_<tile>q4_0_h` reads a
+/// batch's heads; the K-quants' kernels read nothing else and have no suffix.
+fn tile_name(tile: &str, kind: TensorType, heads: bool) -> String {
+    let both = matches!(kind, TensorType::Q4_0 | TensorType::Q8_0);
+    format!(
+        "matmul8_{tile}{}{}",
+        kind.name().to_lowercase(),
+        if heads && both { "_h" } else { "" }
+    )
 }
 
 /// The weight types with 8-bit-activation kernels, in the order of `Kernels::matvec8`.
@@ -398,6 +413,10 @@ const MAX_PARTS_KV: u32 = 64;
 const TILE_TOKENS: u32 = 64;
 /// The K-quants' wider tile, in tokens.
 const WIDE_TOKENS: usize = 128;
+/// The bytes of a row's heads in a batch's 8-bit layout: 8 floats for each 128 numbers.
+fn head_bytes(cols: usize) -> usize {
+    cols.div_ceil(128) * 32
+}
 /// The gated feed-forward kernels (`Gpu::glu_8bit`) take batches of more tokens than this:
 /// their smallest tile is 64 tokens, and costs the same for 9 as for 64.
 const GLU_LEAST_TOKENS: usize = 32;
@@ -644,6 +663,11 @@ impl Gpu {
                 geglu: function("geglu")?,
                 swiglu_q8: function("swiglu_q8")?,
                 geglu_q8: function("geglu_q8")?,
+                q8_tile: [
+                    function("quantize_q8_tile")?,
+                    function("swiglu_q8_tile")?,
+                    function("geglu_q8_tile")?,
+                ],
                 add: function("add")?,
                 softcap: function("softcap")?,
                 apply_gate: function("apply_gate")?,
@@ -692,31 +716,35 @@ impl Gpu {
                     out
                 },
                 matmul8: if tensor_cores {
-                    let mut out = [std::ptr::null_mut(); 5];
-                    for (slot, kind) in out.iter_mut().zip(KINDS_8) {
-                        *slot = function(&format!("matmul8_{}", kind.name().to_lowercase()))?;
+                    let mut out = [[std::ptr::null_mut(); 5]; 2];
+                    for (layout, heads) in out.iter_mut().zip([false, true]) {
+                        for (slot, kind) in layout.iter_mut().zip(KINDS_8) {
+                            *slot = function(&tile_name("", kind, heads))?;
+                        }
                     }
                     Some(out)
                 } else {
                     None
                 },
                 matmul8_wide: if tensor_cores {
-                    let mut out = [std::ptr::null_mut(); 5];
-                    for (slot, kind) in out.iter_mut().zip(KINDS_8) {
-                        *slot = function(&format!("matmul8_t128_{}", kind.name().to_lowercase()))?;
+                    let mut out = [[std::ptr::null_mut(); 5]; 2];
+                    for (layout, heads) in out.iter_mut().zip([false, true]) {
+                        for (slot, kind) in layout.iter_mut().zip(KINDS_8) {
+                            *slot = function(&tile_name("t128_", kind, heads))?;
+                        }
                     }
                     Some(out)
                 } else {
                     None
                 },
                 matmul8_glu: if tensor_cores {
-                    let mut out = [[[std::ptr::null_mut(); 5]; 2]; 2];
-                    for (tiles, act) in out.iter_mut().zip(["swiglu", "geglu"]) {
-                        for (row, tile) in tiles.iter_mut().zip([64, 128]) {
-                            for (slot, kind) in row.iter_mut().zip(KINDS_8) {
-                                let name =
-                                    format!("matmul8_{act}_t{tile}_{}", kind.name().to_lowercase());
-                                *slot = function(&name)?;
+                    let mut out = [[[[std::ptr::null_mut(); 5]; 2]; 2]; 2];
+                    for (layout, heads) in out.iter_mut().zip([false, true]) {
+                        for (tiles, act) in layout.iter_mut().zip(["swiglu", "geglu"]) {
+                            for (row, tile) in tiles.iter_mut().zip([64, 128]) {
+                                for (slot, kind) in row.iter_mut().zip(KINDS_8) {
+                                    *slot = function(&tile_name(&format!("{act}_t{tile}_"), kind, heads))?;
+                                }
                             }
                         }
                     }
@@ -725,11 +753,12 @@ impl Gpu {
                     None
                 },
                 matmul8_small: if tensor_cores {
-                    let mut out = [[std::ptr::null_mut(); 5]; 2];
-                    for (row, tile) in out.iter_mut().zip([16, 32]) {
-                        for (slot, kind) in row.iter_mut().zip(KINDS_8) {
-                            let name = format!("matmul8_t{tile}_{}", kind.name().to_lowercase());
-                            *slot = function(&name)?;
+                    let mut out = [[[std::ptr::null_mut(); 5]; 2]; 2];
+                    for (layout, heads) in out.iter_mut().zip([false, true]) {
+                        for (row, tile) in layout.iter_mut().zip([16, 32]) {
+                            for (slot, kind) in row.iter_mut().zip(KINDS_8) {
+                                *slot = function(&tile_name(&format!("t{tile}_"), kind, heads))?;
+                            }
                         }
                     }
                     Some(out)
@@ -790,9 +819,10 @@ impl Gpu {
     }
 
     /// A weight matrix of `rows` × `cols` numbers of type `kind` (GGUF's layout) in GPU
-    /// memory, in the layout the kernels read: as it is, except Q4_0, whose 18-byte blocks
-    /// are split into each row's 4-bit numbers (16-byte aligned) and then its scales, and
-    /// Q6_K, whose 210-byte blocks are padded to 224 (16-byte aligned).
+    /// memory, in the layout the kernels read: as it is, except Q4_0 and Q8_0, whose 18- and
+    /// 34-byte blocks are split into each row's numbers (16-byte aligned) and then its scales, and
+    /// Q6_K, whose 210-byte blocks go up as each row's blocks without their scale d (208
+    /// bytes, 16-byte aligned) and then the row's d's.
     pub fn upload_weights(
         &self,
         kind: TensorType,
@@ -801,32 +831,43 @@ impl Gpu {
         cols: usize,
     ) -> Result<Buffer> {
         if kind == TensorType::Q6_K {
-            // Q6_K: each 210-byte block padded to 224, so blocks start 16-byte aligned.
-            let mut out = vec![0u8; data.len() / 210 * 224];
+            // Q6_K: a row's blocks, 208 bytes each (ql, qh and the 16 scales, so blocks start
+            // 16-byte aligned), then its blocks' f16 d's, padded to 16 bytes (the kernels'
+            // q6_k_row_bytes). Padding each block to 224 bytes instead was 6% more for a
+            // token's pass to read.
+            let blocks = cols / 256;
+            let row_bytes = blocks * 208 + (blocks * 2).next_multiple_of(16);
+            let mut out = vec![0u8; rows * row_bytes];
             for (src, dst) in data
-                .as_chunks::<210>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<224>().0)
+                .chunks_exact(blocks * 210)
+                .zip(out.chunks_exact_mut(row_bytes))
             {
-                dst[..210].copy_from_slice(src);
+                let (numbers, scales) = dst.split_at_mut(blocks * 208);
+                for (b, block) in src.as_chunks::<210>().0.iter().enumerate() {
+                    numbers[b * 208..(b + 1) * 208].copy_from_slice(&block[..208]);
+                    scales[b * 2..b * 2 + 2].copy_from_slice(&block[208..]);
+                }
             }
             return self.upload(&out);
         }
-        if kind != TensorType::Q4_0 {
-            return self.upload(data);
-        }
+        // Q4_0 and Q8_0: a row's numbers (16 or 32 bytes a block), then its f16 scales,
+        // padded to 16 bytes (the kernels' q4_0_row_bytes and q8_0_row_bytes).
+        let n = match kind {
+            TensorType::Q4_0 => 16,
+            TensorType::Q8_0 => 32,
+            _ => return self.upload(data),
+        };
         let blocks = cols / 32;
-        let row_bytes = blocks * 16 + (blocks * 2).next_multiple_of(16);
+        let row_bytes = blocks * n + (blocks * 2).next_multiple_of(16);
         let mut out = vec![0u8; rows * row_bytes];
         for (src, dst) in data
-            .chunks_exact(blocks * 18)
+            .chunks_exact(blocks * (n + 2))
             .zip(out.chunks_exact_mut(row_bytes))
         {
-            let (numbers, scales) = dst.split_at_mut(blocks * 16);
-            for (b, block) in src.as_chunks::<18>().0.iter().enumerate() {
+            let (numbers, scales) = dst.split_at_mut(blocks * n);
+            for (b, block) in src.chunks_exact(n + 2).enumerate() {
                 scales[b * 2..b * 2 + 2].copy_from_slice(&block[..2]);
-                numbers[b * 16..b * 16 + 16].copy_from_slice(&block[2..]);
+                numbers[b * n..(b + 1) * n].copy_from_slice(&block[2..]);
             }
         }
         self.upload(&out)
@@ -1728,8 +1769,38 @@ impl Gpu {
         Ok(Q8 {
             q: self.alloc(tokens * cols)?,
             scales: self.alloc(tokens * cols / 32 * 4)?,
-            sums: self.alloc(tokens * cols / 16 * 4)?,
+            // A batch's heads go here instead (`Q8::with_heads`): 32 bytes for each 128 numbers.
+            sums: self.alloc(tokens * (cols / 16 * 4).max(head_bytes(cols)))?,
+            heads: std::cell::Cell::new(false),
+            always: false,
         })
+    }
+
+    /// Whether `tokens` rows rounded to 8 bits are kept in a batch's layout (X8_HEAD in
+    /// vireo.cu: the bytes as ever, and in the sums' buffer a token's scales and its 32s'
+    /// sums together for each 128 numbers), which the tensor-core kernels read; a few
+    /// tokens' kernels read the scales and the 16s' sums as two arrays.
+    fn tiled(&self, q8: &Q8, tokens: usize) -> bool {
+        q8.heads.get() && tokens > Self::FEW_TOKENS && self.kernels.matmul8.is_some()
+    }
+
+    /// Whether a weight type's tensor-core kernels read a batch's heads and nothing else
+    /// (the K-quants): a model of them rounds its batches so ([`Q8::with_heads`]).
+    pub fn wants_heads(kind: TensorType) -> bool {
+        matches!(kind, TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K)
+    }
+
+    /// Where a product reads `n` tokens' scales and sums from token `from` on: a batch's
+    /// heads and nothing, or the two arrays.
+    fn scales_and_sums(q8: &Q8, cols: usize, from: usize) -> [Arg; 2] {
+        if q8.heads.get() {
+            [Arg::Ptr(q8.sums.ptr() + (from * head_bytes(cols)) as u64), Arg::Ptr(0)]
+        } else {
+            [
+                Arg::Ptr(q8.scales.ptr() + (from * cols / 32 * 4) as u64),
+                Arg::Ptr(q8.sums.ptr() + (from * cols / 16 * 4) as u64),
+            ]
+        }
     }
 
     /// Rounds `tokens` rows of `cols` numbers (a multiple of 32) at `x` to 8 bits, into `q8`.
@@ -1749,6 +1820,20 @@ impl Gpu {
         assert!(n.is_multiple_of(32), "rows of {n} aren't whole blocks of 32");
         assert!(tokens * n <= q8.q.len_bytes(), "the 8-bit buffer is too small");
         let blocks = tokens * n / 32;
+        if self.tiled(q8, tokens) {
+            let args = [
+                Arg::Ptr(gate),
+                Arg::Ptr(up),
+                Arg::I32(n as i32),
+                Arg::I32(n as i32),
+                Arg::Ptr(q8.q.ptr()),
+                Arg::Ptr(q8.sums.ptr()),
+            ];
+            let kernel = self.kernels.q8_tile[1 + gelu as usize];
+            // 8 of a token's 32s a block, a row of blocks a token.
+            let grid = ((n as u32 / 32).div_ceil(8), tokens as u32);
+            return self.run(kernel, grid, 256, &args);
+        }
         let args = [
             Arg::Ptr(gate),
             Arg::Ptr(up),
@@ -1777,6 +1862,16 @@ impl Gpu {
             "the 8-bit buffer is too small"
         );
         let blocks = tokens * cols / 32;
+        if self.tiled(q8, tokens) {
+            let args = [
+                Arg::Ptr(x),
+                Arg::Ptr(q8.q.ptr()),
+                Arg::Ptr(q8.sums.ptr()),
+                Arg::I32(cols as i32),
+            ];
+            let grid = ((cols as u32 / 32).div_ceil(8), tokens as u32);
+            return self.run(self.kernels.q8_tile[0], grid, 256, &args);
+        }
         let args = [
             Arg::Ptr(x),
             Arg::Ptr(q8.q.ptr()),
@@ -1846,15 +1941,21 @@ impl Gpu {
                 &args,
             );
         }
-        match self.kernels.matmul8 {
+        let layout = q8.heads.get() as usize;
+        match self.kernels.matmul8.map(|k| k[layout]) {
             Some(kernels) => {
+                assert!(
+                    q8.heads.get() || !Self::wants_heads(kind),
+                    "{kind:?} reads a batch's heads: lay the Q8 out for it before rounding"
+                );
                 // `n` tokens from token `from` on, in tiles of `tile`.
                 let run = |kernel: CuFunction, tile: u32, from: usize, n: usize| {
+                    let [xa, xb] = Self::scales_and_sums(q8, cols, from);
                     let args = [
                         Arg::Ptr(w),
                         Arg::Ptr(q8.q.ptr() + (from * cols) as u64),
-                        Arg::Ptr(q8.scales.ptr() + (from * cols / 32 * 4) as u64),
-                        Arg::Ptr(q8.sums.ptr() + (from * cols / 16 * 4) as u64),
+                        xa,
+                        xb,
                         Arg::Ptr(y + (from * rows * 4) as u64),
                         Arg::I32(rows as i32),
                         Arg::I32(cols as i32),
@@ -1880,7 +1981,7 @@ impl Gpu {
                     _ => 0,
                 };
                 if wide > 0 {
-                    let kernel = self.kernels.matmul8_wide.unwrap()[index];
+                    let kernel = self.kernels.matmul8_wide.unwrap()[layout][index];
                     run(kernel, WIDE_TOKENS as u32, 0, wide)?;
                     if wide == tokens {
                         return Ok(());
@@ -1889,7 +1990,7 @@ impl Gpu {
                 // A short batch takes a tile of 16 or 32 tokens: a tile of 64 costs the
                 // same for 9 tokens as for 64.
                 let rest = tokens - wide;
-                let (kernel, tile) = match (self.kernels.matmul8_small, rest) {
+                let (kernel, tile) = match (self.kernels.matmul8_small.map(|k| k[layout]), rest) {
                     (Some(small), 0..=16) => (small[0][index], 16),
                     (Some(small), 17..=32) => (small[1][index], 32),
                     _ => (kernels[index], TILE_TOKENS),
@@ -1953,18 +2054,25 @@ impl Gpu {
             return Ok(false);
         }
         assert!(tokens * rows <= out.q.len_bytes(), "the 8-bit buffer is too small");
-        let kernels = kernels[gelu as usize];
+        assert_eq!(q8.heads.get(), out.heads.get(), "the two 8-bit buffers have one layout");
+        assert!(
+            q8.heads.get() || !Self::wants_heads(kind),
+            "{kind:?} reads a batch's heads: lay the Q8 out for it before rounding"
+        );
+        let kernels = kernels[q8.heads.get() as usize][gelu as usize];
         // `n` tokens from token `from` on, in tiles of `tile`.
         let run = |kernel: CuFunction, tile: u32, from: usize, n: usize| {
+            let [xa, xb] = Self::scales_and_sums(q8, cols, from);
+            let [oa, ob] = Self::scales_and_sums(out, rows, from);
             let args = [
                 Arg::Ptr(gate),
                 Arg::Ptr(up),
                 Arg::Ptr(q8.q.ptr() + (from * cols) as u64),
-                Arg::Ptr(q8.scales.ptr() + (from * cols / 32 * 4) as u64),
-                Arg::Ptr(q8.sums.ptr() + (from * cols / 16 * 4) as u64),
+                xa,
+                xb,
                 Arg::Ptr(out.q.ptr() + (from * rows) as u64),
-                Arg::Ptr(out.scales.ptr() + (from * rows / 32 * 4) as u64),
-                Arg::Ptr(out.sums.ptr() + (from * rows / 16 * 4) as u64),
+                oa,
+                ob,
                 Arg::I32(rows as i32),
                 Arg::I32(cols as i32),
                 Arg::I32(n as i32),
@@ -2078,9 +2186,32 @@ pub struct Q8 {
     q: Buffer,
     scales: Buffer,
     sums: Buffer,
+    /// Whether a batch's scales and sums are kept as heads now (`Q8::lay_out_for`).
+    heads: std::cell::Cell<bool>,
+    /// Whether they always are (`Q8::with_heads`).
+    always: bool,
 }
 
 impl Q8 {
+    /// For a model of K-quants ([`Gpu::wants_heads`]): a batch's scales and its 32s' sums
+    /// are kept together, a head for each token and 128 numbers (X8_HEAD in vireo.cu), which
+    /// those weights' tensor-core kernels read. A few tokens' are kept as ever.
+    pub fn with_heads(mut self) -> Self {
+        self.heads.set(true);
+        self.always = true;
+        self
+    }
+
+    /// Sets how the next batch rounded into this is laid out, for a product with weights
+    /// of `kind`: with heads if the model's batches always are or `kind` reads nothing
+    /// else (a Q4_0 model's one K-quant matrix). True for heads. What was rounded before
+    /// in the other layout has to be rounded again.
+    pub fn lay_out_for(&self, kind: TensorType) -> bool {
+        let heads = self.always || Gpu::wants_heads(kind);
+        self.heads.set(heads);
+        heads
+    }
+
     /// `tokens` rows of `cols` numbers as they were rounded: the bytes, each 32's scale
     /// and each 16's sum. For tests.
     pub fn read(&self, tokens: usize, cols: usize) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
@@ -2091,6 +2222,24 @@ impl Q8 {
         self.scales.read_f32(&mut scales)?;
         self.sums.read_f32(&mut sums)?;
         Ok((q, scales, sums))
+    }
+
+    /// `tokens` rows of `cols` numbers (a multiple of 128) as a batch keeps them: the
+    /// bytes, then the heads (each 128's scales and sums) or the scales and the 16s' sums.
+    /// For tests.
+    pub fn read_tiles(&self, tokens: usize, cols: usize) -> Result<Vec<u8>> {
+        let mut bytes = vec![0u8; tokens * cols];
+        self.q.read_bytes_at(0, &mut bytes)?;
+        let heads = self.heads.get();
+        let mut rest = vec![0u8; tokens * if heads { head_bytes(cols) } else { cols / 16 * 4 }];
+        self.sums.read_bytes_at(0, &mut rest)?;
+        bytes.extend(rest);
+        if !heads {
+            let mut scales = vec![0u8; tokens * cols / 32 * 4];
+            self.scales.read_bytes_at(0, &mut scales)?;
+            bytes.extend(scales);
+        }
+        Ok(bytes)
     }
 }
 
