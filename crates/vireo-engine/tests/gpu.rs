@@ -22,6 +22,26 @@ fn open_gpu() -> Option<Gpu> {
     }
 }
 
+
+/// Room for `tokens` rows rounded to 8 bits, laid out as a model of `kind` weights keeps a
+/// batch: on CUDA the K-quants' kernels read its scales and sums as heads.
+fn q8_for(
+    gpu: &Gpu,
+    kind: vireo_engine::tensor_type::TensorType,
+    tokens: usize,
+    cols: usize,
+) -> vireo_engine::cuda::Q8 {
+    let q8 = gpu.alloc_q8(tokens, cols).unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let q8 = if Gpu::wants_heads(kind) {
+        q8.with_heads()
+    } else {
+        q8
+    };
+    let _ = kind;
+    q8
+}
+
 fn model(name: &str) -> Option<GgufFile> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../models")
@@ -769,7 +789,7 @@ fn check_8bit(gpu: &Gpu, file: &GgufFile, names: &[&str]) {
         }
         let weights = gpu.upload_weights(w.kind, w.data, w.rows, w.cols).unwrap();
         let x_gpu = gpu.upload_f32(&x).unwrap();
-        let q8 = gpu.alloc_q8(tokens, w.cols).unwrap();
+        let q8 = q8_for(gpu, w.kind, tokens, w.cols);
         let one = gpu.alloc_q8(1, w.cols).unwrap();
         let y_batch = gpu.alloc(w.rows * tokens * 4).unwrap();
         let y_one = gpu.alloc(w.rows * 4).unwrap();
@@ -1730,7 +1750,7 @@ fn few_token_products_match_one_token_at_a_time() {
             if !timing {
                 continue;
             }
-            let q8 = gpu.alloc_q8(max_t, w.cols).unwrap();
+            let q8 = q8_for(&gpu, w.kind, max_t, w.cols);
             let time = |f: &dyn Fn()| {
                 for _ in 0..20 {
                     f();
@@ -1883,7 +1903,7 @@ fn few_token_8bit_products_match_one_token_at_a_time() {
                 .collect();
             let x_gpu = gpu.upload_f32(&x).unwrap();
             let q8_one = gpu.alloc_q8(1, w.cols).unwrap();
-            let q8 = gpu.alloc_q8(most, w.cols).unwrap();
+            let q8 = q8_for(&gpu, w.kind, most, w.cols);
             let y_one = gpu.alloc(most * w.rows * 4).unwrap();
             let y_few = gpu.alloc(most * w.rows * 4).unwrap();
             for tokens in 2..=Gpu::FEW_TOKENS {
@@ -1992,7 +2012,7 @@ fn short_batch_tiles_match_the_64_token_tile() {
                 .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
                 .collect();
             let x_gpu = gpu.upload_f32(&x).unwrap();
-            let q8 = gpu.alloc_q8(all, w.cols).unwrap();
+            let q8 = q8_for(&gpu, w.kind, all, w.cols);
             let y = gpu.alloc(all * w.rows * 4).unwrap();
             gpu.quantize(x_gpu.ptr(), &q8, all, w.cols).unwrap();
             let run = |tokens: usize| {
@@ -2032,6 +2052,24 @@ fn short_batch_tiles_match_the_64_token_tile() {
                     "{t} ({:?}), {tokens} tokens: not the {all}-token batch's numbers",
                     w.kind
                 );
+            }
+            // Q4_0 and Q8_0 in a K-quant model read a batch's heads (their `_h` kernels):
+            // the same numbers as with the scales and sums apart.
+            #[cfg(not(target_os = "macos"))]
+            if !Gpu::wants_heads(w.kind) {
+                let heads = gpu.alloc_q8(all, w.cols).unwrap().with_heads();
+                for tokens in [9, 16, 31, 64, 140, all] {
+                    gpu.quantize(x_gpu.ptr(), &heads, tokens, w.cols).unwrap();
+                    gpu.matmul_8bit(w.kind, weights.ptr(), &heads, y.ptr(), w.rows, w.cols, tokens)
+                        .unwrap();
+                    let mut got = vec![0.0; tokens * w.rows];
+                    y.read_f32(&mut got).unwrap();
+                    assert!(
+                        got == long[..tokens * w.rows],
+                        "{t} ({:?}), {tokens} tokens: heads give other numbers",
+                        w.kind
+                    );
+                }
             }
             if !timing {
                 continue;
@@ -2218,13 +2256,13 @@ fn the_gated_feed_forward_kernel_matches_two_products_and_the_activation() {
             .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
             .collect();
         let x_gpu = gpu.upload_f32(&x).unwrap();
-        let q8 = gpu.alloc_q8(all, cols).unwrap();
+        let q8 = q8_for(&gpu, gate.kind, all, cols);
         gpu.quantize(x_gpu.ptr(), &q8, all, cols).unwrap();
         let (gate_y, up_y) = (
             gpu.alloc(all * rows * 4).unwrap(),
             gpu.alloc(all * rows * 4).unwrap(),
         );
-        let (apart, fused) = (gpu.alloc_q8(all, rows).unwrap(), gpu.alloc_q8(all, rows).unwrap());
+        let (apart, fused) = (q8_for(&gpu, gate.kind, all, rows), q8_for(&gpu, gate.kind, all, rows));
         let three = |tokens: usize| {
             gpu.matmul_8bit(gate.kind, gate_w.ptr(), &q8, gate_y.ptr(), rows, cols, tokens)
                 .unwrap();
@@ -2251,17 +2289,19 @@ fn the_gated_feed_forward_kernel_matches_two_products_and_the_activation() {
         for tokens in [33, 64, 65, 100, 128, 136, 200, 264] {
             three(tokens);
             assert!(one(tokens), "{name}: no gated kernel for {tokens} tokens");
-            let (want, got) = (apart.read(tokens, rows).unwrap(), fused.read(tokens, rows).unwrap());
-            assert!(want.0.iter().any(|q| *q != 0), "{name}: all zeros");
-            let differ = want.0.iter().zip(&got.0).filter(|(a, b)| a != b).count();
+            // Both in a batch's layout: the bytes, then each 128's scales and sums.
+            let (want, got) = (
+                apart.read_tiles(tokens, rows).unwrap(),
+                fused.read_tiles(tokens, rows).unwrap(),
+            );
+            assert!(want.iter().any(|q| *q != 0), "{name}: all zeros");
+            let differ = want.iter().zip(&got).filter(|(a, b)| a != b).count();
             assert!(
                 differ == 0,
                 "{name} ({:?}), {tokens} tokens: {differ} of {} bytes differ",
                 gate.kind,
-                want.0.len()
+                want.len()
             );
-            assert!(want.1 == got.1, "{name}, {tokens} tokens: the scales differ");
-            assert!(want.2 == got.2, "{name}, {tokens} tokens: the sums differ");
         }
         if !timing {
             continue;

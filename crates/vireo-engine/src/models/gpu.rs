@@ -92,11 +92,7 @@ impl GpuMatrix {
             && Gpu::supports_8bit(self.kind)
             && self.cols.is_multiple_of(32)
         {
-            if input.rounded.get() != self.cols {
-                g.quantize(input.x, q8, input.tokens, self.cols)
-                    .map_err(gpu_error)?;
-                input.rounded.set(self.cols);
-            }
+            input.round(q8, self.cols, &[self.kind])?;
             return g
                 .matmul_8bit(
                     self.kind,
@@ -145,6 +141,7 @@ impl GpuMatrix {
             && Gpu::supports_8bit(self.kind)
             && n.is_multiple_of(32)
         {
+            lay_out(q8, &[self.kind]);
             gpu.gated_quantize(gate, up, n, q8, tokens, gelu)
                 .map_err(gpu_error)?;
             return gpu
@@ -187,11 +184,9 @@ impl GpuMatrix {
             && self.cols.is_multiple_of(32)
         {
             let g = input.gpu;
-            if input.rounded.get() != gate.cols {
-                g.quantize(input.x, q8, input.tokens, gate.cols)
-                    .map_err(gpu_error)?;
-                input.rounded.set(gate.cols);
-            }
+            // The middle is laid out as the input: for all three matrices.
+            input.round(q8, gate.cols, &[gate.kind, self.kind])?;
+            lay_out(mid, &[gate.kind, self.kind]);
             if g.glu_8bit(
                 gate.kind,
                 gate.data.ptr(),
@@ -264,6 +259,41 @@ pub(super) struct Input<'a> {
     q8: Option<&'a Q8>,
     /// The row length it was rounded at, or 0.
     rounded: Cell<usize>,
+    /// Whether it was rounded with a batch's heads (CUDA: `Q8::lay_out_for`).
+    heads: Cell<bool>,
+}
+
+/// Lays a batch's 8-bit buffer out for products with weights of these kinds (CUDA: with
+/// heads if any of them reads nothing else, or the model's batches always are). True for
+/// heads.
+fn lay_out(q8: &Q8, kinds: &[crate::TensorType]) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // The last call decides, so the kind that needs heads goes last.
+        let needs = kinds.iter().copied().find(|k| Gpu::wants_heads(*k));
+        q8.lay_out_for(needs.unwrap_or(kinds[0]))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (q8, kinds);
+        false
+    }
+}
+
+impl Input<'_> {
+    /// Rounds the input to 8 bits at rows of `cols` for products with weights of `kinds`,
+    /// unless it is already rounded so.
+    fn round(&self, q8: &Q8, cols: usize, kinds: &[crate::TensorType]) -> Result<()> {
+        let heads = lay_out(q8, kinds);
+        if self.rounded.get() != cols || self.heads.get() != heads {
+            self.gpu
+                .quantize(self.x, q8, self.tokens, cols)
+                .map_err(gpu_error)?;
+            self.rounded.set(cols);
+            self.heads.set(heads);
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Input<'a> {
@@ -274,24 +304,36 @@ impl<'a> Input<'a> {
             tokens,
             q8,
             rounded: Cell::new(0),
+            heads: Cell::new(false),
         }
     }
 }
 
 /// Room for a batch's activations in 8 bits, if the model uses them: `widest` is the
-/// longest row any matrix product reads.
+/// longest row any matrix product reads. `like` is one of the model's large matrices: a
+/// model of K-quants keeps a batch's scales and sums as heads (`Q8::with_heads`).
 pub(super) fn q8_room(
     gpu: &Gpu,
     precision: Precision,
     batch: usize,
     widest: usize,
+    like: &GpuMatrix,
 ) -> Result<Option<Q8>> {
     match precision {
         Precision::Exact => Ok(None),
-        Precision::Int8 => gpu
-            .alloc_q8(batch, widest.next_multiple_of(32))
-            .map(Some)
-            .map_err(gpu_error),
+        Precision::Int8 => {
+            let q8 = gpu
+                .alloc_q8(batch, widest.next_multiple_of(32))
+                .map_err(gpu_error)?;
+            #[cfg(not(target_os = "macos"))]
+            let q8 = if Gpu::wants_heads(like.kind) {
+                q8.with_heads()
+            } else {
+                q8
+            };
+            let _ = like;
+            Ok(Some(q8))
+        }
     }
 }
 

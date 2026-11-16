@@ -569,6 +569,33 @@ MATMUL(matmul_q6_k, K_Q6_K, cols / 256 * Q6K_BYTES)
 // d × Σq for each 16, for the weights' minimums. Rows of x are `cols` long: xq holds cols
 // bytes per row, xd cols / 32 floats and xs cols / 16.
 
+// A batch's layout (the tensor-core kernels read it, matmul8): the bytes as above (a
+// token's 128 for a step of the product on one 128-byte line), and in place of xd and xs
+// a head of X8_HEAD floats for each token and 128 numbers: its four scales, then the four
+// sums d × Σq of its 32s (the two 16s' sums added, as that kernel adds them). A step
+// reads a token's scales and sums in one place, and half the sums. For models of
+// K-quants (matmul8's HEAD): a ~2.3K-token read, Qwen 3.5 9B +5% and 4B +3%; Gemma 4
+// E4B's Q4_0 products were 3% slower so, and Q4_0 models keep xd and xs. (All of it in one
+// block of 160 bytes, bytes after head, cost Q4_0 9%: the bytes off their 128-byte line.)
+#define X8_HEAD 8
+__device__ __forceinline__ size_t x8_heads(int cols) { return (size_t)((cols + 127) / 128); }
+
+// A warp's block of 32 (number g of token t's row of `cols`) into that layout: lane
+// `lane`'s byte q, the scale d, and the sum of q over the lane's 16.
+__device__ __forceinline__ void x8_store(signed char* xq, float* head, int cols, int t, int g, int lane, int q,
+                                         float d, int sum16) {
+    xq[(size_t)t * cols + g * 32 + lane] = (signed char)q;
+    // Each 16's sum times d, then the two added: neither contracted, so the same f32 as
+    // the one-token layout's two numbers added.
+    const float part = __fmul_rn(d, (float)sum16);
+    const float other = __shfl_xor_sync(0xffffffffu, part, 16);
+    if (lane == 0) {
+        float* h = head + ((size_t)t * x8_heads(cols) + g / 4) * X8_HEAD;
+        h[g % 4] = d;
+        h[4 + g % 4] = __fadd_rn(part, other);
+    }
+}
+
 // One warp per block of 32: rounds `x` to 8 bits.
 extern "C" __global__ void quantize_q8(const float* x, signed char* xq, float* xd, float* xs, int blocks) {
     const int block = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
@@ -614,6 +641,42 @@ __device__ __forceinline__ void gated_q8(const float* gate, const float* up, int
     for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     if (lane == 0) xd[block] = d;
     if (lane == 0 || lane == 16) xs[(size_t)block * 2 + lane / 16] = d * (float)sum;
+}
+// quantize_q8 and the gated kernels below, into a batch's layout: a block of 8 warps takes
+// 8 of a token's 32s, the token is blockIdx.y (no dividing to find where a 32 goes).
+extern "C" __global__ void quantize_q8_tile(const float* x, signed char* xq, float* head, int cols) {
+    const int t = blockIdx.y, g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (g >= cols / 32) return;
+    const float v = x[(size_t)t * cols + g * 32 + lane];
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    int sum = q;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    x8_store(xq, head, cols, t, g, lane, q, d, sum);
+}
+template <bool GELU>
+__device__ __forceinline__ void gated_q8_tile(const float* gate, const float* up, int n, int up_stride,
+                                              signed char* xq, float* head) {
+    const int t = blockIdx.y, g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (g >= n / 32) return;
+    const float v = gated_value<GELU>(gate[(size_t)t * n + g * 32 + lane], up[(size_t)t * up_stride + g * 32 + lane]);
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    int sum = q;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    x8_store(xq, head, n, t, g, lane, q, d, sum);
+}
+extern "C" __global__ void swiglu_q8_tile(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                          float* head) {
+    gated_q8_tile<false>(gate, up, n, up_stride, xq, head);
+}
+extern "C" __global__ void geglu_q8_tile(const float* gate, const float* up, int n, int up_stride, signed char* xq,
+                                         float* head) {
+    gated_q8_tile<true>(gate, up, n, up_stride, xq, head);
 }
 extern "C" __global__ void swiglu_q8(const float* gate, const float* up, int n, int up_stride, signed char* xq,
                                      float* xd, float* xs, int blocks) {
@@ -1194,9 +1257,12 @@ __device__ __forceinline__ void ldmatrix_x4_bytes(u32 (&r)[4], const u8* p) {
 // writes is act(gate) x up rounded to 8 bits as quantize_q8 would round it (oq, od, os):
 // the next product's input. Neither product is written as f32 (rows x tokens x 8 bytes a
 // layer, read back once by the activation). Tiles of 64 or 128 tokens; rows in 64s.
-template <int KIND, int GROUP, int NT, int GLU = 0>
-__device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signed char* xq, const float* xd,
-                        const float* xs, float* y, signed char* oq, float* od, float* os, int rows, int cols,
+//
+// HEAD is how x's scales and sums come (and how GLU writes them): false, xa is xd and xb
+// xs; true, xa is a batch's heads (X8_HEAD) and xb isn't read. oa and ob likewise.
+template <int KIND, int GROUP, int NT, int GLU = 0, bool HEAD = false>
+__device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signed char* xq, const float* xa,
+                        const float* xb, float* y, signed char* oq, float* oa, float* ob, int rows, int cols,
                         int tokens) {
     static_assert(GLU == 0 || NT >= 64, "the gated kernel needs a warp's two tiles of 16 rows");
     // 128 columns a step: 64 tensor-core products per warp between syncs. Rows of 128
@@ -1221,6 +1287,7 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
     const int wr = NT >= 64 ? (warp & 3) * 32 : warp * 16, wt = NT >= 64 ? (warp >> 2) * (NT / 2) : 0;
     constexpr bool has_min = KIND == K_Q4_K || KIND == K_Q5_K;
     float acc[MI][NI][4] = {};
+    const size_t x_heads = x8_heads(cols);
     const int xd_cols = cols / 32, xs_cols = cols / 16;
 
     // The next step's raw bytes are read into registers before this step's products, and
@@ -1288,8 +1355,15 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
             raw.xsum[i] = raw.xscale[i] = 0.0f;
             if (t < NT && tok0 + t < tokens && k < cols) {
                 raw.xq[i] = *reinterpret_cast<const uint4*>(xq + (size_t)(tok0 + t) * cols + k);
-                raw.xsum[i] = xs[(size_t)(tok0 + t) * xs_cols + k / 16];
-                raw.xscale[i] = xd[(size_t)(tok0 + t) * xd_cols + k / 32];
+                if constexpr (HEAD) {
+                    // The scale and the sum of this thread's 32, from the step's head.
+                    const float* head = xa + ((size_t)(tok0 + t) * x_heads + k0 / K) * X8_HEAD;
+                    raw.xscale[i] = head[h / 2];
+                    if constexpr (has_min) raw.xsum[i] = head[4 + h / 2];
+                } else {
+                    raw.xsum[i] = xb[(size_t)(tok0 + t) * xs_cols + k / 16];
+                    raw.xscale[i] = xa[(size_t)(tok0 + t) * xd_cols + k / 32];
+                }
             }
         }
     };
@@ -1395,8 +1469,8 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
 #pragma unroll
         for (int i = 0; i < XI; i++) {
             const int c = tid + i * 256, t = c >> 3, h = c & 7;
-            // The runs h and h + 1 of a group are on neighbouring lanes.
-            const float sum32 = raw.xsum[i] + __shfl_xor_sync(0xFFFFFFFFu, raw.xsum[i], 1);
+            // A head has a 32's sum; else the runs h and h + 1 of a 32 are on neighbouring lanes.
+            const float sum32 = HEAD ? raw.xsum[i] : raw.xsum[i] + __shfl_xor_sync(0xFFFFFFFFu, raw.xsum[i], 1);
             if (t >= NT) continue;
             *reinterpret_cast<uint4*>(&xqs[t][h * 16]) = raw.xq[i];
             if ((h & 1) == 0) {
@@ -1535,7 +1609,10 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
         // warp's 16 and the next warp's (warp ^ 1), so each leaves its largest in shared
         // memory for the other; a token's sum of 16 is the warp's own.
         __shared__ float largest[8][NT / 2];
+        __shared__ float sums[8][NT / 2];
         const int orow = row0 + (warp & 3) * 16;
+        const size_t o_heads = x8_heads(rows);
+        float scale[NI][2];
         float v[NI][4];
 #pragma unroll
         for (int ni = 0; ni < NI; ni++) {
@@ -1560,16 +1637,33 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
                 const int q1 = amax == 0.0f ? 0 : __float2int_rn(v[ni][2 + j] / d);
                 int sum = q0 + q1;
                 for (int o = 4; o < 32; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                scale[ni][j] = d;
+                if (HEAD && gid == 0) sums[warp][at] = __fmul_rn(d, (float)sum);
                 if (orow < rows && t < tokens) {
                     signed char* out = oq + (size_t)t * rows + orow + gid;
                     out[0] = (signed char)q0;
                     out[8] = (signed char)q1;
-                    if (gid == 0) {
-                        os[(size_t)t * (rows / 16) + orow / 16] = d * (float)sum;
-                        if ((warp & 1) == 0) od[(size_t)t * (rows / 32) + orow / 32] = d;
+                    if (!HEAD && gid == 0) {
+                        ob[(size_t)t * (rows / 16) + orow / 16] = d * (float)sum;
+                        if ((warp & 1) == 0) oa[(size_t)t * (rows / 32) + orow / 32] = d;
                     }
                 }
             }
+        if constexpr (HEAD) __syncthreads();
+        // A head: a 32's scale, and its sum from the two warps' 16s, by its first warp.
+        if (HEAD && gid == 0 && (warp & 1) == 0 && orow < rows) {
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++)
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int at = ni * 8 + tig * 2 + j, t = tok0 + wt + at;
+                    if (t >= tokens) continue;
+                    float* head = oa + ((size_t)t * o_heads + orow / 128) * X8_HEAD;
+                    const int g = (orow % 128) / 32;
+                    head[g] = scale[ni][j];
+                    head[4 + g] = __fadd_rn(sums[warp][at], sums[warp ^ 1][at]);
+                }
+        }
     } else {
 #pragma unroll
         for (int mi = 0; mi < MI; mi++)
@@ -1583,58 +1677,50 @@ __device__ void matmul8(const u8* w, const u8* w2, size_t row_bytes, const signe
     }
 }
 
-#define MATMUL8(name, KIND, GROUP, NT, ROW_BYTES, BLOCKS)                                                  \
+#define MATMUL8(name, KIND, GROUP, NT, ROW_BYTES, BLOCKS, HEAD)                                            \
     extern "C" __global__ void __launch_bounds__(256, BLOCKS)                                            \
-        name(const u8* w, const signed char* xq, const float* xd, const float* xs, float* y, int rows,   \
+        name(const u8* w, const signed char* xq, const float* xa, const float* xb, float* y, int rows,   \
              int cols, int tokens) {                                                                     \
-        matmul8<KIND, GROUP, NT>(w, nullptr, (size_t)(ROW_BYTES), xq, xd, xs, y, nullptr, nullptr,       \
-                                 nullptr, rows, cols, tokens);                                           \
+        matmul8<KIND, GROUP, NT, 0, HEAD>(w, nullptr, (size_t)(ROW_BYTES), xq, xa, xb, y, nullptr,       \
+                                          nullptr, nullptr, rows, cols, tokens);                         \
+    }
+// A feed-forward's gate and up products with its activation, rounded for the next product
+// (matmul8's GLU): `rows` of each matrix, a block an SM.
+#define MATMUL8_GLU(name, KIND, GROUP, NT, ROW_BYTES, GLU, HEAD)                                           \
+    extern "C" __global__ void __launch_bounds__(256, 1)                                                 \
+        name(const u8* gate, const u8* up, const signed char* xq, const float* xa, const float* xb,      \
+             signed char* oq, float* oa, float* ob, int rows, int cols, int tokens) {                    \
+        matmul8<KIND, GROUP, NT, GLU, HEAD>(gate, up, (size_t)(ROW_BYTES), xq, xa, xb, nullptr, oq, oa,  \
+                                            ob, rows, cols, tokens);                                     \
     }
 
 // One block per SM, with the next step's bytes read ahead into registers (fetch): faster
 // than two blocks without (Q4_0 -6%, Q8_0 -25%), and Q4_K and Q5_K would spill with two.
 // Q6_K keeps two blocks and no read-ahead.
-MATMUL8(matmul8_q4_0, K_Q4_0, 32, 64, q4_0_row_bytes(cols), 1)
-MATMUL8(matmul8_q8_0, K_Q8_0, 32, 64, cols / 32 * 34, 1)
-MATMUL8(matmul8_q4_k, K_Q4_K, 32, 64, cols / 256 * 144, 1)
-MATMUL8(matmul8_q5_k, K_Q5_K, 32, 64, cols / 256 * 176, 1)
-MATMUL8(matmul8_q6_k, K_Q6_K, 16, 64, cols / 256 * Q6K_BYTES, 2)
-// Tiles of 32 and 16 tokens, for batches of up to that many. (Two blocks an SM, which
-// their fewer registers allow, measured slower for Q4_0, 74 -> 86 us, and level for the rest.)
-#define MATMUL8_SMALL(NT)                                                                \
-    MATMUL8(matmul8_t##NT##_q4_0, K_Q4_0, 32, NT, q4_0_row_bytes(cols), 1)    \
-    MATMUL8(matmul8_t##NT##_q8_0, K_Q8_0, 32, NT, cols / 32 * 34, 1)          \
-    MATMUL8(matmul8_t##NT##_q4_k, K_Q4_K, 32, NT, cols / 256 * 144, 1)        \
-    MATMUL8(matmul8_t##NT##_q5_k, K_Q5_K, 32, NT, cols / 256 * 176, 1)        \
-    MATMUL8(matmul8_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, 2)
-MATMUL8_SMALL(32)
-MATMUL8_SMALL(16)
-// Tiles of 128 tokens, one block an SM (Q6_K's as well: the sums take twice the registers).
-MATMUL8(matmul8_t128_q4_0, K_Q4_0, 32, 128, q4_0_row_bytes(cols), 1)
-MATMUL8(matmul8_t128_q8_0, K_Q8_0, 32, 128, cols / 32 * 34, 1)
-MATMUL8(matmul8_t128_q4_k, K_Q4_K, 32, 128, cols / 256 * 144, 1)
-MATMUL8(matmul8_t128_q5_k, K_Q5_K, 32, 128, cols / 256 * 176, 1)
-MATMUL8(matmul8_t128_q6_k, K_Q6_K, 16, 128, cols / 256 * Q6K_BYTES, 1)
-
-// A feed-forward's gate and up products with its activation, rounded for the next product
-// (matmul8's GLU): `rows` of each matrix, a block an SM.
-#define MATMUL8_GLU(name, KIND, GROUP, NT, ROW_BYTES, GLU)                                                 \
-    extern "C" __global__ void __launch_bounds__(256, 1)                                                 \
-        name(const u8* gate, const u8* up, const signed char* xq, const float* xd, const float* xs,      \
-             signed char* oq, float* od, float* os, int rows, int cols, int tokens) {                    \
-        matmul8<KIND, GROUP, NT, GLU>(gate, up, (size_t)(ROW_BYTES), xq, xd, xs, nullptr, oq, od, os,    \
-                                      rows, cols, tokens);                                               \
-    }
-#define MATMUL8_GLUS(act, GLU, NT)                                                         \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_0, K_Q4_0, 32, NT, q4_0_row_bytes(cols), GLU)   \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q8_0, K_Q8_0, 32, NT, cols / 32 * 34, GLU)         \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q4_k, K_Q4_K, 32, NT, cols / 256 * 144, GLU)       \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q5_k, K_Q5_K, 32, NT, cols / 256 * 176, GLU)       \
-    MATMUL8_GLU(matmul8_##act##_t##NT##_q6_k, K_Q6_K, 16, NT, cols / 256 * Q6K_BYTES, GLU)
-MATMUL8_GLUS(swiglu, 1, 64)
-MATMUL8_GLUS(swiglu, 1, 128)
-MATMUL8_GLUS(geglu, 2, 64)
-MATMUL8_GLUS(geglu, 2, 128)
+// Tiles of 32 and 16 tokens are for batches of up to that many (two blocks an SM, which
+// their fewer registers allow, measured slower for Q4_0, 74 -> 86 us, and level for the
+// rest); tiles of 128 run one block an SM, Q6_K's as well (the sums take twice the
+// registers).
+//
+// A type's kernels at every tile, plain and gated. The K-quants read a batch's heads
+// (HEAD); Q4_0 and Q8_0 come both ways, the heads' kernels named `_h`, for what little a
+// K-quant model keeps in them (Qwen's ssm_alpha and ssm_beta).
+#define MATMUL8_ALL(q, sfx, KIND, GROUP, ROW_BYTES, B64, HEAD)                                  \
+    MATMUL8(matmul8_##q##sfx, KIND, GROUP, 64, ROW_BYTES, B64, HEAD)                            \
+    MATMUL8(matmul8_t32_##q##sfx, KIND, GROUP, 32, ROW_BYTES, B64, HEAD)                        \
+    MATMUL8(matmul8_t16_##q##sfx, KIND, GROUP, 16, ROW_BYTES, B64, HEAD)                        \
+    MATMUL8(matmul8_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 1, HEAD)                        \
+    MATMUL8_GLU(matmul8_swiglu_t64_##q##sfx, KIND, GROUP, 64, ROW_BYTES, 1, HEAD)               \
+    MATMUL8_GLU(matmul8_swiglu_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 1, HEAD)             \
+    MATMUL8_GLU(matmul8_geglu_t64_##q##sfx, KIND, GROUP, 64, ROW_BYTES, 2, HEAD)                \
+    MATMUL8_GLU(matmul8_geglu_t128_##q##sfx, KIND, GROUP, 128, ROW_BYTES, 2, HEAD)
+MATMUL8_ALL(q4_0, , K_Q4_0, 32, q4_0_row_bytes(cols), 1, false)
+MATMUL8_ALL(q8_0, , K_Q8_0, 32, cols / 32 * 34, 1, false)
+MATMUL8_ALL(q4_0, _h, K_Q4_0, 32, q4_0_row_bytes(cols), 1, true)
+MATMUL8_ALL(q8_0, _h, K_Q8_0, 32, cols / 32 * 34, 1, true)
+MATMUL8_ALL(q4_k, , K_Q4_K, 32, cols / 256 * 144, 1, true)
+MATMUL8_ALL(q5_k, , K_Q5_K, 32, cols / 256 * 176, 1, true)
+MATMUL8_ALL(q6_k, , K_Q6_K, 16, cols / 256 * Q6K_BYTES, 2, true)
 
 // ---- Attention on the tensor cores (8-bit mode: an f16 cache) ------------------------
 //
