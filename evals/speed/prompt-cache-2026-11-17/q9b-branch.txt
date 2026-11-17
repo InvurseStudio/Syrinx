@@ -1,0 +1,18 @@
+chat            prompt    kept    read  read s  calls                  reply
+plain             1864       0    1864    0.69  -                      The capital of France is Paris.
+plain             1862    1820      42    0.05  -                      The three primary colours are red, blue, and yellow.
+long, change      7649       0    7649    2.83  write_file             Summary written to `/var/folders/kd/2m_rxxd90gn2k_20r3dh75540000gn/T/v
+plain             1867    1820      47    0.08  -                      12 times 12 is 144.
+change            2033    1937      96    0.08  write_file             The file `/var/folders/kd/2m_rxxd90gn2k_20r3dh75540000gn/T/vbench-desk
+plain             1867    1820      47    0.06  -                      A litre is larger than a pint. Specifically: * **1 litre** ≈ 1.76 pint
+long              7595    1937    5658    2.17  -                      The text above is a partial view of two C# source files from the Vireo
+plain             1866    1820      46    0.06  -                      A leap year has 366 days.
+change            2033    1937      96    0.07  write_file             The file `/var/folders/kd/2m_rxxd90gn2k_20r3dh75540000gn/T/vbench-desk
+plain             1865    1820      45    0.06  -                      The mammal that lays eggs is the platypus (and the echidna, also known
+remember          1865    1820      45    0.05  remember               I've remembered that your favourite colour is teal.
+plain             1905    1820      85    0.06  -                      The boiling point of water at standard atmospheric pressure is 100°C.
+plain             1902    1820      82    0.06  -                      A penguin is a bird that cannot fly.
+remember          1903    1820      83    0.06  remember               I've noted that you live in Tampere. Is there anything else you'd like
+plain             1913    1820      93    0.06  -                      The freezing point of water is 32°F.
+
+From the cache: 60% of 39989 prompt tokens.

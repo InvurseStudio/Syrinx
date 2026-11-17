@@ -1108,11 +1108,18 @@ struct Kept {
     turn: Option<Qwen35Checkpoint>,
     /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
     scratch: Option<Qwen35Checkpoint>,
-    /// Gemma, in a session whose sliding-window layers keep rings: the tokens of the last
-    /// system turn read (its instructions and tools, less a few) and the state after
-    /// them. A prompt longer than a ring writes over the window after that turn, and the
-    /// next chat would read the turn again; it loads this instead.
-    head: Option<(Vec<u32>, SavedState)>,
+    /// The starts of the last few system turns read, each its tokens and the state after
+    /// them in system memory, the latest used last (`keep_head`). Qwen: a system turn's
+    /// end, for when another turn has been read over it in the session (its checkpoints
+    /// are only good for the turn the session holds). Gemma, in a session whose
+    /// sliding-window layers keep rings: such a session can only go back a batch's length from
+    /// the furthest it has read, so the chat after a long one, or one whose system turn
+    /// parts early from the last (other tools, a new memory), would read its system turn
+    /// again from the start; it loads the longest of these it starts with instead. Two
+    /// kinds: a system turn's end (its instructions and tools, less a few tokens), and
+    /// where a system turn parted from the one in the session before it (what chats with
+    /// and without the tools that change files share, or with and without a new memory).
+    heads: Vec<(Vec<u32>, SavedState)>,
     /// Small sessions apart, for questions the server asks the model itself (which tools a
     /// request needs, whether a skill fits), so the chat's own cache is left as it is.
     /// One a kind of question (up to [`PICKERS`]), each going on from the start its last
@@ -1125,6 +1132,31 @@ struct Kept {
     /// Gemma's chat is saved up to there, which the next turn and a retry both start with,
     /// since its saved state can only be loaded whole.
     history_end: usize,
+}
+
+/// The most saved starts a chat session keeps (`Kept::heads`), and the most memory
+/// for them all, in system memory. For a 1,600-token system turn Gemma 4 31B's are 1.0 GB
+/// each (0.8 for 875 tokens: up to its window, every layer's positions), Qwen 3.8 27B's
+/// 0.28, Gemma 4 E4B's 0.05.
+const MAX_HEADS: usize = 3;
+const HEADS_BYTES: usize = 4 << 30;
+
+/// Adds a saved start to `heads` as the latest used, in place of one for the same tokens,
+/// and drops the least recently used past `MAX_HEADS` or `HEADS_BYTES` (never the new one).
+fn keep_head(heads: &mut Vec<(Vec<u32>, SavedState)>, tokens: &[u32], state: SavedState) {
+    heads.retain(|(t, _)| t != tokens);
+    heads.push((tokens.to_vec(), state));
+    let bytes = |h: &[(Vec<u32>, SavedState)]| h.iter().map(|(_, s)| s.bytes().len()).sum::<usize>();
+    while heads.len() > 1 && (heads.len() > MAX_HEADS || bytes(heads) > HEADS_BYTES) {
+        heads.remove(0);
+    }
+    eprintln!(
+        "Saved a chat's start: {} tokens, {:.2} GB ({} kept, {:.2} GB).",
+        tokens.len(),
+        heads.last().map_or(0, |(_, s)| s.bytes().len()) as f64 / 1e9,
+        heads.len(),
+        bytes(heads) as f64 / 1e9
+    );
 }
 
 /// A session for the server's own questions, and what's in it.
@@ -1643,17 +1675,18 @@ impl Model {
             // layers no longer hold the window before it.
             (Model::Gemma4(_), Session::Gemma4(s)) => {
                 let mut kept_len = s.truncate(shared);
-                // A ring wrote over the window there: the system turn's saved state, if
-                // this prompt starts with that turn.
+                // The rings no longer hold the window there: the longest saved start
+                // this prompt begins with.
                 if kept_len < shared
-                    && let Some((tokens, state)) = kept
-                        .head
-                        .as_ref()
-                        .filter(|(t, _)| t.len() <= shared && ids.starts_with(t))
+                    && let Some(i) = (0..kept.heads.len())
+                        .filter(|&i| ids.starts_with(&kept.heads[i].0))
+                        .max_by_key(|&i| kept.heads[i].0.len())
                 {
-                    s.import(state, tokens.len()).map_err(e)?;
+                    let (tokens, state) = kept.heads.remove(i);
+                    s.import(&state, tokens.len()).map_err(e)?;
                     kept_len = tokens.len();
-                    kept.tokens.clone_from(tokens);
+                    kept.tokens.clone_from(&tokens);
+                    kept.heads.push((tokens, state));
                 }
                 kept.history_end = kept.history_end.min(kept_len);
                 kept_len
@@ -1669,6 +1702,28 @@ impl Model {
                 } else if let Some(cp) = kept.turn.as_ref().filter(|c| c.len() <= shared) {
                     m.restore(s, cp).map_err(e)?;
                     cp.len()
+                } else if let Some(i) = (0..kept.heads.len())
+                    .filter(|&i| ids.starts_with(&kept.heads[i].0))
+                    .max_by_key(|&i| kept.heads[i].0.len())
+                    .filter(|&i| {
+                        // Worth loading over the shared start the session still has.
+                        let base = kept.base.as_ref().map_or(0, |c| c.len());
+                        kept.heads[i].0.len() >= base.min(shared) + 64
+                    })
+                {
+                    // Another system turn than the session's, read before: its saved
+                    // start, and a checkpoint there as the session's own turn.
+                    let (tokens, state) = kept.heads.remove(i);
+                    s.import(&state).map_err(e)?;
+                    kept.checkpoint = None;
+                    // The shared start's checkpoint stands while this turn begins with it.
+                    if kept.base.as_ref().is_some_and(|c| c.len() > shared) {
+                        kept.base = None;
+                    }
+                    m.save(s, &mut kept.turn).map_err(e)?;
+                    kept.tokens.clone_from(&tokens);
+                    kept.heads.push((tokens, state));
+                    s.len()
                 } else if let Some(cp) = kept.base.as_ref().filter(|c| c.len() <= shared) {
                     // Another system turn from here on: the one kept is no longer the
                     // session's.
@@ -1709,21 +1764,34 @@ impl Model {
                 m.forward_batch(s, &ids[from..head_at], Logits::None)
                     .map_err(e)?;
                 m.save(s, &mut kept.turn).map_err(e)?;
+                // And in system memory, for when another system turn has taken its place
+                // in the session (a chat with the tools that change files, then one
+                // without: Qwen 3.5 9B read 1,250 of its 1,870 tokens again each time).
+                if let Some(cp) = kept.turn.as_ref() {
+                    keep_head(&mut kept.heads, &ids[..head_at], s.export(cp).map_err(e)?);
+                }
                 kept.tokens.extend_from_slice(&ids[from..head_at]);
                 from = head_at;
             }
         }
         // Gemma with rings, reading a system turn (or a good part of one) again: its state
-        // saved at the turn's end (a few tokens early, as Qwen's), for the chat after a
-        // prompt longer than a ring.
-        if let (Model::Gemma4(m), Session::Gemma4(s)) = (self, &mut kept.session) {
+        // saved on the way (each a few tokens early, as Qwen's), for the chats the rings
+        // can't go back for. Where this prompt parts from the last, when that's well
+        // inside the system turn: what the two turns share. Then at the turn's end.
+        if let (Model::Gemma4(m), Session::Gemma4(s)) = (self, &mut kept.session)
+            && s.has_rings()
+        {
             let head_at = head.saturating_sub(8);
-            if s.has_rings() && head_at >= from + 64 && head_at < mark {
-                m.forward_batch(s, &ids[from..head_at], Logits::None)
-                    .map_err(e)?;
-                kept.head = Some((ids[..head_at].to_vec(), s.export(head_at).map_err(e)?));
-                kept.tokens.extend_from_slice(&ids[from..head_at]);
-                from = head_at;
+            let parted_at = shared.saturating_sub(8);
+            let parted = (parted_at + 64 <= head_at).then_some(parted_at);
+            for at in parted.into_iter().chain([head_at]) {
+                if at >= from + 64 && at < mark {
+                    m.forward_batch(s, &ids[from..at], Logits::None)
+                        .map_err(e)?;
+                    keep_head(&mut kept.heads, &ids[..at], s.export(at).map_err(e)?);
+                    kept.tokens.extend_from_slice(&ids[from..at]);
+                    from = at;
+                }
             }
         }
         // Qwen: the history read on its own, and its DeltaNet saved where the next
@@ -2024,7 +2092,7 @@ fn engine(
                 base: None,
                 turn: None,
                 scratch: None,
-                head: None,
+                heads: Vec::new(),
                 pickers: Vec::new(),
                 skill_controls: HashMap::new(),
                 history_end: 0,
@@ -2121,7 +2189,7 @@ fn engine(
                         base: None,
                     turn: None,
                         scratch: None,
-                        head: None,
+                        heads: Vec::new(),
                         pickers: Vec::new(),
                         skill_controls: HashMap::new(),
                         history_end: 0,

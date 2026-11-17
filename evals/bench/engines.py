@@ -316,6 +316,20 @@ def cli_generate(model, prompt_text, n):
             "text": p.stdout.rstrip("\n")}
 
 
+BATCHES = re.compile(r"(\d+): ([\d.]+)")
+
+
+def cli_batches(model, text_file, depth=4000):
+    """vireo-cli batches: milliseconds a batch of 1 to 64 tokens, `depth` tokens into a chat."""
+    cli = common.exe(common.path(engine_cfg("vireo")["cli"]))
+    p = subprocess.run([str(cli), "batches", str(common.path(model["gguf"])), str(text_file), "--depth", str(depth)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
+    line = next((l for l in p.stdout.splitlines() if l.startswith("Batches at")), None)
+    if not line:
+        raise RuntimeError(f"vireo-cli batches: {p.stderr[-400:]}")
+    return {int(n): float(ms) for n, ms in BATCHES.findall(line.split("ms:", 1)[1])}
+
+
 def llama_bench(model, args):
     folder = common.path(engine_cfg("llama")["dir"])
     p = subprocess.run([str(common.exe(folder / "llama-bench")), "-m", str(common.path(model["gguf"])), "-ngl", "99",
