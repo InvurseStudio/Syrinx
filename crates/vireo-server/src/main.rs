@@ -91,12 +91,13 @@ reads the address from the \"Listening on\" line.
 4 E2B for 31B), --draft-tokens at a time (2 by default), for the model to check in one
 pass: every token is still the model's own pick. Gemma 4 only. Without one, --lookup
 guesses up to <n> tokens a round from the chat itself (what followed the last few
-tokens where they appeared before; 3 by default, 0 for none), checked the same way.
-Gemma 4, and Qwen 3.5 on the Mac. A Qwen model with its own multi-token-prediction
-layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by default on the Mac), and a
-Gemma 4 with Google's draft model (gemma-4-31B-it-assistant, or the E2B's or E4B's;
-safetensors) beside it or in the Mac app's DraftModels folder with that, or with --draft's
-folder. On CUDA it guesses only where it's sure, and the chat's long runs are still taken.
+tokens where they appeared before; 7 by default, 0 for none; Gemma 4 up to 31 while a
+copy is running), checked the same way. Gemma 4 and Qwen 3.5. A Qwen model with its own
+multi-token-prediction layer (Qwen 3.8 27B) guesses with that instead (--mtp, on by
+default on the Mac), and a Gemma 4 with Google's draft model (gemma-4-31B-it-assistant,
+or the E2B's or E4B's; safetensors) beside it or in the Mac app's DraftModels folder with
+that, or with --draft's folder; the chat's long runs are still taken. On CUDA the draft
+model guesses only where it's sure.
 
 --thinking is what a request gets when it doesn't say (\"thinking\": true or false): off by
 default. On, Gemma 4 and Qwen think before they answer and after each tool's result (at
@@ -1168,8 +1169,18 @@ const MTP_FLOOR: f32 = if cfg!(target_os = "macos") { 0.0 } else { 0.7 };
 /// With a draft model, the chat's own guesses are still taken where they're a long run
 /// (this many or more: what followed 4 or more of the chat's last tokens before), since a
 /// copied line is right far more often than a draft and costs nothing to guess. Shorter
-/// ones are left to the draft model. On CUDA; the Mac drafts from one or the other.
+/// ones are left to the draft model. On CUDA, where the draft model guesses only where
+/// it's sure (`MTP_FLOOR`).
 const CHAT_RUN_OVER_DRAFT: usize = 3;
+/// The same on the Mac (since 2026-11-17; it drafted from one or the other before), and
+/// for Qwen's multi-token-prediction layer: only what followed 8 of the chat's last
+/// tokens, a copy under way, which `draft::Lookup::guess_on` then guesses further. The
+/// draft model and the layer guess everywhere there and are right more often than a
+/// short match. On the M5 Max, 400-token replies, the draft alone / with the chat's runs
+/// of 3 guesses or more / of 7: Qwen 3.8 27B returning an edited code file 56 / 89 / 89
+/// tokens/s, a document as a list 50 / 45 / 50; Gemma 4 31B with Google's draft model
+/// 48-53 / 153 / 165 and 41-46 / 41 / 41, a new story and an explanation level.
+const CHAT_RUN_OVER_LAYER: usize = 7;
 
 /// On CUDA, how deep in a chat (in tokens) guesses have to earn their keep: the chat's own
 /// from `CHAT_GUESSES_FROM`, a Gemma draft model's from `MTP_GUESSES_FROM`. Checking a
@@ -2723,25 +2734,22 @@ fn reply(
     }
     // Without a draft model: guesses from the chat itself, for a model that can go back.
     // Qwen goes back through the DeltaNet steps its chat session keeps for short batches:
-    // to draft with its multi-token-prediction layer, or from the chat. On the Mac only on
-    // a large model: on a small one a check of a few tokens costs too much against one
-    // token for the chat's guesses to pay (Qwen 3.5 4B, eight eval cases: writing 5.5 →
-    // 5.9 s; 27B 58.4 → 52.9 s). On CUDA a check of 4 costs Qwen 3.5 4B 1.4 times one
-    // token, and it pays on every size (4B rewriting a document as a list 86 → 199
-    // tokens/s, 9B returning an edited code file 52 → 157; a new story 1-3% slower),
-    // where the GPU has the memory for the steps besides what's kept free.
-    // Inside a tool call the guesses are nearly all taken (a path or a number the chat
-    // already holds), so there the chat's guesses pay on the small ones too: `text_drafts`
-    // says whether the reply's own text is guessed at as well.
-    let mut text_drafts = true;
+    // to draft with its multi-token-prediction layer, or from the chat. On every size: a
+    // check of 4 costs Qwen 3.5 4B 1.4 times one token on CUDA and 1.3 on the Mac (9B on
+    // the M5 Max: one token 13.7 ms, 2 14.4, 4 18.6, 8 20.4), and the chat's guesses are
+    // only made where its last tokens appeared before. 400-token replies on the M5 Max,
+    // without and with them: Qwen 3.5 9B returning an edited code file 74 -> 207 tokens/s,
+    // a document as a list 74 -> 78, a new story and an explanation level; 4B 117 -> 246,
+    // 117 -> 126, level. (The Mac left the small ones out while a check of a few tokens
+    // cost them two tokens' time.) On CUDA only where the GPU has the memory for the
+    // steps besides what's kept free.
     let can_go_back = match (model, &mut kept.session) {
         (Model::Gemma4(_) | Model::Llama(_), _) => true,
         (Model::Qwen35(m), Session::Qwen35(s)) if m.can_rewind() => {
-            text_drafts = s.keeps_mtp() || m.config.dim >= 5120 || !cfg!(target_os = "macos");
             let room = cfg!(target_os = "macos")
                 || s.keeps_steps()
                 || m.gpu().free_memory() >= m.steps_bytes() + STEPS_HEADROOM;
-            (text_drafts || !offered.is_empty()) && room && m.keep_steps(s).is_ok()
+            room && m.keep_steps(s).is_ok()
         }
         _ => false,
     };
@@ -2754,14 +2762,25 @@ fn reply(
             _ => false,
         };
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
-    // Gemma 4 with its draft model on CUDA guesses from the chat too, where the chat has
-    // a long run to offer (`CHAT_RUN_OVER_DRAFT`).
-    let both = mtp && matches!(kept.session, Session::Gemma4(_)) && !cfg!(target_os = "macos");
+    // A model with a draft model or layer guesses from the chat too, where the chat has
+    // a long run to offer (`CHAT_RUN_OVER_DRAFT`, `CHAT_RUN_OVER_LAYER`).
+    let both = mtp;
+    let chat_run = match kept.session {
+        Session::Qwen35(_) => CHAT_RUN_OVER_LAYER,
+        _ if cfg!(target_os = "macos") => CHAT_RUN_OVER_LAYER,
+        _ => CHAT_RUN_OVER_DRAFT,
+    };
+    // Gemma 4 and Llama go back any number of tokens, so a running copy is guessed
+    // further; Qwen only through the steps it keeps (a round of 8).
+    let long = match kept.session {
+        Session::Qwen35(_) => 0,
+        _ => draft::LONG_LOOKUP,
+    };
     let mut lookup = (drafter.is_none() && (!mtp || both) && options().lookup > 0 && can_go_back)
-        .then(|| draft::Lookup::new(options().lookup));
+        .then(|| draft::Lookup::new(options().lookup).with_long(long));
     // Whether the guesses read ahead are the draft model's (or the layer's), not the chat's.
     let mut ahead_drafted = false;
-    let drafting = drafter.is_some() || (lookup.is_some() && text_drafts) || mtp;
+    let drafting = drafter.is_some() || lookup.is_some() || mtp;
     // After a tool's result (or the skill written in) the model must say something: its
     // end-of-turn tokens are taken away until it writes one token. Gemma 4 E4B, with a
     // longer list of tools, ended its turn on the result three times in 39 cases,
@@ -2795,13 +2814,11 @@ fn reply(
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
         if ahead.is_empty() && !muse_turn {
-            // The chat's guesses, where it guesses from the chat (in a reply's text only
-            // where `text_drafts`): all of them without a draft model, only a long run with
-            // one.
+            // The chat's guesses, where it guesses from the chat: all of them without a
+            // draft model, only a long run with one.
             let from_chat = match lookup.as_mut() {
                 Some(l)
                     if room > 1
-                        && text_drafts
                         && guesses_pay(
                             kept.tokens.len(),
                             CHAT_GUESSES_FROM,
@@ -2811,8 +2828,8 @@ fn reply(
                             l.taken,
                         ) =>
                 {
-                    let g = l.guess(&kept.tokens, l.max.min(room - 1));
-                    if mtp && g.len() < CHAT_RUN_OVER_DRAFT {
+                    let g = l.guess_on(&kept.tokens, room - 1);
+                    if mtp && g.len() < chat_run {
                         l.guessed -= g.len();
                         Vec::new()
                     } else {

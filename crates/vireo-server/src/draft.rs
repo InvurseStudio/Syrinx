@@ -161,10 +161,20 @@ fn argmax(logits: &[f32]) -> u32 {
 pub struct Lookup {
     /// The most tokens guessed a round.
     pub max: usize,
+    /// The most while a copy is running (`guess_on`): `max`, for a model that can't go
+    /// back further.
+    pub long: usize,
     /// This reply's guesses and those taken.
     pub guessed: usize,
     pub taken: usize,
+    /// The last round's guesses in the reply's text, and `taken` before it.
+    last: (usize, usize),
 }
+
+/// The most guesses a round while a copy is running (see `Lookup::guess_on`), for a model
+/// that goes back any number of tokens (Gemma 4): with the token before them, the 32-token
+/// tile's batch.
+pub const LONG_LOOKUP: usize = 31;
 
 /// Guesses a round from the chat when the command line doesn't say (`--lookup`). Gemma 4
 /// E2B on the M5 Max, 200-400-token replies: rewriting a document as a list 217 → 342-358
@@ -194,22 +204,53 @@ impl Lookup {
     pub fn new(max: usize) -> Self {
         Self {
             max,
+            long: max,
             guessed: 0,
             taken: 0,
+            last: (0, 0),
         }
+    }
+
+    /// Guessing up to `long` tokens a round while a copy is running.
+    pub fn with_long(mut self, long: usize) -> Self {
+        self.long = long.max(self.max);
+        self
     }
 
     /// Up to `n` guesses at the tokens after `tokens`: what followed the latest earlier
     /// place the last LONGEST_RUN tokens (or fewer, down to 2) appeared, at most one fewer
     /// than the run's length (a run of 4: 3; of 2: 1). None when they haven't.
     pub fn guess(&mut self, tokens: &[u32], n: usize) -> Vec<u32> {
-        let out = continuation(tokens, n);
+        let out = continuation(tokens, n, n);
         self.guessed += out.len();
+        out
+    }
+
+    /// A round's guesses in a reply's own text, at most `room`: as [`Self::guess`] with
+    /// `max`, but further while a copy is running. When every guess of the last round
+    /// was taken, and it was as long as its run allowed, the longest run may guess twice
+    /// as many and one more (7, 15, 31, up to `long`): a batch of 4 to 32 tokens costs
+    /// the model much the same (Gemma 4 31B on the M5 Max: 4 tokens 68 ms, 8 70, 16 75,
+    /// 32 97, one 51), so a copied passage is checked in a quarter of the rounds, and the
+    /// first guess not taken ends it.
+    pub fn guess_on(&mut self, tokens: &[u32], room: usize) -> Vec<u32> {
+        let (last, before) = self.last;
+        let running = last >= self.max && self.taken >= before + last;
+        let reach = if running {
+            (2 * last + 1).min(self.long)
+        } else {
+            self.max
+        };
+        let out = continuation(tokens, self.max.min(room), reach.min(room));
+        self.guessed += out.len();
+        self.last = (out.len(), self.taken);
         out
     }
 }
 
-fn continuation(tokens: &[u32], n: usize) -> Vec<u32> {
+/// Up to `n` tokens after the latest earlier match of `tokens`' end, or up to `reach`
+/// (`n` or more) where the match is the longest looked for.
+fn continuation(tokens: &[u32], n: usize, reach: usize) -> Vec<u32> {
     let len = tokens.len();
     for run in (LEAST_RUN..=LONGEST_RUN).rev() {
         if len <= run {
@@ -220,7 +261,11 @@ fn continuation(tokens: &[u32], n: usize) -> Vec<u32> {
         if let Some(start) = (0..len - run).rev().find(|&s| &tokens[s..s + run] == tail) {
             // Fewer guesses on a shorter match: a run of 2 is often chance (in new prose a
             // guess was taken 2% of the time), and each guess checked costs a little.
-            let n = n.min(1 + run - SHORTEST_RUN);
+            let n = if run == LONGEST_RUN && reach > n {
+                reach
+            } else {
+                n.min(1 + run - SHORTEST_RUN)
+            };
             let from = start + run;
             return tokens[from..len.min(from + n)].to_vec();
         }
@@ -236,14 +281,14 @@ mod tests {
     fn guesses_what_followed_the_latest_match() {
         // ... 7 8 9 10 11 ... 7 8 9 → 10 11 (the run of 3 found, its latest place).
         let tokens = [1, 7, 8, 9, 5, 6, 2, 7, 8, 9, 10, 11, 12, 3, 7, 8, 9];
-        assert_eq!(continuation(&tokens, 2), vec![10, 11]);
+        assert_eq!(continuation(&tokens, 2, 2), vec![10, 11]);
         // A run of 4: up to 3 guesses, and no further than what's there.
         let tokens = [1, 2, 3, 4, 5, 6, 1, 2, 3, 4];
-        assert_eq!(continuation(&tokens, 8), vec![5, 6, 1]);
+        assert_eq!(continuation(&tokens, 8, 8), vec![5, 6, 1]);
         // A run of 2: one guess, where a run of 2 is guessed from.
         let tokens = [4, 5, 6, 4, 5];
         let want: &[u32] = if LEAST_RUN <= 2 { &[6] } else { &[] };
-        assert_eq!(continuation(&tokens, 5), want);
+        assert_eq!(continuation(&tokens, 5, 5), want);
         // A longer run guesses further, where the platform looks for one.
         let tokens = [
             9, 1, 2, 3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7, 8,
@@ -253,9 +298,49 @@ mod tests {
         } else {
             &[21, 22, 23]
         };
-        assert_eq!(continuation(&tokens, 8), want);
+        assert_eq!(continuation(&tokens, 8, 8), want);
         // A single token's match isn't enough.
-        assert!(continuation(&[1, 2, 3, 9, 3], 3).is_empty());
-        assert!(continuation(&[], 3).is_empty());
+        assert!(continuation(&[1, 2, 3, 9, 3], 3, 3).is_empty());
+        assert!(continuation(&[], 3, 3).is_empty());
+    }
+
+    #[test]
+    fn a_running_copy_guesses_further() {
+        // A passage of 100 tokens, then its first 8 again: the reply is copying it.
+        let passage: Vec<u32> = (100..200).collect();
+        let mut tokens = passage.clone();
+        tokens.push(1);
+        tokens.extend(&passage[..8]);
+        let mut l = Lookup::new(7).with_long(31);
+        let mut rounds = Vec::new();
+        for _ in 0..3 {
+            let g = l.guess_on(&tokens, 64);
+            rounds.push(g.len());
+            // Every guess taken, and the model's own token after them.
+            l.taken += g.len();
+            let at = tokens.len() - 101;
+            tokens.extend(&g);
+            tokens.push(passage[at + g.len()]);
+        }
+        assert_eq!(rounds, [7, 15, 31]);
+        // One not taken: back to the usual reach.
+        let mut l = Lookup::new(7).with_long(31);
+        let mut tokens = passage.clone();
+        tokens.push(1);
+        tokens.extend(&passage[..8]);
+        assert_eq!(l.guess_on(&tokens, 64).len(), 7);
+        l.taken += 6;
+        tokens.extend(&passage[8..16]);
+        assert_eq!(l.guess_on(&tokens, 64).len(), 7);
+        // No further than the room, or than `long` when the model can't go back.
+        let mut l = Lookup::new(7);
+        let mut tokens = passage.clone();
+        tokens.push(1);
+        tokens.extend(&passage[..8]);
+        assert_eq!(l.guess_on(&tokens, 64).len(), 7);
+        l.taken += 7;
+        tokens.extend(&passage[8..16]);
+        assert_eq!(l.guess_on(&tokens, 64).len(), 7);
+        assert_eq!(l.guess_on(&tokens, 3).len(), 3);
     }
 }

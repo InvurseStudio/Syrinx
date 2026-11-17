@@ -1,0 +1,163 @@
+{
+ "model": "gemma-4-31B-it-Q6_K.gguf",
+ "ways": {
+  "draftonly": "--lookup 0",
+  "both7": ""
+ },
+ "max_tokens": 400,
+ "rounds": 1,
+ "rows": [
+  {
+   "sampling": "greedy",
+   "prompt": "list",
+   "way": "draftonly",
+   "tokens": 324,
+   "seconds": 7.95,
+   "tokens_per_s": 40.8,
+   "guesses": {
+    "draft model": [
+     228,
+     288
+    ]
+   },
+   "read_tokens": 344,
+   "read_seconds": 0.63,
+   "read_tokens_per_s": 546
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "code",
+   "way": "draftonly",
+   "tokens": 400,
+   "seconds": 8.31,
+   "tokens_per_s": 48.1,
+   "guesses": {
+    "draft model": [
+     298,
+     300
+    ]
+   },
+   "read_tokens": 519,
+   "read_seconds": 1.08,
+   "read_tokens_per_s": 481
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "story",
+   "way": "draftonly",
+   "tokens": 400,
+   "seconds": 14.28,
+   "tokens_per_s": 28.0,
+   "guesses": {
+    "draft model": [
+     227,
+     516
+    ]
+   },
+   "read_tokens": 42,
+   "read_seconds": 0.19,
+   "read_tokens_per_s": 221
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "explain",
+   "way": "draftonly",
+   "tokens": 400,
+   "seconds": 10.38,
+   "tokens_per_s": 38.5,
+   "guesses": {
+    "draft model": [
+     273,
+     375
+    ]
+   },
+   "read_tokens": 40,
+   "read_seconds": 0.13,
+   "read_tokens_per_s": 308
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "list",
+   "way": "both7",
+   "tokens": 324,
+   "seconds": 7.92,
+   "tokens_per_s": 40.9,
+   "guesses": {
+    "chat": [
+     7,
+     29
+    ],
+    "draft model": [
+     221,
+     282
+    ]
+   },
+   "read_tokens": 344,
+   "read_seconds": 0.62,
+   "read_tokens_per_s": 555
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "code",
+   "way": "both7",
+   "tokens": 400,
+   "seconds": 2.42,
+   "tokens_per_s": 165.3,
+   "guesses": {
+    "chat": [
+     367,
+     432
+    ],
+    "draft model": [
+     22,
+     22
+    ]
+   },
+   "read_tokens": 519,
+   "read_seconds": 1.08,
+   "read_tokens_per_s": 481
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "story",
+   "way": "both7",
+   "tokens": 400,
+   "seconds": 14.03,
+   "tokens_per_s": 28.5,
+   "guesses": {
+    "chat": [
+     0,
+     0
+    ],
+    "draft model": [
+     227,
+     516
+    ]
+   },
+   "read_tokens": 42,
+   "read_seconds": 0.19,
+   "read_tokens_per_s": 221
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "explain",
+   "way": "both7",
+   "tokens": 400,
+   "seconds": 10.24,
+   "tokens_per_s": 39.1,
+   "guesses": {
+    "chat": [
+     0,
+     0
+    ],
+    "draft model": [
+     273,
+     375
+    ]
+   },
+   "read_tokens": 40,
+   "read_seconds": 0.13,
+   "read_tokens_per_s": 308
+  }
+ ]
+}

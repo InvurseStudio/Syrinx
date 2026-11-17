@@ -879,6 +879,18 @@ const WIDE_TOKENS: usize = 1024;
 /// ffn_down 0.32 → 0.26, 0.32 → 0.26, 0.33 → 0.27 (one token: 0.19). 256 columns a step
 /// did nothing for whole batches (ffn_up at 1,024 tokens 4.69 → 4.63 ms, ffn_down 5.43 →
 /// 5.50) and little at 32 (0.35 → 0.32).
+///
+/// The 256-column tiles hold one tile of decoded weights, not the two the others decode
+/// in turn (BUFS in vireo_tensor.metal): two of 32 rows × 256 columns are the whole 32 KB
+/// of a threadgroup's memory, and with them (15-17 November) the 8- and 16-token tiles
+/// ran slower than the 32-token one. A batch of 4 / 8 / 16 tokens 4,000 tokens into a
+/// chat, two → one (`tests/check_speed.rs`): Gemma 4 31B 102.8 / 107.1 / 113.5 → 67.5 /
+/// 70.1 / 75.0 ms (one token 51), Qwen 3.5 9B 24.9 / 27.2 / 29.4 → 18.6 / 20.4 / 22.2
+/// (13.7), Gemma 4 E4B 15.0 / 16.0 / 17.4 → 12.5 / 13.5 / 14.5 (9.8). The 32- and
+/// 64-token tiles take 256 columns and one tile too since then: 31B at 32 / 64 tokens
+/// 102 → 98 / 141 → 137 ms, Qwen 3.5 9B 26.8 → 25.6 / 35.0 → 33.1, E4B 16.1 → 15.7 /
+/// 18.8 → 18.3; their sums differ from the 128-token tile's by f32 rounding (under 1e-5
+/// of the largest, `tests/big_matmul.rs`).
 const SMALL_TILES: [usize; 6] = [8, 16, 32, 64, 96, 192];
 /// A short batch's product split along the columns (matmul_tc's `splits`, added up by
 /// sum_parts) until there are about SPLIT_TARGET threadgroups: batches of up to
