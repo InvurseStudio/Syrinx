@@ -108,6 +108,8 @@ pub struct Qwen35CudaSession {
     gate: Buffer,
     up: Buffer,
     logits_gpu: LogitsBuffer,
+    /// Whether a batch's logits are left on the GPU (`forward_batch_held`).
+    hold: bool,
     logits: Vec<f32>,
     /// The batch's activations in 8 bits, unless the model is exact.
     q8: Option<Q8>,
@@ -490,6 +492,7 @@ impl<'a> Qwen35Cuda<'a> {
             gate: f32s(batch * c.ffn_dim)?,
             up: f32s(batch * c.ffn_dim)?,
             logits_gpu: LogitsBuffer::new(g, c.vocab)?,
+            hold: false,
             logits: vec![0.0; c.vocab],
             q8_ffn: if cfg!(target_os = "macos") {
                 None
@@ -1217,6 +1220,30 @@ impl<'a> Qwen35Cuda<'a> {
         Ok(want_logits.then_some(&s.logits[..]))
     }
 
+    /// As [`Self::forward_batch`] for every token's logits, but they stay on the GPU:
+    /// [`Self::held_logits`] fetches a row, until the session next runs a token. For a
+    /// draft's guesses, checked in one pass: only the rows of the guesses taken are ever
+    /// read back (a megabyte each for a 262,144-token vocabulary). `tokens` must fit one
+    /// batch.
+    pub fn forward_batch_held(&self, s: &mut Qwen35CudaSession, tokens: &[u32]) -> Result<()> {
+        assert!(
+            tokens.len() <= s.batch,
+            "{} tokens held, in batches of {}",
+            tokens.len(),
+            s.batch
+        );
+        s.hold = true;
+        let done = self.forward_batch(s, tokens, Logits::All).map(|_| ());
+        s.hold = false;
+        done
+    }
+
+    /// Row `row` of the logits [`Self::forward_batch_held`] left on the GPU, into `out`.
+    pub fn held_logits(&self, s: &Qwen35CudaSession, row: usize, out: &mut [f32]) -> Result<()> {
+        assert_eq!(out.len(), self.config.vocab, "a row of logits is the vocabulary long");
+        s.logits_gpu.read_row(row, out)
+    }
+
     /// Runs `tokens` at the session's next positions, a batch at a time, and hands back
     /// the logits asked for: the last token's, or a row for every token.
     pub fn forward_batch<'s>(
@@ -1234,7 +1261,7 @@ impl<'a> Qwen35Cuda<'a> {
             s.capacity
         );
         let e = gpu_error;
-        if logits == Logits::All {
+        if logits == Logits::All && !s.hold {
             s.logits.resize(tokens.len() * c.vocab, 0.0);
         }
         let batch = s.batch;
@@ -1302,9 +1329,11 @@ impl<'a> Qwen35Cuda<'a> {
                         &Input::new(&self.gpu, s.h.ptr(), t, s.q8.as_ref()),
                         out.ptr(),
                     )?;
-                    let start = b * batch * c.vocab;
-                    out.read_f32(&mut s.logits[start..start + t * c.vocab])
-                        .map_err(e)?;
+                    if !s.hold {
+                        let start = b * batch * c.vocab;
+                        out.read_f32(&mut s.logits[start..start + t * c.vocab])
+                            .map_err(e)?;
+                    }
                 }
                 Logits::Last if last_chunk => {
                     let out = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;

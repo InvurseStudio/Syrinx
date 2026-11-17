@@ -419,6 +419,14 @@ impl LogitsBuffer {
         }
         Ok(&self.buffer)
     }
+
+    /// Row `row` of the logits last left here, into `out` (a row long).
+    pub fn read_row(&self, row: usize, out: &mut [f32]) -> Result<()> {
+        assert!(row < self.rows, "row {row} of {} rows of logits", self.rows);
+        self.buffer
+            .read_f32_at(row * out.len(), out)
+            .map_err(gpu_error)
+    }
 }
 
 /// Which of a batch's tokens need the last layer's output, for their logits. The last
