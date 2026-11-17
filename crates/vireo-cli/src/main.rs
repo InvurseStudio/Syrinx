@@ -39,6 +39,11 @@ Usage:
   vireo-cli perplexity <model.gguf> <text-file> [-c <context>] [--chunks <n>] [--gpu] [--exact]
                                                How well the model predicts the text, scored
                                                as llama.cpp's llama-perplexity scores it
+  vireo-cli batches <model.gguf> <text-file> [--depth <tokens>]
+                                               On the GPU: what a batch of 1 to 64 tokens
+                                               costs with <tokens> already read (4000 by
+                                               default): a draft's guesses checked at once,
+                                               a short tool result. Gemma 4 and Qwen 3.5
   vireo-cli --version                          Show the version";
 
 fn main() -> ExitCode {
@@ -66,6 +71,20 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        ["batches", path, text, rest @ ..] => {
+            let depth = match rest {
+                [] => Some(4000),
+                ["--depth", n] => n.parse().ok(),
+                _ => None,
+            };
+            match depth {
+                Some(depth) => batches(path, text, depth),
+                None => {
+                    eprintln!("{USAGE}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         ["perplexity", path, text, rest @ ..] => {
             let mut context = 512;
             let mut chunks = usize::MAX;
@@ -576,6 +595,95 @@ fn perplexity(
         started.elapsed()
     );
     ExitCode::SUCCESS
+}
+
+/// The batch sizes `batches` times.
+const BATCH_SIZES: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+/// What batches of a few tokens cost `depth` tokens into a chat, on the GPU: each size
+/// read with its logits five times from the same place, the quickest kept. One line of
+/// `size: milliseconds` pairs on standard output. A draft's guesses are checked in such
+/// batches, so their cost against one token's decides what drafting gains; no test timed
+/// them until a kernel change doubled a check of 4 to 16 tokens unnoticed (15-17 November
+/// 2026). Vireo Bench's S1 runs this (`b4` to `b64`).
+fn batches(path: &str, text_path: &str, depth: usize) -> ExitCode {
+    let load = || -> Result<Vec<f64>, String> {
+        let text = std::fs::read_to_string(text_path).map_err(|e| format!("{text_path}: {e}"))?;
+        let file = GgufFile::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let tokenizer = Tokenizer::from_gguf(&file).map_err(|e| e.to_string())?;
+        let ids = tokenizer.encode(&text, true, false);
+        let most = BATCH_SIZES[BATCH_SIZES.len() - 1];
+        if ids.len() < depth + most {
+            return Err(format!(
+                "The text has {} tokens: it needs {}.",
+                ids.len(),
+                depth + most
+            ));
+        }
+        let gpu = Gpu::open().map_err(e)?;
+        fn e<E: std::fmt::Display>(e: E) -> String {
+            e.to_string()
+        }
+        let mut ms = Vec::new();
+        let qwen = file.architecture().is_some_and(|a| a.starts_with("qwen"));
+        if qwen {
+            let m = Qwen35Cuda::load(&file, gpu).map_err(e)?;
+            let mut s = m.session(depth + 512).map_err(e)?;
+            // As the server reads a round of guesses: the DeltaNet steps kept.
+            if m.can_rewind() {
+                m.keep_steps(&mut s).map_err(e)?;
+            }
+            m.forward_batch(&mut s, &ids[..depth], Logits::Last).map_err(e)?;
+            let mut checkpoint = None;
+            m.save(&s, &mut checkpoint).map_err(e)?;
+            m.gpu().synchronize().map_err(e)?;
+            for n in BATCH_SIZES {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    m.forward_batch(&mut s, &ids[depth..depth + n], Logits::Last).map_err(e)?;
+                    m.gpu().synchronize().map_err(e)?;
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                    m.restore(&mut s, checkpoint.as_ref().unwrap()).map_err(e)?;
+                    m.gpu().synchronize().map_err(e)?;
+                }
+                ms.push(best);
+            }
+        } else {
+            let m = Gemma4Cuda::load(&file, gpu).map_err(e)?;
+            let mut s = m.session(depth + 512).map_err(e)?;
+            m.forward_batch(&mut s, &ids[..depth], Logits::Last).map_err(e)?;
+            for n in BATCH_SIZES {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    m.forward_batch(&mut s, &ids[depth..depth + n], Logits::Last).map_err(e)?;
+                    m.gpu().synchronize().map_err(e)?;
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                    if s.truncate(depth) != depth {
+                        return Err("The session couldn't go back over a batch.".into());
+                    }
+                }
+                ms.push(best);
+            }
+        }
+        Ok(ms)
+    };
+    match load() {
+        Ok(ms) => {
+            let cells: Vec<String> = BATCH_SIZES
+                .iter()
+                .zip(&ms)
+                .map(|(n, t)| format!("{n}: {t:.2}"))
+                .collect();
+            println!("Batches at {depth} tokens, ms: {}", cells.join("  "));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn argmax(values: &[f32]) -> u32 {
