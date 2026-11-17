@@ -1195,6 +1195,14 @@ const MTP_GUESSES: usize = 3;
 /// / 27.0 / 25.8 / 23.4, the rest level. Two more after a round all taken (tried both):
 /// less on the 31B than 4 every round, and a story 3-6% slower on each.
 const GEMMA_MTP_GUESSES: usize = if cfg!(target_os = "macos") { 4 } else { MTP_GUESSES };
+/// The chat's length, in tokens, from which Gemma 4's draft model is back to `MTP_GUESSES`:
+/// a guess not taken costs its share of a check, and a check costs more the more there is
+/// to attend to, while fewer of four are taken than of three (40-46% against 52-62%).
+/// Gemma 4 31B writing ~500 tokens after a prompt that fills the context, 3 / 4 guesses a
+/// round, two runs each (`evals/speed/draft-guesses-at-depth-2026-11-17`): at 32K 27.8
+/// and 28.6 / 30.4 and 28.2 tokens/s, at 64K 29.2 and 27.9 / 28.9 and 26.6, at 128K 20.8
+/// and 20.4 / 19.6 and 19.6.
+const GEMMA_MTP_GUESSES_UNTIL: usize = 48_000;
 
 /// How sure Gemma 4's draft model must be of a guess for the model to check it (its
 /// probability for the token; a round's guesses stop before the first it gives less). On
@@ -2852,9 +2860,19 @@ fn reply(
             _ => false,
         };
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
-    let mtp_guesses = match kept.session {
-        Session::Gemma4(_) => GEMMA_MTP_GUESSES,
-        _ => MTP_GUESSES,
+    // VIREO_MTP_GUESSES: another count at every depth, to measure one against another.
+    let mtp_fixed: Option<usize> = std::env::var("VIREO_MTP_GUESSES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| (1..=7).contains(n));
+    let gemma = matches!(kept.session, Session::Gemma4(_));
+    // A round's guesses for a chat of `depth` tokens.
+    let mtp_guesses = |depth: usize| {
+        mtp_fixed.unwrap_or(if gemma && depth < GEMMA_MTP_GUESSES_UNTIL {
+            GEMMA_MTP_GUESSES
+        } else {
+            MTP_GUESSES
+        })
     };
     // A model with a draft model or layer guesses from the chat too, where the chat has
     // a long run to offer (`CHAT_RUN_OVER_DRAFT`, `CHAT_RUN_OVER_LAYER`).
@@ -2949,7 +2967,8 @@ fn reply(
                             mtp_stats.1,
                         ) =>
                 {
-                    let g = model.mtp_draft(kept, first, mtp_guesses.min(room - 1))?;
+                    let n = mtp_guesses(kept.tokens.len());
+                    let g = model.mtp_draft(kept, first, n.min(room - 1))?;
                     mtp_stats.0 += g.len();
                     ahead_drafted = true;
                     g
