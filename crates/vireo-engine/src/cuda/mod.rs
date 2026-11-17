@@ -270,6 +270,8 @@ impl Default for AttentionMma {
 
 struct Kernels {
     matvec: [CuFunction; 7],
+    /// f16 rows times a few tokens at once (up to `Gpu::FEW_TOKENS`).
+    matvec_few_f16: CuFunction,
     matmul: [CuFunction; 7],
     rms_norm: CuFunction,
     residual_norm: CuFunction,
@@ -548,6 +550,7 @@ impl Gpu {
             };
             let kernels = Kernels {
                 matvec: per_kind("matvec")?,
+                matvec_few_f16: function("matvec_few_f16")?,
                 matmul: per_kind("matmul")?,
                 rms_norm: function("rms_norm")?,
                 residual_norm: function("residual_norm")?,
@@ -1026,6 +1029,25 @@ impl Gpu {
     ) -> Result<()> {
         if tokens == 1 {
             return self.matvec(kind, w, x, y, rows, cols);
+        }
+        if kind == TensorType::F16 && tokens <= Self::FEW_TOKENS && cols.is_multiple_of(8) {
+            // A few tokens (a draft's guesses): the rows read once, as for one token, with
+            // its sums.
+            let grid = (rows as u32).div_ceil(ROWS_PER_BLOCK);
+            let args = [
+                Arg::Ptr(w),
+                Arg::Ptr(x),
+                Arg::Ptr(y),
+                Arg::I32(rows as i32),
+                Arg::I32(cols as i32),
+                Arg::I32(tokens as i32),
+            ];
+            return self.run(
+                self.kernels.matvec_few_f16,
+                (grid, 1),
+                ROWS_PER_BLOCK * 32,
+                &args,
+            );
         }
         if !cols.is_multiple_of(32) {
             // The tiles take 32 columns at a time; no model here has such a matrix.

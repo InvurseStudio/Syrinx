@@ -597,6 +597,85 @@ fn reading_in_batches_matches_one_token_at_a_time() {
     }
 }
 
+/// A round of guesses' logits left on the GPU (`forward_batch_held`) are the rows
+/// `forward_batch` hands back, to the bit, whichever rows are fetched and in whatever
+/// order. And on a Q6_K Gemma 4 (whose per-layer projection is f16: the few-token f16
+/// kernel) each row is, to the bit, what the same tokens give read one at a time, so a
+/// guess taken can't change a reply.
+#[test]
+fn held_logits_are_the_batchs_rows() {
+    fn same(name: &str, a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len(), "{name}");
+        let differ = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(differ, 0, "{name}: {differ} of {} logits differ", a.len());
+    }
+    const HEAD: usize = 40;
+    const ROUND: usize = 4;
+    if let Some(file) = model("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+        let Some(gpu) = open_gpu() else { return };
+        let ids = long_text(&Tokenizer::from_gguf(&file).unwrap(), false);
+        let m = LlamaCuda::load(&file, gpu).unwrap();
+        let (mut a, mut b) = (m.session(64).unwrap(), m.session(64).unwrap());
+        m.forward_batch(&mut a, &ids[..HEAD], Logits::None).unwrap();
+        m.forward_batch(&mut b, &ids[..HEAD], Logits::None).unwrap();
+        let round = &ids[HEAD..HEAD + ROUND];
+        let all = m.forward_batch(&mut a, round, Logits::All).unwrap().unwrap().to_vec();
+        m.forward_batch_held(&mut b, round).unwrap();
+        let vocab = all.len() / ROUND;
+        let mut row = vec![0f32; vocab];
+        for r in [2, 0, 3, 1] {
+            m.held_logits(&b, r, &mut row).unwrap();
+            same(&format!("Llama, row {r}"), &row, &all[r * vocab..(r + 1) * vocab]);
+        }
+    }
+    if let Some(file) = model("Qwen3.5-0.8B-Q4_K_M.gguf") {
+        let Some(gpu) = open_gpu() else { return };
+        let ids = long_text(&Tokenizer::from_gguf(&file).unwrap(), false);
+        let m = Qwen35Cuda::load(&file, gpu).unwrap();
+        let (mut a, mut b) = (m.session(64).unwrap(), m.session(64).unwrap());
+        m.forward_batch(&mut a, &ids[..HEAD], Logits::None).unwrap();
+        m.forward_batch(&mut b, &ids[..HEAD], Logits::None).unwrap();
+        let round = &ids[HEAD..HEAD + ROUND];
+        let all = m.forward_batch(&mut a, round, Logits::All).unwrap().unwrap().to_vec();
+        m.forward_batch_held(&mut b, round).unwrap();
+        let vocab = all.len() / ROUND;
+        let mut row = vec![0f32; vocab];
+        for r in [2, 0, 3, 1] {
+            m.held_logits(&b, r, &mut row).unwrap();
+            same(&format!("Qwen 3.5, row {r}"), &row, &all[r * vocab..(r + 1) * vocab]);
+        }
+    }
+    for name in ["gemma-4-E2B_q4_0-it.gguf", "gemma-4-E2B-it-Q6_K.gguf"] {
+        let Some(file) = model(name) else { continue };
+        let Some(gpu) = open_gpu() else { return };
+        let ids = long_text(&Tokenizer::from_gguf(&file).unwrap(), true);
+        let m = Gemma4Cuda::load(&file, gpu).unwrap();
+        let (mut a, mut b) = (m.session(64).unwrap(), m.session(64).unwrap());
+        let mut one = m.session(64).unwrap();
+        m.forward_batch(&mut a, &ids[..HEAD], Logits::None).unwrap();
+        m.forward_batch(&mut b, &ids[..HEAD], Logits::None).unwrap();
+        m.forward_batch(&mut one, &ids[..HEAD], Logits::None).unwrap();
+        let round = &ids[HEAD..HEAD + ROUND];
+        let all = m.forward_batch(&mut a, round, Logits::All).unwrap().unwrap().to_vec();
+        m.forward_batch_held(&mut b, round).unwrap();
+        let vocab = all.len() / ROUND;
+        let mut row = vec![0f32; vocab];
+        for r in [2, 0, 3, 1] {
+            m.held_logits(&b, r, &mut row).unwrap();
+            same(&format!("{name}, row {r}"), &row, &all[r * vocab..(r + 1) * vocab]);
+        }
+        // One token at a time, in 8-bit mode: the same numbers.
+        for (r, &id) in round.iter().enumerate() {
+            let single = m.forward(&mut one, id, true).unwrap().unwrap().to_vec();
+            same(
+                &format!("{name}, token {r} alone against the batch"),
+                &single,
+                &all[r * vocab..(r + 1) * vocab],
+            );
+        }
+    }
+}
+
 /// A Gemma sliding-window layer keeps only its window and a batch's new positions, in a
 /// ring. Read in batches of 64 (a ring of 576 for E2B's window of 512),
 /// a text of over 1,700 tokens wraps it three times; its logits match a session that

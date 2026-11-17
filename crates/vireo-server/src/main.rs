@@ -1548,6 +1548,33 @@ impl Model {
             .ok_or_else(|| "no logits".into())
     }
 
+    /// Reads `ids` (a round of guesses: at most a batch) for every one's logits, which
+    /// stay on the GPU: `held_row` fetches a row, until the session next runs a token. A
+    /// round's rows are a megabyte each for the Gemmas, and only those of the guesses
+    /// taken are ever looked at: fetching all four and copying them out cost a round
+    /// 1.5-2 ms of the 17 it took (Gemma 4 E4B on the RTX 5060).
+    fn read_held(&self, s: &mut Session, ids: &[u32]) -> Result<(), String> {
+        let _t = TimeLog::start(self, "read_all", ids.len());
+        match (self, s) {
+            (Model::Llama(m), Session::Llama(s)) => m.forward_batch_held(s, ids),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m.forward_batch_held(s, ids),
+            (Model::Gemma4(m), Session::Gemma4(s)) => m.forward_batch_held(s, ids),
+            _ => unreachable!("a session belongs to its model"),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// Row `row` of the logits `read_held` left on the GPU, into `logits`.
+    fn held_row(&self, s: &Session, row: usize, logits: &mut [f32]) -> Result<(), String> {
+        match (self, s) {
+            (Model::Llama(m), Session::Llama(s)) => m.held_logits(s, row, logits),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m.held_logits(s, row, logits),
+            (Model::Gemma4(m), Session::Gemma4(s)) => m.held_logits(s, row, logits),
+            _ => unreachable!("a session belongs to its model"),
+        }
+        .map_err(|e| e.to_string())
+    }
+
     /// How likely the model finds `ids` next, given `logits` for the first of them: the
     /// sum of each token's log-probability. The session is left as it was.
     fn score(&self, kept: &mut Kept, logits: &[f32], ids: &[u32]) -> Result<f64, String> {
@@ -2686,7 +2713,8 @@ fn reply(
     let mut may_call = !offered.is_empty();
     let mut brace_tokens: Option<Vec<u32>> = None;
     // Drafted tokens the model has read past `kept.tokens`, each with its logits after.
-    let mut ahead: std::collections::VecDeque<(u32, Vec<f32>)> = Default::default();
+    // Each with the row of its logits in the round's pass (`Model::read_held`).
+    let mut ahead: std::collections::VecDeque<(u32, usize)> = Default::default();
     // With a draft: the last token picked, in `kept.tokens` but not read yet. It's read
     // with the next round's guesses, in the same pass, rather than on its own.
     let mut unread: Option<u32> = None;
@@ -2825,17 +2853,11 @@ fn reply(
                         .into_iter()
                         .chain(guesses.iter().copied())
                         .collect();
-                    let rows = model.read_all(&mut kept.session, &batch)?;
-                    let vocab = rows.len() / batch.len();
+                    model.read_held(&mut kept.session, &batch)?;
                     if first == 1 {
-                        logits.copy_from_slice(&rows[..vocab]);
+                        model.held_row(&kept.session, 0, &mut logits)?;
                     }
-                    ahead.extend(guesses.iter().enumerate().map(|(i, &g)| {
-                        (
-                            g,
-                            rows[(first + i) * vocab..(first + i + 1) * vocab].to_vec(),
-                        )
-                    }));
+                    ahead.extend(guesses.iter().enumerate().map(|(i, &g)| (g, first + i)));
                 }
                 _ => {
                     if let Some(u) = unread.take() {
@@ -3251,7 +3273,9 @@ fn reply(
             }
         }
         if guessed {
-            logits = ahead.pop_front().unwrap().1;
+            // Nothing has run on the session since the round's pass: its rows are there.
+            let (_, row) = ahead.pop_front().unwrap();
+            model.held_row(&kept.session, row, &mut logits)?;
             if let Some(d) = drafter.as_deref_mut() {
                 d.taken += 1;
             }
@@ -4029,14 +4053,16 @@ fn write_call(
             model.next(&mut kept.session, next, logits)?;
         } else {
             let batch: Vec<u32> = std::iter::once(next).chain(guesses.iter().copied()).collect();
-            let rows = model.read_all(&mut kept.session, &batch)?;
-            let vocab = rows.len() / batch.len();
+            // `logits` holds the row after the last token taken, fetched as each is.
+            model.read_held(&mut kept.session, &batch)?;
+            model.held_row(&kept.session, 0, logits)?;
+            let vocab = logits.len();
             let mut taken = 0;
             for &guess in &guesses {
                 if !free_next(&m) {
                     break;
                 }
-                let row = &rows[taken * vocab..(taken + 1) * vocab];
+                let row = &logits[..];
                 let allowed = m.allowed(trie);
                 let pick = (0..vocab as u32)
                     .filter(|&id| allowed[id as usize / 64] >> (id % 64) & 1 == 1)
@@ -4054,8 +4080,8 @@ fn write_call(
                 *tokens += 1;
                 n_free += 1;
                 taken += 1;
+                model.held_row(&kept.session, taken, logits)?;
             }
-            logits.copy_from_slice(&rows[taken * vocab..(taken + 1) * vocab]);
             if taken < guesses.len() {
                 model.rewind(kept)?;
             }

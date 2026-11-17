@@ -217,6 +217,42 @@ extern "C" __global__ void matvec_f16(const __half* w, const float* x, float* y,
     if (lane == 0) y[row] = sum;
 }
 
+// f16 rows for a few tokens at once (a draft's guesses checked in one pass: 2 to 8): each
+// row is read once, as for one token, and multiplied by every token's x while it's in
+// registers, with matvec_f16's sums in its order. Token t's x is row t of x (cols floats),
+// its results row t of y. Only for rows of whole 8s. (The tile kernel, matmul_f16, costs a
+// round of 4 tokens four times one token's pass over Gemma 4's per-layer projection: 18 us
+// against 4.6, on each of its 35 or 42 layers.)
+#define FEW_F16_MOST 8
+extern "C" __global__ void matvec_few_f16(const __half* w, const float* x, float* y, int rows, int cols,
+                                          int tokens) {
+    MATVEC_ROW
+    const __half* r = w + (size_t)row * cols;
+    float sum[FEW_F16_MOST];
+#pragma unroll
+    for (int t = 0; t < FEW_F16_MOST; t++) sum[t] = 0.0f;
+    for (int c = lane * 8; c < cols; c += 256) {
+        const uint4 packed = *reinterpret_cast<const uint4*>(r + c);
+        const __half2* h = reinterpret_cast<const __half2*>(&packed);
+        const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+        const float2 cc = __half22float2(h[2]), d = __half22float2(h[3]);
+#pragma unroll
+        for (int t = 0; t < FEW_F16_MOST; t++) {
+            if (t >= tokens) break;
+            const float* xt = x + (size_t)t * cols + c;
+            const float4 x0 = f4(xt), x1 = f4(xt + 4);
+            sum[t] += a.x * x0.x + a.y * x0.y + b.x * x0.z + b.y * x0.w;
+            sum[t] += cc.x * x1.x + cc.y * x1.y + d.x * x1.z + d.y * x1.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < FEW_F16_MOST; t++) {
+        if (t >= tokens) break;
+        const float total = warp_sum(sum[t]);
+        if (lane == 0) y[(size_t)t * rows + row] = total;
+    }
+}
+
 // The quantized kernels below give each warp MV_ROWS rows: the slice of x a lane needs
 // is read once and used for all of them, which halves the reads of x per weight byte.
 // A small whole number (under 2^23) as a float, minus `offset`, exactly: the number
