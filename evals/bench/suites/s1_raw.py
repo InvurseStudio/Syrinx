@@ -4,6 +4,13 @@
   tg128                   writing 128 tokens after a short prompt
   tg128@d8K, tg128@d32K   writing 128 tokens with 8K / 32K already in the context
 
+  b1, b4 ... b64          Vireo only: a batch of that many tokens read at once, 4,000 tokens
+                          into a chat (tokens/s of the batch; `ms` beside it). A draft's
+                          guesses are checked in batches of 2 to 32 and a short tool result
+                          is one of up to 64, so drafted writing rests on these, and the
+                          other tests here never run them: a kernel change doubled the 4-
+                          to 16-token ones for two days in November 2026 unseen
+
 Vireo: `vireo-cli generate --gpu` (greedy, one token at a time: no drafting). llama.cpp:
 `llama-bench -fa 1 -ngl 99`, one repetition per bench rep. A Vireo or mlx-vlm row that
 wrote fewer than 128 tokens (the model ended its turn) is marked `short` and its speed is
@@ -44,6 +51,10 @@ def run(ctx, kind):
             r = engines.cli_generate(m, depth_prompt(key, name), 128)
             ctx.rec("S1", test, kind, tps=r["tg_tps"], tokens=r["gen_tokens"], depth=r["prompt_tokens"],
                     pp_tps=r["pp_tps"], short=r["gen_tokens"] < 128 or None)
+        if cap >= 4000 + 512:
+            ms = engines.cli_batches(m, common.FIX / "corpus.txt")
+            for n in (1, 4, 8, 16, 32, 64):
+                ctx.rec("S1", f"b{n}", kind, tps=round(n * 1000 / ms[n], 1), ms=ms[n], tokens=n, depth=4000)
     elif kind == "llama":
         rows = engines.llama_bench(m, ["-p", "512,4096", "-n", "128", "-r", "1"])
         if depths:

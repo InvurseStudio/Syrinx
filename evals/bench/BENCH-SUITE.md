@@ -94,6 +94,12 @@ The `llama-bench` shapes, so our numbers can be checked against anyone's posted 
 | `pp512`, `pp4096` | reading speed, a 512- and 4,096-token prompt |
 | `tg128` | writing speed, 128 tokens after a short prompt |
 | `tg128@d8K`, `tg128@d32K` | writing speed with 8K / 32K already in the context |
+| `b1`, `b4`, `b8`, `b16`, `b32`, `b64` | Vireo only: a batch of that many tokens read at once, 4,000 tokens into a chat (`vireo-cli batches`; tokens/s of the batch, `ms` beside it) |
+
+The `b` tests are there because nothing else here runs a short batch: a draft's guesses
+are checked 2 to 32 at a time and a short tool result is a batch of up to 64, so drafted
+writing rests on them. A kernel change doubled the 4- to 16-token ones on the Mac for two
+days in November 2026 and no test showed it.
 
 Vireo uses `vireo-cli generate --gpu` and llama.cpp uses `llama-bench -fa 1 -ngl 99`, both
 one token at a time with no drafting. mlx-vlm has no bench tool, so it runs through its
