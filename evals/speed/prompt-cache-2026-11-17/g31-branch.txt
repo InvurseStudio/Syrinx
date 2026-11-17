@@ -1,0 +1,18 @@
+chat            prompt    kept    read  read s  calls                  reply
+plain             1642       0    1642    2.74  -                      The capital of France is Paris.
+plain             1640    1609      31    0.10  -                      Red, blue, and yellow.
+long, change      7933    1414    6519   10.29  write_file             The summary has been written to /var/folders/kd/2m_rxxd90gn2k_20r3dh75
+plain             1645    1598      47    0.28  calculate              144
+change            1805    1706      99    0.27  write_file             The file /var/folders/kd/2m_rxxd90gn2k_20r3dh75540000gn/T/vbench-desk-
+plain             1645    1598      47    0.20  -                      A litre is larger than a pint. One litre is approximately 2.11 US liqu
+long              7875    1706    6169    9.61  -                      The text consists of C# source code for a Windows client of the Vireo 
+plain             1644    1598      46    0.21  -                      There are 366 days in a leap year.
+change            1805    1706      99    0.24  write_file             The file /var/folders/kd/2m_rxxd90gn2k_20r3dh75540000gn/T/vbench-desk-
+plain             1642    1598      44    0.16  -                      The platypus is a mammal that lays eggs.
+remember          1643    1609      34    0.13  remember               I've remembered that your favourite colour is teal.
+plain             1686       0    1686    2.93  -                      The boiling point of water is 100 degrees Celsius.
+plain             1683    1650      33    0.12  -                      An ostrich is a bird that cannot fly.
+remember          1684    1650      34    0.12  remember               OK. I've remembered that you live in Tampere.
+plain             1695     924     771    1.41  -                      The freezing point of water is 32°F.
+
+From the cache: 54% of 37667 prompt tokens.
