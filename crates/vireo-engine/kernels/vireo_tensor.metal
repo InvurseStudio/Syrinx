@@ -16,8 +16,12 @@
 // tokens a tile, matmul_tc_wide_* with TC_WIDE for a prompt's whole batches (a large
 // model's weights decoded half as often), and matmul_tc_t8_* to matmul_tc_t192_* for
 // short batches (SMALL_TILES in src/metal/mod.rs: no multiplying of padding). ROWS and KK
-// are the tile's rows and its columns a step (TC_ROWS and TC_K but for the 8- and
-// 16-token tiles, which take 256 columns a step).
+// are the tile's rows and its columns a step (TC_ROWS and TC_K but for the 8- to 64-token
+// tiles, which take 256 columns a step). BUFS is how many tiles of weights the
+// threadgroup holds: two, decoded in turn, so a step's decoding doesn't wait for the
+// last step's product (128 columns a step: 16 KB); one for the 256-column tiles, where
+// two are the whole 32 KB a threadgroup may have and cost far more than they saved (a
+// check of 8 tokens on Gemma 4 31B: 107 ms with two, 70 with one).
 #ifndef TC_ROWS
 #define TC_ROWS 32
 #endif
@@ -35,7 +39,7 @@
 #endif
 #define TC_THREADS (32 * TC_SG)
 
-template <int KIND, int TOK, int ROWS = TC_ROWS, int KK = TC_K>
+template <int KIND, int TOK, int ROWS = TC_ROWS, int KK = TC_K, int BUFS = 2>
 kernel void matmul_tc(ARGS, KP) {
     device const u8* w = ARG_PTR(const u8, 0);
     device half* x = ARG_PTR(half, 1);  // the activations in f16 (to_half)
@@ -49,7 +53,7 @@ kernel void matmul_tc(ARGS, KP) {
     const int chunk = ((cols + KK - 1) / KK + splits - 1) / splits * KK;
     const int k_begin = (int)gid.z * chunk, k_end = min(cols, k_begin + chunk);
     const ulong row_bytes = mm_row_bytes<KIND>(cols);
-    threadgroup half sab[2 * ROWS * KK];  // the weights' tile, [row][k]: two, a step's decoded while the last's may still be read
+    threadgroup half sab[BUFS * ROWS * KK];  // the weights' tile, [row][k]: with two, a step's decoded while the last's may still be read
     const int row0 = gid.x * ROWS, tok0 = gid.y * TOK;
     // Decoding: the tile's runs of 32 numbers (KK / 32 a row) shared out among the threads.
     constexpr int RUNS = KK / 32, PER = (ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
@@ -67,7 +71,7 @@ kernel void matmul_tc(ARGS, KP) {
 
     int flip = 0;
     for (int k0 = k_begin; k0 < k_end; k0 += KK, flip ^= 1) {
-        threadgroup half* sa = sab + flip * (ROWS * KK);
+        threadgroup half* sa = sab + (BUFS > 1 ? flip : 0) * (ROWS * KK);
         for (int part = 0; part < PER; part++) {
             const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
             if (lr >= ROWS) break;
@@ -84,6 +88,7 @@ kernel void matmul_tc(ARGS, KP) {
         auto tile_x = tensor(x + (ulong)tok0 * cols + k0, dextents<int32_t, 2>(k_len, tokens - tok0),
                              array<int, 2>({1, cols}));
         mm.run(tile_x, tile_w, acc);
+        if (BUFS == 1) BARRIER;
     }
     // y holds a row of `rows` per token: C's rows are y's, the contiguous dimension rows.
     if (splits > 1) y = ARG_PTR(float, 7) + (ulong)gid.z * rows * tokens;
@@ -100,35 +105,36 @@ template [[host_name("matmul_tc_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_TOKENS
 template [[host_name("matmul_tc_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_TOKENS>(ARGS, KP);
 template [[host_name("matmul_tc_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_TOKENS>(ARGS, KP);
 template [[host_name("matmul_tc_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_TOKENS>(ARGS, KP);
-// 8 and 16 tokens, 256 columns a step (see SMALL_TILES in src/metal/mod.rs).
-template [[host_name("matmul_tc_t8_f32")]] kernel void matmul_tc<K_F32, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t8_f16")]] kernel void matmul_tc<K_F16, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t8_q4_0")]] kernel void matmul_tc<K_Q4_0, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t8_q8_0")]] kernel void matmul_tc<K_Q8_0, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t8_q4_k")]] kernel void matmul_tc<K_Q4_K, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t8_q5_k")]] kernel void matmul_tc<K_Q5_K, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t8_q6_k")]] kernel void matmul_tc<K_Q6_K, 8, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_f32")]] kernel void matmul_tc<K_F32, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_f16")]] kernel void matmul_tc<K_F16, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_q4_0")]] kernel void matmul_tc<K_Q4_0, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_q8_0")]] kernel void matmul_tc<K_Q8_0, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_q4_k")]] kernel void matmul_tc<K_Q4_K, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_q5_k")]] kernel void matmul_tc<K_Q5_K, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t16_q6_k")]] kernel void matmul_tc<K_Q6_K, 16, TC_ROWS, 256>(ARGS, KP);
-template [[host_name("matmul_tc_t32_f32")]] kernel void matmul_tc<K_F32, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t32_f16")]] kernel void matmul_tc<K_F16, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t32_q4_0")]] kernel void matmul_tc<K_Q4_0, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t32_q8_0")]] kernel void matmul_tc<K_Q8_0, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t32_q4_k")]] kernel void matmul_tc<K_Q4_K, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t32_q5_k")]] kernel void matmul_tc<K_Q5_K, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t32_q6_k")]] kernel void matmul_tc<K_Q6_K, 32>(ARGS, KP);
-template [[host_name("matmul_tc_t64_f32")]] kernel void matmul_tc<K_F32, 64>(ARGS, KP);
-template [[host_name("matmul_tc_t64_f16")]] kernel void matmul_tc<K_F16, 64>(ARGS, KP);
-template [[host_name("matmul_tc_t64_q4_0")]] kernel void matmul_tc<K_Q4_0, 64>(ARGS, KP);
-template [[host_name("matmul_tc_t64_q8_0")]] kernel void matmul_tc<K_Q8_0, 64>(ARGS, KP);
-template [[host_name("matmul_tc_t64_q4_k")]] kernel void matmul_tc<K_Q4_K, 64>(ARGS, KP);
-template [[host_name("matmul_tc_t64_q5_k")]] kernel void matmul_tc<K_Q5_K, 64>(ARGS, KP);
-template [[host_name("matmul_tc_t64_q6_k")]] kernel void matmul_tc<K_Q6_K, 64>(ARGS, KP);
+// 8 to 64 tokens: 256 columns a step and one tile of weights (see SMALL_TILES in
+// src/metal/mod.rs).
+template [[host_name("matmul_tc_t8_f32")]] kernel void matmul_tc<K_F32, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_f16")]] kernel void matmul_tc<K_F16, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_q4_0")]] kernel void matmul_tc<K_Q4_0, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_q8_0")]] kernel void matmul_tc<K_Q8_0, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_q4_k")]] kernel void matmul_tc<K_Q4_K, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_q5_k")]] kernel void matmul_tc<K_Q5_K, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_q6_k")]] kernel void matmul_tc<K_Q6_K, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_f32")]] kernel void matmul_tc<K_F32, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_f16")]] kernel void matmul_tc<K_F16, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_q4_0")]] kernel void matmul_tc<K_Q4_0, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_q8_0")]] kernel void matmul_tc<K_Q8_0, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_q4_k")]] kernel void matmul_tc<K_Q4_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_q5_k")]] kernel void matmul_tc<K_Q5_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_q6_k")]] kernel void matmul_tc<K_Q6_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_f32")]] kernel void matmul_tc<K_F32, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_f16")]] kernel void matmul_tc<K_F16, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q4_0")]] kernel void matmul_tc<K_Q4_0, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q8_0")]] kernel void matmul_tc<K_Q8_0, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q4_k")]] kernel void matmul_tc<K_Q4_K, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q5_k")]] kernel void matmul_tc<K_Q5_K, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_q6_k")]] kernel void matmul_tc<K_Q6_K, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_f32")]] kernel void matmul_tc<K_F32, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_f16")]] kernel void matmul_tc<K_F16, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q4_0")]] kernel void matmul_tc<K_Q4_0, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q8_0")]] kernel void matmul_tc<K_Q8_0, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q4_k")]] kernel void matmul_tc<K_Q4_K, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q5_k")]] kernel void matmul_tc<K_Q5_K, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_q6_k")]] kernel void matmul_tc<K_Q6_K, 64, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t96_f32")]] kernel void matmul_tc<K_F32, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t96_f16")]] kernel void matmul_tc<K_F16, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t96_q4_0")]] kernel void matmul_tc<K_Q4_0, 96>(ARGS, KP);
