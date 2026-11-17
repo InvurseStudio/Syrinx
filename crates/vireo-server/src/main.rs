@@ -1186,6 +1186,15 @@ fn is_assistant(path: &str) -> bool {
 /// server 2 / 3 / 4 guesses write a copied document at 44 / 53 / 59 tokens/s and a new
 /// story at 30.1 / 29.6 / 26.5: 3.
 const MTP_GUESSES: usize = 3;
+/// The same for Gemma 4's draft model on the Mac: 4, since a check of 5 tokens costs what
+/// one of 4 does (the 8-token tile: Gemma 4 31B 68 ms for 4 tokens, 70 for 8, one token
+/// 51). Gemma 4 31B with Google's draft model on the M5 Max, 400-token replies, 3 / 4 / 5
+/// / 7 guesses a round: a document as a list 45.1 / 53.2 / 57.3 / 58.5 tokens/s, an
+/// explanation 41.8 / 44.1 / 45.4 / 47.2, an edited code file returned 180 / 188 / 182 /
+/// 181, a new story 30.8 / 30.8 / 28.9 / 26.7. Qwen 3.8 27B's layer keeps 3: a story 28.7
+/// / 27.0 / 25.8 / 23.4, the rest level. Two more after a round all taken (tried both):
+/// less on the 31B than 4 every round, and a story 3-6% slower on each.
+const GEMMA_MTP_GUESSES: usize = if cfg!(target_os = "macos") { 4 } else { MTP_GUESSES };
 
 /// How sure Gemma 4's draft model must be of a guess for the model to check it (its
 /// probability for the token; a round's guesses stop before the first it gives less). On
@@ -2012,7 +2021,7 @@ fn engine(
                     let started = Instant::now();
                     match m.load_assistant(&draft) {
                         Ok(()) => eprintln!(
-                            "Drafting with {}, Google's draft model, {MTP_GUESSES} tokens a round (loaded in {:.1?}).",
+                            "Drafting with {}, Google's draft model, {GEMMA_MTP_GUESSES} tokens a round (loaded in {:.1?}).",
                             draft.display(),
                             started.elapsed()
                         ),
@@ -2501,7 +2510,7 @@ fn reply(
     let system_turn = |tools: &[tools::Tool], known: usize| -> (Option<String>, String) {
         // With tools, the system prompt opens with what they're for.
         let preamble = || {
-            let mut text = match tools::family_notes(family) {
+            let mut text = match tools::family_notes(family, prompt_thinking) {
                 Some(notes) => format!("{}\n\n{notes}", tools::PREAMBLE),
                 None => tools::PREAMBLE.to_string(),
             };
@@ -2524,12 +2533,25 @@ fn reply(
             (false, Some(s)) if !s.is_empty() => Some(format!("{}\n\n{s}", preamble())),
             (false, _) => Some(preamble()),
         };
-        // What the user asked to be remembered, after the rest (the Mac's order).
-        let system = match (system, memory::instructions_for(&facts[..known])) {
+        // What the user asked to be remembered, after the rest (the Mac's order). For
+        // Gemma, whose template puts the tools after the instructions, after the tools
+        // too: a memory saved then changes only the system turn's end, and the next new
+        // chat reads the memories again, not the ~1,100 tokens of tools after them (Qwen's
+        // template has the tools first).
+        let declared = tools::declarations(family, tools);
+        let memories = memory::instructions_for(&facts[..known]);
+        if family == Family::Gemma4 && !declared.is_empty() {
+            let declared = match memories {
+                Some(m) => format!("{declared}\n\n{m}"),
+                None => declared,
+            };
+            return (system, declared);
+        }
+        let system = match (system, memories) {
             (Some(s), Some(m)) => Some(format!("{s}\n\n{m}")),
             (s, m) => s.or(m),
         };
-        (system, tools::declarations(family, tools))
+        (system, declared)
     };
     let build = |tools: &[tools::Tool], known: usize| -> Prompt {
         let (system, declared) = system_turn(tools, known);
@@ -2830,6 +2852,10 @@ fn reply(
             _ => false,
         };
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
+    let mtp_guesses = match kept.session {
+        Session::Gemma4(_) => GEMMA_MTP_GUESSES,
+        _ => MTP_GUESSES,
+    };
     // A model with a draft model or layer guesses from the chat too, where the chat has
     // a long run to offer (`CHAT_RUN_OVER_DRAFT`, `CHAT_RUN_OVER_LAYER`).
     let both = mtp;
@@ -2923,7 +2949,7 @@ fn reply(
                             mtp_stats.1,
                         ) =>
                 {
-                    let g = model.mtp_draft(kept, first, MTP_GUESSES.min(room - 1))?;
+                    let g = model.mtp_draft(kept, first, mtp_guesses.min(room - 1))?;
                     mtp_stats.0 += g.len();
                     ahead_drafted = true;
                     g
@@ -3022,9 +3048,25 @@ fn reply(
             answer_due = false;
         }
         if debug_calls() && turn_start {
+            // And the likeliest three, with their shares: how near a call was.
+            let mut top: Vec<usize> = (0..logits.len()).collect();
+            top.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            let max = logits[top[0]];
+            let sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
+            let top: Vec<String> = top[..3]
+                .iter()
+                .map(|&t| {
+                    format!(
+                        "{:?} {:.2}",
+                        tokenizer.decode(&[t as u32], true),
+                        (logits[t] - max).exp() / sum
+                    )
+                })
+                .collect();
             eprintln!(
-                "[calls] turn starts with {:?}",
-                tokenizer.decode(&[next], true)
+                "[calls] turn starts with {:?} (likeliest: {})",
+                tokenizer.decode(&[next], true),
+                top.join(", ")
             );
         }
         let by_token = !muse_turn && Some(next) == start_token;
