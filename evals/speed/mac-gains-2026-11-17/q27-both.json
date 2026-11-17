@@ -1,0 +1,178 @@
+{
+ "model": "Qwen3.8-27B-Q6_K.gguf",
+ "ways": {
+  "both": ""
+ },
+ "max_tokens": 400,
+ "rounds": 1,
+ "rows": [
+  {
+   "sampling": "greedy",
+   "prompt": "list",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 8.92,
+   "tokens_per_s": 44.8,
+   "guesses": {
+    "chat": [
+     77,
+     180
+    ],
+    "multi-token-prediction layer": [
+     221,
+     255
+    ]
+   },
+   "read_tokens": 359,
+   "read_seconds": 0.61,
+   "read_tokens_per_s": 589
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "code",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 4.5,
+   "tokens_per_s": 88.9,
+   "guesses": {
+    "chat": [
+     376,
+     403
+    ],
+    "multi-token-prediction layer": [
+     15,
+     15
+    ]
+   },
+   "read_tokens": 486,
+   "read_seconds": 0.79,
+   "read_tokens_per_s": 615
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "story",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 12.76,
+   "tokens_per_s": 31.3,
+   "guesses": {
+    "chat": [
+     10,
+     22
+    ],
+    "multi-token-prediction layer": [
+     214,
+     517
+    ]
+   },
+   "read_tokens": 54,
+   "read_seconds": 0.19,
+   "read_tokens_per_s": 284
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "explain",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 9.96,
+   "tokens_per_s": 40.2,
+   "guesses": {
+    "chat": [
+     16,
+     47
+    ],
+    "multi-token-prediction layer": [
+     251,
+     383
+    ]
+   },
+   "read_tokens": 52,
+   "read_seconds": 0.19,
+   "read_tokens_per_s": 274
+  },
+  {
+   "sampling": "own",
+   "prompt": "list",
+   "way": "both",
+   "tokens": 521,
+   "seconds": 12.89,
+   "tokens_per_s": 40.4,
+   "guesses": {
+    "chat": [
+     136,
+     264
+    ],
+    "multi-token-prediction layer": [
+     220,
+     326
+    ]
+   },
+   "read_tokens": 26,
+   "read_seconds": 0.1,
+   "read_tokens_per_s": 260
+  },
+  {
+   "sampling": "own",
+   "prompt": "code",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 4.55,
+   "tokens_per_s": 87.9,
+   "guesses": {
+    "chat": [
+     378,
+     400
+    ],
+    "multi-token-prediction layer": [
+     13,
+     15
+    ]
+   },
+   "read_tokens": 26,
+   "read_seconds": 0.11,
+   "read_tokens_per_s": 236
+  },
+  {
+   "sampling": "own",
+   "prompt": "story",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 14.8,
+   "tokens_per_s": 27.0,
+   "guesses": {
+    "chat": [
+     0,
+     6
+    ],
+    "multi-token-prediction layer": [
+     198,
+     596
+    ]
+   },
+   "read_tokens": 1510,
+   "read_seconds": 2.15,
+   "read_tokens_per_s": 702
+  },
+  {
+   "sampling": "own",
+   "prompt": "explain",
+   "way": "both",
+   "tokens": 400,
+   "seconds": 10.0,
+   "tokens_per_s": 40.0,
+   "guesses": {
+    "chat": [
+     8,
+     33
+    ],
+    "multi-token-prediction layer": [
+     258,
+     379
+    ]
+   },
+   "read_tokens": 49,
+   "read_seconds": 0.18,
+   "read_tokens_per_s": 272
+  }
+ ]
+}
