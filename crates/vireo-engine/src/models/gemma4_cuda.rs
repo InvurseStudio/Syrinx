@@ -156,6 +156,8 @@ pub struct Gemma4CudaSession {
     /// Room for a batch's experts (a mixture-of-experts model).
     experts: Option<ExpertBuffers>,
     logits_gpu: LogitsBuffer,
+    /// Whether a batch's logits are left on the GPU (`forward_batch_held`).
+    hold: bool,
     logits: Vec<f32>,
     /// The batch's activations in 8 bits, unless the model is exact.
     q8: Option<Q8>,
@@ -564,6 +566,7 @@ impl<'a> Gemma4Cuda<'a> {
                 None => None,
             },
             logits_gpu: LogitsBuffer::new(&self.gpu, c.vocab)?,
+            hold: false,
             logits: vec![0.0; c.vocab],
             q8_ffn: if cfg!(target_os = "macos") {
                 None
@@ -1131,6 +1134,9 @@ impl<'a> Gemma4Cuda<'a> {
                 .softcap(out.ptr(), cap, rows * c.vocab)
                 .map_err(e)?;
         }
+        if s.hold {
+            return Ok(());
+        }
         out.read_f32(&mut s.logits[out_at..out_at + rows * c.vocab])
             .map_err(e)
     }
@@ -1164,6 +1170,30 @@ impl<'a> Gemma4Cuda<'a> {
         Ok(Some(&s.logits))
     }
 
+    /// As [`Self::forward_batch`] for every token's logits, but they stay on the GPU:
+    /// [`Self::held_logits`] fetches a row, until the session next runs a token. For a
+    /// draft's guesses, checked in one pass: only the rows of the guesses taken are ever
+    /// read back (a megabyte each for a 262,144-token vocabulary). `tokens` must fit one
+    /// batch.
+    pub fn forward_batch_held(&self, s: &mut Gemma4CudaSession, tokens: &[u32]) -> Result<()> {
+        assert!(
+            tokens.len() <= s.batch,
+            "{} tokens held, in batches of {}",
+            tokens.len(),
+            s.batch
+        );
+        s.hold = true;
+        let done = self.forward_batch(s, tokens, Logits::All).map(|_| ());
+        s.hold = false;
+        done
+    }
+
+    /// Row `row` of the logits [`Self::forward_batch_held`] left on the GPU, into `out`.
+    pub fn held_logits(&self, s: &Gemma4CudaSession, row: usize, out: &mut [f32]) -> Result<()> {
+        assert_eq!(out.len(), self.config.vocab, "a row of logits is the vocabulary long");
+        s.logits_gpu.read_row(row, out)
+    }
+
     /// Runs `tokens` at the session's next positions, a batch at a time, and hands back
     /// the logits asked for: the last token's, or a row for every token.
     pub fn forward_batch<'s>(
@@ -1181,7 +1211,7 @@ impl<'a> Gemma4Cuda<'a> {
             s.capacity
         );
         s.logits.resize(
-            if logits == Logits::All {
+            if logits == Logits::All && !s.hold {
                 tokens.len() * vocab
             } else {
                 vocab

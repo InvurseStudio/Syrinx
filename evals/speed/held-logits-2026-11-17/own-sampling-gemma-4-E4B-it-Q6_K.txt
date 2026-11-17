@@ -1,0 +1,20 @@
+round 0 base  story       94.1 tok/s  400 tokens  guesses {'chat': [7, 9], 'draft model': [121, 185]}  reply 596e
+round 0 base  explain    122.7 tok/s  400 tokens  guesses {'chat': [8, 18], 'draft model': [198, 295]}  reply 8ad8
+round 0 base  list       133.8 tok/s  400 tokens  guesses {'chat': [72, 231], 'draft model': [197, 242]}  reply 316b
+round 0 base  code       270.3 tok/s  400 tokens  guesses {'chat': [376, 399], 'draft model': [13, 13]}  reply bc08
+round 0 new   story       93.9 tok/s  400 tokens  guesses {'chat': [6, 15], 'draft model': [110, 189]}  reply 32f1
+round 0 new   explain    129.9 tok/s  400 tokens  guesses {'chat': [2, 9], 'draft model': [203, 310]}  reply 31da
+round 0 new   list       146.0 tok/s  400 tokens  guesses {'chat': [63, 176], 'draft model': [199, 246]}  reply f6e0
+round 0 new   code       294.1 tok/s  400 tokens  guesses {'chat': [374, 399], 'draft model': [14, 17]}  reply b729
+round 1 new   story       92.8 tok/s  400 tokens  guesses {'chat': [7, 12], 'draft model': [105, 208]}  reply dd7c
+round 1 new   explain    126.6 tok/s  400 tokens  guesses {'chat': [2, 15], 'draft model': [197, 297]}  reply 2b5e
+round 1 new   list       144.2 tok/s  395 tokens  guesses {'chat': [53, 210], 'draft model': [205, 249]}  reply 8179
+round 1 new   code       133.3 tok/s  4 tokens  guesses {'chat': [0, 0], 'draft model': [2, 3]}  reply b6fb
+round 1 base  story       93.5 tok/s  400 tokens  guesses {'chat': [8, 15], 'draft model': [126, 220]}  reply 5551
+round 1 base  explain    129.0 tok/s  400 tokens  guesses {'chat': [3, 6], 'draft model': [215, 313]}  reply c88f
+round 1 base  list       130.3 tok/s  400 tokens  guesses {'chat': [52, 152], 'draft model': [209, 261]}  reply 889b
+round 1 base  code       272.1 tok/s  400 tokens  guesses {'chat': [376, 399], 'draft model': [13, 13]}  reply bc08
+story     base    93.8 (94.1, 93.5)  new    93.4 (93.9, 92.8)  -0.5%
+explain   base   125.9 (122.7, 129.0)  new   128.2 (129.9, 126.6)  +1.9%
+list      base   132.0 (133.8, 130.3)  new   145.1 (146.0, 144.2)  +9.9%
+code      base   271.2 (270.3, 272.1)  new   213.7 (294.1, 133.3)  -21.2%
