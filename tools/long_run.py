@@ -137,7 +137,9 @@ class Vireo:
         self.log = open(self.log_path, "w")
         self.read_to = 0
         self.token = "long-run"
-        args = [str(HERE / "target/release/vireo-server"), model, "--port", "0",
+        # VIREO_SERVER_BIN: another build of the server, to compare two.
+        binary = os.environ.get("VIREO_SERVER_BIN") or str(HERE / "target/release/vireo-server")
+        args = [binary, model, "--port", "0",
                 "--token", self.token, "--chat-cache", str(self.cache)]
         if context:
             args += ["--context", str(context)]

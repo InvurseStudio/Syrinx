@@ -1,0 +1,94 @@
+{
+ "model": "gemma-4-31B-it-Q6_K.gguf",
+ "ways": {
+  "new": ""
+ },
+ "max_tokens": 400,
+ "rounds": 1,
+ "rows": [
+  {
+   "sampling": "greedy",
+   "prompt": "list",
+   "way": "new",
+   "tokens": 324,
+   "seconds": 8.14,
+   "tokens_per_s": 39.8,
+   "guesses": {
+    "chat": [
+     29,
+     71
+    ],
+    "draft model": [
+     203,
+     258
+    ]
+   },
+   "read_tokens": 344,
+   "read_seconds": 0.59,
+   "read_tokens_per_s": 583
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "code",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 2.5,
+   "tokens_per_s": 160.0,
+   "guesses": {
+    "chat": [
+     377,
+     451
+    ],
+    "draft model": [
+     13,
+     13
+    ]
+   },
+   "read_tokens": 519,
+   "read_seconds": 1.03,
+   "read_tokens_per_s": 504
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "story",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 13.81,
+   "tokens_per_s": 29.0,
+   "guesses": {
+    "chat": [
+     0,
+     3
+    ],
+    "draft model": [
+     226,
+     516
+    ]
+   },
+   "read_tokens": 42,
+   "read_seconds": 0.18,
+   "read_tokens_per_s": 233
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "explain",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 10.1,
+   "tokens_per_s": 39.6,
+   "guesses": {
+    "chat": [
+     5,
+     13
+    ],
+    "draft model": [
+     268,
+     369
+    ]
+   },
+   "read_tokens": 40,
+   "read_seconds": 0.13,
+   "read_tokens_per_s": 308
+  }
+ ]
+}

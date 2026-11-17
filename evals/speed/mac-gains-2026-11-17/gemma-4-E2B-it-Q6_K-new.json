@@ -1,0 +1,146 @@
+{
+ "model": "gemma-4-E2B-it-Q6_K.gguf",
+ "ways": {
+  "new": ""
+ },
+ "max_tokens": 400,
+ "rounds": 1,
+ "rows": [
+  {
+   "sampling": "greedy",
+   "prompt": "list",
+   "way": "new",
+   "tokens": 332,
+   "seconds": 1.35,
+   "tokens_per_s": 245.9,
+   "guesses": {
+    "chat": [
+     197,
+     333
+    ]
+   },
+   "read_tokens": 340,
+   "read_seconds": 0.02,
+   "read_tokens_per_s": 17000
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "code",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 0.38,
+   "tokens_per_s": 1052.6,
+   "guesses": {
+    "chat": [
+     383,
+     466
+    ]
+   },
+   "read_tokens": 515,
+   "read_seconds": 0.03,
+   "read_tokens_per_s": 17167
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "story",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 2.35,
+   "tokens_per_s": 170.2,
+   "guesses": {
+    "chat": [
+     15,
+     59
+    ]
+   },
+   "read_tokens": 38,
+   "read_seconds": 0.01,
+   "read_tokens_per_s": 3800
+  },
+  {
+   "sampling": "greedy",
+   "prompt": "explain",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 2.51,
+   "tokens_per_s": 159.4,
+   "guesses": {
+    "chat": [
+     9,
+     71
+    ]
+   },
+   "read_tokens": 36,
+   "read_seconds": 0.01,
+   "read_tokens_per_s": 3600
+  },
+  {
+   "sampling": "own",
+   "prompt": "list",
+   "way": "new",
+   "tokens": 334,
+   "seconds": 1.56,
+   "tokens_per_s": 214.1,
+   "guesses": {
+    "chat": [
+     193,
+     330
+    ]
+   },
+   "read_tokens": 22,
+   "read_seconds": 0.01,
+   "read_tokens_per_s": 2200
+  },
+  {
+   "sampling": "own",
+   "prompt": "code",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 0.37,
+   "tokens_per_s": 1081.1,
+   "guesses": {
+    "chat": [
+     383,
+     466
+    ]
+   },
+   "read_tokens": 22,
+   "read_seconds": 0.01,
+   "read_tokens_per_s": 2200
+  },
+  {
+   "sampling": "own",
+   "prompt": "story",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 2.39,
+   "tokens_per_s": 167.4,
+   "guesses": {
+    "chat": [
+     13,
+     79
+    ]
+   },
+   "read_tokens": 49,
+   "read_seconds": 0.01,
+   "read_tokens_per_s": 4900
+  },
+  {
+   "sampling": "own",
+   "prompt": "explain",
+   "way": "new",
+   "tokens": 400,
+   "seconds": 2.5,
+   "tokens_per_s": 160.0,
+   "guesses": {
+    "chat": [
+     17,
+     85
+    ]
+   },
+   "read_tokens": 36,
+   "read_seconds": 0.01,
+   "read_tokens_per_s": 3600
+  }
+ ]
+}
