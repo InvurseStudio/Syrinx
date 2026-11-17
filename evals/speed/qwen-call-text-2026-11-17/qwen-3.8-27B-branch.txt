@@ -1,0 +1,14 @@
+bye    write_file   Created `bye.txt` containing "bye".
+zebra  write_file   Created `zebra.txt` containing the word "zebra".
+ok     write_file   Created `ok.txt` containing "ok".
+cat    write_file   Created `cat.txt` containing the word "cat".
+dog    write_file   Created `dog.txt` containing the word "dog".
+sun    write_file   Created `sun.txt` containing the word "sun".
+moon   write_file   Created `moon.txt` containing the word "moon".
+tree   write_file   Created `tree.txt` containing the word "tree".
+blue   write_file   Created `blue.txt` containing the word "blue".
+green  write_file   Created `green.txt` containing the word "green".
+seven  write_file   Created `seven.txt` containing the word "seven".
+milk   write_file   Created `milk.txt` containing the word "milk".
+
+0 of 12 without a write_file call. Server log: /var/folders/kd/2m_rxxd90gn2k_20r3dh75540000gn/T/vireo-bench-logs/vireo-calls-1794945855.log

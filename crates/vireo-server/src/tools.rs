@@ -1448,16 +1448,23 @@ pub const PARALLEL_CALLS: &str = "Every step costs the user time, so ask for eve
 
 /// The family's own lines after [`PREAMBLE`] (0.9's `model_profiles.py`: each family's
 /// `tool_note`, and Qwen's `system_note`). Muse's are `chat::MUSE_NOTE`, in its system turn.
-pub fn family_notes(family: Family) -> Option<String> {
+///
+/// `thinking` is the reply's: Qwen's line says to call "after your thinking ends" only
+/// when it thinks. With thinking off the words named something that wasn't there, and Qwen
+/// 3.8 27B took the reply for the place to report a call, not make one: asked to create a
+/// small file it began with "[" twice as often as with <tool_call> and wrote "[Tool call:
+/// write_file]" (or "I'll create that file for you.") and stopped, 8 times in 12; without
+/// them, none in 12, <tool_call> at 0.81-0.86.
+pub fn family_notes(family: Family, thinking: bool) -> Option<String> {
     match family {
         Family::Gemma4 => Some(format!(
             "{PARALLEL_CALLS}\n\nTool-call format: call tools with Gemma's own tool-call format, as the tool list below describes. Write every argument value in full: text quoted, lists in [ ], objects in {{ }} with quoted keys. Make each call outside your thinking, after it ends."
         )),
         // Not the parallel line yet: the server runs Qwen's calls one at a time.
-        Family::Qwen35 => Some(
-            "Tool-call format: call tools only in the <tool_call> format the tools section describes, one <tool_call> block per call, after your thinking ends. Give each parameter its full value.\n\nKeep the final reply short: the result, then the points the user must know. Do not restate rules, file contents or your steps, do not list the sources again, and do not offer a menu of next steps. Never shorten a draft, a document or a list the user asked for."
-            .to_string(),
-        ),
+        Family::Qwen35 => Some(format!(
+            "Tool-call format: call tools only in the <tool_call> format the tools section describes, one <tool_call> block per call{}. Give each parameter its full value.\n\nKeep the final reply short: the result, then the points the user must know. Do not restate rules, file contents or your steps, do not list the sources again, and do not offer a menu of next steps. Never shorten a draft, a document or a list the user asked for.",
+            if thinking { ", after your thinking ends" } else { "" }
+        )),
         Family::Muse | Family::Llama => None,
     }
 }
@@ -2657,14 +2664,19 @@ mod tests {
         ] {
             assert!(PREAMBLE.contains(rule), "{rule}");
         }
-        let gemma = family_notes(Family::Gemma4).unwrap();
+        let gemma = family_notes(Family::Gemma4, true).unwrap();
         assert!(
             gemma.starts_with(PARALLEL_CALLS) && gemma.contains("Gemma's own tool-call format")
         );
-        let qwen = family_notes(Family::Qwen35).unwrap();
+        let qwen = family_notes(Family::Qwen35, true).unwrap();
+        assert!(qwen.contains("after your thinking ends"));
+        // Thinking off: nothing about thinking, the rest the same.
+        let plain = family_notes(Family::Qwen35, false).unwrap();
+        assert!(!plain.contains("thinking"));
+        assert_eq!(plain, qwen.replace(", after your thinking ends", ""));
         assert!(qwen.contains("<tool_call>") && qwen.contains("Keep the final reply short"));
         assert!(!qwen.contains(PARALLEL_CALLS));
-        assert_eq!(family_notes(Family::Muse), None);
-        assert_eq!(family_notes(Family::Llama), None);
+        assert_eq!(family_notes(Family::Muse, true), None);
+        assert_eq!(family_notes(Family::Llama, false), None);
     }
 }

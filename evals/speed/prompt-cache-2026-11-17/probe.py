@@ -52,6 +52,8 @@ def main():
         ("plain", "Name a bird that cannot fly."),
         ("remember", "Remember that I live in Tampere."),
         ("plain", "What is the freezing point of water in Fahrenheit?"),
+        ("recall", "What is my favourite colour, and where do I live?"),
+        ("recall, tool", f"Read {work}/README.md if there is one, then tell me my favourite colour."),
     ]
     server = engines.Vireo({"key": "probe", "gguf": str(Path(a.model).resolve())}, a.context)
     try:
