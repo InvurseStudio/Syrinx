@@ -50,7 +50,7 @@ class Vireo:
     REPLY = re.compile(r"Reply: (\d+) prompt tokens \((\d+) kept, (\d+) read in ([\d.]+)s, \d+/s\), "
                        r"(\d+) tokens in ([\d.]+)s")
 
-    def __init__(self, model, ctx, plain=False, thinking=False):
+    def __init__(self, model, ctx, plain=False, thinking=False, extra=()):
         cfg = engine_cfg("vireo")
         self.kind = "vireo-plain" if plain else "vireo"
         self.thinking = thinking
@@ -63,6 +63,7 @@ class Vireo:
                 "--thinking", "on" if thinking else "off"]
         if plain:
             args += ["--mtp", "off", "--lookup", "0"]
+        args += list(extra)
         env = dict(os.environ, INVURSE_SKILLS_DIR=str(common.FIX / "skills"),
                    VIREO_BUILTIN_SKILLS=str(self.dir / "builtin"),
                    VIREO_MEMORY_FILE=str(self.dir / "memories.txt"),

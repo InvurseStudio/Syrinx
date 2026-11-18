@@ -67,7 +67,7 @@ Usage: vireo-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exact
                     [--changes declared|scored|offered] [--skills on|off]
                     [--skill-shortlist on|off]
                     [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
-                    [--mtp on|off] [--thinking on|off]
+                    [--mtp on|off] [--thinking on|off] [--slots <n>]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -141,6 +141,9 @@ struct Options {
     mtp: bool,
     /// Thinking for a request that doesn't say (`--thinking on`; off by default).
     thinking: bool,
+    /// How many replies may be written at once, each in a chat slot of its own on the
+    /// GPU (`--slots`; 1 by default: one at a time). Gemma 4 only so far.
+    slots: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -180,6 +183,7 @@ fn main() -> ExitCode {
     let mut lookup = draft::DEFAULT_LOOKUP;
     let mut mtp = true;
     let mut thinking = false;
+    let mut slots = 1;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -276,6 +280,10 @@ fn main() -> ExitCode {
                 thinking = value.map(String::as_str) == Some("on");
                 i += 1;
             }
+            "--slots" if value.and_then(|v| v.parse::<usize>().ok()).is_some_and(|n| (1..=64).contains(&n)) => {
+                slots = value.unwrap().parse().unwrap_or(1);
+                i += 1;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -305,6 +313,7 @@ fn main() -> ExitCode {
         lookup,
         mtp,
         thinking,
+        slots,
     });
     // The engine thread owns the GPU; requests reach it over a channel.
     let (jobs, job_rx) = channel::<Work>();
@@ -324,7 +333,8 @@ fn main() -> ExitCode {
         });
     }
     let (ready_tx, ready_rx) = channel::<Result<ModelInfo, String>>();
-    std::thread::spawn(move || engine(&path, context, precision, chat_cache, ready_tx, job_rx));
+    let back = jobs.clone();
+    std::thread::spawn(move || engine(&path, context, precision, chat_cache, ready_tx, job_rx, back));
     let info = match ready_rx.recv() {
         Ok(Ok(info)) => info,
         Ok(Err(e)) => {
@@ -1035,6 +1045,8 @@ enum Work {
     Reply(Job),
     /// Save the chat in use, then say so.
     Shutdown(Sender<()>),
+    /// A chat slot's worker has finished its reply (`--slots`).
+    Free(usize),
 }
 
 struct Job {
@@ -1132,6 +1144,24 @@ struct Kept {
     /// Gemma's chat is saved up to there, which the next turn and a retry both start with,
     /// since its saved state can only be loaded whole.
     history_end: usize,
+}
+
+impl Kept {
+    /// An empty chat in `session`.
+    fn new(session: Session) -> Self {
+        Self {
+            session,
+            tokens: Vec::new(),
+            checkpoint: None,
+            base: None,
+            turn: None,
+            scratch: None,
+            heads: Vec::new(),
+            pickers: Vec::new(),
+            skill_controls: HashMap::new(),
+            history_end: 0,
+        }
+    }
 }
 
 /// The most saved starts a chat session keeps (`Kept::heads`), and the most memory
@@ -1570,6 +1600,32 @@ impl Model {
         }
     }
 
+    /// The prompt, as [`Self::read`]. With several chat slots and other replies under
+    /// way, a batch at a time, and between batches the replies being written get the
+    /// GPU for as long as the batch took: a long prompt read in one go kept everyone
+    /// else's reply waiting until it was through (eight people's 3,000-token prompts at
+    /// once: the first to be read waited 57 s for the last before its reply began).
+    fn read_in_turns(
+        &self,
+        s: &mut Session,
+        ids: &[u32],
+        serving: Option<&Serving>,
+    ) -> Result<Vec<f32>, String> {
+        let Some(serving) = serving.filter(|_| ids.len() > READ_SLICE) else {
+            return self.read(s, ids);
+        };
+        let mut logits = Vec::new();
+        let mut slices = ids.chunks(READ_SLICE).peekable();
+        while let Some(slice) = slices.next() {
+            let started = Instant::now();
+            logits = self.read(s, slice)?;
+            if slices.peek().is_some() {
+                serving.turns.give_way(started.elapsed());
+            }
+        }
+        Ok(logits)
+    }
+
     /// The prompt, in batches; the last token's logits.
     fn read(&self, s: &mut Session, ids: &[u32]) -> Result<Vec<f32>, String> {
         let _t = TimeLog::start(self, "read", ids.len());
@@ -1680,6 +1736,7 @@ impl Model {
         ids: &[u32],
         mark: usize,
         head: usize,
+        serving: Option<&Serving>,
     ) -> Result<(Vec<f32>, usize), String> {
         let e = |e: vireo_engine::models::Error| e.to_string();
         let shared = shared_start(&kept.tokens, ids);
@@ -1822,7 +1879,7 @@ impl Model {
             m.save(s, &mut kept.checkpoint).map_err(e)?;
             start = mark;
         }
-        let logits = self.read(&mut kept.session, &ids[start..])?;
+        let logits = self.read_in_turns(&mut kept.session, &ids[start..], serving)?;
         kept.tokens.extend_from_slice(&ids[from..]);
         kept.history_end = mark;
         Ok((logits, reused))
@@ -1956,6 +2013,45 @@ impl Model {
         Ok(())
     }
 
+    /// One token for each of `chats` in one pass, each one's logits (Gemma 4). `work`:
+    /// the pass's batch buffers, made here for up to `most` chats the first time.
+    fn next_each(
+        &self,
+        work: &Mutex<Option<Session>>,
+        most: usize,
+        chats: &mut [&mut Session],
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let _t = TimeLog::start(self, "next_each", tokens.len());
+        let Model::Gemma4(m) = self else {
+            return Err("Several replies at once are for Gemma 4 models so far.".into());
+        };
+        let e = |e: vireo_engine::models::Error| e.to_string();
+        let mut work = work.lock().unwrap_or_else(|e| e.into_inner());
+        if work.is_none() {
+            let s = m.session_with_batch(most.max(2), most.max(2)).map_err(e)?;
+            *work = Some(Session::Gemma4(s));
+        }
+        let Some(Session::Gemma4(work)) = work.as_mut() else {
+            unreachable!("made just above")
+        };
+        let mut sessions: Vec<_> = chats
+            .iter_mut()
+            .map(|s| match &mut **s {
+                Session::Gemma4(s) => s,
+                _ => unreachable!("a session belongs to its model"),
+            })
+            .collect();
+        m.forward_each(work, &mut sessions, tokens).map_err(e)?;
+        let mut rows = Vec::with_capacity(tokens.len());
+        for i in 0..tokens.len() {
+            let mut row = vec![0.0; m.config.vocab];
+            m.held_logits(work, i, &mut row).map_err(e)?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     fn next(&self, s: &mut Session, id: u32, logits: &mut [f32]) -> Result<(), String> {
         let _t = TimeLog::start(self, "next", 1);
         let r = match (self, s) {
@@ -1982,6 +2078,7 @@ fn engine(
     chat_cache: Option<Option<PathBuf>>,
     ready: Sender<Result<ModelInfo, String>>,
     jobs: Receiver<Work>,
+    back: Sender<Work>,
 ) {
     let started = Instant::now();
     let file: &'static GgufFile = match GgufFile::open(path) {
@@ -2102,18 +2199,7 @@ fn engine(
                 "Chats keep up to {context} tokens ({:.1} GB of the GPU's memory for their cache).",
                 (model.cache_bytes_per_position(&session) * context) as f64 / 1e9
             );
-            Some(Kept {
-                session,
-                tokens: Vec::new(),
-                checkpoint: None,
-                base: None,
-                turn: None,
-                scratch: None,
-                heads: Vec::new(),
-                pickers: Vec::new(),
-                skill_controls: HashMap::new(),
-                history_end: 0,
-            })
+            Some(Kept::new(session))
         }
         Err(e) => {
             let _ = ready.send(Err(format!(
@@ -2155,6 +2241,13 @@ fn engine(
         }
         None => None,
     };
+    let slots = options().slots;
+    if slots > 1 && (!matches!(model, Model::Gemma4(_)) || drafter.is_some()) {
+        let _ = ready.send(Err(
+            "--slots works with Gemma 4 models so far, and not with --draft.".into(),
+        ));
+        return;
+    }
     let _ = ready.send(Ok(ModelInfo {
         model: name,
         runtime: format!("Vireo engine ({gpu_name}, {mode})"),
@@ -2167,7 +2260,7 @@ fn engine(
         .filter_map(|t| tokenizer.token_id(t))
         .collect();
     let trie = TokenTrie::with_extra(&tokenizer, &extra);
-    let mut store = chat_cache.map(|dir| {
+    let store = chat_cache.map(|dir| {
         let key = store::model_key(std::path::Path::new(path), mode);
         let dir = dir.unwrap_or_else(|| store::default_dir(&key));
         let full_chat = kept
@@ -2182,9 +2275,90 @@ fn engine(
             budget as f64 / (1u64 << 30) as f64,
             memory as f64 / (1u64 << 30) as f64
         );
-        s
+        Mutex::new(s)
     });
+    let saved = || store.as_ref().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()));
     let mut seed = random_u64();
+    if slots > 1 {
+        eprintln!(
+            "{slots} chat slots: up to {slots} replies written at once, each slot's chat taking up to {:.1} GB of the GPU's memory.",
+            kept.as_ref().map_or(0.0, |k| (model.cache_bytes_per_position(&k.session) * context)
+                as f64
+                / 1e9)
+        );
+        let serving = Serving {
+            turns: Together::new(),
+            work: Mutex::new(None),
+            slots,
+        };
+        let stopped = std::thread::scope(|scope| {
+            let mut senders = Vec::new();
+            for slot in 0..slots {
+                let (tx, rx) = channel::<Job>();
+                senders.push(tx);
+                let kept = if slot == 0 { kept.take() } else { None };
+                let seed = seed.wrapping_add(slot as u64);
+                let (back, model, serving, store) = (back.clone(), &model, &serving, store.as_ref());
+                let (tokenizer, trie) = (&tokenizer, &trie);
+                scope.spawn(move || {
+                    worker(slot, kept, rx, back, model, serving, store, tokenizer, trie, family, context, seed)
+                });
+            }
+            // Each slot: whether it's free, the chat it last wrote for, and when.
+            let mut free = vec![true; slots];
+            let mut last: Vec<Option<String>> = vec![None; slots];
+            let mut used = vec![0u64; slots];
+            let mut clock = 0u64;
+            let mut waiting = std::collections::VecDeque::new();
+            loop {
+                match jobs.recv_timeout(SAVE_WHEN_IDLE) {
+                    Ok(Work::Reply(job)) => waiting.push_back(job),
+                    Ok(Work::Free(slot)) => free[slot] = true,
+                    // The workers finish the replies under way (each saves its chat after
+                    // a reply), then the chats are written.
+                    Ok(Work::Shutdown(done)) => return Some(done),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if free.iter().all(|f| *f)
+                            && let Some(mut store) = saved()
+                        {
+                            store.save_idle();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+                }
+                // A waiting request goes to the free slot that last wrote for its chat
+                // (the chat is still there), else to the one used last: one person's
+                // chats stay in one slot, whose saved starts and questions they share
+                // (alternating slots read a third more tokens over the eval's 43 cases).
+                while let Some(job) = waiting.front() {
+                    let idle = || (0..slots).filter(|&i| free[i]);
+                    let same = idle().find(|&i| job.chat_id.is_some() && last[i] == job.chat_id);
+                    let Some(slot) = same.or_else(|| idle().max_by_key(|&i| used[i])) else {
+                        break;
+                    };
+                    let job = waiting.pop_front().unwrap();
+                    clock += 1;
+                    (free[slot], used[slot]) = (false, clock);
+                    for l in &mut last {
+                        if job.chat_id.is_some() && *l == job.chat_id {
+                            *l = None;
+                        }
+                    }
+                    last[slot].clone_from(&job.chat_id);
+                    if let Err(e) = senders[slot].send(job) {
+                        let _ = e.0.out.send(Out::Error("The server is stopping.".into()));
+                    }
+                }
+            }
+        });
+        if let Some(mut store) = saved() {
+            store.save_all();
+        }
+        if let Some(done) = stopped {
+            let _ = done.send(());
+        }
+        return;
+    }
     loop {
         // With nothing asked for a while, the saved chats not yet on disk are written (in
         // the store's own thread), so stopping has little left to save and a server
@@ -2192,7 +2366,7 @@ fn engine(
         let work = match jobs.recv_timeout(SAVE_WHEN_IDLE) {
             Ok(work) => work,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(store) = store.as_mut() {
+                if let Some(mut store) = saved() {
                     store.save_idle();
                 }
                 continue;
@@ -2202,31 +2376,19 @@ fn engine(
         let job = match work {
             Work::Reply(job) => job,
             Work::Shutdown(done) => {
-                if let (Some(k), Some(store)) = (kept.as_ref(), store.as_mut()) {
-                    stash(&model, k, store);
+                if let (Some(k), Some(mut store)) = (kept.as_ref(), saved()) {
+                    stash(&model, k, &mut store);
                     store.save_all();
                 }
                 let _ = done.send(());
                 return;
             }
+            Work::Free(_) => continue,
         };
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         if kept.is_none() {
             match model.chat_session(context) {
-                Ok(session) => {
-                    kept = Some(Kept {
-                        session,
-                        tokens: Vec::new(),
-                        checkpoint: None,
-                        base: None,
-                    turn: None,
-                        scratch: None,
-                        heads: Vec::new(),
-                        pickers: Vec::new(),
-                        skill_controls: HashMap::new(),
-                        history_end: 0,
-                    })
-                }
+                Ok(session) => kept = Some(Kept::new(session)),
                 Err(e) => {
                     let _ = job.out.send(Out::Error(e));
                     continue;
@@ -2236,7 +2398,8 @@ fn engine(
         if let Err(e) = reply(
             &model,
             kept.as_mut().unwrap(),
-            store.as_mut(),
+            store.as_ref(),
+            None,
             &tokenizer,
             &trie,
             family,
@@ -2252,9 +2415,356 @@ fn engine(
     }
 }
 
+/// A chat slot's worker (`--slots`): the replies the engine's loop sends it, one after
+/// another, in a chat session of its own, taking turns at the GPU with the other slots'
+/// (`Together`). After each reply its chat is saved (in memory: `store`), so whichever
+/// slot the chat's next turn goes to finds it.
+#[allow(clippy::too_many_arguments)] // the engine loop's state, shared by its workers
+fn worker(
+    slot: usize,
+    mut kept: Option<Kept>,
+    jobs: Receiver<Job>,
+    back: Sender<Work>,
+    model: &Model,
+    serving: &Serving,
+    store: Option<&Mutex<store::Store>>,
+    tokenizer: &Tokenizer,
+    trie: &TokenTrie,
+    family: Family,
+    context: usize,
+    mut seed: u64,
+) {
+    for job in jobs {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        if kept.is_none() {
+            let _turn = serving.turns.enter();
+            match model.chat_session(context) {
+                Ok(session) => kept = Some(Kept::new(session)),
+                Err(e) => {
+                    let _ = job.out.send(Out::Error(format!(
+                        "No room on the GPU for chat slot {} ({e}). Try fewer --slots or a smaller --context.",
+                        slot + 1
+                    )));
+                    let _ = back.send(Work::Free(slot));
+                    continue;
+                }
+            }
+        }
+        let k = kept.as_mut().unwrap();
+        match reply(model, k, store, Some(serving), tokenizer, trie, family, context, seed, &job, None) {
+            Ok(()) => {
+                if let Some(store) = store {
+                    let _turn = serving.turns.enter();
+                    stash(model, k, &mut store.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+            }
+            Err(e) => {
+                // Whatever the session held is unknown now: the next reply starts afresh.
+                kept = None;
+                let _ = job.out.send(Out::Error(e));
+            }
+        }
+        let _ = back.send(Work::Free(slot));
+    }
+}
+
 /// How long the server waits with nothing to do before it writes the saved chats that
 /// are only in memory to disk.
 const SAVE_WHEN_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Several replies written at once (`--slots`): each has a worker of its own, and they
+/// share the GPU by turns. A worker holds the turn while it does anything of its own (a
+/// prompt read, a tool call written, its sampling), and gives it up where it wants its
+/// reply's next token: once every worker with a reply under way is waiting for one, the
+/// tokens are run in one pass (`Gemma4Cuda::forward_each`), which reads the weights once
+/// for all of them. `S` is a chat's session.
+struct Together<S> {
+    turns: Mutex<Turns<S>>,
+    changed: std::sync::Condvar,
+}
+
+struct Turns<S> {
+    /// The GPU is in use: a worker's own turn, or a pass for several.
+    busy: bool,
+    /// Workers with a reply under way: not counting one waiting on a tool to run, nor
+    /// one waiting for the turn to start its reply or to go on reading its prompt.
+    active: usize,
+    /// Workers whose next token is ready, waiting for the turn to go on writing.
+    resuming: usize,
+    /// Workers waiting for the turn that aren't under way yet (a reply to start, a tool
+    /// that has run, a prompt to go on reading): no pass starts while there are any,
+    /// or the replies being written would keep the turn among themselves.
+    waiting: usize,
+    /// A worker reading a long prompt has given the turn to the replies being written
+    /// and will take it back: no other reply starts meanwhile (prompts are read one
+    /// after another; read a slice each in turn, they would all finish late).
+    reserved: bool,
+    /// The next tokens waited for.
+    queue: Vec<Ask<S>>,
+    /// Their logits, by the ask's number, until its worker takes them.
+    done: HashMap<u64, Result<Vec<f32>, String>>,
+    asked: u64,
+    /// How many passes wrote for 1, 2, 3... replies, since the server started.
+    passes: Vec<usize>,
+}
+
+struct Ask<S> {
+    id: u64,
+    session: *mut S,
+    token: u32,
+}
+
+// SAFETY: `session` is its worker's `&mut S`, and that worker waits in `Together::next`
+// until the ask is answered: whichever worker runs the pass is the only one using it.
+unsafe impl<S: Send> Send for Ask<S> {}
+
+/// A worker's reply under way: its place among the active, and the turn, until dropped.
+struct Turn<'a, S>(&'a Together<S>);
+
+impl<S> Drop for Turn<'_, S> {
+    fn drop(&mut self) {
+        let mut t = self.0.lock();
+        t.active -= 1;
+        t.busy = false;
+        self.0.changed.notify_all();
+    }
+}
+
+impl<S> Together<S> {
+    fn new() -> Self {
+        Self {
+            turns: Mutex::new(Turns {
+                busy: false,
+                active: 0,
+                resuming: 0,
+                waiting: 0,
+                reserved: false,
+                queue: Vec::new(),
+                done: HashMap::new(),
+                asked: 0,
+                passes: Vec::new(),
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Turns<S>> {
+        self.turns.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait<'a>(&self, t: std::sync::MutexGuard<'a, Turns<S>>) -> std::sync::MutexGuard<'a, Turns<S>> {
+        self.changed.wait(t).unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waits for the turn and takes it.
+    fn take<'a>(&self, mut t: std::sync::MutexGuard<'a, Turns<S>>) -> std::sync::MutexGuard<'a, Turns<S>> {
+        while t.busy {
+            t = self.wait(t);
+        }
+        t.busy = true;
+        t
+    }
+
+    /// A reply starts: the turn, once it's free. Until then it isn't under way: the
+    /// replies being written go on without it.
+    fn enter(&self) -> Turn<'_, S> {
+        let mut t = self.lock();
+        while t.busy || t.reserved {
+            // Behind a prompt being read, it isn't waiting for the turn yet.
+            let counted = !t.reserved;
+            t.waiting += usize::from(counted);
+            t = self.wait(t);
+            if counted {
+                t.waiting -= 1;
+                if t.reserved {
+                    self.changed.notify_all();
+                }
+            }
+        }
+        t.busy = true;
+        t.active += 1;
+        Turn(self)
+    }
+
+    /// Waits for the turn and takes it, for a worker to be under way again.
+    fn rejoin(&self, mut t: std::sync::MutexGuard<'_, Turns<S>>) {
+        t.waiting += 1;
+        let mut t = self.take(t);
+        t.waiting -= 1;
+        t.active += 1;
+    }
+
+    /// Whether this worker's is the only reply under way (then it may draft: guesses
+    /// use the room in a pass that other replies' tokens would).
+    fn alone(&self) -> bool {
+        let t = self.lock();
+        t.active <= 1 && t.waiting == 0
+    }
+
+    /// Runs `wait` (a tool, which may take as long as the user does to approve it)
+    /// without the turn, and without the other replies waiting for this one.
+    fn pause<R>(&self, wait: impl FnOnce() -> R) -> R {
+        {
+            let mut t = self.lock();
+            t.active -= 1;
+            t.busy = false;
+            self.changed.notify_all();
+        }
+        let r = wait();
+        self.rejoin(self.lock());
+        r
+    }
+
+    /// Gives the turn to the replies waiting for their next tokens for up to `time`
+    /// (less if none is under way), then takes it back: for a long piece of work of
+    /// one worker's own, between its parts.
+    fn give_way(&self, time: std::time::Duration) {
+        let mut t = self.lock();
+        if t.queue.is_empty() && t.resuming == 0 {
+            return;
+        }
+        t.active -= 1;
+        t.busy = false;
+        t.reserved = true;
+        self.changed.notify_all();
+        let until = Instant::now() + time;
+        loop {
+            let now = Instant::now();
+            // Until the time is up, or no reply is being written any more.
+            if now >= until || (!t.busy && t.queue.is_empty() && t.resuming == 0) {
+                break;
+            }
+            t = self
+                .changed
+                .wait_timeout(t, until - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        // Its place kept until it has the turn again.
+        t.waiting += 1;
+        let mut t = self.take(t);
+        t.waiting -= 1;
+        t.active += 1;
+        t.reserved = false;
+        self.changed.notify_all();
+    }
+
+    /// `token` at `session`'s next position, its logits into `logits`: on its own
+    /// (`one`) when no other reply is under way, else with the other replies' next
+    /// tokens in one pass (`many`: a token for each session, each one's logits back).
+    /// Called with the turn; it's given up while waiting and held again on return.
+    fn next(
+        &self,
+        session: &mut S,
+        token: u32,
+        logits: &mut [f32],
+        one: impl Fn(&mut S, u32, &mut [f32]) -> Result<(), String>,
+        many: impl Fn(&mut [&mut S], &[u32]) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        let mut t = self.lock();
+        if t.active <= 1 && t.waiting == 0 {
+            drop(t);
+            return one(session, token, logits);
+        }
+        t.asked += 1;
+        let id = t.asked;
+        t.queue.push(Ask {
+            id,
+            session,
+            token,
+        });
+        t.busy = false;
+        self.changed.notify_all();
+        loop {
+            if let Some(answer) = t.done.remove(&id) {
+                t.resuming += 1;
+                self.take(t).resuming -= 1;
+                logits.copy_from_slice(&answer?);
+                return Ok(());
+            }
+            // Everyone with a reply under way is waiting for a token: this worker runs
+            // the pass for them all.
+            if !t.busy && t.waiting == 0 && !t.queue.is_empty() && t.queue.len() >= t.active {
+                t.busy = true;
+                let asks = std::mem::take(&mut t.queue);
+                drop(t);
+                let tokens: Vec<u32> = asks.iter().map(|a| a.token).collect();
+                // SAFETY: each is its worker's `&mut S`, lent for as long as that worker
+                // waits here for its answer (`Ask`); this worker's own is `session`,
+                // unused until the pass is over.
+                let mut sessions: Vec<&mut S> =
+                    asks.iter().map(|a| unsafe { &mut *a.session }).collect();
+                let answers = if let [only] = &mut sessions[..] {
+                    let mut row = vec![0.0; logits.len()];
+                    one(only, tokens[0], &mut row).map(|()| vec![row])
+                } else {
+                    many(&mut sessions, &tokens)
+                };
+                drop(sessions);
+                t = self.lock();
+                if t.passes.len() < asks.len() {
+                    t.passes.resize(asks.len(), 0);
+                }
+                t.passes[asks.len() - 1] += 1;
+                match answers {
+                    Ok(rows) => {
+                        for (a, row) in asks.iter().zip(rows) {
+                            t.done.insert(a.id, Ok(row));
+                        }
+                    }
+                    Err(e) => {
+                        for a in &asks {
+                            t.done.insert(a.id, Err(e.clone()));
+                        }
+                    }
+                }
+                t.busy = false;
+                self.changed.notify_all();
+                continue;
+            }
+            t = self.wait(t);
+        }
+    }
+}
+
+/// How much of a prompt is read between turns given to the replies being written
+/// (`Model::read_in_turns`): a batch, the most a session reads in one pass.
+const READ_SLICE: usize = vireo_engine::models::DEFAULT_BATCH;
+
+/// What the workers of a server with several chat slots share.
+struct Serving {
+    turns: Together<Session>,
+    /// The batch buffers a pass for several replies runs in, made at the first.
+    work: Mutex<Option<Session>>,
+    slots: usize,
+}
+
+impl Serving {
+    /// `token` next in `s`, with the other replies' tokens where there are any.
+    fn next(&self, model: &Model, s: &mut Session, token: u32, logits: &mut [f32]) -> Result<(), String> {
+        self.turns.next(
+            s,
+            token,
+            logits,
+            |s, token, logits| model.next(s, token, logits),
+            |chats, tokens| model.next_each(&self.work, self.slots, chats, tokens),
+        )
+    }
+}
+
+/// `token` next in `s`: through the server's shared passes, where it has them.
+fn next_token(
+    model: &Model,
+    serving: Option<&Serving>,
+    s: &mut Session,
+    token: u32,
+    logits: &mut [f32],
+) -> Result<(), String> {
+    match serving {
+        Some(serving) => serving.next(model, s, token, logits),
+        None => model.next(s, token, logits),
+    }
+}
 
 /// Saves the chat in `kept` to `store`, if there's one worth saving.
 fn stash(model: &Model, kept: &Kept, store: &mut store::Store) {
@@ -2357,7 +2867,8 @@ fn switch_chat(
 fn reply(
     model: &Model,
     kept: &mut Kept,
-    store: Option<&mut store::Store>,
+    store: Option<&Mutex<store::Store>>,
+    serving: Option<&Serving>,
     tokenizer: &Tokenizer,
     trie: &TokenTrie,
     family: Family,
@@ -2366,6 +2877,9 @@ fn reply(
     job: &Job,
     mut drafter: Option<&mut draft::Drafter>,
 ) -> Result<(), String> {
+    // With several chat slots: this reply's turn at the GPU, held but where it waits for
+    // its next token (`Together`).
+    let _turn = serving.map(|s| s.turns.enter());
     let today = chat::today();
     tools::set_context(context);
     let max_tokens = job.max_tokens.min(context / 2);
@@ -2661,9 +3175,10 @@ fn reply(
     let mut prompt = build(&offered, facts.len());
     let mut keep_changes = false;
     if job.messages.len() - prompt.first > 1 && (with_changes.is_some() || !facts.is_empty()) {
+        let saved = store.map(|s| s.lock().unwrap_or_else(|e| e.into_inner()));
         let caches: Vec<&[u32]> = std::iter::once(kept.tokens.as_slice())
             .chain(
-                store
+                saved
                     .as_deref()
                     .into_iter()
                     .flat_map(|s| s.entries().iter().map(|e| e.tokens.as_slice())),
@@ -2741,7 +3256,8 @@ fn reply(
     }
     let started = Instant::now();
     if let Some(store) = store {
-        switch_chat(model, kept, store, &ids, context)?;
+        let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+        switch_chat(model, kept, &mut store, &ids, context)?;
     }
     let (ids, mark) = if family == Family::Qwen35 && chat::qwen_keeps_thought() {
         keep_notes(tokenizer, &kept.tokens, ids, mark, context.saturating_sub(max_tokens))
@@ -2762,7 +3278,7 @@ fn reply(
     } else {
         0
     };
-    let (mut logits, reused) = model.continue_with(kept, &ids, mark, head)?;
+    let (mut logits, reused) = model.continue_with(kept, &ids, mark, head, serving)?;
     if let Some(d) = drafter.as_deref_mut() {
         d.sync(&kept.tokens)?;
     }
@@ -2945,11 +3461,14 @@ fn reply(
         // Out of guesses: a new round (after the unread token, if there's one), read by
         // the model in one pass with it.
         if ahead.is_empty() && !muse_turn {
+            // With other replies under way, no guesses: the room in a pass is theirs.
+            let alone = serving.is_none_or(|s| s.turns.alone());
             // The chat's guesses, where it guesses from the chat: all of them without a
             // draft model, only a long run with one.
             let from_chat = match lookup.as_mut() {
                 Some(l)
-                    if room > 1
+                    if alone
+                        && room > 1
                         && guesses_pay(
                             kept.tokens.len(),
                             CHAT_GUESSES_FROM,
@@ -2976,6 +3495,7 @@ fn reply(
                 // The layer guesses what follows the token just picked.
                 (None, Some(first))
                     if mtp
+                        && alone
                         && room > 1
                         && guesses_pay(
                             kept.tokens.len(),
@@ -3010,7 +3530,7 @@ fn reply(
                 }
                 _ => {
                     if let Some(u) = unread.take() {
-                        model.next(&mut kept.session, u, &mut logits)?;
+                        next_token(model, serving, &mut kept.session, u, &mut logits)?;
                     }
                 }
             }
@@ -3293,7 +3813,12 @@ fn reply(
                     "This is the same call as one before, and its result is above. Go on from it: call the next tool the task needs, or answer."
                         .to_string()
                 } else {
-                    match run_tool(&call, &offered, job) {
+                    // A tool may wait on the app or the user: not with the GPU's turn.
+                    let ran = match serving {
+                        Some(s) => s.turns.pause(|| run_tool(&call, &offered, job)),
+                        None => run_tool(&call, &offered, job),
+                    };
+                    match ran {
                         // A file read: what else is in its folder, said once a folder.
                         Some(r) => match beside_note(&call, &offered, job, &mut noted_folders) {
                             Some(note) => format!("{r}\n\n{note}"),
@@ -3452,7 +3977,7 @@ fn reply(
         } else if drafting {
             unread = Some(next);
         } else {
-            model.next(&mut kept.session, next, &mut logits)?;
+            next_token(model, serving, &mut kept.session, next, &mut logits)?;
         }
         kept.tokens.push(next);
     }
@@ -4050,7 +4575,7 @@ fn call_draft<'a>(
 fn take_back(model: &Model, kept: &mut Kept, len: usize) -> Result<Vec<f32>, String> {
     let ids = kept.tokens[..len].to_vec();
     let mark = kept.history_end.min(len);
-    let (logits, _) = model.continue_with(kept, &ids, mark, 0)?;
+    let (logits, _) = model.continue_with(kept, &ids, mark, 0, None)?;
     Ok(logits)
 }
 
@@ -4526,5 +5051,101 @@ fn preview(result: &str) -> String {
         format!("{short}…")
     } else {
         short
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Several workers writing at once through `Together`: each gets its own tokens'
+    /// logits, in order, in its own session; tokens are run together while more than one
+    /// reply is under way; a worker waiting on a tool holds nobody up; an error in a pass
+    /// reaches every reply in it; and it all ends with nothing left waiting.
+    #[test]
+    fn replies_written_together_keep_to_their_own_chats() {
+        const WORKERS: u32 = 4;
+        const TOKENS: u32 = 200;
+        let together: Together<Vec<u32>> = Together::new();
+        // A pass takes a moment, as on the GPU, so the workers' replies overlap.
+        let pass = || std::thread::sleep(std::time::Duration::from_micros(50));
+        let start = std::sync::Barrier::new(WORKERS as usize);
+        let one = |s: &mut Vec<u32>, token: u32, logits: &mut [f32]| {
+            pass();
+            s.push(token);
+            logits.copy_from_slice(&[token as f32, 1.0]);
+            Ok(())
+        };
+        let many = |chats: &mut [&mut Vec<u32>], tokens: &[u32]| {
+            let n = chats.len() as f32;
+            pass();
+            Ok(chats
+                .iter_mut()
+                .zip(tokens)
+                .map(|(s, &t)| {
+                    s.push(t);
+                    vec![t as f32, n]
+                })
+                .collect())
+        };
+        let shared = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|w| {
+                    let (together, start) = (&together, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        let _turn = together.enter();
+                        let (mut session, mut logits, mut shared) = (Vec::new(), [0f32; 2], 0);
+                        for i in 0..TOKENS {
+                            let token = w * 1000 + i;
+                            together.next(&mut session, token, &mut logits, one, many).unwrap();
+                            assert_eq!(logits[0], token as f32);
+                            shared += usize::from(logits[1] > 1.0);
+                            // A long prompt's next slice, as one worker reads it.
+                            if w == 1 && i % 40 == 39 {
+                                together.give_way(std::time::Duration::from_millis(1));
+                            }
+                            if w == 0 && i % 50 == 49 {
+                                together.pause(|| {
+                                    std::thread::sleep(std::time::Duration::from_millis(5))
+                                });
+                            }
+                        }
+                        assert_eq!(session, (0..TOKENS).map(|i| w * 1000 + i).collect::<Vec<_>>());
+                        shared
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).sum::<usize>()
+        });
+        assert!(shared > 0, "no token was run with another reply's");
+        {
+            let t = together.lock();
+            assert!(!t.busy && t.active == 0 && t.queue.is_empty() && t.done.is_empty());
+            assert!(!t.reserved && t.waiting == 0 && t.resuming == 0);
+        }
+        let failing =
+            |_: &mut [&mut Vec<u32>], _: &[u32]| Err::<Vec<Vec<f32>>, _>("no".to_string());
+        let failed = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let together = &together;
+                    scope.spawn(move || {
+                        let _turn = together.enter();
+                        let (mut session, mut logits) = (Vec::new(), [0f32; 2]);
+                        (0..50)
+                            .filter(|&t| {
+                                together.next(&mut session, t, &mut logits, one, failing).is_err()
+                            })
+                            .count()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect::<Vec<_>>()
+        });
+        // A failed pass fails for both replies in it.
+        assert_eq!(failed[0] > 0, failed[1] > 0);
+        let t = together.lock();
+        assert!(!t.busy && t.active == 0 && t.queue.is_empty() && t.done.is_empty());
     }
 }
