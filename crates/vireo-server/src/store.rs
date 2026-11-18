@@ -2,10 +2,14 @@
 //! after them (`vireo_engine::models::SavedState`), so going back to a chat, or opening
 //! it after a restart, reads only what's new in it.
 //!
-//! Saved in `chat-cache\<model>\` in the prototype's folder (`data_dir`), a file per chat, written
-//! by a thread of their own so switching chats doesn't wait for the disk. The newest
-//! states stay in memory as well. The oldest files go once they take more than the
-//! budget. A file is:
+//! Saved in `chat-cache\<model>\` in the prototype's folder (`data_dir`), a file per chat. A
+//! state stays in memory while the newest ones fit a budget (`memory_budget`), and its
+//! file is written only when it's pushed out of memory, the server has been idle a while
+//! (`save_idle`) or it stops, by a thread
+//! of its own: several people taking turns on one server swap their chats at every turn,
+//! and writing each swap was a gigabyte or more to the disk a turn (Gemma 4 31B, 10K-token
+//! chats). A server that's killed loses the states not yet written; those chats are read
+//! again. The oldest chats go once they all take more than the disk budget. A file is:
 //!
 //!   "VIREOKV1", the number of tokens n (u64), the tokens (n × u32), the state's length
 //!   in bytes (u64), the state's bytes; little-endian.
@@ -38,8 +42,31 @@ const MOST_DISK: u64 = 32 << 30;
 pub fn budget_for(full_chat: u64) -> u64 {
     DISK_BUDGET.max(FULL_CHATS.saturating_mul(full_chat)).min(MOST_DISK)
 }
-/// How many saved states stay in memory too (the newest; on top of the one in use).
+/// How many saved states stay in memory whatever their size (the newest; on top of the
+/// one in use).
 const IN_MEMORY: usize = 2;
+/// The memory for saved states where the machine's memory isn't known.
+const MEMORY_BUDGET: u64 = 4 << 30;
+/// The share of the machine's memory saved states may take: one part in this many.
+const MEMORY_SHARE: u64 = 8;
+
+/// The memory the saved states may take before the oldest are written to disk and let
+/// go: an eighth of the machine's (16 GB of 128), which six 10K-token chats of Gemma 4
+/// 31B fit in several times over.
+pub fn memory_budget() -> u64 {
+    physical_memory().map_or(MEMORY_BUDGET, |m| m / MEMORY_SHARE)
+}
+
+fn physical_memory() -> Option<u64> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
 
 /// The folder name for a model file in a precision: its name, size and modification time
 /// (a new download of the same name is another model), hashed.
@@ -90,16 +117,18 @@ pub struct Entry {
     pub tokens: Vec<u32>,
     file: PathBuf,
     bytes: u64,
-    /// The state, while it's in memory. The writer thread holds the other reference
-    /// until the file is written.
+    /// The state, while it's in memory. The writer thread holds another reference
+    /// from when the file is sent to be written until it is.
     data: Option<Arc<SavedState>>,
+    /// Whether its file has been sent to be written (or was there when the store opened).
+    filed: bool,
     used: u64,
 }
 
 impl Entry {
     /// Whether its file is still being written (the writer thread holds its state).
     fn writing(&self) -> bool {
-        self.data.as_ref().is_some_and(|d| Arc::strong_count(d) > 1)
+        self.filed && self.data.as_ref().is_some_and(|d| Arc::strong_count(d) > 1)
     }
 }
 
@@ -110,6 +139,8 @@ pub struct Store {
     dir: PathBuf,
     entries: Vec<Entry>,
     budget: u64,
+    /// What the states in memory may take ([`memory_budget`]).
+    memory: u64,
     clock: u64,
     next_name: u64,
     writer: Option<(Sender<ToWrite>, JoinHandle<()>)>,
@@ -117,7 +148,7 @@ pub struct Store {
 
 impl Store {
     /// The chats saved in `dir` (made if it isn't there), oldest first.
-    pub fn open(dir: PathBuf, budget: u64) -> Self {
+    pub fn open(dir: PathBuf, budget: u64, memory: u64) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         let mut found = Vec::new();
         for item in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -144,6 +175,7 @@ impl Store {
             dir,
             entries: Vec::new(),
             budget,
+            memory,
             clock: 0,
             next_name: 0,
             writer: None,
@@ -155,6 +187,7 @@ impl Store {
                 file,
                 bytes,
                 data: None,
+                filed: true,
                 used: store.clock,
             });
         }
@@ -186,14 +219,13 @@ impl Store {
         });
         let file = self.new_file();
         let bytes = state.bytes().len() as u64;
-        let data = Arc::new(state);
-        self.write(file.clone(), tokens.clone(), data.clone());
         self.clock += 1;
         self.entries.push(Entry {
             tokens,
             file,
             bytes,
-            data: Some(data),
+            data: Some(Arc::new(state)),
+            filed: false,
             used: self.clock,
         });
         self.trim();
@@ -234,7 +266,33 @@ impl Store {
         }
     }
 
-    /// Waits for every file to be written.
+    /// Writes every state that has no file yet, and waits for them (the server stopping).
+    pub fn save_all(&mut self) {
+        self.save_idle();
+        self.flush();
+    }
+
+    /// Sends every state that has no file yet to be written, without waiting (the
+    /// server idle).
+    pub fn save_idle(&mut self) {
+        for i in 0..self.entries.len() {
+            self.file(i);
+        }
+    }
+
+    /// Sends entry `i`'s state to be written, if it hasn't been.
+    fn file(&mut self, i: usize) {
+        let e = &mut self.entries[i];
+        if e.filed {
+            return;
+        }
+        let Some(data) = e.data.clone() else { return };
+        e.filed = true;
+        let (file, tokens) = (e.file.clone(), e.tokens.clone());
+        self.write(file, tokens, data);
+    }
+
+    /// Waits for every file sent to be written.
     pub fn flush(&mut self) {
         if let Some((tx, handle)) = self.writer.take() {
             drop(tx);
@@ -266,8 +324,9 @@ impl Store {
         let _ = tx.send((file, tokens, data));
     }
 
-    /// Keeps the files within the budget (the oldest go) and the newest few states in
-    /// memory.
+    /// Keeps the chats within the disk budget (the oldest go) and the newest states in
+    /// memory: the newest [`IN_MEMORY`], and as many more as fit the memory budget. An
+    /// older one's file is written, and its state let go once it has been.
     fn trim(&mut self) {
         self.entries.sort_by_key(|e| e.used);
         let mut total: u64 = self.entries.iter().map(|e| e.bytes).sum();
@@ -281,9 +340,20 @@ impl Store {
             let _ = std::fs::remove_file(e.file);
         }
         let n = self.entries.len();
-        for e in &mut self.entries[..n.saturating_sub(IN_MEMORY)] {
+        let mut held = 0u64;
+        for i in (0..n).rev() {
+            if self.entries[i].data.is_none() {
+                continue;
+            }
+            held += self.entries[i].bytes;
+            if n - i <= IN_MEMORY || held <= self.memory {
+                continue;
+            }
+            self.file(i);
             // Only once its file is written (the writer has let go of it).
+            let e = &mut self.entries[i];
             if e.data.as_ref().is_some_and(|d| Arc::strong_count(d) == 1) {
+                held -= e.bytes;
                 e.data = None;
             }
         }
@@ -292,7 +362,7 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        self.flush();
+        self.save_all();
     }
 }
 
@@ -377,11 +447,11 @@ mod tests {
     fn saves_and_reads_back_after_a_restart() {
         let d = dir("restart");
         {
-            let mut s = Store::open(d.clone(), DISK_BUDGET);
+            let mut s = Store::open(d.clone(), DISK_BUDGET, 1 << 20);
             s.put(vec![1, 2, 3], state(&[1, 2, 3], 7, 100));
             s.put(vec![9, 9], state(&[9, 9], 8, 50));
         }
-        let mut s = Store::open(d.clone(), DISK_BUDGET);
+        let mut s = Store::open(d.clone(), DISK_BUDGET, 1 << 20);
         assert_eq!(s.entries().len(), 2);
         let i = s
             .entries()
@@ -397,16 +467,48 @@ mod tests {
     #[test]
     fn a_chat_that_goes_on_replaces_its_earlier_save() {
         let d = dir("replace");
-        let mut s = Store::open(d.clone(), DISK_BUDGET);
+        let mut s = Store::open(d.clone(), DISK_BUDGET, 1 << 20);
         s.put(vec![1, 2], state(&[1, 2], 1, 10));
         s.put(vec![5], state(&[5], 1, 10));
         s.put(vec![1, 2, 3, 4], state(&[1, 2, 3, 4], 2, 10));
         let mut t: Vec<_> = s.entries().iter().map(|e| e.tokens.clone()).collect();
         t.sort();
         assert_eq!(t, vec![vec![1, 2, 3, 4], vec![5]]);
+        // Both fit in memory: nothing is written until the store stops.
         s.flush();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
         drop(s);
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_state_is_written_when_it_is_pushed_out_of_memory() {
+        let d = dir("memory");
+        // Room in memory for two states' worth past the newest two.
+        let mut s = Store::open(d.clone(), DISK_BUDGET, 450);
+        for id in 1..=4u32 {
+            s.put(vec![id], state(&[id], id as u8, 100));
+        }
+        s.flush();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        // A fifth: the oldest no longer fits, and its file is written.
+        s.put(vec![5], state(&[5], 5, 100));
+        s.flush();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        // The next save lets go of its state; it reads back from the file.
+        s.put(vec![6], state(&[6], 6, 100));
+        let i = s.entries().iter().position(|e| e.tokens == [1]).unwrap();
+        assert!(s.entries()[i].data.is_none());
+        assert_eq!(s.get(i).unwrap().bytes(), &[1u8; 100][..]);
+        // A chat let go before its file was written leaves no file behind.
+        s.put(vec![6, 7], state(&[6, 7], 7, 100));
+        s.save_all();
+        drop(s);
+        let s = Store::open(d.clone(), DISK_BUDGET, 450);
+        let mut t: Vec<_> = s.entries().iter().map(|e| e.tokens.clone()).collect();
+        t.sort();
+        assert_eq!(t, vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6, 7]]);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -420,7 +522,7 @@ mod tests {
     #[test]
     fn the_oldest_go_past_the_budget_and_bad_files_are_dropped() {
         let d = dir("budget");
-        let mut s = Store::open(d.clone(), 250);
+        let mut s = Store::open(d.clone(), 250, 1 << 20);
         s.put(vec![1], state(&[1], 1, 100));
         s.put(vec![2], state(&[2], 1, 100));
         let _ = s.get(0); // chat 1 used again: now chat 2 is the oldest
@@ -431,7 +533,7 @@ mod tests {
         drop(s);
         std::fs::write(d.join("junk.kv"), b"VIREOKV1 not really").unwrap();
         std::fs::write(d.join("half.part"), b"x").unwrap();
-        let s = Store::open(d.clone(), 250);
+        let s = Store::open(d.clone(), 250, 1 << 20);
         assert_eq!(s.entries().len(), 2);
         assert!(!d.join("junk.kv").exists() && !d.join("half.part").exists());
         let _ = std::fs::remove_dir_all(d);
