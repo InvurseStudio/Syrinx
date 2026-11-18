@@ -7,39 +7,39 @@ record; this is the short version and the to-do list.
 ## One workspace for both platforms
 
 Until today the Mac had its own copy of the engine in `Mac/Engine/`. It's been folded back
-in: there is one Cargo workspace, here in `VireoPrototype/`, and both machines build it.
+in: there is one Cargo workspace, here in `Syrinx/`, and both machines build it.
 
 | Part | Shared or per platform |
 |---|---|
-| `crates/vireo-engine` model code, GGUF, tokenizers, grammar, CPU path | Shared |
-| GPU backend | Per platform: CUDA on Windows (`src/cuda`, `kernels/vireo.cu`), Metal on the Mac (`src/metal`, `kernels/*.metal`). On macOS `src/metal` stands in for the `cuda` module, with the same API |
+| `crates/syrinx-engine` model code, GGUF, tokenizers, grammar, CPU path | Shared |
+| GPU backend | Per platform: CUDA on Windows (`src/cuda`, `kernels/syrinx.cu`), Metal on the Mac (`src/metal`, `kernels/*.metal`). On macOS `src/metal` stands in for the `cuda` module, with the same API |
 | Backend tuning | Per platform, behind `cfg(target_os = "macos")`: the Mac's fused gate-up-activation for one token (`mul_glu`). The prompt batch (`DEFAULT_BATCH`) is 1,024 on both |
-| `crates/vireo-server` (tools, approvals, skills, attachments, chat cache) | Shared |
-| `crates/vireo-eval` (35 cases) | Shared |
+| `crates/syrinx-server` (tools, approvals, skills, attachments, chat cache) | Shared |
+| `crates/syrinx-eval` (35 cases) | Shared |
 | Folders | Shared code (`store::data_dir`): `%LOCALAPPDATA%\VireoPrototype` on Windows, `~/Library/Application Support/VireoPrototype` on the Mac |
 
 The rule from here: only the Metal backend and its tuning are the Mac's own. Anything else
-written on one machine is written for both, and measured with `vireo-eval` on both.
+written on one machine is written for both, and measured with `syrinx-eval` on both.
 
 ## After pulling on the Mac
 
 Done on 2026-11-11 for the one-workspace merge (PR #129): every test passes on the Mac
 (engine 69, GPU 12 on the M5 Max, server 58, eval 9; swift test 132), the app builds
-`vireo-server` from the workspace, and the 35 cases on Metal (`evals/mac.json`) match
+`syrinx-server` from the workspace, and the 35 cases on Metal (`evals/mac.json`) match
 Windows but for three that tip between the two GPUs. The steps, for the next time:
 
 1. Move the local, untracked folders that were in `Mac/Engine/` up to the workspace:
-   `Mac/Engine/models/` to `VireoPrototype/models/` and `Mac/Engine/reference/` to
-   `VireoPrototype/reference/` (git doesn't track them, so they stay behind in the old
+   `Mac/Engine/models/` to `Syrinx/models/` and `Mac/Engine/reference/` to
+   `Syrinx/reference/` (git doesn't track them, so they stay behind in the old
    folder). `Mac/Engine/target/` can be deleted.
-2. From `VireoPrototype/`: `cargo test --release`. Not run on a Mac since the merge.
+2. From `Syrinx/`: `cargo test --release`. Not run on a Mac since the merge.
    Three of `files.rs`'s tests are macOS-only now (`/tmp` and `/etc`, Git where the Mac
    keeps it) and run only there.
 3. From `Mac/App/`: `swift test`, then `./build-test-app.sh`. The build script and
-   `LocalEngine.swift` now build and find `vireo-server` in `VireoPrototype/target/release`;
+   `LocalEngine.swift` now build and find `syrinx-server` in `Syrinx/target/release`;
    `LocalEngineTests` was updated for that layout. Not run (no Swift here).
 4. Run the eval on Metal and save it beside the others:
-   `cargo run --release -p vireo-eval -- --full --out evals/mac.json` (a plain run is
+   `cargo run --release -p syrinx-eval -- --full --out ../evals/eval-runs/mac.json` (a plain run is
    the short one, two models). The Mac's last run,
    `evals/mac-baseline.json`, has only the first 24 cases.
 
@@ -102,7 +102,7 @@ has no CUDA kernel). Details:
 
 Shared code changed behind `cfg(target_os = "macos")` switches and **not compiled on a
 Mac**: `gemma4_cuda.rs` and `qwen35_cuda.rs` (`forward_batch` queues a batch through
-`queue_batch`, replayed from a graph on CUDA only), `vireo-server` (`PICKER_BATCH`, 1,024
+`queue_batch`, replayed from a graph on CUDA only), `syrinx-server` (`PICKER_BATCH`, 1,024
 on the Mac as before; Qwen's steps kept only if `keep_steps` succeeds, not an error
 otherwise; `DEFAULT_LOOKUP` and `LONGEST_RUN` now one value for both, the Mac's),
 `tests/check_speed.rs` (runs on both; Qwen goes back through a checkpoint). Run
@@ -110,10 +110,10 @@ otherwise; `DEFAULT_LOOKUP` and `LONGEST_RUN` now one value for both, the Mac's)
 
 ## After the gauntlet's first run (the Mac, 2026-11-13)
 
-Built in answer to `docs/dev/test-gauntlet/runs/Aurelia-Proto-Run-2026-11-12-Gemma4-31B-notes.md`
+Built in answer to `evals/gauntlet/runs/Aurelia-Proto-Run-2026-11-12-Gemma4-31B-notes.md`
 (PLAN.md's Progress has the detail). **Nothing here has been run on a model**: unit tests
 only (server 103, Mac app 144). Before it's merged: the eval on the small and the large
-models, thinking off and on, and the gauntlet (`tools/aurelia_run.py`, which now plays all
+models, thinking off and on, and the gauntlet (`evals/tools/aurelia_run.py`, which now plays all
 32 prompts; `--thinking off` for a like-for-like with the 12 November run).
 
 - **Thinking:** a request's `"thinking": true` (else `--thinking`, off by default, so the
@@ -140,7 +140,7 @@ models, thinking off and on, and the gauntlet (`tools/aurelia_run.py`, which now
 
 ## Working rules and Gemma's several calls (the Mac, 2026-11-13, after the second run)
 
-In answer to `docs/dev/test-gauntlet/runs/Aurelia-Proto-Run-2026-11-13-Gemma4-31B-notes.md`
+In answer to `evals/gauntlet/runs/Aurelia-Proto-Run-2026-11-13-Gemma4-31B-notes.md`
 (17 pass / 12 partial / 3 fail by hand, thinking on): the format and sampling already
 matched Google's template; the gap was the instructions. **Unit tests only (server 105);
 not run on a model.** To check: a few eval cases on Gemma 31B, thinking off and on (e.g.
@@ -167,7 +167,7 @@ the small models too, then the gauntlet against the 13 November run.
 ## Google's draft model for Gemma 4 31B (the Mac, 2026-11-13)
 
 `gemma-4-31B-it-assistant` (Google's, safetensors bf16, 926 MB; the one 0.9 drafts with)
-runs on the engine: `vireo-engine/src/models/gemma4_assistant.rs`, a child of
+runs on the engine: `syrinx-engine/src/models/gemma4_assistant.rs`, a child of
 `gemma4_cuda.rs`. Four small layers with no keys or values of their own: they read the
 main model's (its last sliding and last global layer's), from its final state for the last
 position read and the token just picked. Weights rounded to Q8_0 on load (about 1 s).
@@ -225,7 +225,7 @@ would garble the prompts):
 (`MODELS` takes `e2b,e4b,q4b,q9b`; `python -X utf8 report.py <results.jsonl>` prints the
 Mac's summary of it.) Things that matter:
 
-- **Contexts are forced** (`WIN_MODELS`; `CONTEXT=` overrides): vireo-server's own choice
+- **Contexts are forced** (`WIN_MODELS`; `CONTEXT=` overrides): syrinx-server's own choice
   stops at 32,768, and the Mac's long prompt is 33,797 tokens on Vireo for the Gemmas and
   its long tool prompt ~57K. 65,536 fits Gemma 4 E2B, E4B and Qwen 3.5 4B with nothing in
   Windows' shared GPU memory; Qwen 3.5 9B spills past 32,768 on Vireo, so it runs at
@@ -246,13 +246,13 @@ Uncommitted on `windows/cuda-reading-memory`, on top of 7e00a19. Measured on Win
 (`evals/speed/windows-rtx5060-2026-11-15-after-changes.html`, PLAN.md's Progress). For the Mac:
 
 - **Shared code, both machines: Qwen's saved state at the system turn's end**
-  (`crates/vireo-server/src/main.rs`, `Kept::turn`). When Qwen reads a system turn, its
+  (`crates/syrinx-server/src/main.rs`, `Kept::turn`). When Qwen reads a system turn, its
   DeltaNet layers are now saved a few tokens before that turn's end, beside the saved state
   where the first two chats parted (`Kept::base`), so a new chat with the same instructions
   and tools reads none of them. On Windows the eval's Qwens read 55-61% fewer tokens and ran
   18-20% quicker, the same cases passing. **It has not been compiled or run on a Mac**: run
   the workspace tests and the eval there before relying on it.
-- **CUDA only: sliding-window rings** (`attention_ring` and `ring_row` in `vireo.cu`,
+- **CUDA only: sliding-window rings** (`attention_ring` and `ring_row` in `syrinx.cu`,
   `src/cuda/mod.rs`; `gemma4_cuda.rs` drops its `cfg!(target_os = "macos")`). The Gemmas'
   sliding-window layers keep only their window on CUDA, as Metal already did. Nothing
   changes on the Mac.
@@ -273,7 +273,7 @@ dropped). Shared code, not compiled on a Mac:
   bits as it is worked out (`swiglu_q8`, `geglu_q8`) and `gate` is left unchanged.
 - **`draft::LEAST_RUN`**: guesses from the chat need a run of 3 on CUDA; 2 on the Mac, as
   before.
-- `tools/reply_speed.py` loads one server at a time now.
+- `evals/tools/reply_speed.py` loads one server at a time now.
 
 ## The prompt attention kernel on Windows (2026-11-15, night)
 
@@ -294,7 +294,7 @@ only: nothing here changes on the Mac.
 - `tests/prompt_attention_speed_cuda.rs` times a batch's attention for the small models'
   shapes (the Mac's `prompt_attention_speed.rs` is for the large ones and Metal only).
 - **Shared code, both machines, not compiled on a Mac: Gemma's state at the system
-  turn's end** (`crates/vireo-server/src/main.rs`, `Kept::head`;
+  turn's end** (`crates/syrinx-server/src/main.rs`, `Kept::head`;
   `Gemma4CudaSession::has_rings`). Where the sliding-window layers keep rings, the
   server exports the session's state a few tokens before the system turn's end when it
   reads one, and imports it when `truncate` can't go back (a prompt longer than a ring
@@ -305,7 +305,7 @@ only: nothing here changes on the Mac.
   Q4_0 and Q8_0, x's for Q4_K and Q5_K): ~3K reads 5% faster on the Gemmas, 2% on the
   Qwens, the same numbers.
 - **CUDA only (server): guesses deep in a chat** (`guesses_pay`, `mtp_share`,
-  `CHAT_GUESSES_FROM`, `MTP_GUESSES_FROM` in `crates/vireo-server/src/main.rs`). Past
+  `CHAT_GUESSES_FROM`, `MTP_GUESSES_FROM` in `crates/syrinx-server/src/main.rs`). Past
   24,000 tokens the chat's guesses, and past 48,000 a Gemma draft model's, stop for a
   reply once too few of them were taken: a round's check costs each guess a pass over
   the context there. `guesses_pay` is always true on the Mac; worth measuring there with
@@ -346,7 +346,7 @@ only: nothing here changes on the Mac.
    `VIREO_BUILTIN_SKILLS`. The slash-command list should also follow the asking device's
    tools.
 6. **Small things:** three clippy warnings in `attach/` (from the Mac's code), one in
-   `vireo-cli`; prompt attention on CUDA for long prompts (78–87% of
+   `syrinx-cli`; prompt attention on CUDA for long prompts (78–87% of
    llama.cpp at ~31K tokens at full clocks; see PLAN.md, "What limits speed now"); the GPU performance counters on the Windows machine are open to all users
    for Nsight and should go back to administrators only when the tuning is done.
 7. **From the Mac's all-Q6 comparison** (2026-11-13, eight models against llama.cpp and
