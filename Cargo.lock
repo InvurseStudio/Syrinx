@@ -87,14 +87,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "vireo-cli"
+name = "syrinx-cli"
 version = "0.1.0"
 dependencies = [
- "vireo-engine",
+ "syrinx-engine",
 ]
 
 [[package]]
-name = "vireo-engine"
+name = "syrinx-engine"
 version = "0.1.0"
 dependencies = [
  "objc2",
@@ -103,14 +103,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "vireo-eval"
+name = "syrinx-eval"
 version = "0.1.0"
 
 [[package]]
-name = "vireo-server"
+name = "syrinx-server"
 version = "0.1.0"
 dependencies = [
  "objc2",
  "objc2-foundation",
- "vireo-engine",
+ "syrinx-engine",
 ]

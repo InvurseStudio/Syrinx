@@ -1,6 +1,6 @@
 """Checks Vireo's tokenizer against llama.cpp's, token for token.
 
-Runs llama.cpp's `llama-tokenize` and `vireo-cli tokenize` on the same texts and reports
+Runs llama.cpp's `llama-tokenize` and `syrinx-cli tokenize` on the same texts and reports
 every text where the ids differ. The texts:
 
 - every text file in the Vireo repository (code, docs, data) up to 100 KB, cut into
@@ -13,7 +13,7 @@ Each text is tokenized twice: as a prompt (BOS added, special tokens read) and r
 
     python -I tools/compare_tokenizer.py models/Llama-3.2-1B-Instruct-Q4_K_M.gguf
 
-Needs a release build of vireo-cli (`cargo build --release -p vireo-cli`) and llama.cpp
+Needs a release build of syrinx-cli (`cargo build --release -p syrinx-cli`) and llama.cpp
 in reference/ (see PLAN.md).
 """
 
@@ -29,8 +29,8 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REPO = ROOT.parent
 # Windows (.exe, reference/llama.cpp-*) or the Mac (reference/llama-b*).
-VIREO = next((p for p in (ROOT / "target/release/vireo-cli.exe", ROOT / "target/release/vireo-cli")
-              if p.exists()), ROOT / "target/release/vireo-cli")
+VIREO = next((p for p in (ROOT / "target/release/syrinx-cli.exe", ROOT / "target/release/syrinx-cli")
+              if p.exists()), ROOT / "target/release/syrinx-cli")
 LLAMA = next((p for pattern in ("reference/llama.cpp-*/llama-tokenize.exe",
                                 "reference/llama-*/llama-tokenize")
               for p in ROOT.glob(pattern)), None)
@@ -112,7 +112,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     args = parser.parse_args()
     if LLAMA is None or not VIREO.exists():
-        sys.exit("Needs llama.cpp's llama-tokenize in reference/ and a release vireo-cli.")
+        sys.exit("Needs llama.cpp's llama-tokenize in reference/ and a release syrinx-cli.")
 
     texts = list(repo_texts()) + list(fuzz_texts(args.fuzz))
     work = [(name, text, raw) for name, text in texts for raw in (False, True)]

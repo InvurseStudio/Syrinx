@@ -1,4 +1,4 @@
-"""Writes crates/vireo-engine/src/tokenizer/unicode_tables.rs: the code point ranges of
+"""Writes crates/syrinx-engine/src/tokenizer/unicode_tables.rs: the code point ranges of
 Unicode's letters (general category L), marks (M) and numbers (N), which the
 tokenizer's pre-tokenizers split text by. With --case, writes unicode_case_tables.rs
 instead: the uppercase and titlecase letters (Lu, Lt) and the lowercase ones (Ll), for
@@ -19,7 +19,7 @@ import pathlib
 import sys
 import unicodedata
 
-HERE = pathlib.Path(__file__).resolve().parent.parent / "crates/vireo-engine/src/tokenizer"
+HERE = pathlib.Path(__file__).resolve().parent.parent / "crates/syrinx-engine/src/tokenizer"
 OUT = HERE / "unicode_tables.rs"
 CASE_OUT = HERE / "unicode_case_tables.rs"
 
