@@ -605,7 +605,11 @@ fn reading_in_batches_matches_one_token_at_a_time() {
 #[test]
 fn chats_written_together_match_alone() {
     const STEPS: usize = 4;
-    for name in ["gemma-4-E2B_q4_0-it.gguf", "gemma-4-E2B-it-Q6_K.gguf"] {
+    for name in [
+        "gemma-4-E2B_q4_0-it.gguf",
+        "gemma-4-E2B-it-Q6_K.gguf",
+        "gemma-4-E4B-it-Q6_K.gguf",
+    ] {
         let Some(file) = model(name) else { continue };
         let Some(gpu) = open_gpu() else { return };
         let ids = long_text(&Tokenizer::from_gguf(&file).unwrap(), true);
@@ -626,12 +630,20 @@ fn chats_written_together_match_alone() {
         let vocab = m.config.vocab;
         let mut row = vec![0f32; vocab];
         for step in 0..STEPS {
-            let tokens: Vec<u32> = chats.iter().map(|c| ids[c.0 + c.1 + step]).collect();
-            let mut refs: Vec<&mut _> = together.iter_mut().collect();
+            // Every other step the conversations come in the other order: each still
+            // gets its own row back.
+            let mut order: Vec<usize> = (0..chats.len()).collect();
+            if step % 2 == 1 {
+                order.reverse();
+            }
+            let tokens: Vec<u32> = order.iter().map(|&i| ids[chats[i].0 + chats[i].1 + step]).collect();
+            let mut slots: Vec<Option<&mut _>> = together.iter_mut().map(Some).collect();
+            let mut refs: Vec<&mut _> = order.iter().map(|&i| slots[i].take().unwrap()).collect();
             m.forward_each(&mut work, &mut refs, &tokens).unwrap();
-            for (i, &token) in tokens.iter().enumerate() {
+            for (r, &token) in tokens.iter().enumerate() {
+                let i = order[r];
                 let want = m.forward(&mut alone[i], token, true).unwrap().unwrap();
-                m.held_logits(&work, i, &mut row).unwrap();
+                m.held_logits(&work, r, &mut row).unwrap();
                 let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
                 let worst = row.iter().zip(want).fold(0f32, |w, (a, b)| w.max((a - b).abs()));
                 assert_eq!(top(&row), top(want), "{name}, chat {i}, step {step}");
@@ -690,7 +702,11 @@ fn held_logits_are_the_batchs_rows() {
             same(&format!("Qwen 3.5, row {r}"), &row, &all[r * vocab..(r + 1) * vocab]);
         }
     }
-    for name in ["gemma-4-E2B_q4_0-it.gguf", "gemma-4-E2B-it-Q6_K.gguf"] {
+    for name in [
+        "gemma-4-E2B_q4_0-it.gguf",
+        "gemma-4-E2B-it-Q6_K.gguf",
+        "gemma-4-E4B-it-Q6_K.gguf",
+    ] {
         let Some(file) = model(name) else { continue };
         let Some(gpu) = open_gpu() else { return };
         let ids = long_text(&Tokenizer::from_gguf(&file).unwrap(), true);
