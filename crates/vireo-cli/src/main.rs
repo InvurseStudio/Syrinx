@@ -40,6 +40,7 @@ Usage:
                                                How well the model predicts the text, scored
                                                as llama.cpp's llama-perplexity scores it
   vireo-cli batches <model.gguf> <text-file> [--depth <tokens>]
+  vireo-cli together <model.gguf> <text-file> [--depth <tokens>] [--chats <n>]
                                                On the GPU: what a batch of 1 to 64 tokens
                                                costs with <tokens> already read (4000 by
                                                default): a draft's guesses checked at once,
@@ -83,6 +84,22 @@ fn main() -> ExitCode {
                     eprintln!("{USAGE}");
                     ExitCode::from(2)
                 }
+            }
+        }
+        ["together", path, text, rest @ ..] => {
+            let (mut depth, mut chats, mut ok) = (4000, 8, rest.len().is_multiple_of(2));
+            for pair in rest.chunks(2) {
+                match pair {
+                    ["--depth", n] => depth = n.parse().unwrap_or(0),
+                    ["--chats", n] => chats = n.parse().unwrap_or(0),
+                    _ => ok = false,
+                }
+            }
+            if ok && depth > 0 && chats > 0 {
+                together(path, text, depth, chats)
+            } else {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
             }
         }
         ["perplexity", path, text, rest @ ..] => {
@@ -679,6 +696,115 @@ fn batches(path: &str, text_path: &str, depth: usize) -> ExitCode {
             println!("Batches at {depth} tokens, ms: {}", cells.join("  "));
             ExitCode::SUCCESS
         }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// How far apart in the text the chats `together` reads start.
+const TOGETHER_APART: usize = 300;
+/// How many tokens each chat writes in a timed run of `together`.
+const TOGETHER_STEPS: usize = 8;
+
+/// What a token costs each of several chats written together (Gemma 4, on the GPU):
+/// `chats` conversations, each `depth` tokens of a different stretch of the text, then
+/// one token for each in one pass (`Gemma4Cuda::forward_each`), every chat's logits read
+/// back. First that each chat's logits are what it gets alone; then, for 1, 2, 4...
+/// chats, the milliseconds a step (the quickest of five runs of a few steps) and the
+/// tokens a second each chat and all of them get.
+fn together(path: &str, text_path: &str, depth: usize, chats: usize) -> ExitCode {
+    fn e<E: std::fmt::Display>(e: E) -> String {
+        e.to_string()
+    }
+    let run = || -> Result<(), String> {
+        let text = std::fs::read_to_string(text_path).map_err(|e| format!("{text_path}: {e}"))?;
+        let file = GgufFile::open(path).map_err(|e| format!("{path}: {e}"))?;
+        if file.architecture().is_some_and(|a| a.starts_with("qwen")) {
+            return Err("`together` is for Gemma 4 models so far.".into());
+        }
+        let tokenizer = Tokenizer::from_gguf(&file).map_err(|e| e.to_string())?;
+        let ids = tokenizer.encode(&text, true, false);
+        let needs = depth + chats * TOGETHER_APART + TOGETHER_STEPS;
+        if ids.len() < needs {
+            return Err(format!("The text has {} tokens: it needs {needs}.", ids.len()));
+        }
+        let m = Gemma4Cuda::load(&file, Gpu::open().map_err(e)?).map_err(e)?;
+        let vocab = m.config.vocab;
+        let mut sessions = Vec::new();
+        for c in 0..chats {
+            let mut s = m.session(depth + 512).map_err(e)?;
+            let from = c * TOGETHER_APART;
+            m.forward_batch(&mut s, &ids[from..from + depth], Logits::Last).map_err(e)?;
+            sessions.push(s);
+        }
+        let mut work = m.session_with_batch(chats.max(2), chats).map_err(e)?;
+        let next = |c: usize, step: usize| ids[c * TOGETHER_APART + depth + step];
+
+        // The same logits as alone.
+        let mut alone = Vec::new();
+        for (c, s) in sessions.iter_mut().enumerate() {
+            alone.push(m.forward(s, next(c, 0), true).map_err(e)?.unwrap().to_vec());
+            if s.truncate(depth) != depth {
+                return Err("The session couldn't go back over a token.".into());
+            }
+        }
+        let tokens: Vec<u32> = (0..chats).map(|c| next(c, 0)).collect();
+        let mut refs: Vec<&mut _> = sessions.iter_mut().collect();
+        m.forward_each(&mut work, &mut refs, &tokens).map_err(e)?;
+        let mut row = vec![0.0f32; vocab];
+        let (mut same, mut worst) = (0, 0.0f32);
+        for (c, alone) in alone.iter().enumerate() {
+            m.held_logits(&work, c, &mut row).map_err(e)?;
+            same += usize::from(argmax(&row) == argmax(alone));
+            worst = row.iter().zip(alone).fold(worst, |w, (a, b)| w.max((a - b).abs()));
+        }
+        println!(
+            "Together against alone at {depth} tokens: the same likeliest token for {same} of {chats} chats; logits differ by {worst:.4} at most."
+        );
+        for s in &mut sessions {
+            s.truncate(depth);
+        }
+
+        let mut n = 1;
+        let mut cells = Vec::new();
+        while n <= chats {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let t = Instant::now();
+                for step in 0..TOGETHER_STEPS {
+                    let tokens: Vec<u32> = (0..n).map(|c| next(c, step)).collect();
+                    let mut refs: Vec<&mut _> = sessions[..n].iter_mut().collect();
+                    m.forward_each(&mut work, &mut refs, &tokens).map_err(e)?;
+                    for c in 0..n {
+                        m.held_logits(&work, c, &mut row).map_err(e)?;
+                    }
+                }
+                best = best.min(t.elapsed().as_secs_f64() * 1e3 / TOGETHER_STEPS as f64);
+                for s in &mut sessions[..n] {
+                    s.truncate(depth);
+                }
+            }
+            cells.push(format!("{n}: {best:.2} ms ({:.1} each, {:.0} in all)", 1e3 / best, n as f64 * 1e3 / best));
+            n *= 2;
+        }
+        // One chat the usual way, for the cost of going through `forward_each` at all.
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            for step in 0..TOGETHER_STEPS {
+                m.forward(&mut sessions[0], next(0, step), true).map_err(e)?;
+            }
+            best = best.min(t.elapsed().as_secs_f64() * 1e3 / TOGETHER_STEPS as f64);
+            sessions[0].truncate(depth);
+        }
+        println!("Chats written together at {depth} tokens, a step (tokens/s): {}", cells.join("  "));
+        println!("One chat alone, the usual way: {best:.2} ms ({:.1} tokens/s).", 1e3 / best);
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
