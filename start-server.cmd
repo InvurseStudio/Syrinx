@@ -1,5 +1,5 @@
 @echo off
-rem Builds and starts vireo-server, Vireo's own engine serving a model on this PC for the
+rem Builds and starts syrinx-server, Vireo's own engine serving a model on this PC for the
 rem Vireo Prototype app. Leave this window open while you chat; close it to stop.
 rem   start-server.cmd                       Gemma 4 E2B from models\
 rem   start-server.cmd models\other.gguf     any Llama, Qwen 3.5 or Gemma 4 GGUF
@@ -14,9 +14,9 @@ if not exist "%MODEL%" (
     exit /b 1
 )
 echo Building the server...
-cargo build --release -p vireo-server -q
+cargo build --release -p syrinx-server -q
 if errorlevel 1 (
     echo The build failed.
     exit /b 1
 )
-target\release\vireo-server.exe "%MODEL%" %2 %3 %4 %5 %6
+target\release\syrinx-server.exe "%MODEL%" %2 %3 %4 %5 %6
