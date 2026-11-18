@@ -16,6 +16,11 @@ use crate::GgufFile;
 use crate::cpu::Matrix;
 use crate::cuda::{Buffer, CuDevicePtr, Gpu, Graph, Q8, QkvPrep};
 
+/// The most `forward_each` graphs a session keeps (CUDA): one for each set of
+/// conversations written together; past this many they're all recorded again.
+#[cfg(not(target_os = "macos"))]
+const EACH_GRAPHS: usize = 128;
+
 /// Google's draft model for Gemma 4, run on the main model's state.
 #[path = "gemma4_assistant.rs"]
 pub mod assistant;
@@ -171,6 +176,13 @@ pub struct Gemma4CudaSession {
     /// wanted (`graph_slot`), each recorded the first time such a batch is read (CUDA).
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     few_graphs: Vec<Option<Graph>>,
+    /// Graphs for `forward_each`, by the conversations they were recorded for (the
+    /// addresses of their caches and positions, in their rows' order; CUDA).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    each_graphs: std::collections::HashMap<Vec<u64>, Graph>,
+    /// After `forward_each`: the row of the held logits that is each conversation's, in
+    /// the order they were given (the rows are in the order of the graph's key).
+    each_rows: Vec<usize>,
     /// The positions whose final states (after the final norm) the last read left in
     /// `h`'s rows, from row 0: `hidden_rows` of them from `hidden_from`. The draft model
     /// starts from the last position's.
@@ -602,6 +614,8 @@ impl<'a> Gemma4Cuda<'a> {
             half_cache: self.precision == Precision::Int8,
             graph: None,
             few_graphs: Vec::new(),
+            each_graphs: std::collections::HashMap::new(),
+            each_rows: Vec::new(),
             hidden_from: 0,
             hidden_rows: 0,
             assistant: None,
@@ -1194,6 +1208,7 @@ impl<'a> Gemma4Cuda<'a> {
             "the session is full ({} positions)",
             s.capacity
         );
+        s.each_rows.clear();
         self.upload_inputs(s, &[token])?;
         if s.graph.is_none() {
             let all = 0..self.config.layers;
@@ -1236,6 +1251,7 @@ impl<'a> Gemma4Cuda<'a> {
             self.config.vocab,
             "a row of logits is the vocabulary long"
         );
+        let row = s.each_rows.get(row).copied().unwrap_or(row);
         s.logits_gpu.read_row(row, out)
     }
 
@@ -1263,6 +1279,7 @@ impl<'a> Gemma4Cuda<'a> {
             },
             0.0,
         );
+        s.each_rows.clear();
         let batch = s.batch;
         for (b, chunk) in tokens.chunks(batch).enumerate() {
             let t = chunk.len();
@@ -1346,7 +1363,13 @@ impl<'a> Gemma4Cuda<'a> {
             "{t} conversations, in batches of {}",
             work.batch
         );
-        self.upload_inputs(work, tokens)?;
+        // The rows in the order of the conversations' positions' addresses (CUDA), so a
+        // set of conversations replays one graph whichever order they come in.
+        let mut order: Vec<usize> = (0..t).collect();
+        #[cfg(not(target_os = "macos"))]
+        order.sort_by_key(|&i| chats[i].pos.ptr());
+        let sorted: Vec<u32> = order.iter().map(|&i| tokens[i]).collect();
+        self.upload_inputs(work, &sorted)?;
         for chat in chats.iter() {
             assert!(
                 chat.len < chat.capacity,
@@ -1356,23 +1379,54 @@ impl<'a> Gemma4Cuda<'a> {
             chat.pos.write_i32(&[chat.len as i32]).map_err(gpu_error)?;
         }
         {
-            let chats: Vec<&Gemma4CudaSession> = chats.iter().map(|c| &**c).collect();
-            self.queue_layers(work, t, 0..self.config.layers, work.pos.ptr(), &chats)?;
+            let rows: Vec<&Gemma4CudaSession> = order.iter().map(|&i| &*chats[i]).collect();
+            let layers = 0..self.config.layers;
+            // Replayed from a graph recorded for these conversations, as one token is:
+            // queued one by one, the launches cost the CPU more than the GPU's work
+            // (Gemma 4 E4B, one conversation: 25.0 ms a step against 22.6 replayed).
+            #[cfg(not(target_os = "macos"))]
+            {
+                let key: Vec<u64> = rows
+                    .iter()
+                    .flat_map(|c| {
+                        let caches = c.keys.iter().chain(&c.values).flatten().map(Buffer::ptr);
+                        std::iter::once(c.pos.ptr())
+                            .chain(caches)
+                            .chain(c.rings.iter().map(|&r| r as u64))
+                    })
+                    .collect();
+                if !work.each_graphs.contains_key(&key) {
+                    if work.each_graphs.len() >= EACH_GRAPHS {
+                        work.each_graphs.clear();
+                    }
+                    let graph = record(&self.gpu, || {
+                        self.queue_layers(work, t, layers, work.pos.ptr(), &rows)
+                    })?;
+                    work.each_graphs.insert(key.clone(), graph);
+                }
+                work.each_graphs[&key].launch().map_err(gpu_error)?;
+            }
+            #[cfg(target_os = "macos")]
+            self.queue_layers(work, t, layers, work.pos.ptr(), &rows)?;
         }
         // Each conversation's final state to its own row 0, where its draft model looks
         // for the last position's (as after `forward`).
         let dim = self.config.dim;
-        for (i, chat) in chats.iter_mut().enumerate() {
+        let mut each_rows = vec![0; t];
+        for (r, &i) in order.iter().enumerate() {
+            let chat = &mut chats[i];
             self.gpu
-                .copy(chat.h.ptr(), row(&work.h, i, dim), dim * 4)
+                .copy(chat.h.ptr(), row(&work.h, r, dim), dim * 4)
                 .map_err(gpu_error)?;
             (chat.hidden_from, chat.hidden_rows) = (chat.len, 1);
             chat.len += 1;
+            each_rows[i] = r;
         }
         work.hidden_rows = 0;
         work.hold = true;
         let done = self.logits_into(work, 0, t, 0);
         work.hold = false;
+        work.each_rows = each_rows;
         done
     }
 
