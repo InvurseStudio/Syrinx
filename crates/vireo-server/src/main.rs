@@ -2174,22 +2174,37 @@ fn engine(
             .as_ref()
             .map_or(0, |k| model.cache_bytes_per_position(&k.session) * context);
         let budget = store::budget_for(full_chat as u64);
-        let s = store::Store::open(dir, budget);
+        let memory = store::memory_budget().min(budget);
+        let s = store::Store::open(dir, budget, memory);
         eprintln!(
-            "{} saved chats; they may take up to {:.0} GB on disk.",
+            "{} saved chats; they may take up to {:.0} GB on disk, {:.0} GB of it held in memory.",
             s.entries().len(),
-            budget as f64 / (1u64 << 30) as f64
+            budget as f64 / (1u64 << 30) as f64,
+            memory as f64 / (1u64 << 30) as f64
         );
         s
     });
     let mut seed = random_u64();
-    for work in jobs {
+    loop {
+        // With nothing asked for a while, the saved chats not yet on disk are written (in
+        // the store's own thread), so stopping has little left to save and a server
+        // that's killed loses few of them. A busy server's chats stay in memory alone.
+        let work = match jobs.recv_timeout(SAVE_WHEN_IDLE) {
+            Ok(work) => work,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(store) = store.as_mut() {
+                    store.save_idle();
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         let job = match work {
             Work::Reply(job) => job,
             Work::Shutdown(done) => {
                 if let (Some(k), Some(store)) = (kept.as_ref(), store.as_mut()) {
                     stash(&model, k, store);
-                    store.flush();
+                    store.save_all();
                 }
                 let _ = done.send(());
                 return;
@@ -2236,6 +2251,10 @@ fn engine(
         }
     }
 }
+
+/// How long the server waits with nothing to do before it writes the saved chats that
+/// are only in memory to disk.
+const SAVE_WHEN_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Saves the chat in `kept` to `store`, if there's one worth saving.
 fn stash(model: &Model, kept: &Kept, store: &mut store::Store) {
