@@ -32,7 +32,7 @@ pub const DISK_BUDGET: u64 = 4 << 30;
 /// A large model's budget is room for this many chats of the whole context...
 const FULL_CHATS: u64 = 4;
 /// ...up to this much.
-const MOST_DISK: u64 = 32 << 30;
+pub const MOST_DISK: u64 = 32 << 30;
 
 /// The disk budget for a model whose chat of the whole context takes `full_chat` bytes in
 /// the GPU's cache (about what it takes saved): 4 GB for the small models, and for a

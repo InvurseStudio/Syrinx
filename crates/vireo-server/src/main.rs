@@ -2266,7 +2266,11 @@ fn engine(
         let full_chat = kept
             .as_ref()
             .map_or(0, |k| model.cache_bytes_per_position(&k.session) * context);
-        let budget = store::budget_for(full_chat as u64);
+        // With several chat slots, room for a chat a slot at least: every slot's chat is
+        // saved after its reply, and with the least budget (4 GB) 32 people's chats
+        // pushed each other out and were read again at every turn.
+        let budget = store::budget_for(full_chat as u64)
+            .max((options().slots as u64).saturating_mul(full_chat as u64).min(store::MOST_DISK));
         let memory = store::memory_budget().min(budget);
         let s = store::Store::open(dir, budget, memory);
         eprintln!(

@@ -89,11 +89,13 @@ class Vireo:
         new, self.read_to = text[self.read_to:], len(text)
         return new
 
-    def chat(self, messages, max_tokens, tools=False, desk=None, system=SYSTEM, log=True):
+    def chat(self, messages, max_tokens, tools=False, desk=None, system=SYSTEM, log=True, chat_id=None):
         if log:
             self.new_log()
         body = {"systemPrompt": system, "messages": messages, "thinking": self.thinking,
                 "generation": {"max_tokens": max_tokens, "temperature": 0}}
+        if chat_id:
+            body["chatId"] = chat_id
         if tools:
             body["clientTools"] = VIREO_CLIENT_TOOLS
         t0 = time.time()
