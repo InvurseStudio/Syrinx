@@ -6,8 +6,9 @@
 //! and the driver compiles them for whatever NVIDIA GPU it finds. On a computer
 //! without one, [`Gpu::open`] says why and the CPU backend is used instead.
 //!
-//! All GPU work goes, in order, through one stream, from the thread that opened the
-//! [`Gpu`]: the driver's context is made current on that thread. A run of launches can
+//! All GPU work goes, in order, through one stream. Several threads may use the [`Gpu`]
+//! by turns (a server's chat slots), never at once: each makes the driver's context
+//! current on itself before its first call (`Context::bind`). A run of launches can
 //! be recorded once as a [`Graph`] and replayed with a single call, which is how a
 //! token is generated: launching each of its few hundred kernels one by one costs more
 //! than running them.
@@ -59,16 +60,35 @@ pub type Result<T> = std::result::Result<T, Error>;
 struct Context {
     driver: Driver,
     device: CuDevice,
+    /// The device's primary context, made current on each thread that uses it.
+    context: CuContext,
     module: CuModule,
     stream: CuStream,
 }
 
-// The context is only used from the thread that opened it (see the module docs);
-// the raw pointers inside are handles, not memory this process reads.
+// The context is used by one thread at a time (see the module docs), each binding it
+// first; the raw pointers inside are handles, not memory this process reads.
 unsafe impl Send for Context {}
 unsafe impl Sync for Context {}
 
+thread_local! {
+    /// The context last made current on this thread.
+    static BOUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Context {
+    /// Makes the context current on this thread, if it isn't yet: the driver's calls act
+    /// on the calling thread's current context.
+    fn bind(&self) {
+        let ctx = self.context as usize;
+        BOUND.with(|bound| {
+            if bound.get() != ctx {
+                unsafe { (self.driver.cuCtxSetCurrent)(self.context) };
+                bound.set(ctx);
+            }
+        });
+    }
+
     fn check(&self, call: &'static str, result: CuResult) -> Result<()> {
         if result == CUDA_SUCCESS {
             return Ok(());
@@ -92,12 +112,14 @@ impl Context {
     /// Copies `bytes` from the host to `to`, after the work already queued. The data is
     /// staged before this returns, so `from` can be reused straight away.
     fn upload(&self, to: CuDevicePtr, from: *const c_void, bytes: usize) -> Result<()> {
+        self.bind();
         let r = unsafe { (self.driver.cuMemcpyHtoDAsync_v2)(to, from, bytes, self.stream) };
         self.check("cuMemcpyHtoDAsync", r)
     }
 
     /// Copies `bytes` from `from` to the host once the queued work is done.
     fn download(&self, to: *mut c_void, from: CuDevicePtr, bytes: usize) -> Result<()> {
+        self.bind();
         let r = unsafe { (self.driver.cuMemcpyDtoHAsync_v2)(to, from, bytes, self.stream) };
         self.check("cuMemcpyDtoHAsync", r)?;
         let r = unsafe { (self.driver.cuStreamSynchronize)(self.stream) };
@@ -107,6 +129,7 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
+        self.bind();
         unsafe {
             (self.driver.cuStreamDestroy_v2)(self.stream);
             (self.driver.cuModuleUnload)(self.module);
@@ -188,6 +211,7 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        self.context.bind();
         unsafe { (self.context.driver.cuMemFree_v2)(self.ptr) };
     }
 }
@@ -200,9 +224,14 @@ pub struct Graph {
     exec: CuGraphExec,
 }
 
+// Handles, used by one thread at a time (see the module docs).
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
 impl Graph {
     /// Queues the whole recorded run.
     pub fn launch(&self) -> Result<()> {
+        self.context.bind();
         let r = unsafe { (self.context.driver.cuGraphLaunch)(self.exec, self.context.stream) };
         self.context.check("cuGraphLaunch", r)
     }
@@ -210,6 +239,7 @@ impl Graph {
 
 impl Drop for Graph {
     fn drop(&mut self) {
+        self.context.bind();
         unsafe {
             (self.context.driver.cuGraphExecDestroy)(self.exec);
             (self.context.driver.cuGraphDestroy)(self.graph);
@@ -397,6 +427,10 @@ pub struct Gpu {
     pub info: DeviceInfo,
 }
 
+// The kernels are handles into the context's module, used by one thread at a time.
+unsafe impl Send for Gpu {}
+unsafe impl Sync for Gpu {}
+
 #[cfg(syrinx_cuda)]
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/vireo.ptx"));
 /// The same kernels plus the tensor-core ones, for compute capability 8.0 and later.
@@ -530,6 +564,7 @@ impl Gpu {
             let context = Arc::new(Context {
                 driver,
                 device,
+                context,
                 module,
                 stream,
             });
@@ -797,6 +832,7 @@ impl Gpu {
     /// Free GPU memory, in bytes.
     pub fn free_memory(&self) -> usize {
         let (mut free, mut total) = (0, 0);
+        self.context.bind();
         unsafe { (self.context.driver.cuMemGetInfo_v2)(&mut free, &mut total) };
         free
     }
@@ -804,6 +840,7 @@ impl Gpu {
     /// `bytes` of uninitialized GPU memory.
     pub fn alloc(&self, bytes: usize) -> Result<Buffer> {
         let mut ptr = 0;
+        self.context.bind();
         let r = unsafe { (self.context.driver.cuMemAlloc_v2)(&mut ptr, bytes.max(4)) };
         self.context.check("cuMemAlloc", r)?;
         Ok(Buffer {
@@ -885,6 +922,7 @@ impl Gpu {
     /// Copies `bytes` within GPU memory, after the work already queued.
     pub fn copy(&self, to: CuDevicePtr, from: CuDevicePtr, bytes: usize) -> Result<()> {
         let c = &self.context;
+        c.bind();
         let r = unsafe { (c.driver.cuMemcpyDtoDAsync_v2)(to, from, bytes, c.stream) };
         c.check("cuMemcpyDtoDAsync", r)
     }
@@ -895,6 +933,7 @@ impl Gpu {
 
     /// Waits for all queued GPU work, and reports any error a kernel hit.
     pub fn synchronize(&self) -> Result<()> {
+        self.context.bind();
         let r = unsafe { (self.context.driver.cuStreamSynchronize)(self.context.stream) };
         self.context.check("cuStreamSynchronize", r)
     }
@@ -903,6 +942,7 @@ impl Gpu {
     /// launches: copying to or from the GPU meanwhile is an error.
     pub fn start_recording(&self) -> Result<()> {
         let c = &self.context;
+        c.bind();
         let r = unsafe {
             (c.driver.cuStreamBeginCapture_v2)(c.stream, STREAM_CAPTURE_MODE_THREAD_LOCAL)
         };
@@ -947,6 +987,7 @@ impl Gpu {
         let mut values = [0u64; 24];
         let mut params = [std::ptr::null_mut::<c_void>(); 24];
         assert!(args.len() <= values.len());
+        self.context.bind();
         for (i, a) in args.iter().enumerate() {
             let slot = &mut values[i];
             match *a {

@@ -812,7 +812,8 @@ fn together(path: &str, text_path: &str, depth: usize, chats: usize) -> ExitCode
                 }
             }
             cells.push(format!("{n}: {best:.2} ms ({:.1} each, {:.0} in all)", 1e3 / best, n as f64 * 1e3 / best));
-            n *= 2;
+            // Every number up to 8 (where a GPU's kernels change shape), then doubling.
+            n = if n < 8 { n + 1 } else { n * 2 };
         }
         // One chat the usual way, for the cost of going through `forward_each` at all.
         let mut best = f64::MAX;
