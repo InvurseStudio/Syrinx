@@ -117,3 +117,25 @@ copied out, its sampling, one worker after another) is what's left.
 
 vireo-eval with `--slots 2`: 40 of 43, the three failing those of this afternoon's run on main
 (`two-files`, `office-note`, `office-policy`).
+
+## More people on Gemma 4 26B-A4B (branch `prototype/more-slots`)
+
+The first try at 32 people wrote 120 tok/s in all with first tokens up to 45.8 s, and 64 ran out
+of GPU memory. Two causes, neither the pass: the saved chats' budget was 4 GB for this model, so
+32 people's chats (each saved after its reply) pushed each other out and were read again every
+round (now at least a chat a slot, up to 32 GB); and `together.py` sent no chat ids, so chats
+changed slots every round (now `chatId`, as the app sends). Round 2 (200-token replies, everyone
+at once, 3,000-token chats), after both:
+
+| People = slots | Context | First tokens | Replies done | Each reply written at | In all |
+|---|---|---|---|---|---|
+| 8 | 32K | within 0.9 s | 8.0-8.1 s | 25.4-27.9 tok/s | 198.0 tok/s (before the fixes) |
+| 16 | 32K | within 1.3 s | 13.3-13.4 s | 15.2-16.7 tok/s | 238.8 tok/s |
+| 32 | 32K | within 3.1 s | 27.4-27.7 s | 7.3-8.2 tok/s | 231.3 tok/s |
+| 48 | 32K | within 4.6 s | 38.8-46.1 s | 4.4-5.6 tok/s | 208.3 tok/s |
+| 64 | 16K | within 6.1 s | 49.4-72.8 s | 2.8-4.6 tok/s | 175.7 tok/s |
+
+64 slots at 32K ran out of GPU memory (a slot's chat is 1.1 GB at 32K, 0.8 GB at 16K, and each
+slot has its own batch buffers besides). What the server writes in all stops growing at about
+240 tok/s from 16 people on: each reply's megabyte of logits and its sampling are done a worker
+at a time, and each chat's attention is a dispatch of its own.

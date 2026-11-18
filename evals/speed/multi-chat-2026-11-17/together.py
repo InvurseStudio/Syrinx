@@ -57,7 +57,8 @@ def main():
             server.new_log()
 
             def one(c):
-                results[c] = server.chat(chats[c], a.max_tokens if r else 60, log=False)
+                # Each person's chat has its id, as the app's chats do.
+                results[c] = server.chat(chats[c], a.max_tokens if r else 60, log=False, chat_id=f"person-{c}")
 
             t0 = time.time()
             threads = [threading.Thread(target=one, args=(c,)) for c in range(a.people)]
