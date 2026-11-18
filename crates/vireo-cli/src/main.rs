@@ -754,18 +754,43 @@ fn together(path: &str, text_path: &str, depth: usize, chats: usize) -> ExitCode
         let mut refs: Vec<&mut _> = sessions.iter_mut().collect();
         m.forward_each(&mut work, &mut refs, &tokens).map_err(e)?;
         let mut row = vec![0.0f32; vocab];
-        let (mut same, mut worst) = (0, 0.0f32);
+        // The ten likeliest tokens alone: what a reply is picked from.
+        let top = |alone: &[f32]| {
+            let mut order: Vec<usize> = (0..alone.len()).collect();
+            order.select_nth_unstable_by(10, |&a, &b| alone[b].total_cmp(&alone[a]));
+            order.truncate(10);
+            order
+        };
+        let (mut same, mut worst, mut worst_top) = (0, 0.0f32, 0.0f32);
         for (c, alone) in alone.iter().enumerate() {
             m.held_logits(&work, c, &mut row).map_err(e)?;
             same += usize::from(argmax(&row) == argmax(alone));
             worst = row.iter().zip(alone).fold(worst, |w, (a, b)| w.max((a - b).abs()));
+            worst_top = top(alone).iter().fold(worst_top, |w, &i| w.max((row[i] - alone[i]).abs()));
         }
         println!(
-            "Together against alone at {depth} tokens: the same likeliest token for {same} of {chats} chats; logits differ by {worst:.4} at most."
+            "Together against alone at {depth} tokens: the same likeliest token for {same} of {chats} chats; logits differ by {worst:.4} at most, {worst_top:.4} among each chat's ten likeliest."
         );
         for s in &mut sessions {
             s.truncate(depth);
         }
+        // For scale: each chat's token as the first of a batch of as many of its own
+        // tokens as there are chats (the same kernels, one chat's cache) against alone.
+        let (mut same, mut worst, mut worst_top) = (0, 0.0f32, 0.0f32);
+        for (c, alone) in alone.iter().enumerate() {
+            let s = &mut sessions[c];
+            let from = c * TOGETHER_APART + depth;
+            let tokens = &ids[from..from + chats.min(TOGETHER_STEPS)];
+            let batch = m.forward_batch(s, tokens, Logits::All).map_err(e)?.unwrap();
+            let batch = &batch[..vocab];
+            same += usize::from(argmax(batch) == argmax(alone));
+            worst = batch.iter().zip(alone).fold(worst, |w, (a, b)| w.max((a - b).abs()));
+            worst_top = top(alone).iter().fold(worst_top, |w, &i| w.max((batch[i] - alone[i]).abs()));
+            s.truncate(depth);
+        }
+        println!(
+            "One chat's batch against alone, for scale: the same likeliest token for {same} of {chats}; logits differ by {worst:.4} at most, {worst_top:.4} among the ten likeliest."
+        );
 
         let mut n = 1;
         let mut cells = Vec::new();
