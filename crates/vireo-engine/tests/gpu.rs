@@ -597,6 +597,51 @@ fn reading_in_batches_matches_one_token_at_a_time() {
     }
 }
 
+/// One token for each of several conversations in one pass (`forward_each`) gives each
+/// what it gets written alone: the same likeliest token, and logits within the few
+/// hundredths that a batch's kernels differ from one token's. The conversations are of
+/// different lengths, one of them longer than the sliding window with its layers' rings
+/// in use, and they go on for a few steps, each from its own cache.
+#[test]
+fn chats_written_together_match_alone() {
+    const STEPS: usize = 4;
+    for name in ["gemma-4-E2B_q4_0-it.gguf", "gemma-4-E2B-it-Q6_K.gguf"] {
+        let Some(file) = model(name) else { continue };
+        let Some(gpu) = open_gpu() else { return };
+        let ids = long_text(&Tokenizer::from_gguf(&file).unwrap(), true);
+        let m = Gemma4Cuda::load(&file, gpu).unwrap();
+        let window = m.config.sliding_window;
+        // Where in the text each starts, how much of it it has read, and its room.
+        let mut chats = vec![(0, 40, 64), (11, 23, 64), (5, 57, 128)];
+        if ids.len() > window + 200 + STEPS {
+            chats.push((3, window + 150, 4 * window));
+        }
+        let mut alone: Vec<_> = chats.iter().map(|c| m.session(c.2).unwrap()).collect();
+        let mut together: Vec<_> = chats.iter().map(|c| m.session(c.2).unwrap()).collect();
+        for (i, &(from, read, _)) in chats.iter().enumerate() {
+            m.forward_batch(&mut alone[i], &ids[from..from + read], Logits::None).unwrap();
+            m.forward_batch(&mut together[i], &ids[from..from + read], Logits::None).unwrap();
+        }
+        let mut work = m.session_with_batch(8, chats.len()).unwrap();
+        let vocab = m.config.vocab;
+        let mut row = vec![0f32; vocab];
+        for step in 0..STEPS {
+            let tokens: Vec<u32> = chats.iter().map(|c| ids[c.0 + c.1 + step]).collect();
+            let mut refs: Vec<&mut _> = together.iter_mut().collect();
+            m.forward_each(&mut work, &mut refs, &tokens).unwrap();
+            for (i, &token) in tokens.iter().enumerate() {
+                let want = m.forward(&mut alone[i], token, true).unwrap().unwrap();
+                m.held_logits(&work, i, &mut row).unwrap();
+                let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
+                let worst = row.iter().zip(want).fold(0f32, |w, (a, b)| w.max((a - b).abs()));
+                assert_eq!(top(&row), top(want), "{name}, chat {i}, step {step}");
+                assert!(worst < 0.25, "{name}, chat {i}, step {step}: logits differ by {worst}");
+                assert_eq!(together[i].len(), alone[i].len());
+            }
+        }
+    }
+}
+
 /// A round of guesses' logits left on the GPU (`forward_batch_held`) are the rows
 /// `forward_batch` hands back, to the bit, whichever rows are fetched and in whatever
 /// order. And on a Q6_K Gemma 4 (whose per-layer projection is f16: the few-token f16

@@ -340,7 +340,8 @@ impl<'a> Gemma4Cuda<'a> {
                     None
                 },
                 per_layer_q8: if pl > 0 && cfg!(not(target_os = "macos")) {
-                    let gate = GpuMatrix::upload_q8_0(&gpu, &matrix(file, &name("inp_gate"), dim, pl)?)?;
+                    let gate =
+                        GpuMatrix::upload_q8_0(&gpu, &matrix(file, &name("inp_gate"), dim, pl)?)?;
                     let proj = GpuMatrix::upload_f16(&gpu, &matrix(file, &name("proj"), pl, dim)?)?;
                     gate.zip(proj)
                 } else {
@@ -350,7 +351,8 @@ impl<'a> Gemma4Cuda<'a> {
                 experts: match c.experts {
                     Some(x) => {
                         let root = (dim as f32).sqrt();
-                        let gate_up = matrices(file, &name("ffn_gate_up_exps"), dim, 2 * x.width, x.count)?;
+                        let gate_up =
+                            matrices(file, &name("ffn_gate_up_exps"), dim, 2 * x.width, x.count)?;
                         let down = matrices(file, &name("ffn_down_exps"), x.width, dim, x.count)?;
                         #[cfg(target_os = "macos")]
                         for m in [&gate_up, &down] {
@@ -363,13 +365,21 @@ impl<'a> Gemma4Cuda<'a> {
                         }
                         Some(ExpertLayer {
                             router: upload(matrix(file, &name("ffn_gate_inp"), dim, x.count)?)?,
-                            router_weight: up(vector(file, &format!("blk.{i}.ffn_gate_inp.scale"), dim)?
-                                .iter()
-                                .map(|s| s / root)
-                                .collect())?,
+                            router_weight: up(vector(
+                                file,
+                                &format!("blk.{i}.ffn_gate_inp.scale"),
+                                dim,
+                            )?
+                            .iter()
+                            .map(|s| s / root)
+                            .collect())?,
                             gate_up: upload(gate_up)?,
                             down: upload(down)?,
-                            scale: up(vector(file, &format!("blk.{i}.ffn_down_exps.scale"), x.count)?)?,
+                            scale: up(vector(
+                                file,
+                                &format!("blk.{i}.ffn_down_exps.scale"),
+                                x.count,
+                            )?)?,
                             pre_norm: up(vector(file, &name("pre_ffw_norm_2"), dim)?)?,
                             dense_post_norm: up(vector(file, &name("post_ffw_norm_1"), dim)?)?,
                             post_norm: up(vector(file, &name("post_ffw_norm_2"), dim)?)?,
@@ -571,7 +581,13 @@ impl<'a> Gemma4Cuda<'a> {
             q8_ffn: if cfg!(target_os = "macos") {
                 None
             } else {
-                q8_room(&self.gpu, self.precision, batch, widest_ffn, &self.layers[0].gate)?
+                q8_room(
+                    &self.gpu,
+                    self.precision,
+                    batch,
+                    widest_ffn,
+                    &self.layers[0].gate,
+                )?
             },
             q8: q8_room(
                 &self.gpu,
@@ -634,13 +650,30 @@ impl<'a> Gemma4Cuda<'a> {
     /// Queues layers `layers` for the `t` tokens in `s.x` (at positions `*pos` on),
     /// leaving each token's input to the next layer (after the last, the final norm) in
     /// `s.h`. Starting at layer 0, the per-layer inputs too.
+    ///
+    /// With `chats`, the tokens are one each for those conversations, in their order
+    /// (`forward_each`): each row's keys and values go to its own conversation's cache at
+    /// its own position, and it attends over that cache; everything else, the products
+    /// that read the weights, runs for the rows together in `s`'s buffers.
     fn queue_layers(
         &self,
         s: &Gemma4CudaSession,
         t: usize,
         layers: std::ops::Range<usize>,
         pos: CuDevicePtr,
+        chats: &[&Gemma4CudaSession],
     ) -> Result<()> {
+        // Whose cache, from which row of the batch, how many rows, at which position.
+        let parts: Vec<(&Gemma4CudaSession, usize, usize, CuDevicePtr)> = if chats.is_empty() {
+            vec![(s, 0, t, pos)]
+        } else {
+            debug_assert_eq!(chats.len(), t);
+            chats
+                .iter()
+                .enumerate()
+                .map(|(i, chat)| (*chat, i, 1, chat.pos.ptr()))
+                .collect()
+        };
         let c = &self.config;
         let g = &self.gpu;
         let e = gpu_error;
@@ -660,8 +693,8 @@ impl<'a> Gemma4Cuda<'a> {
 
             let h = Input::new(g, s.h.ptr(), t, s.q8.as_ref());
             layer.q.mul(&h, s.q.ptr())?;
-            let own = match (&layer.k, &s.keys[l], &s.values[l]) {
-                (Some(k), Some(keys), Some(values)) => {
+            let own = match (&layer.k, &s.keys[l]) {
+                (Some(k), Some(_)) => {
                     k.mul(&h, s.k_new.ptr())?;
                     match &layer.v {
                         Some(v) => v.mul(&h, s.v_new.ptr())?,
@@ -670,71 +703,79 @@ impl<'a> Gemma4Cuda<'a> {
                             .copy(s.v_new.ptr(), s.k_new.ptr(), t * kv_dim * 4)
                             .map_err(e)?,
                     }
-                    Some((keys.ptr(), values.ptr()))
+                    true
                 }
-                _ => None,
+                _ => false,
             };
-            g.qkv_prep(
-                &QkvPrep {
-                    q: s.q.ptr(),
-                    q_stride: c.heads * hd,
-                    q_head_stride: hd,
-                    q_norm: Some(layer.q_norm.ptr()),
-                    q_out: s.q.ptr(),
-                    k: s.k_new.ptr(),
-                    k_norm: layer.k_norm.as_ref().map(Buffer::ptr),
-                    v: s.v_new.ptr(),
-                    v_norm: !c.muse,
-                    cache: own,
-                    heads: c.heads,
-                    kv_heads: c.kv_heads_of(l),
-                    head_dim: hd,
-                    // Muse's global layers have no RoPE.
-                    rope_dims: if c.muse && !c.is_swa[l] { 0 } else { hd },
-                    rope_base: base,
-                    rope_factors: factors,
-                    // Muse's converter permutes its queries and keys for RoPE on pairs of
-                    // neighbours (llama.cpp's "normal"), as for Llama; Gemma's rotates halves.
-                    neox: !c.muse,
-                    pos,
-                    eps,
-                    half_cache: s.half_cache,
-                    ring: s.rings[l],
-                },
-                t,
-            )
-            .map_err(e)?;
-
             let source = c.kv_source(l);
-            let (keys, values) = (
-                s.keys[source]
-                    .as_ref()
-                    .expect("a source layer has its own keys"),
-                s.values[source].as_ref().expect("and values"),
-            );
-            g.attention_ring(
-                s.half_cache,
-                s.q.ptr(),
-                keys.ptr(),
-                values.ptr(),
-                s.attention.ptr(),
-                pos,
-                if c.is_swa[l] { c.sliding_window } else { 0 },
-                s.rings[source],
-                c.heads,
-                t,
-                hd,
-                kv_dim,
-                c.heads / c.kv_heads_of(l),
-                // Gemma's queries and keys are normed (scale 1); Muse's queries carry
-                // their scale in q_norm.
-                if c.muse {
-                    1.0 / (hd as f32).sqrt()
-                } else {
-                    1.0
-                },
-            )
-            .map_err(e)?;
+            for &(chat, at, rows, pos) in &parts {
+                let q = s.q.f32_at(at * c.heads * hd);
+                g.qkv_prep(
+                    &QkvPrep {
+                        q,
+                        q_stride: c.heads * hd,
+                        q_head_stride: hd,
+                        q_norm: Some(layer.q_norm.ptr()),
+                        q_out: q,
+                        k: s.k_new.f32_at(at * kv_dim),
+                        k_norm: layer.k_norm.as_ref().map(Buffer::ptr),
+                        v: s.v_new.f32_at(at * kv_dim),
+                        v_norm: !c.muse,
+                        cache: own.then(|| {
+                            (
+                                chat.keys[l].as_ref().expect("its own keys").ptr(),
+                                chat.values[l].as_ref().expect("and values").ptr(),
+                            )
+                        }),
+                        heads: c.heads,
+                        kv_heads: c.kv_heads_of(l),
+                        head_dim: hd,
+                        // Muse's global layers have no RoPE.
+                        rope_dims: if c.muse && !c.is_swa[l] { 0 } else { hd },
+                        rope_base: base,
+                        rope_factors: factors,
+                        // Muse's converter permutes its queries and keys for RoPE on pairs of
+                        // neighbours (llama.cpp's "normal"), as for Llama; Gemma's rotates halves.
+                        neox: !c.muse,
+                        pos,
+                        eps,
+                        half_cache: s.half_cache,
+                        ring: chat.rings[l],
+                    },
+                    rows,
+                )
+                .map_err(e)?;
+
+                let (keys, values) = (
+                    chat.keys[source]
+                        .as_ref()
+                        .expect("a source layer has its own keys"),
+                    chat.values[source].as_ref().expect("and values"),
+                );
+                g.attention_ring(
+                    s.half_cache,
+                    q,
+                    keys.ptr(),
+                    values.ptr(),
+                    s.attention.f32_at(at * c.heads * hd),
+                    pos,
+                    if c.is_swa[l] { c.sliding_window } else { 0 },
+                    chat.rings[source],
+                    c.heads,
+                    rows,
+                    hd,
+                    kv_dim,
+                    c.heads / c.kv_heads_of(l),
+                    // Gemma's queries and keys are normed (scale 1); Muse's queries carry
+                    // their scale in q_norm.
+                    if c.muse {
+                        1.0 / (hd as f32).sqrt()
+                    } else {
+                        1.0
+                    },
+                )
+                .map_err(e)?;
+            }
             if let Some(gate) = &layer.attn_gate {
                 // s.h still holds the layer's normed input; s.gate is free until the FFN.
                 gate.mul(&Input::new(g, s.h.ptr(), t, s.q8.as_ref()), s.gate.ptr())?;
@@ -1156,7 +1197,7 @@ impl<'a> Gemma4Cuda<'a> {
         self.upload_inputs(s, &[token])?;
         if s.graph.is_none() {
             let all = 0..self.config.layers;
-            let graph = record(&self.gpu, || self.queue_layers(s, 1, all, s.pos.ptr()))?;
+            let graph = record(&self.gpu, || self.queue_layers(s, 1, all, s.pos.ptr(), &[]))?;
             s.graph = Some(graph);
         }
         s.graph.as_ref().unwrap().launch().map_err(gpu_error)?;
@@ -1190,7 +1231,11 @@ impl<'a> Gemma4Cuda<'a> {
 
     /// Row `row` of the logits [`Self::forward_batch_held`] left on the GPU, into `out`.
     pub fn held_logits(&self, s: &Gemma4CudaSession, row: usize, out: &mut [f32]) -> Result<()> {
-        assert_eq!(out.len(), self.config.vocab, "a row of logits is the vocabulary long");
+        assert_eq!(
+            out.len(),
+            self.config.vocab,
+            "a row of logits is the vocabulary long"
+        );
         s.logits_gpu.read_row(row, out)
     }
 
@@ -1280,6 +1325,57 @@ impl<'a> Gemma4Cuda<'a> {
         })
     }
 
+    /// One token for each of several conversations in one pass: `tokens[i]` at `chats[i]`'s
+    /// next position, attending over that conversation's own keys and values. The weights
+    /// are read once for all of them, which is most of what a token costs, so several
+    /// people's replies written together cost little more than one's. `work` lends its
+    /// batch buffers (any session of this model with a batch that long; what it holds
+    /// itself is untouched), and keeps every row's logits on the GPU:
+    /// [`Self::held_logits`]`(work, i, ..)` is `chats[i]`'s. The conversations must be of
+    /// one precision, which sessions of one model are.
+    pub fn forward_each(
+        &self,
+        work: &mut Gemma4CudaSession,
+        chats: &mut [&mut Gemma4CudaSession],
+        tokens: &[u32],
+    ) -> Result<()> {
+        let t = tokens.len();
+        assert_eq!(t, chats.len(), "a token for each conversation");
+        assert!(
+            t >= 1 && t <= work.batch,
+            "{t} conversations, in batches of {}",
+            work.batch
+        );
+        self.upload_inputs(work, tokens)?;
+        for chat in chats.iter() {
+            assert!(
+                chat.len < chat.capacity,
+                "a session is full ({} positions)",
+                chat.capacity
+            );
+            chat.pos.write_i32(&[chat.len as i32]).map_err(gpu_error)?;
+        }
+        {
+            let chats: Vec<&Gemma4CudaSession> = chats.iter().map(|c| &**c).collect();
+            self.queue_layers(work, t, 0..self.config.layers, work.pos.ptr(), &chats)?;
+        }
+        // Each conversation's final state to its own row 0, where its draft model looks
+        // for the last position's (as after `forward`).
+        let dim = self.config.dim;
+        for (i, chat) in chats.iter_mut().enumerate() {
+            self.gpu
+                .copy(chat.h.ptr(), row(&work.h, i, dim), dim * 4)
+                .map_err(gpu_error)?;
+            (chat.hidden_from, chat.hidden_rows) = (chat.len, 1);
+            chat.len += 1;
+        }
+        work.hidden_rows = 0;
+        work.hold = true;
+        let done = self.logits_into(work, 0, t, 0);
+        work.hold = false;
+        done
+    }
+
     /// How many of a batch's `t` rows of `h` hold final states after a read for no
     /// logits: all of them, unless some layers share keys and values (they didn't run).
     fn rows_without_logits(&self, t: usize) -> usize {
@@ -1296,12 +1392,12 @@ impl<'a> Gemma4Cuda<'a> {
         let c = &self.config;
         let (all, shared) = (0..c.layers, c.first_shared_layer..c.layers);
         if wanted == Logits::All {
-            return self.queue_layers(s, t, all, s.pos.ptr());
+            return self.queue_layers(s, t, all, s.pos.ptr(), &[]);
         }
         // The layers that share an earlier layer's keys and values leave nothing for
         // later tokens: a token's pass through them only makes its own logits. So
         // they run for the one token whose logits are wanted, and for no other.
-        self.queue_layers(s, t, 0..c.first_shared_layer, s.pos.ptr())?;
+        self.queue_layers(s, t, 0..c.first_shared_layer, s.pos.ptr(), &[])?;
         if wanted == Logits::Last {
             if t > 1 {
                 // The last token's state to row 0, where a one-token pass reads it.
@@ -1317,7 +1413,7 @@ impl<'a> Gemma4Cuda<'a> {
                         .map_err(e)?;
                 }
             }
-            self.queue_layers(s, 1, shared, s.pos_last.ptr())?;
+            self.queue_layers(s, 1, shared, s.pos_last.ptr(), &[])?;
         }
         Ok(())
     }
