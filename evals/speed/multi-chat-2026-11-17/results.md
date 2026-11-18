@@ -84,3 +84,36 @@ same four failing as on main this afternoon (`two-files`, `recover`, `office-not
 
     python3 -I evals/speed/multi-chat-2026-11-17/together.py "$M" --people 8 --slots 8 --rounds 1
     ./target/release/vireo-eval --models "$M" --server-arg --slots --server-arg 2
+
+## Gemma 4 26B-A4B (the mixture-of-experts model), main at 582ab45
+
+`vireo-cli together`, a step and tokens a second for each chat / for all of them:
+
+| Chats | 4,000 tokens each | 16,000 tokens each |
+|---|---|---|
+| 1 | 10.4 ms (95.9 / 96) | 11.3 ms (88.6 / 89) |
+| 2 | 13.0 ms (77.0 / 154) | 14.6 ms (68.3 / 137) |
+| 4 | 18.1 ms (55.3 / 221) | 21.3 ms (47.0 / 188) |
+| 8 | 32.1 ms (31.1 / 249) | 40.8 ms (24.5 / 196) |
+| 16 | 55.5 ms (18.0 / 288) | - |
+
+The same likeliest token as each chat alone, 16 of 16 at 4,000 tokens and 8 of 8 at 16,000. The
+logits differ by up to 11.7 (6.6 among a chat's ten likeliest) at 4,000 tokens, and that is this
+model's batches, not the pass: one chat's own batch of 8 tokens differs from the same token
+alone by 11.65 (6.60 among the ten likeliest), where Gemma 4 31B's differs by 0.03. `together`
+prints both now.
+
+`together.py`, 32K context, 3,000-token chats, everyone asking for 200 tokens at once:
+
+| People | Slots | First tokens | Replies done | Each reply written at | In all |
+|---|---|---|---|---|---|
+| 8 | 1 | 0.1 to 17.2 s | 2.3 to 19.6 s | 84-93 tok/s (drafted), in turn | 81.8 tok/s |
+| 8 | 8 | within 0.9 s | 8.0-8.1 s | 25.4-27.9 tok/s | 198.0 tok/s |
+| 16 | 16 | 0.1 to 7.5 s | 16.4-17.9 s | 12.3-19.3 tok/s | 178.5 tok/s |
+
+Sixteen at once write less in all than eight (178 against 198 tok/s) though the engine's pass
+carries more (288 against 249): the server's own work a token (each reply's megabyte of logits
+copied out, its sampling, one worker after another) is what's left.
+
+vireo-eval with `--slots 2`: 40 of 43, the three failing those of this afternoon's run on main
+(`two-files`, `office-note`, `office-policy`).
