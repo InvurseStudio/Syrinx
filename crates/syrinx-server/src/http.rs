@@ -137,11 +137,14 @@ pub fn respond_with(stream: &mut TcpStream, status: u16, content_type: &str, bod
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
         422 => "Unprocessable Content",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
         _ => "Error",
     };
     let head = format!(

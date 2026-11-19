@@ -28,11 +28,13 @@ mod calc;
 mod chat;
 mod chats;
 mod claims;
+mod developer;
 mod draft;
 mod files;
 mod http;
 mod json;
 mod memory;
+mod openai;
 mod sample;
 mod shortcuts;
 mod skills;
@@ -70,6 +72,7 @@ Usage: syrinx-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exac
                     [--skill-shortlist on|off]
                     [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
                     [--mtp on|off] [--thinking on|off] [--slots <n>]
+                    [--openai on|off]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -104,7 +107,12 @@ model guesses only where it's sure.
 --thinking is what a request gets when it doesn't say (\"thinking\": true or false): off by
 default. On, Gemma 4 and Qwen think before they answer and after each tool's result (at
 most 2,000 tokens a thought), sent to the app as \"thinking\" events apart from the
-answer, and Muse reasons at high strength.";
+answer, and Muse reasons at high strength.
+
+--openai on serves the OpenAI-compatible API at /v1 (GET /v1/models, POST
+/v1/chat/completions, streamed or whole), whatever Vireo's settings say; off turns it off.
+Without it, the settings decide (off until turned on). Requests need no key unless the
+settings ask for one: the server listens only on this computer.";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -282,6 +290,10 @@ fn main() -> ExitCode {
                 thinking = value.map(String::as_str) == Some("on");
                 i += 1;
             }
+            "--openai" if matches!(value.map(String::as_str), Some("on" | "off")) => {
+                developer::set_override(value.map(String::as_str) == Some("on"));
+                i += 1;
+            }
             "--slots" if value.and_then(|v| v.parse::<usize>().ok()).is_some_and(|n| (1..=64).contains(&n)) => {
                 slots = value.unwrap().parse().unwrap_or(1);
                 i += 1;
@@ -360,6 +372,9 @@ fn main() -> ExitCode {
     println!();
     println!("Vireo server: {} on {}", info.model, info.runtime);
     println!("Listening on http://127.0.0.1:{port}");
+    if developer::load().enabled {
+        println!("OpenAI-compatible API: http://127.0.0.1:{port}/v1");
+    }
     println!(
         "To pair the Vireo Prototype app: Settings, connect to \"localhost\" with the code {}",
         pairing.code
@@ -585,6 +600,13 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         };
     }
 
+    // The OpenAI-compatible API has keys of its own (`developer.rs`): a pairing token
+    // doesn't open it, and an API key doesn't open the rest.
+    if path == "/v1" || path.starts_with("/v1/") {
+        let path = path.to_string();
+        return openai::serve(stream, shared, &request, &path);
+    }
+
     let device = shared
         .pairing
         .lock()
@@ -785,6 +807,40 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 ),
             }
         }
+        // The OpenAI-compatible API's settings and keys, for the app's Settings.
+        ("GET", "/api/developer") => {
+            http::respond(&mut stream, 200, &developer::load().public_json(&shared.info.model))
+        }
+        ("PUT", "/api/developer") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            match developer::set(&body) {
+                Ok(s) => http::respond(&mut stream, 200, &s.public_json(&shared.info.model)),
+                Err(why) => http::respond(&mut stream, 400, &error(&why)),
+            }
+        }
+        ("POST", "/api/developer/keys") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            match developer::create_key(body.str("name").unwrap_or("")) {
+                // The only time the key itself is shown.
+                Ok((token, key)) => http::respond(
+                    &mut stream,
+                    200,
+                    &format!(
+                        "{{\"key\":{},\"info\":{}}}",
+                        json::string(&token),
+                        developer::public_key(&key)
+                    ),
+                ),
+                Err(why) => http::respond(&mut stream, 400, &error(&why)),
+            }
+        }
+        ("DELETE", p) if p.starts_with("/api/developer/keys/") => {
+            match developer::revoke_key(&p["/api/developer/keys/".len()..]) {
+                Ok(true) => http::respond(&mut stream, 200, "{\"success\":true}"),
+                Ok(false) => http::respond(&mut stream, 404, &error("Key not found.")),
+                Err(why) => http::respond(&mut stream, 500, &error(&why)),
+            }
+        }
         ("POST", p) if p.starts_with("/api/chat/runs/") && p.ends_with("/stop") => {
             let id = &p["/api/chat/runs/".len()..p.len() - "/stop".len()];
             if let Some(stop) = shared.runs.lock().unwrap().get(id) {
@@ -893,6 +949,7 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8], source: stats
         chat_id: body.str("chatId").map(str::to_string),
         thinking,
         no_tools,
+        api: false,
         tool_results: shared.tool_results.clone(),
         approvals: shared.approvals.clone(),
     };
@@ -1074,6 +1131,9 @@ struct Job {
     thinking: bool,
     /// No tools at all (the request's `"tools": false`).
     no_tools: bool,
+    /// A request through the OpenAI-compatible API (`openai.rs`): nothing of the user's
+    /// own in its prompt (what they asked to be remembered), only what the caller sent.
+    api: bool,
     tool_results: ToolWaits,
     approvals: Arc<Approvals>,
 }
@@ -3036,7 +3096,8 @@ fn reply(
     // was written another way keeps that way: those tools stay declared (though not
     // callable now), and its instructions keep the facts they began with, the newer
     // ones told at the end of the request.
-    let facts = memory::all();
+    // What the user asked to be remembered is theirs, not an API caller's.
+    let facts = if job.api { Vec::new() } else { memory::all() };
     // A skill written in comes before any thought: the turn opens without one, and the
     // thought follows the skill's instructions, as it follows any tool's result.
     let opening_text = if skill_ids.is_empty() {
