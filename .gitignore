@@ -7,3 +7,7 @@
 
 # Reference builds (llama.cpp) for checking our output and speed
 /reference/
+
+# The Windows app's build output
+bin/
+obj/

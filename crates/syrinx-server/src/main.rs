@@ -36,6 +36,7 @@ mod json;
 mod memory;
 mod openai;
 mod sample;
+mod standalone;
 mod shortcuts;
 mod skills;
 mod stats;
@@ -73,6 +74,8 @@ Usage: syrinx-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exac
                     [--draft <small-model.gguf>] [--draft-tokens <n>] [--lookup <n>]
                     [--mtp on|off] [--thinking on|off] [--slots <n>]
                     [--openai on|off]
+       syrinx-server --standalone <model.gguf> [--host <address>] [--port <n>]
+                    [--api-key <key>] [and the options above]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
 the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
@@ -112,7 +115,15 @@ answer, and Muse reasons at high strength.
 --openai on serves the OpenAI-compatible API at /v1 (GET /v1/models, POST
 /v1/chat/completions, streamed or whole), whatever Vireo's settings say; off turns it off.
 Without it, the settings decide (off until turned on). Requests need no key unless the
-settings ask for one: the server listens only on this computer.";
+settings ask for one: the server listens only on this computer.
+
+--standalone serves the model on its own, apart from Vireo: the OpenAI-compatible API
+(always on), a chat page at http://127.0.0.1:<port>/ (8088 by default), and the
+statistics at /stats. No pairing and no tools; chats' caches and the rest are kept in
+Syrinx's own folder (%LOCALAPPDATA%\\Syrinx, on the Mac ~/Library/Application Support/Syrinx).
+--api-key (or SYRINX_API_KEY) makes callers give that key as a bearer token. --host listens
+on another address than this computer's own (0.0.0.0 for every network); that needs an API
+key. --token (the app that started it) may use the API and see the statistics too.";
 
 /// How replies use the tools, from the command line: features the eval turns on and off.
 #[derive(Debug, Default)]
@@ -194,12 +205,17 @@ fn main() -> ExitCode {
     let mut mtp = true;
     let mut thinking = false;
     let mut slots = 1;
+    let mut standalone = false;
+    let mut host: Option<String> = None;
+    let mut api_key = std::env::var("SYRINX_API_KEY").ok().filter(|k| !k.is_empty());
+    let mut port_given = false;
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1);
         match args[i].as_str() {
             "--port" if value.and_then(|v| v.parse::<u16>().ok()).is_some() => {
                 port = value.unwrap().parse().unwrap();
+                port_given = true;
                 i += 1;
             }
             "--context" if value.is_some_and(|v| v == "auto") => {
@@ -220,6 +236,15 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "--with-app" => with_app = true,
+            "--standalone" => standalone = true,
+            "--host" if value.is_some() => {
+                host = value.cloned();
+                i += 1;
+            }
+            "--api-key" if value.is_some_and(|v| !v.is_empty()) => {
+                api_key = value.cloned();
+                i += 1;
+            }
             "--heal" if matches!(value.map(String::as_str), Some("on" | "off")) => {
                 heal = value.unwrap() == "on";
                 i += 1;
@@ -315,6 +340,40 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    if !standalone {
+        if host.is_some() {
+            eprintln!("--host is for --standalone: the Vireo app reaches the server on this computer.");
+            return ExitCode::FAILURE;
+        }
+        // The Vireo app's keys are in its settings (developer.rs).
+        api_key = None;
+    }
+    let host = host.unwrap_or_else(|| "127.0.0.1".into());
+    let loopback = host
+        .parse::<std::net::IpAddr>()
+        .map_or(host == "localhost", |a| a.is_loopback());
+    if !loopback && api_key.is_none() {
+        eprintln!(
+            "Listening on {host} lets other computers in: give an API key too (--api-key or SYRINX_API_KEY)."
+        );
+        return ExitCode::FAILURE;
+    }
+    if standalone {
+        // Syrinx's own folder for chats' caches, apart from the prototype's; the API on,
+        // and open to pages on other sites, for clients that run in a browser.
+        store::use_own_folder();
+        http::allow_cross_origin();
+        developer::set_override(true);
+        if let Some(key) = &api_key {
+            developer::set_command_line_key(key);
+        }
+        if let Some(token) = &app_token {
+            developer::set_app_token(token);
+        }
+        if !port_given {
+            port = STANDALONE_PORT;
+        }
+    }
     let _ = OPTIONS.set(Options {
         score_choices,
         heal,
@@ -358,10 +417,10 @@ fn main() -> ExitCode {
         Err(_) => return ExitCode::FAILURE,
     };
 
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+    let listener = match TcpListener::bind((host.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Couldn't listen on port {port}: {e}");
+            eprintln!("Couldn't listen on {host} port {port}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -370,17 +429,32 @@ fn main() -> ExitCode {
     pairing.app_token = app_token;
     tasks::set_port(port);
     println!();
-    println!("Vireo server: {} on {}", info.model, info.runtime);
-    println!("Listening on http://127.0.0.1:{port}");
-    if developer::load().enabled {
-        println!("OpenAI-compatible API: http://127.0.0.1:{port}/v1");
+    if standalone {
+        // "Vireo engine (GPU, 8-bit)": the GPU and how it runs.
+        let on = info.runtime.trim_start_matches("Vireo engine (").trim_end_matches(')');
+        let shown = if host == "0.0.0.0" { "127.0.0.1" } else { host.as_str() };
+        println!("Syrinx: {} on {on}, {} tokens of context", info.model, info.context);
+        println!("Listening on http://{shown}:{port}");
+        println!("  Chat in your browser:  http://{shown}:{port}/");
+        println!("  OpenAI-compatible API: http://{shown}:{port}/v1");
+        println!("  Statistics:            http://{shown}:{port}/stats");
+        if developer::command_line_key() {
+            println!("  Callers give the API key as a bearer token.");
+        }
+    } else {
+        println!("Vireo server: {} on {}", info.model, info.runtime);
+        println!("Listening on http://127.0.0.1:{port}");
+        if developer::load().enabled {
+            println!("OpenAI-compatible API: http://127.0.0.1:{port}/v1");
+        }
+        println!(
+            "To pair the Vireo Prototype app: Settings, connect to \"localhost\" with the code {}",
+            pairing.code
+        );
     }
-    println!(
-        "To pair the Vireo Prototype app: Settings, connect to \"localhost\" with the code {}",
-        pairing.code
-    );
     println!();
     let shared = Arc::new(Shared {
+        standalone,
         info,
         pairing: Mutex::new(pairing),
         jobs: Mutex::new(jobs),
@@ -395,7 +469,7 @@ fn main() -> ExitCode {
             dir: store::data_dir().join("uploads"),
         },
     });
-    {
+    if !standalone {
         let shared = shared.clone();
         std::thread::spawn(move || prune_uploads(&shared));
     }
@@ -413,7 +487,13 @@ struct ModelInfo {
     context: usize,
 }
 
+/// The port `--standalone` listens on unless `--port` says.
+const STANDALONE_PORT: u16 = 8088;
+
 struct Shared {
+    /// Serving on its own (`--standalone`, `standalone.rs`): the API, the chat page and the
+    /// statistics only.
+    standalone: bool,
     info: ModelInfo,
     pairing: Mutex<Pairing>,
     jobs: Mutex<Sender<Work>>,
@@ -560,6 +640,10 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         Ok(r) => r,
         Err((status, e)) => return http::respond(&mut stream, status, &error(&e)),
     };
+    // On its own, the server answers only what `standalone.rs` serves.
+    if shared.standalone {
+        return standalone::serve(stream, request, shared);
+    }
     let method = request.method.as_str();
     let path = request.path.trim_end_matches('/');
 

@@ -1,0 +1,1154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syrinx</title>
+<!--
+  The chat page Syrinx serves on its own (--standalone). It follows the Vireo prototype
+  app for the Mac (Vireo's Mac/Sources/VireoMac/Views) as closely as a page can: its
+  colours (AppTheme.swift), the sidebar (ChatSidebarView), the chat column and its input
+  bar (ChatAreaView), messages (MessageBubbleView), the status line above the input
+  (ReplyStatusLine), the folded thought (ToolStepsView), the chat settings panel
+  (ChatInspectorView), the model pill (ModelPickerView), the context ring
+  (ContextIndicatorView) and Markdown (MarkdownContentView). Dark only, as the apps are.
+  Chats are kept in this browser's storage.
+-->
+<style>
+:root {
+  --bg-primary: #0b1018;
+  --bg-secondary: #0e141e;
+  --bg-tertiary: #111a26;
+  --text-primary: #e8f0f1;
+  --text-secondary: #8d9ba8;
+  --accent: #4cf0ac;
+  --border: rgba(232, 240, 241, 0.10);
+  --danger: #f87171;
+  --raised: rgba(232, 240, 241, 0.06);
+  --accent-soft: rgba(76, 240, 172, 0.10);
+  --yellow: #facc15;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg-primary); color: var(--text-primary);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased; overflow: hidden;
+}
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+button:disabled { cursor: default; }
+input, textarea, select { font: inherit; color: var(--text-primary); }
+svg.i { width: 1em; height: 1em; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+[hidden] { display: none !important; }
+
+#app { display: flex; height: 100vh; height: 100dvh; }
+
+/* ---- Sidebar (ChatSidebarView) ---- */
+#sidebar {
+  width: 280px; flex: none; display: flex; flex-direction: column;
+  background: var(--bg-secondary); border-right: 1px solid var(--border);
+}
+#new-chat {
+  margin: 14px 12px; display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 12px; border-radius: 9px; background: var(--raised);
+  font-size: 13.5px; font-weight: 600; color: var(--text-primary);
+}
+#new-chat:hover { background: rgba(232, 240, 241, 0.09); }
+.side-tools { padding: 0 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+#search {
+  width: 100%; padding: 5px 9px; border-radius: 6px; font-size: 13px;
+  background: var(--bg-primary); border: 1px solid var(--border);
+}
+#search::placeholder { color: var(--text-secondary); }
+.segmented { display: flex; padding: 2px; border-radius: 7px; background: var(--raised); }
+.segmented button {
+  flex: 1; padding: 3px 0; border-radius: 5px; font-size: 12px; color: var(--text-secondary);
+}
+.segmented button[aria-pressed="true"] { background: var(--bg-tertiary); color: var(--text-primary); box-shadow: 0 1px 2px rgba(0,0,0,.35); }
+#chats { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+.group-title {
+  font: 500 10.5px var(--mono); letter-spacing: 1px; text-transform: uppercase;
+  color: var(--text-secondary); padding: 12px 10px 4px;
+}
+.row {
+  position: relative; height: 36px; margin: 2px 0; border-radius: 9px;
+  display: flex; align-items: center; color: var(--text-secondary);
+}
+.row:hover { background: var(--raised); color: var(--text-primary); }
+.row.active { background: var(--accent-soft); color: var(--text-primary); }
+.row .open {
+  flex: 1; min-width: 0; height: 100%; display: flex; align-items: center; gap: 6px;
+  padding: 0 10px; text-align: left; font-size: 13.5px;
+}
+.row.active .open { font-weight: 500; }
+.row .open span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .pinmark { color: var(--accent); font-size: 10px; }
+.row:hover .pinmark { display: none; }
+.row .acts { position: absolute; right: 4px; display: none; gap: 4px; }
+.row:hover .acts, .row:focus-within .acts { display: flex; }
+.row:hover .open, .row:focus-within .open { padding-right: 100px; }
+.act {
+  width: 28px; height: 28px; border-radius: 6px; display: grid; place-items: center;
+  font-size: 13px; color: var(--text-secondary); transition: transform .12s ease-out, background .12s;
+}
+.act:hover { background: rgba(141, 155, 168, 0.16); transform: scale(1.05); }
+.act:active { transform: scale(0.9); }
+.act.on { color: var(--accent); }
+.act.on:hover { background: rgba(76, 240, 172, 0.16); }
+.act.danger { color: var(--danger); }
+.act.danger:hover { background: rgba(248, 113, 113, 0.16); }
+.row input {
+  flex: 1; height: 100%; padding: 0 12px; border-radius: 9px; font-size: 13.5px;
+  background: var(--bg-primary); border: 1px solid var(--accent); outline: none;
+}
+.side-empty { text-align: center; padding: 28px 16px 0; color: var(--text-secondary); }
+.side-empty svg { font-size: 20px; }
+.side-empty b { display: block; color: var(--text-primary); font-weight: 500; font-size: 13px; margin: 10px 0 4px; }
+.side-empty p { margin: 0 0 10px; font-size: 11px; }
+.side-empty button { color: var(--accent); display: inline-flex; gap: 5px; align-items: center; }
+#open-settings {
+  border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
+  padding: 10px 16px; font-size: 14px; font-weight: 500; color: var(--text-secondary); text-align: left;
+}
+#open-settings:hover { color: var(--text-primary); }
+
+/* ---- Chat column (ChatAreaView) ---- */
+#main { flex: 1; min-width: 0; display: flex; }
+#column { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#bar {
+  display: flex; align-items: center; gap: 12px; padding: 10px 20px; min-height: 47px;
+  border-bottom: 1px solid var(--border);
+}
+#menu { display: none; font-size: 16px; color: var(--text-secondary); }
+#title { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spacer { flex: 1; min-width: 8px; }
+#model-pill {
+  display: flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 999px;
+  background: var(--raised); font: 12px var(--mono); color: var(--text-secondary); white-space: nowrap; min-width: 0;
+}
+#model-pill .name { max-width: 170px; overflow: hidden; text-overflow: ellipsis; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-secondary); flex: none; }
+.dot.up { background: var(--accent); box-shadow: 0 0 4px var(--accent); }
+.dot.down { background: var(--danger); }
+#context { display: flex; align-items: center; gap: 6px; font: 11px var(--mono); color: var(--text-secondary); }
+#context svg { width: 13px; height: 13px; transform: rotate(-90deg); }
+#toggle-panel { font-size: 15px; color: var(--text-secondary); width: 26px; height: 26px; display: grid; place-items: center; border-radius: 6px; }
+#toggle-panel:hover, #toggle-panel[aria-pressed="true"] { color: var(--text-primary); background: var(--raised); }
+
+#scroll { flex: 1; overflow-y: auto; padding-top: 28px; }
+#messages { max-width: 800px; margin: 0 auto; padding: 0 24px 24px; display: flex; flex-direction: column; gap: 24px; }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 16px; padding-top: 60px; }
+.empty svg { font-size: 48px; color: var(--text-secondary); opacity: .6; stroke-width: 1.5; }
+.empty h2 { margin: 0; font-size: 24px; font-weight: 700; }
+.empty p { margin: 0; color: var(--text-secondary); font-size: 13px; text-align: center; max-width: 420px; }
+
+/* ---- Messages (MessageBubbleView) ---- */
+.user { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; padding-left: 80px; }
+.user .bubble { background: var(--bg-tertiary); border-radius: 18px; padding: 10px 14px; max-width: 100%; }
+.assistant { display: flex; flex-direction: column; gap: 10px; padding-right: 40px; }
+.assistant.error .md { color: var(--danger); }
+.footer { display: flex; align-items: center; gap: 12px; min-height: 18px; opacity: 0; transition: opacity .12s; }
+.msg:hover .footer, .footer.shown { opacity: 1; }
+.footer .meta { display: flex; gap: 12px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text-secondary); opacity: 0; }
+.msg:hover .footer .meta { opacity: 1; }
+.icon-btn { font-size: 12px; color: var(--text-secondary); display: grid; place-items: center; height: 18px; }
+.icon-btn:hover { color: var(--text-primary); }
+.icon-btn.done { color: var(--accent); }
+.versions { display: flex; align-items: center; gap: 2px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.versions button { color: var(--text-secondary); display: grid; place-items: center; width: 16px; height: 16px; }
+.versions button:disabled { opacity: .35; }
+.fold { display: flex; flex-direction: column; gap: 8px; }
+.fold > button { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); align-self: flex-start; }
+.fold > button svg { font-size: 9px; stroke-width: 3; transition: transform .15s ease-out; }
+.fold.open > button svg { transform: rotate(90deg); }
+.fold .thought { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; padding: 0 0 4px 4px; }
+.retry { display: flex; gap: 8px; }
+.bordered {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px;
+  font-size: 12px; background: var(--raised); border: 1px solid var(--border);
+}
+.bordered:hover { background: rgba(232, 240, 241, 0.10); }
+
+/* ---- Markdown (MarkdownContentView) ---- */
+.md { font-size: 15px; line-height: calc(1.2em + 3px); overflow-wrap: anywhere; }
+.md > * { margin: 0; }
+.md h1 { font-size: 22px; font-weight: 700; }
+.md h2 { font-size: 19px; font-weight: 700; }
+.md h3, .md h4, .md h5, .md h6 { font-size: 17px; font-weight: 700; }
+.md .li { display: flex; gap: 8px; padding-left: 4px; }
+.md .li .marker { color: var(--text-secondary); flex: none; }
+.md .li .marker svg { font-size: 14px; position: relative; top: 2px; stroke-width: 1.7; }
+.md .li.checked .text { text-decoration: line-through; text-decoration-color: var(--text-secondary); }
+.md hr { border: 0; border-top: 1px solid var(--border); margin-top: 12px; margin-bottom: 4px; }
+.md code { font-family: var(--mono); font-size: .9em; background: var(--raised); padding: 1px 4px; border-radius: 4px; }
+.md a { color: var(--accent); }
+.md .code { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.md .code .head {
+  display: flex; justify-content: space-between; align-items: center; padding: 6px 10px;
+  background: var(--raised); font-size: 10px; color: var(--text-secondary);
+}
+.md .code .head span { font-family: var(--mono); }
+.md .code .head button { font-size: 10px; color: var(--text-secondary); }
+.md .code .head button:hover { color: var(--text-primary); }
+.md .code pre { margin: 0; padding: 10px; font: 14px/1.35 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.md .code pre code { background: none; padding: 0; font-size: inherit; }
+.md table { border-collapse: separate; border-spacing: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-size: 14px; }
+.md th, .md td { padding: 6px 10px; vertical-align: top; text-align: left; border-top: 1px solid var(--border); }
+.md th { background: var(--bg-tertiary); font-weight: 600; border-top: 0; }
+.md th + th, .md td + td { border-left: 1px solid var(--border); }
+.md .math { font-family: var(--mono); font-size: 14px; color: var(--text-secondary); white-space: pre-wrap; }
+
+/* ---- Input bar ---- */
+#composer { max-width: 800px; width: 100%; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 8px; }
+#status { height: 22px; padding: 0 12px; display: flex; align-items: center; gap: 8px; }
+#status .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1.6s ease-in-out infinite; flex: none; }
+@keyframes pulse { 50% { opacity: .35; } }
+#status-text {
+  font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-secondary) 40%, rgba(232,240,241,.85) 50%, var(--text-secondary) 60%, var(--text-secondary) 100%);
+  background-size: 250% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: shimmer 1.6s linear infinite;
+}
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -50% 0; } }
+#elapsed { font-size: 11px; font-variant-numeric: tabular-nums; color: rgba(141, 155, 168, 0.7); }
+#stop { width: 18px; height: 18px; border-radius: 50%; background: var(--bg-tertiary); color: var(--text-secondary); display: grid; place-items: center; }
+#stop svg { font-size: 8px; fill: currentColor; stroke: none; }
+#stop:hover { color: var(--text-primary); }
+#notice { font-size: 12px; color: var(--text-secondary); padding: 0 8px; }
+#notice.bad { color: var(--danger); }
+.box {
+  display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 28px;
+}
+#input {
+  flex: 1; resize: none; border: 0; outline: none; background: none; padding: 0;
+  font-size: 15px; line-height: 20px; max-height: 120px; min-height: 20px; display: block;
+}
+#input::placeholder { color: var(--text-secondary); }
+#send {
+  width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; flex: none;
+  background: var(--bg-tertiary); color: var(--text-secondary); font-size: 14px;
+}
+#send svg { stroke-width: 3; }
+#send:not(:disabled) { background: var(--accent); color: #000; }
+
+/* ---- Chat settings (ChatInspectorView) ---- */
+#panel { width: 300px; flex: none; background: var(--bg-secondary); border-left: 1px solid var(--border); overflow-y: auto; }
+#panel .inner { padding: 16px; display: flex; flex-direction: column; gap: 22px; }
+.section { display: flex; flex-direction: column; gap: 10px; }
+.section > h3 { margin: 0; font-size: 10px; font-weight: 600; letter-spacing: .6px; text-transform: uppercase; color: var(--text-secondary); }
+.caption { font-size: 11px; color: var(--text-secondary); margin: 0; }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 12px; color: var(--text-secondary); }
+.facts dt { color: var(--text-primary); }
+.facts dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+#system-prompt {
+  min-height: 110px; max-height: 220px; resize: vertical; padding: 6px; font-size: 12px;
+  background: var(--bg-tertiary); border: 0; border-radius: 6px; outline: none;
+}
+#system-prompt::placeholder { color: rgba(141, 155, 168, 0.7); }
+.field { display: flex; flex-direction: column; gap: 2px; }
+.field .top { display: flex; justify-content: space-between; font-size: 12px; font-weight: 500; }
+.field .top span:last-child { font: 400 12px var(--mono); color: var(--text-secondary); }
+input[type=range] { width: 100%; accent-color: var(--accent); margin: 4px 0; }
+.select-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
+select, .num {
+  background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font-size: 12px;
+}
+.num { width: 80px; text-align: right; }
+.switch { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 500; cursor: pointer; }
+.switch input { appearance: none; width: 26px; height: 15px; border-radius: 999px; background: var(--bg-tertiary); border: 1px solid var(--border); position: relative; cursor: pointer; margin: 0; flex: none; transition: background .15s; }
+.switch input::after { content: ""; position: absolute; top: 1px; left: 1px; width: 11px; height: 11px; border-radius: 50%; background: var(--text-primary); transition: transform .15s; }
+.switch input:checked { background: var(--accent); border-color: var(--accent); }
+.switch input:checked::after { transform: translateX(11px); background: #000; }
+details.advanced summary { font-size: 12px; font-weight: 500; cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; }
+details.advanced summary svg { font-size: 9px; stroke-width: 3; transition: transform .15s; }
+details.advanced[open] summary svg { transform: rotate(90deg); }
+details.advanced .fields { display: flex; flex-direction: column; gap: 14px; padding-top: 10px; }
+.panel-foot { display: flex; justify-content: space-between; }
+
+/* ---- Dialogs ---- */
+dialog {
+  background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px; width: min(520px, calc(100vw - 32px));
+}
+dialog::backdrop { background: rgba(0, 0, 0, .5); }
+dialog h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+dialog .caption { margin-bottom: 12px; }
+dialog textarea, dialog input[type=password], dialog input[type=text] {
+  width: 100%; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 13px; outline: none;
+}
+dialog textarea { min-height: 120px; resize: vertical; }
+dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.prominent { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 500; }
+.prominent:hover { background: #6af4bc; }
+.destructive { color: var(--danger); }
+dialog .facts { margin-bottom: 16px; }
+dialog label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; }
+
+/* ---- Narrow windows ---- */
+@media (max-width: 760px) {
+  #sidebar { position: fixed; inset: 0 auto 0 0; z-index: 10; transform: translateX(-100%); transition: transform .2s ease-out; box-shadow: 0 0 30px rgba(0,0,0,.5); }
+  #app.side-open #sidebar { transform: none; }
+  #menu { display: grid; place-items: center; width: 26px; height: 26px; }
+  #panel { position: fixed; inset: 0 0 0 auto; z-index: 10; width: min(300px, 90vw); box-shadow: 0 0 30px rgba(0,0,0,.5); }
+  #bar { padding: 10px 16px; }
+  #model-pill .where { display: none; }
+  #messages { padding: 0 16px 16px; }
+  #composer { padding: 12px 16px 16px; }
+  .user { padding-left: 32px; }
+  .assistant { padding-right: 0; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5M9 3h6l-1 7 4 3v2H6v-2l4-3z"/></symbol>
+  <symbol id="i-pin-fill" viewBox="0 0 24 24"><path d="M12 17v5" /><path d="M9 3h6l-1 7 4 3v2H6v-2l4-3z" fill="currentColor"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-again" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-11.5 8.5"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="i-bubbles" viewBox="0 0 24 24"><path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/></symbol>
+  <symbol id="i-square" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/></symbol>
+  <symbol id="i-square-check" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8 12 3 3 5-6"/></symbol>
+</svg>
+
+<div id="app">
+  <aside id="sidebar" aria-label="Chats">
+    <button id="new-chat" type="button">New Chat <svg class="i"><use href="#i-plus"/></svg></button>
+    <div class="side-tools">
+      <input id="search" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off">
+      <div class="segmented" role="group" aria-label="View">
+        <button type="button" data-section="all" aria-pressed="true">All</button>
+        <button type="button" data-section="pinned" aria-pressed="false">Pinned</button>
+      </div>
+    </div>
+    <div id="chats"></div>
+    <button id="open-settings" type="button"><svg class="i"><use href="#i-gear"/></svg> Settings</button>
+  </aside>
+
+  <div id="main">
+    <section id="column">
+      <header id="bar">
+        <button id="menu" type="button" aria-label="Chats"><svg class="i"><use href="#i-menu"/></svg></button>
+        <span id="title"></span>
+        <span class="spacer"></span>
+        <span id="model-pill" title="Connecting…"><span class="dot" id="model-dot"></span><span class="name" id="model-name">Connecting…</span><span class="where" id="model-where" hidden>· on this computer</span></span>
+        <span id="context" hidden>
+          <svg viewBox="0 0 13 13" aria-hidden="true"><circle cx="6.5" cy="6.5" r="5.5" fill="none" stroke="rgba(232,240,241,.10)" stroke-width="2"/><circle id="context-ring" cx="6.5" cy="6.5" r="5.5" fill="none" stroke="#4cf0ac" stroke-width="2" stroke-linecap="round" stroke-dasharray="0 100" pathLength="100"/></svg>
+          <span id="context-text">0%</span>
+        </span>
+        <button id="toggle-panel" type="button" aria-pressed="false" title="Chat settings" aria-label="Chat settings"><svg class="i"><use href="#i-panel"/></svg></button>
+      </header>
+      <div id="scroll"><div id="messages"></div></div>
+      <div id="composer">
+        <div id="notice" hidden></div>
+        <div id="status">
+          <span class="pulse"></span><span id="status-text">Thinking…</span><span class="spacer"></span>
+          <span id="elapsed">0s</span>
+          <button id="stop" type="button" title="Stop the current response" aria-label="Stop"><svg class="i"><use href="#i-stop"/></svg></button>
+        </div>
+        <div class="box">
+          <textarea id="input" rows="1" placeholder="Message Syrinx…" aria-label="Message"></textarea>
+          <button id="send" type="button" disabled aria-label="Send"><svg class="i"><use href="#i-up"/></svg></button>
+        </div>
+      </div>
+    </section>
+
+    <aside id="panel" hidden aria-label="Chat settings">
+      <div class="inner">
+        <div class="section">
+          <h3>Model</h3>
+          <dl class="facts">
+            <dt>Model</dt><dd id="fact-model">…</dd>
+            <dt>Status</dt><dd id="fact-status">…</dd>
+            <dt>Runtime</dt><dd id="fact-runtime">…</dd>
+            <dt>Context window</dt><dd id="fact-context">…</dd>
+          </dl>
+          <label class="switch">Think before answering <input type="checkbox" id="thinking"></label>
+          <p class="caption">Gemma 4, Qwen and Muse models think first, shown apart from the answer.</p>
+        </div>
+        <div class="section">
+          <h3>Instructions for this chat</h3>
+          <textarea id="system-prompt" placeholder="For example: Answer briefly. Use Canadian spelling."></textarea>
+          <p class="caption">Sent as the chat's system prompt.</p>
+        </div>
+        <div class="section">
+          <h3>Sampling</h3>
+          <div class="select-row"><span>Preset</span>
+            <select id="preset">
+              <option value="recommended">Recommended</option>
+              <option value="balanced">Balanced</option>
+              <option value="precise">Precise</option>
+              <option value="creative">Creative</option>
+              <option value="custom" hidden>Custom</option>
+            </select>
+          </div>
+          <p class="caption" id="preset-summary"></p>
+          <div class="field" data-key="temperature" data-step="0.05" data-min="0" data-max="2">
+            <div class="top"><span>Temperature</span><span></span></div>
+            <input type="range"><p class="caption">Higher is more varied, lower is more predictable.</p>
+          </div>
+          <div class="field">
+            <label class="switch">Limit reply length <input type="checkbox" id="limit"></label>
+            <div class="select-row" id="limit-row"><span>Max tokens</span><input class="num" id="max-tokens" type="number" min="16" max="65536"></div>
+            <p class="caption" id="limit-note">No limit beyond the context window.</p>
+          </div>
+          <details class="advanced">
+            <summary><svg class="i"><use href="#i-right"/></svg>Advanced</summary>
+            <div class="fields">
+              <div class="field" data-key="topP" data-step="0.01" data-min="0.01" data-max="1">
+                <div class="top"><span>Top P</span><span></span></div>
+                <input type="range"><p class="caption">Picks only from the most likely words that add up to this share.</p>
+              </div>
+              <div class="field" data-key="topK" data-step="5" data-min="0" data-max="500" data-off="0">
+                <div class="top"><span>Top K</span><span></span></div>
+                <input type="range"><p class="caption">Picks only from this many of the most likely words.</p>
+              </div>
+              <div class="field" data-key="minP" data-step="0.01" data-min="0" data-max="1" data-off="0">
+                <div class="top"><span>Min P</span><span></span></div>
+                <input type="range"><p class="caption">Skips words much less likely than the top choice.</p>
+              </div>
+              <div class="field" data-key="repetitionPenalty" data-step="0.01" data-min="0.5" data-max="2" data-off="1">
+                <div class="top"><span>Repeat penalty</span><span></span></div>
+                <input type="range"><p class="caption">Above 1 makes repeating words less likely.</p>
+              </div>
+            </div>
+          </details>
+        </div>
+        <div class="panel-foot">
+          <button class="bordered" id="reset" type="button" title="Clear this chat's instructions and use the standard settings.">Reset</button>
+          <button class="bordered" id="save-default" type="button" title="New chats will start with these instructions and settings.">Use for New Chats</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<dialog id="edit-dialog">
+  <h2>Edit Message</h2>
+  <p class="caption">Sending it again replaces the replies after it. To keep them, branch from the message first.</p>
+  <textarea id="edit-text"></textarea>
+  <div class="buttons">
+    <button class="bordered" type="button" id="edit-cancel">Cancel</button>
+    <button class="bordered prominent" type="button" id="edit-send">Send</button>
+  </div>
+</dialog>
+
+<dialog id="settings-dialog">
+  <h2>Settings</h2>
+  <dl class="facts">
+    <dt>Server</dt><dd id="set-server"></dd>
+    <dt>Model</dt><dd id="set-model"></dd>
+    <dt>Runtime</dt><dd id="set-runtime"></dd>
+    <dt>Context window</dt><dd id="set-context"></dd>
+  </dl>
+  <div id="key-section">
+    <label for="api-key">API key</label>
+    <input id="api-key" type="password" autocomplete="off" placeholder="The key the server was started with">
+    <p class="caption" style="margin-top:6px">Kept in this browser only.</p>
+  </div>
+  <p class="caption">Chats are kept in this browser's storage, on this device.</p>
+  <div class="buttons">
+    <button class="bordered destructive" type="button" id="delete-all">Delete All Chats</button>
+    <span class="spacer"></span>
+    <button class="bordered prominent" type="button" id="settings-done">Done</button>
+  </div>
+</dialog>
+
+<dialog id="confirm-dialog">
+  <h2 id="confirm-title"></h2>
+  <p class="caption" id="confirm-text"></p>
+  <div class="buttons">
+    <button class="bordered" type="button" id="confirm-cancel">Cancel</button>
+    <button class="bordered destructive" type="button" id="confirm-ok">Delete</button>
+  </div>
+</dialog>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const icon = (name) => `<svg class="i"><use href="#i-${name}"/></svg>`;
+  const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  // ---- Storage: chats, the chat in view and the defaults, in this browser ----
+  const store = {
+    get(key, fallback) { try { const v = localStorage.getItem("syrinx." + key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } },
+    set(key, value) { try { localStorage.setItem("syrinx." + key, JSON.stringify(value)); } catch {} },
+  };
+
+  // GenerationSettings.standard and GenerationPreset, as the Mac app has them.
+  const STANDARD = { followsModel: true, temperature: 0.7, topP: 0.9, topK: 0, minP: 0, repetitionPenalty: 1, maxTokens: null };
+  const PRESETS = {
+    recommended: { summary: "The settings the model's makers recommend for it. Moving a slider switches to your own settings.", apply: (g) => ({ ...g, followsModel: true }) },
+    balanced: { summary: "Good for most chats.", values: { temperature: 0.7, topP: 0.9, topK: 0, minP: 0, repetitionPenalty: 1 } },
+    precise: { summary: "Focused and repeatable. Good for code and facts.", values: { temperature: 0.2, topP: 0.9, topK: 40, minP: 0, repetitionPenalty: 1 } },
+    creative: { summary: "More varied wording. Good for writing and brainstorming.", values: { temperature: 1.0, topP: 0.95, topK: 0, minP: 0.05, repetitionPenalty: 1.05 } },
+  };
+  const presetOf = (g) => {
+    if (g.followsModel) return "recommended";
+    for (const [name, p] of Object.entries(PRESETS)) {
+      if (p.values && Object.entries(p.values).every(([k, v]) => Math.abs(g[k] - v) < 1e-9)) return name;
+    }
+    return "custom";
+  };
+
+  let chats = store.get("chats", []);
+  let currentId = store.get("current", null);
+  let defaults = store.get("defaults", { systemPrompt: "", generation: STANDARD, thinking: false });
+  let section = "all";
+  let editingRow = null;
+  let server = null;
+  let reply = null; // { chatId, controller, started, phase, timer }
+
+  const save = () => { store.set("chats", chats); store.set("current", currentId); };
+  const chat = () => chats.find((c) => c.id === currentId) || null;
+  const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+  // QuickAskController.title(for:): the first line, up to 60 characters.
+  const titleFor = (text) => {
+    const line = (text.split(/\r?\n/)[0] || text).trim();
+    return line.length > 60 ? line.slice(0, 57) + "…" : line;
+  };
+  const version = (m) => m.versions[m.v];
+
+  function newChat() {
+    const c = {
+      id: uid(), title: "New Chat", pinned: false, createdAt: Date.now(), updatedAt: Date.now(),
+      systemPrompt: defaults.systemPrompt, generation: { ...STANDARD, ...defaults.generation }, thinking: !!defaults.thinking,
+      messages: [], tokensUsed: 0,
+    };
+    chats.unshift(c);
+    currentId = c.id;
+    save();
+    closeSidebar();
+    renderAll();
+    $("input").focus();
+    return c;
+  }
+
+  // ---- Server ----
+  const headers = () => {
+    const h = { "Content-Type": "application/json" };
+    const key = store.get("apiKey", "");
+    if (key) h.Authorization = "Bearer " + key;
+    return h;
+  };
+  async function checkServer() {
+    try {
+      const r = await fetch("/health");
+      server = await r.json();
+    } catch {
+      server = null;
+    }
+    renderServer();
+  }
+  const modelName = () => server ? server.model.replace(/\.gguf$/i, "") : "Not connected";
+  function renderServer() {
+    $("model-dot").className = "dot " + (server ? "up" : "down");
+    $("model-name").textContent = modelName();
+    $("model-where").hidden = !server;
+    $("model-pill").title = server ? `Loaded: ${server.model} on ${server.runtime}` : "The server isn't answering.";
+    $("fact-model").textContent = modelName();
+    $("fact-status").textContent = server ? "Loaded" : "Not answering";
+    $("fact-runtime").textContent = server ? server.runtime : "—";
+    $("fact-context").textContent = server ? `${server.context.toLocaleString()} tokens` : "—";
+    $("set-server").textContent = location.host;
+    $("set-model").textContent = modelName();
+    $("set-runtime").textContent = server ? server.runtime : "—";
+    $("set-context").textContent = server ? `${server.context.toLocaleString()} tokens` : "—";
+    $("key-section").hidden = !(server && server.key);
+    renderContext();
+  }
+
+  // ---- Sidebar ----
+  function groups(list) {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const weekAgo = today.getTime() - 6 * 86400000;
+    const out = [];
+    for (const c of list) {
+      const title = c.pinned ? "Pinned" : c.updatedAt >= today.getTime() ? "Today" : c.updatedAt >= weekAgo ? "This week" : "Older";
+      if (out.length && out[out.length - 1].title === title) out[out.length - 1].chats.push(c);
+      else out.push({ title, chats: [c] });
+    }
+    return out;
+  }
+  function visibleChats() {
+    const q = $("search").value.trim().toLowerCase();
+    return chats
+      .filter((c) => section === "all" || c.pinned)
+      .filter((c) => !q || c.title.toLowerCase().includes(q) || c.messages.some((m) => (m.role === "user" ? m.content : version(m).content).toLowerCase().includes(q)))
+      .sort((a, b) => (b.pinned - a.pinned) || (b.updatedAt - a.updatedAt));
+  }
+  function renderSidebar() {
+    const list = visibleChats();
+    const el = $("chats");
+    if (!list.length) {
+      el.innerHTML = $("search").value.trim()
+        ? `<div class="side-empty"><b>No matches</b></div>`
+        : section === "pinned"
+          ? `<div class="side-empty">${icon("pin")}<b>No pinned chats</b><p>Pin a chat to keep it close.</p></div>`
+          : `<div class="side-empty">${icon("bubbles")}<b>No chats yet</b><p>Start a conversation to build your workspace.</p><button type="button" data-act="start">${icon("plus")} Start a chat</button></div>`;
+      return;
+    }
+    el.innerHTML = groups(list).map((g) =>
+      (section === "pinned" ? "" : `<div class="group-title">${escape(g.title)}</div>`) +
+      g.chats.map((c) => editingRow === c.id
+        ? `<div class="row" data-id="${c.id}"><input value="${escape(c.title)}" aria-label="Title"></div>`
+        : `<div class="row${c.id === currentId ? " active" : ""}" data-id="${c.id}">
+            <button class="open" type="button" data-act="open"><span>${escape(c.title)}</span>${c.pinned ? `<span class="pinmark">${icon("pin-fill")}</span>` : ""}</button>
+            <span class="acts">
+              <button class="act${c.pinned ? " on" : ""}" type="button" data-act="pin" title="${c.pinned ? "Unpin chat" : "Pin chat"}">${icon(c.pinned ? "pin-fill" : "pin")}</button>
+              <button class="act" type="button" data-act="rename" title="Rename chat">${icon("pencil")}</button>
+              <button class="act danger" type="button" data-act="delete" title="Delete chat">${icon("trash")}</button>
+            </span>
+          </div>`).join("")
+    ).join("");
+    const input = el.querySelector(".row input");
+    if (input) {
+      input.focus(); input.select();
+      const commit = () => {
+        const c = chats.find((x) => x.id === editingRow);
+        if (c && input.value.trim()) { c.title = input.value.trim(); save(); }
+        editingRow = null; renderAll();
+      };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") { editingRow = null; renderSidebar(); }
+      });
+      input.addEventListener("blur", commit);
+    }
+  }
+  $("chats").addEventListener("click", (e) => {
+    const button = e.target.closest("[data-act]");
+    if (!button) return;
+    const id = button.closest(".row")?.dataset.id;
+    const c = chats.find((x) => x.id === id);
+    switch (button.dataset.act) {
+      case "start": newChat(); break;
+      case "open": currentId = id; save(); closeSidebar(); renderAll(); break;
+      case "pin": c.pinned = !c.pinned; save(); renderSidebar(); break;
+      case "rename": editingRow = id; renderSidebar(); break;
+      case "delete": confirmDelete("Delete this chat?", `“${c.title}” will be deleted from this browser.`, () => {
+        if (reply && reply.chatId === id) reply.controller.abort();
+        chats = chats.filter((x) => x.id !== id);
+        if (currentId === id) currentId = chats[0]?.id || null;
+        save(); renderAll();
+      }); break;
+    }
+  });
+  $("new-chat").onclick = () => newChat();
+  $("search").addEventListener("input", renderSidebar);
+  for (const b of document.querySelectorAll(".segmented button")) {
+    b.onclick = () => {
+      section = b.dataset.section;
+      for (const o of document.querySelectorAll(".segmented button")) o.setAttribute("aria-pressed", o === b);
+      renderSidebar();
+    };
+  }
+  const closeSidebar = () => $("app").classList.remove("side-open");
+  $("menu").onclick = () => $("app").classList.toggle("side-open");
+  $("main").addEventListener("click", (e) => { if (!e.target.closest("#menu")) closeSidebar(); });
+
+  // ---- Markdown (MarkdownParser and MarkdownContentView) ----
+  function inline(text) {
+    const codes = [];
+    let s = text.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+    s = escape(s)
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`)
+      .replace(/(\*\*|__)(?=\S)([\s\S]*?\S)\1/g, "<strong>$2</strong>")
+      .replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?!\*)/g, "$1<em>$2</em>")
+      .replace(/(^|[^\w_])_(?=\S)([^_\n]*?\S)_(?![\w_])/g, "$1<em>$2</em>")
+      .replace(/~~(?=\S)([^~\n]*?\S)~~/g, "<del>$1</del>")
+      .replace(/\n/g, "<br>");
+    return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${escape(codes[+i])}</code>`);
+  }
+  const isRule = (t) => /^([-*_])( *\1){2,} *$/.test(t);
+  const cells = (line) => {
+    let row = line.trim();
+    if (row.startsWith("|")) row = row.slice(1);
+    if (row.endsWith("|") && !row.endsWith("\\|")) row = row.slice(0, -1);
+    const out = []; let cell = "", code = false;
+    for (let i = 0; i < row.length; i++) {
+      const c = row[i];
+      if (c === "\\" && row[i + 1] === "|") { cell += "|"; i++; continue; }
+      if (c === "|" && !code) { out.push(cell.trim()); cell = ""; continue; }
+      if (c === "`") code = !code;
+      cell += c;
+    }
+    out.push(cell.trim());
+    return out;
+  };
+  function parse(content) {
+    const blocks = [], lines = content.split("\n");
+    let para = [];
+    const flush = () => { if (para.length) { blocks.push({ kind: "p", text: para.join("\n") }); para = []; } };
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (t.startsWith("```")) {
+        flush();
+        const lang = t.slice(3).trim(), code = [];
+        for (i++; i < lines.length && !lines[i].trim().startsWith("```"); i++) code.push(lines[i]);
+        blocks.push({ kind: "code", lang, text: code.join("\n") });
+        continue;
+      }
+      if (t.startsWith("$$") || t.startsWith("\\[")) {
+        const close = t.startsWith("$$") ? "$$" : "\\]", rest = t.slice(2);
+        const at = rest.indexOf(close);
+        if (at >= 0 && !rest.slice(at + 2).trim()) { flush(); blocks.push({ kind: "math", text: rest.slice(0, at).trim() }); continue; }
+        if (at < 0) {
+          let end = i + 1;
+          while (end < lines.length && !lines[end].includes(close)) end++;
+          if (end < lines.length) {
+            flush();
+            const body = [rest, ...lines.slice(i + 1, end), lines[end].slice(0, lines[end].indexOf(close))];
+            blocks.push({ kind: "math", text: body.join("\n").trim() });
+            i = end; continue;
+          }
+        }
+      }
+      if (i + 1 < lines.length && lines[i].includes("|")) {
+        const head = cells(lines[i]), sep = cells(lines[i + 1]);
+        if (sep.length === head.length && sep.every((c) => /^:?-+:?$/.test(c))) {
+          flush();
+          const align = sep.map((c) => c.length > 1 && c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "left");
+          const rows = [];
+          let n = i + 2;
+          for (; n < lines.length && lines[n].includes("|") && lines[n].trim(); n++) {
+            const r = cells(lines[n]).slice(0, head.length);
+            while (r.length < head.length) r.push("");
+            rows.push(r);
+          }
+          blocks.push({ kind: "table", head, align, rows });
+          i = n - 1; continue;
+        }
+      }
+      if (!t) { flush(); continue; }
+      if (isRule(t)) { flush(); blocks.push({ kind: "rule" }); continue; }
+      let m;
+      if ((m = t.match(/^(#{1,6}) (.*)$/))) { flush(); blocks.push({ kind: "h", level: m[1].length, text: m[2].trim() }); continue; }
+      if ((m = t.match(/^[-*+] (.*)$/))) {
+        flush();
+        const task = m[1].match(/^\[([ xX])\] (.*)$/);
+        blocks.push(task ? { kind: "task", checked: task[1] !== " ", text: task[2] } : { kind: "li", marker: "•", text: m[1] });
+        continue;
+      }
+      if ((m = t.match(/^(\d+)\. (.*)$/))) { flush(); blocks.push({ kind: "li", marker: m[1] + ".", text: m[2] }); continue; }
+      para.push(t);
+    }
+    flush();
+    return blocks;
+  }
+  // A heading, or a paragraph that's one bold line (models write those as titles).
+  const sectionLevel = (b) => b.kind === "h" ? b.level
+    : b.kind === "p" && !b.text.includes("\n") && b.text.length <= 120 && /^(\*\*|__)[^*_\n]+(\*\*|__):?$/.test(b.text.trim()) ? 3 : null;
+  // MarkdownContentView.gap(after:before:).
+  function gap(prev, b) {
+    const level = sectionLevel(b);
+    if (level !== null) return level <= 2 ? 22 : 16;
+    if (sectionLevel(prev) !== null) return 6;
+    const list = (x) => x.kind === "li" || x.kind === "task";
+    if (list(prev) && list(b)) return 5;
+    if (prev.kind === "rule" || b.kind === "rule") return 8;
+    const big = (x) => x.kind === "code" || x.kind === "math" || x.kind === "table";
+    if (big(prev) || big(b)) return 14;
+    return 12;
+  }
+  function render(content) {
+    const blocks = parse(content);
+    return blocks.map((b, i) => {
+      const style = i ? ` style="margin-top:${gap(blocks[i - 1], b)}px"` : "";
+      switch (b.kind) {
+        case "h": return `<h${b.level}${style}>${inline(b.text)}</h${b.level}>`;
+        case "li": return `<div class="li"${style}><span class="marker">${escape(b.marker)}</span><span class="text">${inline(b.text)}</span></div>`;
+        case "task": return `<div class="li${b.checked ? " checked" : ""}"${style}><span class="marker">${icon(b.checked ? "square-check" : "square")}</span><span class="text">${inline(b.text)}</span></div>`;
+        case "rule": return `<hr${style}>`;
+        case "code": return `<div class="code"${style}><div class="head"><span>${escape((b.lang || "code").toUpperCase())}</span><button type="button" data-copy-code>Copy</button></div><pre><code>${escape(b.text)}</code></pre></div>`;
+        case "math": return `<div class="math"${style}>${escape(b.text)}</div>`;
+        case "table": return `<table${style}><thead><tr>${b.head.map((h, c) => `<th style="text-align:${b.align[c]}">${inline(h)}</th>`).join("")}</tr></thead><tbody>${b.rows.map((r) => `<tr>${r.map((d, c) => `<td style="text-align:${b.align[c]}">${inline(d)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+        default: return `<p${style}>${inline(b.text)}</p>`;
+      }
+    }).join("");
+  }
+
+  // ---- Messages ----
+  const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const replying = (c) => reply && reply.chatId === c.id;
+  function messageHTML(c, m, index) {
+    const last = index === c.messages.length - 1;
+    const idle = !reply;
+    if (m.role === "user") {
+      return `<div class="msg user" data-index="${index}">
+        ${m.content.trim() ? `<div class="bubble md">${render(m.content)}</div>` : ""}
+        <div class="footer"><span class="meta" style="opacity:1">${time(m.createdAt)}</span>
+          ${idle ? `<button class="icon-btn" type="button" data-act="edit" title="Edit and send again (the replies after it are replaced)">${icon("pencil")}</button>
+          <button class="icon-btn" type="button" data-act="branch" title="Branch: continue from here in a new chat">${icon("branch")}</button>` : ""}
+        </div></div>`;
+    }
+    const v = version(m);
+    const live = replying(c) && last;
+    const fold = !live && v.reasoning !== undefined && v.reasoning !== null
+      ? `<div class="fold"><button type="button" data-act="fold" title="Show the steps">${icon("right")}<span>Thought</span></button><div class="thought" hidden>${escape(v.reasoning || "…")}</div></div>` : "";
+    const answer = live && !v.content ? "" : `<div class="md">${render(v.content || " ")}</div>`;
+    const meta = [time(v.createdAt), v.tps ? `${v.tps} tok/s` : "", v.duration ? `${v.duration}s` : ""].filter(Boolean).map((t) => `<span>${escape(t)}</span>`).join("");
+    const actions = live ? "" : `
+      ${v.content.trim() ? `<button class="icon-btn" type="button" data-act="copy" title="Copy response">${icon("copy")}</button>` : ""}
+      ${idle && last ? `<button class="icon-btn" type="button" data-act="regenerate" title="Regenerate (this answer is kept as an earlier version)">${icon("again")}</button>` : ""}
+      ${idle ? `<button class="icon-btn" type="button" data-act="branch" title="Branch: continue from here in a new chat">${icon("branch")}</button>` : ""}
+      ${m.versions.length > 1 ? `<span class="versions" title="Earlier and later answers to this message"><button type="button" data-act="prev" ${m.v === 0 || !idle ? "disabled" : ""} aria-label="Earlier answer">${icon("left")}</button>${m.v + 1}/${m.versions.length}<button type="button" data-act="next" ${m.v >= m.versions.length - 1 || !idle ? "disabled" : ""} aria-label="Later answer">${icon("right")}</button></span>` : ""}
+      <span class="meta">${meta}</span>`;
+    const retry = v.error && idle && last ? `<div class="retry"><button class="bordered" type="button" data-act="retry">${icon("again")} Retry</button></div>` : "";
+    return `<div class="msg assistant${v.error ? " error" : ""}" data-index="${index}">${fold}${answer}${retry}
+      <div class="footer${(idle && last) || m.versions.length > 1 ? " shown" : ""}">${actions}</div></div>`;
+  }
+  function renderMessages(stick) {
+    const c = chat();
+    const el = $("messages"), scroll = $("scroll");
+    const atBottom = stick || scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+    if (!c || !c.messages.length) {
+      el.innerHTML = `<div class="empty">${icon("bubbles")}<h2>Start a conversation</h2></div>`;
+    } else {
+      el.innerHTML = c.messages.map((m, i) => messageHTML(c, m, i)).join("");
+    }
+    if (atBottom) scroll.scrollTop = scroll.scrollHeight;
+  }
+  // Only the reply being written, while it streams.
+  function renderLive() {
+    const c = chat();
+    if (!c || !replying(c)) return;
+    const index = c.messages.length - 1;
+    const node = $("messages").querySelector(`.msg[data-index="${index}"]`);
+    const scroll = $("scroll");
+    const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+    if (node) node.outerHTML = messageHTML(c, c.messages[index], index);
+    if (atBottom) scroll.scrollTop = scroll.scrollHeight;
+  }
+  $("messages").addEventListener("click", async (e) => {
+    const copy = e.target.closest("[data-copy-code]");
+    if (copy) {
+      await navigator.clipboard?.writeText(copy.closest(".code").querySelector("code").textContent).catch(() => {});
+      copy.textContent = "Copied"; setTimeout(() => (copy.textContent = "Copy"), 1500);
+      return;
+    }
+    const button = e.target.closest("[data-act]");
+    const c = chat();
+    if (!button || !c) return;
+    const index = +button.closest(".msg").dataset.index;
+    const m = c.messages[index];
+    switch (button.dataset.act) {
+      case "fold": {
+        const fold = button.parentElement, open = fold.classList.toggle("open");
+        fold.querySelector(".thought").hidden = !open;
+        button.title = open ? "Hide the steps" : "Show the steps";
+        break;
+      }
+      case "copy":
+        await navigator.clipboard?.writeText(version(m).content).catch(() => {});
+        button.innerHTML = icon("check"); button.classList.add("done"); button.title = "Copied response";
+        setTimeout(() => { button.innerHTML = icon("copy"); button.classList.remove("done"); button.title = "Copy response"; }, 1500);
+        break;
+      case "regenerate": run(c, { regenerate: true }); break;
+      case "retry":
+        c.messages.pop();
+        save(); run(c);
+        break;
+      case "prev": case "next":
+        m.v = Math.max(0, Math.min(m.versions.length - 1, m.v + (button.dataset.act === "next" ? 1 : -1)));
+        save(); renderMessages();
+        break;
+      case "branch": {
+        const b = { ...structuredClone(c), id: uid(), title: `${c.title} (branch)`, pinned: false, createdAt: Date.now(), updatedAt: Date.now(), messages: structuredClone(c.messages.slice(0, index + 1)) };
+        chats.unshift(b); currentId = b.id; save(); renderAll();
+        break;
+      }
+      case "edit":
+        $("edit-text").value = m.content;
+        $("edit-dialog").dataset.index = index;
+        $("edit-dialog").showModal();
+        $("edit-text").focus();
+        break;
+    }
+  });
+  $("edit-cancel").onclick = () => $("edit-dialog").close();
+  $("edit-send").onclick = () => {
+    const c = chat(), index = +$("edit-dialog").dataset.index, text = $("edit-text").value.trim();
+    $("edit-dialog").close();
+    if (!c || !text || reply) return;
+    c.messages = c.messages.slice(0, index);
+    c.messages.push({ id: uid(), role: "user", content: text, createdAt: Date.now() });
+    save(); run(c);
+  };
+
+  // ---- Header: title and context (ContextIndicatorView) ----
+  function renderContext() {
+    const c = chat();
+    const limit = server ? server.context : 0;
+    $("context").hidden = !c || !limit;
+    if (!c || !limit) return;
+    const used = c.tokensUsed || 0, ratio = Math.min(used / limit, 1), percent = Math.floor(ratio * 100);
+    $("context-ring").setAttribute("stroke-dasharray", `${ratio * 100} 100`);
+    $("context-ring").setAttribute("stroke", ratio < 0.6 ? "#4cf0ac" : ratio < 0.8 ? "#facc15" : "#f87171");
+    $("context-ring").style.opacity = ratio > 0 ? 1 : 0;
+    $("context-text").textContent = `${percent}%`;
+    $("context").title = `Context: ~${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${percent}%)`;
+  }
+
+  // ---- Chat settings (ChatInspectorView) ----
+  const fmt = (v) => (Math.round(v * 100) / 100).toFixed(2);
+  function renderPanel() {
+    const c = chat();
+    const g = c ? c.generation : { ...STANDARD, ...defaults.generation };
+    $("system-prompt").value = c ? c.systemPrompt : defaults.systemPrompt;
+    $("thinking").checked = c ? c.thinking : !!defaults.thinking;
+    const preset = presetOf(g);
+    $("preset").value = preset;
+    $("preset").querySelector('[value="custom"]').hidden = preset !== "custom";
+    $("preset-summary").textContent = preset === "custom" ? "" : PRESETS[preset].summary;
+    $("preset-summary").hidden = preset === "custom";
+    for (const f of document.querySelectorAll(".field[data-key]")) {
+      const key = f.dataset.key, range = f.querySelector("input");
+      Object.assign(range, { min: f.dataset.min, max: f.dataset.max, step: f.dataset.step });
+      range.value = g[key];
+      const off = f.dataset.off;
+      f.querySelector(".top span:last-child").textContent =
+        off !== undefined && +g[key] === +off ? "Off" : key === "topK" ? String(g[key]) : fmt(g[key]);
+    }
+    $("limit").checked = g.maxTokens != null;
+    $("limit-row").hidden = g.maxTokens == null;
+    $("limit-note").hidden = g.maxTokens != null;
+    $("max-tokens").value = g.maxTokens ?? "";
+    const isDefault = c && c.systemPrompt === defaults.systemPrompt && c.thinking === !!defaults.thinking &&
+      JSON.stringify(c.generation) === JSON.stringify({ ...STANDARD, ...defaults.generation });
+    $("save-default").disabled = !c || isDefault;
+    $("save-default").textContent = "Use for New Chats";
+  }
+  const chatForSettings = () => chat() || newChat();
+  function setGeneration(change) {
+    const c = chatForSettings();
+    c.generation = { ...c.generation, ...change };
+    save(); renderPanel();
+  }
+  for (const f of document.querySelectorAll(".field[data-key]")) {
+    f.querySelector("input").addEventListener("input", (e) => {
+      const step = +f.dataset.step;
+      const value = Math.round(Math.round(+e.target.value / step) * step * 100) / 100;
+      setGeneration({ [f.dataset.key]: value, followsModel: false });
+    });
+  }
+  // Each reads the control before chatForSettings, which may start a chat and redraw this panel.
+  $("preset").onchange = () => {
+    const p = PRESETS[$("preset").value], c = chatForSettings();
+    if (!p) return;
+    c.generation = p.apply ? p.apply(c.generation) : { ...c.generation, ...p.values, followsModel: false };
+    save(); renderPanel();
+  };
+  $("limit").onchange = () => setGeneration({ maxTokens: $("limit").checked ? 2048 : null });
+  $("max-tokens").onchange = () => setGeneration({ maxTokens: Math.min(Math.max(+$("max-tokens").value || 16, 16), 65536) });
+  $("thinking").onchange = () => { const on = $("thinking").checked, c = chatForSettings(); c.thinking = on; save(); renderPanel(); };
+  let promptTimer;
+  $("system-prompt").addEventListener("input", () => {
+    clearTimeout(promptTimer);
+    promptTimer = setTimeout(() => {
+      const text = $("system-prompt").value, c = chatForSettings();
+      c.systemPrompt = text; save(); renderPanel();
+    }, 500);
+  });
+  $("reset").onclick = () => { const c = chatForSettings(); c.systemPrompt = ""; c.generation = { ...STANDARD }; c.thinking = false; save(); renderPanel(); };
+  $("save-default").onclick = () => {
+    const c = chat(); if (!c) return;
+    defaults = { systemPrompt: c.systemPrompt, generation: { ...c.generation }, thinking: c.thinking };
+    store.set("defaults", defaults);
+    renderPanel();
+    $("save-default").textContent = "Saved"; $("save-default").disabled = true;
+  };
+  $("toggle-panel").onclick = () => {
+    const open = $("panel").hidden;
+    $("panel").hidden = !open;
+    $("toggle-panel").setAttribute("aria-pressed", open);
+    if (!narrow.matches) store.set("panel", open);
+  };
+
+  // ---- Settings dialog ----
+  $("open-settings").onclick = () => { $("api-key").value = store.get("apiKey", ""); renderServer(); $("settings-dialog").showModal(); };
+  $("settings-done").onclick = () => { store.set("apiKey", $("api-key").value.trim()); $("settings-dialog").close(); checkServer(); };
+  $("delete-all").onclick = () => {
+    $("settings-dialog").close();
+    confirmDelete("Delete all chats?", "Every chat in this browser will be deleted. This can't be undone.", () => {
+      if (reply) reply.controller.abort();
+      chats = []; currentId = null; save(); renderAll();
+    });
+  };
+  function confirmDelete(title, text, then) {
+    $("confirm-title").textContent = title;
+    $("confirm-text").textContent = text;
+    $("confirm-ok").onclick = () => { $("confirm-dialog").close(); then(); };
+    $("confirm-dialog").showModal();
+  }
+  $("confirm-cancel").onclick = () => $("confirm-dialog").close();
+
+  // ---- Status line (ReplyStatusLine) and the input bar ----
+  function renderStatus() {
+    const c = chat();
+    const mine = c && replying(c);
+    $("status").style.visibility = mine ? "visible" : "hidden";
+    if (mine) {
+      const text = reply.phase === "writing" ? "Writing…" : "Thinking…";
+      if ($("status-text").textContent !== text) $("status-text").textContent = text;
+      const s = Math.max(0, Math.floor((Date.now() - reply.started) / 1000));
+      $("elapsed").textContent = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+    }
+    const busyElsewhere = reply && !mine;
+    $("notice").hidden = !busyElsewhere;
+    $("notice").className = "";
+    if (busyElsewhere) $("notice").textContent = "Another chat is still replying. You can send once it finishes.";
+    $("send").disabled = !!reply || !$("input").value.trim();
+  }
+  const input = $("input");
+  const grow = () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 120) + "px"; };
+  input.addEventListener("input", () => { grow(); renderStatus(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+  $("send").onclick = send;
+  $("stop").onclick = () => reply?.controller.abort();
+
+  function send() {
+    const text = input.value.trim();
+    if (!text || reply) return;
+    const c = chat() || newChat();
+    input.value = ""; grow();
+    if (!c.messages.length && c.title === "New Chat") c.title = titleFor(text);
+    c.messages.push({ id: uid(), role: "user", content: text, createdAt: Date.now() });
+    save();
+    run(c);
+  }
+
+  // ---- A reply ----
+  async function run(c, { regenerate = false } = {}) {
+    if (reply) return;
+    let m;
+    if (regenerate) {
+      m = c.messages[c.messages.length - 1];
+      if (!m || m.role !== "assistant") return;
+      m.versions.push({ content: "", createdAt: Date.now() });
+      m.v = m.versions.length - 1;
+    } else {
+      m = { id: uid(), role: "assistant", versions: [{ content: "", createdAt: Date.now() }], v: 0 };
+      c.messages.push(m);
+    }
+    const v = version(m);
+    c.updatedAt = Date.now();
+    const history = c.messages.slice(0, -1).filter((x) => x.role === "user" || !version(x).error)
+      .map((x) => ({ role: x.role, content: x.role === "user" ? x.content : version(x).content }));
+    const g = c.generation;
+    const body = { model: server?.model || "local", messages: [], stream: true, stream_options: { include_usage: true }, thinking: !!c.thinking };
+    if (c.systemPrompt.trim()) body.messages.push({ role: "system", content: c.systemPrompt });
+    body.messages.push(...history);
+    if (!g.followsModel) {
+      body.temperature = g.temperature; body.top_p = g.topP;
+      if (g.topK > 0) body.top_k = g.topK;
+      if (g.minP > 0) body.min_p = g.minP;
+      if (g.repetitionPenalty !== 1) body.repetition_penalty = g.repetitionPenalty;
+    }
+    if (g.maxTokens != null) body.max_tokens = g.maxTokens;
+
+    reply = { chatId: c.id, controller: new AbortController(), started: Date.now(), phase: "thinking" };
+    reply.timer = setInterval(renderStatus, 1000);
+    renderAll(true);
+    let firstAt = null, usage = null, dirty = false;
+    const paint = () => { if (dirty) { dirty = false; renderLive(); renderStatus(); } requestAnimationFrame(() => reply && reply.chatId === c.id && paint()); };
+    requestAnimationFrame(paint);
+    try {
+      const r = await fetch("/v1/chat/completions", { method: "POST", headers: headers(), body: JSON.stringify(body), signal: reply.controller.signal });
+      if (!r.ok) {
+        const j = await r.json().catch(() => null);
+        if (r.status === 401) throw new Error("This server needs its API key. Add it in Settings, at the foot of the sidebar.");
+        throw new Error(j?.error?.message || `The server answered ${r.status}.`);
+      }
+      const reader = r.body.getReader(), decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let cut;
+        while ((cut = buffer.indexOf("\n\n")) >= 0) {
+          const line = buffer.slice(0, cut).replace(/^data: ?/, "");
+          buffer = buffer.slice(cut + 2);
+          if (!line || line === "[DONE]") continue;
+          const chunk = JSON.parse(line);
+          if (chunk.error) throw new Error(chunk.error.message);
+          if (chunk.usage) usage = chunk.usage;
+          const d = chunk.choices?.[0]?.delta;
+          if (!d) continue;
+          if (d.reasoning_content) { v.reasoning = (v.reasoning || "") + d.reasoning_content; firstAt ??= Date.now(); }
+          if (d.content) { v.content += d.content; firstAt ??= Date.now(); reply.phase = "writing"; }
+          dirty = true;
+        }
+      }
+      if (usage && firstAt) {
+        const seconds = (Date.now() - firstAt) / 1000;
+        v.duration = ((Date.now() - reply.started) / 1000).toFixed(2);
+        if (seconds > 0.05) v.tps = (usage.completion_tokens / seconds).toFixed(2);
+        c.tokensUsed = usage.total_tokens;
+      }
+    } catch (err) {
+      if (err.name !== "AbortError") {
+        v.error = true;
+        v.content = v.content ? `${v.content}\n\n${err.message}` : err.message;
+      }
+    } finally {
+      clearInterval(reply.timer);
+      reply = null;
+      v.content = v.content.trim();
+      c.updatedAt = Date.now();
+      save();
+      renderAll();
+      input.focus();
+    }
+  }
+
+  // ---- Everything ----
+  function renderAll(stick) {
+    const c = chat();
+    $("title").textContent = c ? c.title : "";
+    document.title = c && c.title !== "New Chat" ? `${c.title} · Syrinx` : "Syrinx";
+    renderSidebar();
+    renderMessages(stick);
+    renderContext();
+    renderPanel();
+    renderStatus();
+  }
+
+  // On a narrow screen the panel covers the chat, so it starts closed there.
+  const narrow = matchMedia("(max-width: 760px)");
+  if (store.get("panel", false) && !narrow.matches) { $("panel").hidden = false; $("toggle-panel").setAttribute("aria-pressed", "true"); }
+  document.addEventListener("click", (e) => {
+    if (narrow.matches && !$("panel").hidden && !e.target.closest("#panel, #toggle-panel, dialog")) {
+      $("panel").hidden = true;
+      $("toggle-panel").setAttribute("aria-pressed", "false");
+    }
+  });
+  if (currentId && !chat()) currentId = chats[0]?.id || null;
+  renderAll(true);
+  checkServer();
+  setInterval(checkServer, 30000);
+  input.focus();
+})();
+</script>
+</body>
+</html>

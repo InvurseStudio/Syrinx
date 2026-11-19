@@ -98,10 +98,13 @@ pub fn serve(mut stream: TcpStream, shared: &Shared, request: &http::Request, pa
             }
         }
         ("POST", "/v1/chat/completions") => {
-            let source = stats::Source {
-                id: key.as_ref().map_or_else(|| "api:local".to_string(), |k| format!("api:{}", k.id)),
-                name: key.as_ref().map_or_else(|| "OpenAI-compatible API".to_string(), |k| format!("API key {}", k.name)),
-                kind: "api",
+            let source = match &key {
+                Some(k) => stats::Source {
+                    id: format!("api:{}", k.id),
+                    name: format!("API key {}", k.name),
+                    kind: "api",
+                },
+                None => caller(request, &stream),
             };
             chat_completion(stream, shared, &request.body, source);
         }
@@ -123,6 +126,46 @@ pub fn serve(mut stream: TcpStream, shared: &Shared, request: &http::Request, pa
             "unknown_url",
             &format!("Unknown request: {} {path}", request.method),
         ),
+    }
+}
+
+/// A caller without a saved key, for the statistics: the client as its User-Agent names
+/// it, and from where ("OpenAI/Python on this computer"), each a connection of its own.
+fn caller(request: &http::Request, stream: &TcpStream) -> stats::Source {
+    let client = client_name(request.user_agent.as_deref());
+    let address = crate::peer(stream);
+    let place = if address == "127.0.0.1" || address == "::1" {
+        "this computer".to_string()
+    } else {
+        address
+    };
+    stats::Source {
+        id: format!("api:{client}@{place}"),
+        name: format!("{client} on {place}"),
+        kind: "api",
+    }
+}
+
+/// A client's name from its User-Agent: a browser (Syrinx's chat page, or a page calling
+/// from one) or the product it names first ("OpenAI/Python 2.8.0" → "OpenAI/Python",
+/// "curl/8.9" → "curl").
+fn client_name(user_agent: Option<&str>) -> String {
+    let Some(ua) = user_agent.map(str::trim).filter(|u| !u.is_empty()) else {
+        return "API client".into();
+    };
+    if ua.starts_with("Mozilla/") {
+        return "Browser".into();
+    }
+    let first = ua.split_whitespace().next().unwrap_or(ua);
+    let mut parts: Vec<&str> = first.split('/').collect();
+    if parts.len() > 1 && parts.last().is_some_and(|p| p.starts_with(|c: char| c.is_ascii_digit())) {
+        parts.pop();
+    }
+    let name = parts.join("/");
+    if name.chars().count() > 40 {
+        format!("{}…", name.chars().take(39).collect::<String>())
+    } else {
+        name
     }
 }
 
@@ -578,6 +621,15 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_clients_by_their_user_agent() {
+        assert_eq!(client_name(Some("OpenAI/Python 2.8.0")), "OpenAI/Python");
+        assert_eq!(client_name(Some("curl/8.9.1")), "curl");
+        assert_eq!(client_name(Some("Mozilla/5.0 (Windows NT 10.0)")), "Browser");
+        assert_eq!(client_name(Some("")), "API client");
+        assert_eq!(client_name(None), "API client");
+    }
 
     fn asked(text: &str) -> Result<Asked, String> {
         read(&json::parse(text).unwrap())

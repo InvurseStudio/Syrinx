@@ -8,7 +8,7 @@
 //! running the server by hand.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::json::{self, Value};
@@ -43,6 +43,27 @@ static LOCK: Mutex<()> = Mutex::new(());
 
 pub fn set_override(on: bool) {
     OVERRIDE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Serving on its own (`--standalone`): the key given on the command line (`--api-key`),
+/// kept as its SHA-256 as the saved keys are. Once set, every request needs it, or a saved
+/// key, or the app's token: the server may be listening on a network (`--host`).
+static COMMAND_LINE_KEY: OnceLock<String> = OnceLock::new();
+/// Serving on its own: the token of the app that started the server (`--token`, the Syrinx
+/// manager), as its SHA-256, which may use the API and read the statistics.
+static APP_TOKEN: OnceLock<String> = OnceLock::new();
+
+pub fn set_command_line_key(key: &str) {
+    let _ = COMMAND_LINE_KEY.set(sha256_hex(key.as_bytes()));
+}
+
+pub fn set_app_token(token: &str) {
+    let _ = APP_TOKEN.set(sha256_hex(token.as_bytes()));
+}
+
+/// Whether a key from the command line is needed (`--api-key`).
+pub fn command_line_key() -> bool {
+    COMMAND_LINE_KEY.get().is_some()
 }
 
 fn file() -> PathBuf {
@@ -210,6 +231,21 @@ pub fn revoke_key(id: &str) -> Result<bool, String> {
 /// A wrong key is refused only when a key is needed: OpenAI's client libraries insist on
 /// sending one, so callers on this computer often send a placeholder.
 pub fn authorize(settings: &Settings, bearer: Option<&str>) -> Result<Option<Key>, (u16, &'static str, String)> {
+    authorize_with(
+        settings,
+        bearer,
+        COMMAND_LINE_KEY.get().map(String::as_str),
+        APP_TOKEN.get().map(String::as_str),
+    )
+}
+
+/// [`authorize`], with the command line's key and the app's token (their hashes) given.
+fn authorize_with(
+    settings: &Settings,
+    bearer: Option<&str>,
+    command_line: Option<&str>,
+    app: Option<&str>,
+) -> Result<Option<Key>, (u16, &'static str, String)> {
     if !settings.enabled {
         return Err((
             403,
@@ -217,16 +253,22 @@ pub fn authorize(settings: &Settings, bearer: Option<&str>) -> Result<Option<Key
             "The OpenAI-compatible API is turned off. Turn it on in Vireo's settings, or start syrinx-server with --openai on.".into(),
         ));
     }
-    let key = bearer.and_then(|token| {
-        let hash = sha256_hex(token.as_bytes());
-        settings.keys.iter().find(|k| same(&k.key_hash, &hash)).cloned()
-    });
-    if key.is_none() && settings.require_key_locally {
+    let hash = bearer.map(|token| sha256_hex(token.as_bytes()));
+    // The command line's key and the app's token (`--standalone`).
+    if let Some(hash) = &hash
+        && [command_line, app].iter().flatten().any(|kept| same(kept, hash))
+    {
+        return Ok(None);
+    }
+    let key = hash.and_then(|hash| settings.keys.iter().find(|k| same(&k.key_hash, &hash)).cloned());
+    if key.is_none() && (settings.require_key_locally || command_line.is_some()) {
         return Err((
             401,
             "invalid_api_key",
             if bearer.is_some() {
                 "Incorrect API key provided.".into()
+            } else if command_line.is_some() {
+                "An API key is required: give this server's key as a bearer token (Authorization: Bearer <key>).".into()
             } else {
                 "An API key is required. Create one in Vireo's settings.".into()
             },
@@ -382,6 +424,23 @@ pub fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_line_key_is_needed_once_given_and_the_app_token_opens_too() {
+        let on = Settings { enabled: true, ..Settings::default() };
+        let cli = sha256_hex(b"sx-secret");
+        let app = sha256_hex(b"app-token");
+        let check = |bearer| authorize_with(&on, bearer, Some(&cli), Some(&app)).map(|k| k.is_none());
+        assert_eq!(check(Some("sx-secret")), Ok(true));
+        assert_eq!(check(Some("app-token")), Ok(true));
+        assert_eq!(check(Some("wrong")).unwrap_err().0, 401);
+        assert_eq!(check(None).unwrap_err().0, 401);
+        // Without one, this computer needs no key (as before).
+        assert!(authorize_with(&on, None, None, None).is_ok());
+        // Turned off is off, whatever the key.
+        let off = Settings::default();
+        assert_eq!(authorize_with(&off, Some("sx-secret"), Some(&cli), None).unwrap_err().0, 403);
+    }
 
     #[test]
     fn sha256_matches_the_standards_examples() {

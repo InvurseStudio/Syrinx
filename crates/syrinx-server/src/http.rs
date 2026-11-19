@@ -3,6 +3,24 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether replies let pages from other sites call this server (`--standalone`: its
+/// OpenAI-compatible API is for any client, ones in a browser too).
+static CROSS_ORIGIN: AtomicBool = AtomicBool::new(false);
+
+pub fn allow_cross_origin() {
+    CROSS_ORIGIN.store(true, Ordering::Relaxed);
+}
+
+/// The headers that let other sites' pages call, when they may.
+fn cross_origin() -> &'static str {
+    if CROSS_ORIGIN.load(Ordering::Relaxed) {
+        "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    } else {
+        ""
+    }
+}
 
 pub struct Request {
     pub method: String,
@@ -148,8 +166,9 @@ pub fn respond_with(stream: &mut TcpStream, status: u16, content_type: &str, bod
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\n{}Connection: close\r\n\r\n",
+        body.len(),
+        cross_origin()
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
@@ -159,7 +178,11 @@ pub fn respond_with(stream: &mut TcpStream, status: u16, content_type: &str, bod
 /// Starts a text/event-stream reply; then write events with [`event`].
 pub fn start_events(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{}Connection: close\r\n\r\n",
+            cross_origin()
+        )
+        .as_bytes(),
     )?;
     stream.flush()
 }

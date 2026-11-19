@@ -183,6 +183,53 @@ print(reply.choices[0].message.content)
 - **Access:** the server listens only on this computer, and needs no API key unless
   Vireo's settings ask for one.
 
+## Run it on its own
+
+`--standalone` runs Syrinx without Vireo: the OpenAI API (always on), a chat page for your
+browser, and a statistics dashboard, on port 8088. No pairing and no tools; its chats'
+caches are kept in Syrinx's own folder (`%LOCALAPPDATA%\Syrinx`, or
+`~/Library/Application Support/Syrinx` on the Mac), apart from Vireo's.
+
+```bash
+./target/release/syrinx-server --standalone path/to/model.gguf
+```
+
+On Windows, `serve.cmd path\to\model.gguf` builds it and starts it. Then:
+
+| Address | What it is |
+|---|---|
+| <http://127.0.0.1:8088/> | Chat in your browser, in Vireo's look |
+| `http://127.0.0.1:8088/v1` | The OpenAI API, as above |
+| <http://127.0.0.1:8088/stats> | Statistics: requests, speed, the prompt cache, and which apps are connected |
+| `http://127.0.0.1:8088/health` | Whether it's up, and which model on which GPU |
+
+It listens only on this computer unless you give `--host` (for example `0.0.0.0` for your
+network), and that needs an API key: `--api-key <key>` or `SYRINX_API_KEY`, which callers
+send as a bearer token.
+
+### The Windows app
+
+`windows/SyrinxManager` is a Windows app that runs the server for you, in Vireo's look:
+
+- **Server:** start and stop it, with the port, network access, API key, context length,
+  thinking and chat slots, and the server's output.
+- **Models:** Vireo's model manager. Suggested small models and a Hugging Face search that
+  shows only repositories whose architecture Syrinx runs (as Hugging Face read it from
+  their GGUF files), with resumable downloads checked against Hugging Face's SHA-256, and
+  each file on this PC checked against what the engine reads.
+- **Connect:** the base URL, key and model name other chat apps need, with examples.
+- **Statistics:** the dashboard above.
+
+Build the server first, then run the app:
+
+```bash
+cargo build --release -p syrinx-server
+dotnet run -c Release --project windows/SyrinxManager
+```
+
+It finds `syrinx-server.exe` beside itself or in this checkout's `target/release`, and
+keeps models in `%LOCALAPPDATA%\Syrinx\Models` and any folders you add.
+
 ## Status
 
 Syrinx is young and moving fast. It runs every chat in the Vireo-Proto apps for Mac and
