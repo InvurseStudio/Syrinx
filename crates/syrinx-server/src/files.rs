@@ -731,7 +731,7 @@ impl Files {
             && !is_absolute(expanded)
             && !expanded.starts_with(['/', '\\']);
         let full = standardized(&if is_absolute(expanded) {
-            expanded.to_string()
+            long_form(expanded)
         } else if cfg!(windows) && (expanded.starts_with('/') || expanded.starts_with('\\')) {
             // The root of the home folder's drive.
             format!("{}{expanded}", self.home.get(..2).unwrap_or(""))
@@ -1211,26 +1211,40 @@ impl Files {
     }
 }
 
-/// A folder as Windows spells it in full, its 8.3 short names (`RUNNER~1`) expanded, as
-/// Git and the file dialogs give paths: so a path Git reports is found within the home
-/// folder or a chosen one. Links and junctions are left as they are. Unchanged if it isn't
-/// there, and everywhere but Windows.
+/// A path as Windows spells it in full, its 8.3 short names (`RUNNER~1`) expanded, as Git
+/// and the file dialogs give paths: so a path Git reports is found within the home folder
+/// or a chosen one. The deepest part that exists is expanded and the rest kept (a file
+/// about to be written). Links and junctions are left as they are. Unchanged everywhere
+/// but Windows.
 #[cfg(windows)]
 fn long_form(path: &str) -> String {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetLongPathNameW(short: *const u16, long: *mut u16, len: u32) -> u32;
     }
+    let long = |p: &str| -> Option<String> {
+        let wide: Vec<u16> = p.encode_utf16().chain([0]).collect();
+        let mut buffer = vec![0u16; 1024];
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        (n > 0 && n < buffer.len()).then(|| String::from_utf16_lossy(&buffer[..n]))
+    };
     if !path.contains('~') {
         return path.to_string();
     }
-    let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
-    let mut buffer = vec![0u16; 1024];
-    let n = unsafe { GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if n == 0 || n >= buffer.len() {
-        return path.to_string();
+    let mut head = path;
+    let mut tail = String::new();
+    loop {
+        if let Some(full) = long(head) {
+            return full + &tail;
+        }
+        match head.rfind(['\\', '/']) {
+            Some(i) if i > 0 => {
+                tail = format!("{}{tail}", &head[i..]);
+                head = &head[..i];
+            }
+            _ => return path.to_string(),
+        }
     }
-    String::from_utf16_lossy(&buffer[..n])
 }
 
 #[cfg(not(windows))]
@@ -2353,7 +2367,10 @@ mod windows_tests {
     }
 
     fn home() -> Home {
-        let base = std::env::temp_dir().join(format!("FileTools-{:016x}", crate::random_u64()));
+        // The temporary folder in long form, as the tools spell the home folder (a CI
+        // runner's is C:\Users\RUNNER~1\...).
+        let temp = long_form(&std::env::temp_dir().to_string_lossy());
+        let base = std::path::Path::new(&temp).join(format!("FileTools-{:016x}", crate::random_u64()));
         let home = Home(standardized(&base.to_string_lossy()));
         for (file, text) in [
             (r"Documents\notes.txt", "The code word for Friday is PELICAN."),
