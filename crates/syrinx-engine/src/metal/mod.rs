@@ -127,9 +127,10 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         n if n.starts_with("moe_matvec") || n.starts_with("moe_matmul") => &[2],
         "moe_group" => &[1, 2, 7],
         "moe_geglu" | "moe_sum" => &[0],
-        "moe_gather_half" => &[1],
+        "moe_gather_half" | "moe_geglu_half" => &[1],
         "residual_norm" => &[0, 5],
         "qkv_prep" => &[4, 9, 10, 23],
+        "dequant_kv_q8_to_half" => &[1],
         n if n.starts_with("attention_part") => &[3],
         n if n.starts_with("attention_decode") => &[3, 10, 11],
         "attention_tcg_merge" => &[1],
@@ -137,6 +138,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "attention_combine" => &[1],
         n if n.starts_with("attention") => &[3],
         "swiglu" | "geglu" | "add" | "softcap" | "apply_gate" => &[0],
+        "swiglu_half" | "geglu_half" => &[2],
         "conv_silu" => &[1, 3],
         "conv_silu_parallel" => &[3],
         "conv_history" => &[1],
@@ -147,6 +149,8 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "delta_chunk_prep" => &[7],
         n if n.starts_with("delta_chunk_scan") => &[1, 2],
         "copy_bytes" => &[0],
+        "argmax_part" => &[1, 2],
+        "argmax_final" => &[2],
         "to_half" | "q_group_half" => &[1],
         _ => return None,
     })
@@ -326,22 +330,29 @@ impl Context {
         self.encoder(state)?;
         // A barrier first when it touches what the dispatches since the last one wrote, or
         // writes what they read.
-        let hazard = state.blocked
-            || match &d.access {
-                None => !state.pending.is_empty(),
-                Some(access) => access
-                    .iter()
-                    .any(|&(b, w)| state.pending.iter().any(|&(pb, pw)| pb == b && (w || pw))),
-            };
+        let hazard = hazard(&state.pending, state.blocked, d.access.as_deref());
+        self.submit_dispatch(state, d, hazard)?;
+        match &d.access {
+            Some(access) => state.pending.extend_from_slice(access),
+            None => state.blocked = true,
+        }
+        Ok(())
+    }
+
+    /// Encodes `d` with a precomputed barrier flag (used by [`Graph::launch`] to skip
+    /// per-dispatch hazard scanning on replay).
+    fn encode_precomputed(&self, state: &mut State, d: &Dispatch, barrier: bool) -> Result<()> {
+        self.encoder(state)?;
+        let open_count = state.open.as_ref().unwrap().count;
+        self.submit_dispatch(state, d, barrier && open_count > 0)
+    }
+
+    fn submit_dispatch(&self, state: &mut State, d: &Dispatch, hazard: bool) -> Result<()> {
         let encoder = &state.open.as_ref().unwrap().encoder;
         if hazard {
             encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
             state.pending.clear();
             state.blocked = false;
-        }
-        match &d.access {
-            Some(access) => state.pending.extend_from_slice(access),
-            None => state.blocked = true,
         }
         encoder.setComputePipelineState(&d.pipeline);
         unsafe {
@@ -660,6 +671,26 @@ fn as_bytes<T: Copy>(data: &[T]) -> &[u8] {
 pub struct Graph {
     context: Arc<Context>,
     dispatches: Vec<Dispatch>,
+    /// Precomputed per-dispatch barrier flags within the graph, so `launch` skips the
+    /// `state.pending` hazard scan on every replay.
+    barriers: Vec<bool>,
+    /// What the dispatches after the graph's last barrier read and wrote, and whether one
+    /// of them is unknown: the encoder's state once the graph is queued.
+    tail: Vec<(u64, bool)>,
+    tail_blocked: bool,
+}
+
+/// Whether a dispatch that reads and writes `access` (None: unknown) needs a barrier
+/// first: it touches what the dispatches since the last one (`pending`; `blocked` when one
+/// of them is unknown) wrote, or writes what they read.
+fn hazard(pending: &[(u64, bool)], blocked: bool, access: Option<&[(u64, bool)]>) -> bool {
+    blocked
+        || match access {
+            None => !pending.is_empty(),
+            Some(access) => access
+                .iter()
+                .any(|&(b, w)| pending.iter().any(|&(pb, pw)| pb == b && (w || pw))),
+        }
 }
 
 unsafe impl Send for Graph {}
@@ -673,10 +704,23 @@ impl Graph {
             state.recording.is_none(),
             "launching a graph while recording"
         );
-        for d in &self.dispatches {
-            self.context.encode(&mut state, d)?;
+        if self.dispatches.is_empty() {
+            return Ok(());
+        }
+        // First dispatch checks against any prior work already in the open encoder.
+        let first_barrier = state.blocked || !state.pending.is_empty();
+        self.context
+            .encode_precomputed(&mut state, &self.dispatches[0], first_barrier)?;
+        self.context.profile_step(&mut state, &self.dispatches[0])?;
+        for (d, &barrier) in self.dispatches[1..].iter().zip(&self.barriers[1..]) {
+            self.context.encode_precomputed(&mut state, d, barrier)?;
             self.context.profile_step(&mut state, d)?;
         }
+        // As after queuing them one by one. (A barrier skipped along the way, the encoder
+        // being new, leaves this more than is pending: a barrier too many at worst.)
+        state.pending.clear();
+        state.pending.extend_from_slice(&self.tail);
+        state.blocked = self.tail_blocked;
         Ok(())
     }
 }
@@ -717,6 +761,7 @@ struct Kernels {
     moe_matvec_q8_0: Pso,
     moe_matvec_q6_k: Pso,
     moe_geglu: Pso,
+    moe_geglu_half: Pso,
     moe_sum: Pso,
     /// A batch's slots put in order of their expert, and the product a tile of them.
     moe_group: Pso,
@@ -726,6 +771,7 @@ struct Kernels {
     moe_matmul_tc: Option<[Pso; 7]>,
     residual_norm: Pso,
     qkv_prep: Pso,
+    dequant_kv_q8_to_half: Pso,
     sigmoid_mul: Pso,
     attention: Pso,
     attention_h: Pso,
@@ -736,12 +782,12 @@ struct Kernels {
     /// kernel takes more, see syrinx.metal).
     attention_decode: [[[Option<Pso>; 4]; 4]; 2],
     /// The same for heads of 128, 256 and 512 with a SIMD group a position (lanes across
-    /// the head), over f32 and f16 caches.
-    attention_decode_wide: [[Pso; 3]; 2],
+    /// the head), over f32, f16, and q8 caches.
+    attention_decode_wide: [[Pso; 3]; 3],
     /// The same with each key and value row read once for all the query heads that share
-    /// it, over f32 and f16 caches, for heads of 256 and 512, by how many heads a SIMD
+    /// it, over f32, f16, and q8 caches, for heads of 256 and 512, by how many heads a SIMD
     /// group holds (index = that number; see [`GROUP_HEADS`]).
-    attention_decode_group: [[[Option<Pso>; 5]; 2]; 2],
+    attention_decode_group: [[[Option<Pso>; 5]; 2]; 3],
     /// For head sizes 64, 128, 256 and 512, over f32 and f16 caches.
     attention_tiled: [Pso; 4],
     attention_tiled_h: [Pso; 4],
@@ -757,6 +803,8 @@ struct Kernels {
     attention_tcg: Option<([Pso; 3], Pso, Pso)>,
     swiglu: Pso,
     geglu: Pso,
+    swiglu_half: Pso,
+    geglu_half: Pso,
     add: Pso,
     softcap: Pso,
     apply_gate: Pso,
@@ -775,6 +823,10 @@ struct Kernels {
     delta_chunk_scan: Pso,
     /// delta_chunk_scan on SIMD-group matrices, 8 columns a threadgroup.
     delta_chunk_scan_sg: [Pso; 1],
+    /// delta_chunk_scan on Metal 4 neural accelerators, 16 columns a threadgroup (n = 128).
+    delta_chunk_scan_tc: Option<Pso>,
+    argmax_part: Pso,
+    argmax_final: Pso,
 }
 
 /// The weight types with kernels, in the order of `Kernels::matvec` and `matmul`.
@@ -820,6 +872,14 @@ pub struct Gpu {
     /// The queries the last [`Gpu::qkv_prep`] also wrote there, until an attention call
     /// takes them: (q, tokens, heads, head size, group).
     qh_ready: Mutex<Option<ReadyQueries>>,
+    /// Scratch buffers for GPU-side [`Gpu::argmax`] (up to 256 partials + 4-byte result).
+    argmax_vals: Buffer,
+    argmax_idxs: Buffer,
+    argmax_out: Buffer,
+    /// Reusable f16 KV dequantization scratch buffers for multi-token prompt attention
+    /// when `VIREO_KV_Q8=1` stores KV caches in Q8_0.
+    kv_half_k: Mutex<Option<Buffer>>,
+    kv_half_v: Mutex<Option<Buffer>>,
     pub info: DeviceInfo,
 }
 
@@ -1093,6 +1153,7 @@ impl Gpu {
             moe_matvec_q8_0: pipeline("moe_matvec_q8_0")?,
             moe_matvec_q6_k: pipeline("moe_matvec_q6_k")?,
             moe_geglu: pipeline("moe_geglu")?,
+            moe_geglu_half: pipeline("moe_geglu_half")?,
             moe_sum: pipeline("moe_sum")?,
             moe_group: pipeline("moe_group")?,
             moe_matmul: per_kind("moe_matmul")?,
@@ -1104,6 +1165,7 @@ impl Gpu {
             },
             residual_norm: pipeline("residual_norm")?,
             qkv_prep: pipeline("qkv_prep")?,
+            dequant_kv_q8_to_half: pipeline("dequant_kv_q8_to_half")?,
             sigmoid_mul: pipeline("sigmoid_mul")?,
             attention: pipeline("attention")?,
             attention_h: pipeline("attention_h")?,
@@ -1123,6 +1185,11 @@ impl Gpu {
                     pipeline("attention_decode_wide_f16_256")?,
                     pipeline("attention_decode_wide_f16_512")?,
                 ],
+                [
+                    pipeline("attention_decode_wide_q8_128")?,
+                    pipeline("attention_decode_wide_q8_256")?,
+                    pipeline("attention_decode_wide_q8_512")?,
+                ],
             ],
             attention_decode: {
                 let mut v: [[[Option<Pso>; 4]; 4]; 2] = Default::default();
@@ -1139,8 +1206,8 @@ impl Gpu {
                 v
             },
             attention_decode_group: {
-                let mut v: [[[Option<Pso>; 5]; 2]; 2] = Default::default();
-                for (c, cache) in ["f32", "f16"].iter().enumerate() {
+                let mut v: [[[Option<Pso>; 5]; 2]; 3] = Default::default();
+                for (c, cache) in ["f32", "f16", "q8"].iter().enumerate() {
                     for (i, (d, hs)) in GROUP_HEADS.iter().enumerate() {
                         for &h in *hs {
                             v[c][i][h] = Some(pipeline(&format!(
@@ -1200,6 +1267,8 @@ impl Gpu {
             ],
             swiglu: pipeline("swiglu")?,
             geglu: pipeline("geglu")?,
+            swiglu_half: pipeline("swiglu_half")?,
+            geglu_half: pipeline("geglu_half")?,
             add: pipeline("add")?,
             softcap: pipeline("softcap")?,
             apply_gate: pipeline("apply_gate")?,
@@ -1215,6 +1284,13 @@ impl Gpu {
             delta_chunk_prep: pipeline("delta_chunk_prep")?,
             delta_chunk_scan: pipeline("delta_chunk_scan")?,
             delta_chunk_scan_sg: [pipeline("delta_chunk_scan_sg_8")?],
+            delta_chunk_scan_tc: if tensor_ops {
+                Some(pipeline("delta_chunk_scan_tc_32")?)
+            } else {
+                None
+            },
+            argmax_part: pipeline("argmax_part")?,
+            argmax_final: pipeline("argmax_final")?,
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
@@ -1282,6 +1358,9 @@ impl Gpu {
         let attention_counters = Self::alloc_in(&context, 64 * 8 * 4)?;
         attention_counters.write_bytes_at(0, &[0u8; 64 * 8 * 4])?;
         let matmul_parts = Self::alloc_in(&context, MATMUL_PARTS_BYTES)?;
+        let argmax_vals = Self::alloc_in(&context, 256 * 4)?;
+        let argmax_idxs = Self::alloc_in(&context, 256 * 4)?;
+        let argmax_out = Self::alloc_in(&context, 4)?;
         Ok(Self {
             context,
             kernels,
@@ -1292,6 +1371,11 @@ impl Gpu {
             attention_tcg_parts: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
             qh_ready: Mutex::new(None),
+            argmax_vals,
+            argmax_idxs,
+            argmax_out,
+            kv_half_k: Mutex::new(None),
+            kv_half_v: Mutex::new(None),
             info,
         })
     }
@@ -1394,6 +1478,40 @@ impl Gpu {
             .dispatch(copy_dispatch(&self.context.copy, to, from, bytes))
     }
 
+    /// Index of the largest f32 in `x[0..n]` (smallest index on ties), computed on the
+    /// GPU so callers read back 4 bytes instead of the full vocabulary's logits.
+    pub fn argmax(&self, x: CuDevicePtr, n: usize) -> Result<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let blocks = n.div_ceil(1024).clamp(1, 256) as u32;
+        self.run(
+            &self.kernels.argmax_part,
+            (blocks, 1),
+            256,
+            &[
+                Arg::Ptr(x),
+                Arg::Ptr(self.argmax_vals.ptr()),
+                Arg::Ptr(self.argmax_idxs.ptr()),
+                Arg::I32(n as i32),
+            ],
+        )?;
+        self.run(
+            &self.kernels.argmax_final,
+            (1, 1),
+            256,
+            &[
+                Arg::Ptr(self.argmax_vals.ptr()),
+                Arg::Ptr(self.argmax_idxs.ptr()),
+                Arg::Ptr(self.argmax_out.ptr()),
+                Arg::I32(blocks as i32),
+            ],
+        )?;
+        let mut bytes = [0u8; 4];
+        self.argmax_out.read_bytes_at(0, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
     /// Has the buffers made so far (a model's weights, just uploaded) made resident now.
     /// Left to itself Metal does it when the first work is queued: the first prompt after
     /// a load then waited on it (135 ms for Gemma 4 26B-A4B's 23 GB on the M5 Max).
@@ -1423,9 +1541,27 @@ impl Gpu {
     /// The dispatches since [`Gpu::start_recording`], as a [`Graph`].
     pub fn finish_recording(&self) -> Result<Graph> {
         let dispatches = self.context.lock().recording.take().unwrap_or_default();
+        let mut barriers = Vec::with_capacity(dispatches.len());
+        let mut pending: Vec<(u64, bool)> = Vec::new();
+        let mut blocked = false;
+        for d in &dispatches {
+            let hazard = hazard(&pending, blocked, d.access.as_deref());
+            barriers.push(hazard);
+            if hazard {
+                pending.clear();
+                blocked = false;
+            }
+            match &d.access {
+                Some(access) => pending.extend_from_slice(access),
+                None => blocked = true,
+            }
+        }
         Ok(Graph {
             context: Arc::clone(&self.context),
             dispatches,
+            barriers,
+            tail: pending,
+            tail_blocked: blocked,
         })
     }
 
@@ -1963,6 +2099,28 @@ impl Gpu {
         )
     }
 
+    /// Fused `moe_geglu` + f32->f16 conversion directly into `out` for sorted MoE slots.
+    pub fn moe_geglu_half(
+        &self,
+        gate_up: CuDevicePtr,
+        out: CuDevicePtr,
+        width: usize,
+        slots: usize,
+    ) -> Result<()> {
+        debug_assert!(width.is_multiple_of(4));
+        let total4 = slots * (width / 4);
+        self.run_per_number(
+            &self.kernels.moe_geglu_half,
+            total4,
+            &[
+                Arg::Ptr(gate_up),
+                Arg::Ptr(out),
+                Arg::I32(width as i32),
+                Arg::I32(total4 as i32),
+            ],
+        )
+    }
+
     /// `out` = each token's slots' `n` numbers, added up with their shares: `parts` in
     /// slot order, or with `place` in `moe_group`'s order (each slot's at its place).
     #[allow(clippy::too_many_arguments)]
@@ -2058,6 +2216,11 @@ impl Gpu {
         };
         *self.qh_ready.lock().unwrap_or_else(|e| e.into_inner()) =
             ready.map(|_| (p.q_out, tokens, p.heads, p.head_dim, group));
+        let cache_mode = if Self::kv_q8(p.half_cache, p.head_dim) {
+            2i32
+        } else {
+            p.half_cache as i32
+        };
         let args = [
             Arg::Ptr(p.q),
             Arg::I32(p.q_stride as i32),
@@ -2079,7 +2242,7 @@ impl Gpu {
             Arg::I32(p.neox as i32),
             Arg::Ptr(p.pos),
             Arg::F32(p.eps),
-            Arg::I32(p.half_cache as i32),
+            Arg::I32(cache_mode),
             Arg::I32(tokens as i32),
             Arg::I32(p.ring as i32),
             Arg::Ptr(q_half),
@@ -2176,6 +2339,33 @@ impl Gpu {
         )
     }
 
+    /// Whether `VIREO_KV_Q8=1` is set: stores KV caches (for head_dim >= 128 in Int8 mode)
+    /// as Q8_0 (17/16 bytes per element, 1.88× smaller than f16).
+    pub fn kv_q8_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("VIREO_KV_Q8")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+        })
+    }
+
+    /// Whether a cache of heads of `head_dim` is kept in Q8_0: asked for, in 8-bit mode,
+    /// and the heads whole blocks of 32 (the layout and the kernels have no part blocks).
+    fn kv_q8(half_cache: bool, head_dim: usize) -> bool {
+        half_cache && Self::kv_q8_enabled() && head_dim >= 128 && head_dim.is_multiple_of(32)
+    }
+
+    /// Bytes per head-position for a KV cache of head dimension `head_dim`.
+    pub fn kv_head_bytes(half_cache: bool, head_dim: usize) -> usize {
+        if Self::kv_q8(half_cache, head_dim) {
+            head_dim * 17 / 16
+        } else if half_cache {
+            head_dim * 2
+        } else {
+            head_dim * 4
+        }
+    }
+
     /// [`Gpu::attention`] over a cache that keeps a sliding-window layer's last `ring`
     /// positions only, position p at row p mod `ring` (0: every position, at its own row).
     /// The ring holds the window and a batch's new positions, and is a multiple of 64 (the
@@ -2212,6 +2402,45 @@ impl Gpu {
             ring == 0 || ring >= window + tokens,
             "a ring of {ring} for {tokens} tokens"
         );
+        let use_q8 = Self::kv_q8(half_cache, head_dim);
+        let cache_idx = if use_q8 { 2 } else { usize::from(half_cache) };
+        let wide = match head_dim {
+            64 => Some(0),
+            128 => Some(1),
+            256 => Some(2),
+            512 => Some(3),
+            _ => None,
+        };
+        // For multi-token prompt attention on a Q8_0 cache, dequantize this layer's K and V
+        // into reusable f16 scratch buffers so attention_tcg / attention_tc run at full speed.
+        let (keys, values) = if use_q8 && !(tokens <= 8 && heads <= 64 && wide.is_some()) {
+            let kv_heads = kv_dim / head_dim;
+            let q8_row_bytes = kv_heads * (head_dim * 17 / 16);
+            let max_rows = (self.context.bytes_from(keys) as usize / q8_row_bytes)
+                .max(ring)
+                .max(tokens);
+            let half_bytes = max_rows * kv_dim * 2;
+            let hk = self.grown(&self.kv_half_k, half_bytes)?;
+            let hv = self.grown(&self.kv_half_v, half_bytes)?;
+            let stride_blocks = (max_rows as u32).min(256).max(1);
+            let grid = (kv_heads as u32, stride_blocks);
+            for (src, dst) in [(keys, hk), (values, hv)] {
+                let d_args = [
+                    Arg::Ptr(src),
+                    Arg::Ptr(dst),
+                    Arg::Ptr(pos),
+                    Arg::I32(tokens as i32),
+                    Arg::I32(ring as i32),
+                    Arg::I32(kv_heads as i32),
+                    Arg::I32(head_dim as i32),
+                    Arg::I32(window as i32),
+                ];
+                self.run(&self.kernels.dequant_kv_q8_to_half, grid, 256, &d_args)?;
+            }
+            (hk, hv)
+        } else {
+            (keys, values)
+        };
         let args = [
             Arg::Ptr(q),
             Arg::Ptr(keys),
@@ -2224,18 +2453,11 @@ impl Gpu {
             Arg::I32(group as i32),
             Arg::F32(scale),
         ];
-        let wide = match head_dim {
-            64 => Some(0),
-            128 => Some(1),
-            256 => Some(2),
-            512 => Some(3),
-            _ => None,
-        };
         // Up to 8 tokens (a draft's guesses, a short batch) the same way, a token a grid
         // layer: the prompt kernels' tiles cost several times as much for a few (Gemma 4
         // E2B, 2 tokens at 500: ~71 µs a layer against ~13 for one).
         if let (1..=8, true, Some(i)) = (tokens, heads <= 64, wide) {
-            if tcg_few() && Self::grouped_few(tokens, heads, head_dim, group, window) {
+            if !use_q8 && tcg_few() && Self::grouped_few(tokens, heads, head_dim, group, window) {
                 let mut tc_args = args.to_vec();
                 tc_args.push(Arg::I32(tokens as i32));
                 if self.attention_grouped(
@@ -2245,19 +2467,7 @@ impl Gpu {
                     return Ok(());
                 }
             }
-            // One token, in one dispatch: the query heads sharing a key/value head together
-            // (so each key and value is read once for them), the context in parts so
-            // every GPU core has work, the parts merged by the last to finish.
-            // One query head a threadgroup: taking a key/value head's whole group at once (2,
-            // 4 or 8 heads, each key and value read once for them) was slower on the M5 Max
-            // at every split tried, the repeated reads coming from the cache. Narrow heads
-            // want more parts (Llama's 64: 340 tokens/s generating at 2,500 tokens with
-            // twice as many, against 315); 256- and 512-wide heads fewer.
-            // Full attention over wide heads that share a key/value head: each key and value
-            // row read once for the group (see attention_decode_group), three threadgroups
-            // a GPU core (the quickest of 2, 3, 4 and 6 on the M5 Max for Qwen 3.8 27B and
-            // Gemma 4 31B's global layers).
-            if let Some(kernel) = self.group_kernel(half_cache, head_dim, group, heads, window) {
+            if let Some(kernel) = self.group_kernel(cache_idx, head_dim, group, heads, window) {
                 let kv_heads = (heads / group) as u32;
                 let cores = self.info.multiprocessors.max(1) as u32;
                 let parts = (3 * cores)
@@ -2284,7 +2494,7 @@ impl Gpu {
             // Heads of 128 or more: a SIMD group a position (Gemma 4 generating 5–6% faster
             // than with a lane a position on the M5 Max).
             let kernel = if i >= 1 {
-                &self.kernels.attention_decode_wide[usize::from(half_cache)][i - 1]
+                &self.kernels.attention_decode_wide[cache_idx][i - 1]
             } else {
                 self.kernels.attention_decode[usize::from(half_cache)][i][j]
                     .as_ref()
@@ -2522,7 +2732,7 @@ impl Gpu {
     /// GPU's caches anyway).
     fn group_kernel(
         &self,
-        half_cache: bool,
+        cache_idx: usize,
         head_dim: usize,
         group: usize,
         heads: usize,
@@ -2538,7 +2748,7 @@ impl Gpu {
                 && slices <= 8
                 && (group + 8 / slices) * head_dim <= GROUP_SCRATCH
         })?;
-        self.kernels.attention_decode_group[usize::from(half_cache)][i][h].as_ref()
+        self.kernels.attention_decode_group[cache_idx][i][h].as_ref()
     }
 
     /// `gate = SiLU(gate) × up` over `tokens` rows of `n`; up's rows are `up_stride` apart.
@@ -2725,7 +2935,12 @@ impl Gpu {
                 Arg::I32(n as i32),
                 Arg::I32(tokens as i32),
             ];
-            if n.is_multiple_of(8) {
+            if let Some(tc) = &self.kernels.delta_chunk_scan_tc
+                && n == 128
+            {
+                let grid = (d.v_heads as u32, (n / 32) as u32);
+                self.run(tc, grid, 128, &scan)?;
+            } else if n.is_multiple_of(8) {
                 // On SIMD-group matrices, 8 columns of the state a threadgroup: on the M5
                 // Max, Qwen 3.5 read prompts 15% faster than with delta_chunk_scan (16
                 // columns a threadgroup was 1% faster than that, 32 slower).
@@ -2888,6 +3103,53 @@ impl Gpu {
         Ok(())
     }
 
+    /// Fused `act(gate) × up` directly into `q8`'s f16 buffer for `matmul_tc`, leaving
+    /// `gate` untouched and skipping both the f32 store and `to_half`. Returns `true` when
+    /// it ran (a prompt batch using f16 tensor products), `false` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_quantize(
+        &self,
+        gate: CuDevicePtr,
+        up: CuDevicePtr,
+        cols: usize,
+        q8: &Q8,
+        tokens: usize,
+        gelu: bool,
+    ) -> Result<bool> {
+        let Some(half) = &q8.half else {
+            return Ok(false);
+        };
+        if tokens <= 1 || !cols.is_multiple_of(32) || self.kernels.matmul_tc.is_none() {
+            return Ok(false);
+        }
+        let n = tokens * cols;
+        assert!(n * 2 <= half.len_bytes(), "the f16 buffer is too small");
+        let n4 = n / 4;
+        let kernel = if gelu {
+            &self.kernels.geglu_half
+        } else {
+            &self.kernels.swiglu_half
+        };
+        let args = [
+            Arg::Ptr(gate),
+            Arg::Ptr(up),
+            Arg::Ptr(half.ptr()),
+            Arg::I32(n4 as i32),
+        ];
+        self.run(kernel, ((n4 as u32).div_ceil(256), 1), 256, &args)?;
+        // No f32 copy of the activations exists (`gate` still holds the gate's product):
+        // 0 has matmul_8bit stop rather than read one.
+        q8.x.store(0, Ordering::Relaxed);
+        q8.half_ready.store(true, Ordering::Relaxed);
+        q8.i8_ready.store(false, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// What [`Gpu::matmul_8bit`] says when asked for a product that reads the f32
+    /// activations after [`Gpu::gated_quantize`], which leaves only the f16 copy.
+    const NO_F32: &'static str =
+        "a product that reads f32 activations after gated_quantize, which made only f16";
+
     /// `y = W x` for each of `tokens` rows of the activations [`Gpu::quantize`] noted: a
     /// prompt on the neural accelerators, one token as in exact mode.
     #[allow(clippy::too_many_arguments)]
@@ -2908,6 +3170,7 @@ impl Gpu {
         {
             let n = tokens * cols;
             if !q8.i8_ready.swap(true, Ordering::Relaxed) {
+                assert!(x != 0, "{}", Self::NO_F32);
                 assert!(n <= bytes.len_bytes(), "the 8-bit buffer is too small");
                 let args = [Arg::Ptr(x), Arg::Ptr(bytes.ptr()), Arg::Ptr(scales.ptr())];
                 self.run(to_i8, ((n / I8_K) as u32, 1), I8_K as u32, &args)?;
@@ -2930,11 +3193,15 @@ impl Gpu {
         }
         let (kernels, half) = match (&self.kernels.matmul_tc, &q8.half) {
             (Some((k, _)), Some(half)) if tokens > 1 && cols.is_multiple_of(32) => (k, half),
-            _ => return self.matmul(kind, w, x, y, rows, cols, tokens),
+            _ => {
+                assert!(x != 0, "{}", Self::NO_F32);
+                return self.matmul(kind, w, x, y, rows, cols, tokens);
+            }
         };
         if !q8.half_ready.swap(true, Ordering::Relaxed)
             && let Some((_, to_half)) = &self.kernels.matmul_tc
         {
+            assert!(x != 0, "{}", Self::NO_F32);
             let n = tokens * cols;
             assert!(n * 2 <= half.len_bytes(), "the f16 buffer is too small");
             let args = [Arg::Ptr(x), Arg::Ptr(half.ptr()), Arg::I32(n as i32)];

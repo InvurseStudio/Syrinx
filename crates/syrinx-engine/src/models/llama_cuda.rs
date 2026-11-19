@@ -206,18 +206,21 @@ impl<'a> LlamaCuda<'a> {
         let batch = batch.clamp(1, capacity.max(1));
         let kv_dim = c.kv_heads * c.head_dim;
         let f32s = |n: usize| self.gpu.alloc(n * 4).map_err(gpu_error);
-        // Keys and values: f16 in 8-bit mode (half the memory), f32 when exact.
-        let cache_bytes = if self.precision == Precision::Int8 {
-            2
-        } else {
-            4
+        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1 on macOS) in 8-bit mode, f32 when exact.
+        #[cfg(target_os = "macos")]
+        let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, c.head_dim);
+        #[cfg(not(target_os = "macos"))]
+        let head_bytes = c.head_dim * if self.precision == Precision::Int8 { 2 } else { 4 };
+        let cache = |rows: usize| {
+            self.gpu
+                .alloc(rows * c.kv_heads * head_bytes)
+                .map_err(gpu_error)
         };
-        let cache = |n: usize| self.gpu.alloc(n * cache_bytes).map_err(gpu_error);
         let mut keys = Vec::with_capacity(c.layers);
         let mut values = Vec::with_capacity(c.layers);
         for _ in 0..c.layers {
-            keys.push(cache(capacity * kv_dim)?);
-            values.push(cache(capacity * kv_dim)?);
+            keys.push(cache(capacity)?);
+            values.push(cache(capacity)?);
         }
         Ok(CudaSession {
             keys,
@@ -424,6 +427,27 @@ impl<'a> LlamaCuda<'a> {
         token: u32,
         want_logits: bool,
     ) -> Result<Option<&'s [f32]>> {
+        self.step(s, token)?;
+        if !want_logits {
+            return Ok(None);
+        }
+        self.queue_logits(s)?;
+        s.logits.resize(self.config.vocab, 0.0);
+        s.logits_gpu.read_row(0, &mut s.logits)?;
+        Ok(Some(&s.logits))
+    }
+
+    /// As [`Self::forward`], for the likeliest next token alone: on the Mac it is found on
+    /// the GPU, and the vocabulary's logits aren't read back.
+    pub fn forward_greedy(&self, s: &mut CudaSession, token: u32) -> Result<u32> {
+        self.step(s, token)?;
+        self.queue_logits(s)?;
+        s.logits_gpu
+            .likeliest(&self.gpu, self.config.vocab, &mut s.logits)
+    }
+
+    /// `token` through the recorded layers, at the session's next position.
+    fn step(&self, s: &mut CudaSession, token: u32) -> Result<()> {
         let c = &self.config;
         assert!(
             s.len < s.capacity,
@@ -445,17 +469,16 @@ impl<'a> LlamaCuda<'a> {
         }
         s.graph.as_ref().unwrap().launch().map_err(e)?;
         s.len += 1;
-        if !want_logits {
-            return Ok(None);
-        }
-        let logits = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;
+        Ok(())
+    }
+
+    /// The last token's logits, left on the GPU.
+    fn queue_logits(&self, s: &mut CudaSession) -> Result<()> {
+        let logits = s.logits_gpu.rows(&self.gpu, 1, self.config.vocab)?;
         self.output.mul(
             &Input::new(&self.gpu, s.h.ptr(), 1, s.q8.as_ref()),
             logits.ptr(),
-        )?;
-        s.logits.resize(c.vocab, 0.0);
-        logits.read_f32(&mut s.logits).map_err(e)?;
-        Ok(Some(&s.logits))
+        )
     }
 
     /// As [`Self::forward_batch`] for every token's logits, but they stay on the GPU:

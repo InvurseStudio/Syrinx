@@ -326,6 +326,21 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn forward_greedy(&self, state: &mut State, token: u32) -> u32 {
+        match (self, &mut *state) {
+            (Engine::Qwen35Gpu(m), State::Qwen35Gpu(s)) => m
+                .forward_greedy(s, token)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
+            (Engine::Gemma4Gpu(m), State::Gemma4Gpu(s)) => m
+                .forward_greedy(s, token)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
+            (Engine::Gpu(m), State::Gpu(s)) => m
+                .forward_greedy(s, token)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
+            _ => argmax(self.forward(state, token, true).expect("asked for logits")),
+        }
+    }
+
     /// Runs `tokens` in order: in batches on the GPU, one by one on the CPU. Hands back
     /// the logits asked for (the last token's, or a row of the vocabulary per token).
     fn forward_batch(&self, state: &mut State, tokens: &[u32], logits: Logits) -> Option<Vec<f32>> {
@@ -454,7 +469,7 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
 
     // The prompt: only the last token's logits are needed.
     let started = Instant::now();
-    let mut logits = model
+    let logits = model
         .forward_batch(&mut session, &ids, Logits::Last)
         .expect("asked for logits");
     let prompt_time = started.elapsed();
@@ -476,8 +491,8 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
     let mut pending = Vec::new();
     let mut generated = Vec::new();
     let mut out = std::io::stdout().lock();
+    let mut next = argmax(&logits);
     for _ in 0..options.tokens {
-        let next = argmax(&logits);
         generated.push(next);
         if tokenizer.is_end_of_generation(next) {
             break;
@@ -494,11 +509,7 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
         if session.len() == session.capacity() {
             break;
         }
-        logits.copy_from_slice(
-            model
-                .forward(&mut session, next, true)
-                .expect("asked for logits"),
-        );
+        next = model.forward_greedy(&mut session, next);
     }
     let _ = out.write_all(String::from_utf8_lossy(&pending).as_bytes());
     let _ = writeln!(out);

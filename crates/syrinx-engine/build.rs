@@ -35,7 +35,7 @@ fn main() {
     // capability 8.0 on (RTX 30 series and later) with the tensor-core kernels too.
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for (target, name) in [
-        (PTX_TARGET, "vireo.ptx"),
+        (PTX_TARGET, "syrinx.ptx"),
         (PTX_TARGET_MMA, "syrinx_sm80.ptx"),
     ] {
         let mut command = Command::new(&nvcc);

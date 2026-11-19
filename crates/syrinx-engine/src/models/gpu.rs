@@ -159,9 +159,10 @@ impl GpuMatrix {
 impl GpuMatrix {
     /// `y = W (act(gate) × up)` over `tokens` rows of this matrix's columns: a
     /// feed-forward's last product, with its activation (SiLU, or tanh-GELU with `gelu`).
-    /// With 8-bit activations on CUDA the activation and the rounding are one pass
-    /// (`Gpu::gated_quantize`) and `gate` is left as it was; otherwise `gate` holds the
-    /// activation's result, as after `swiglu` or `geglu`.
+    /// With 8-bit activations on CUDA, and for a prompt batch on the Mac's neural
+    /// accelerators, the activation and the rounding are one pass (`Gpu::gated_quantize`)
+    /// and `gate` is left as it was; otherwise `gate` holds the activation's result, as
+    /// after `swiglu` or `geglu`.
     #[allow(clippy::too_many_arguments)]
     pub fn mul_gated(
         &self,
@@ -182,6 +183,21 @@ impl GpuMatrix {
             lay_out(q8, &[self.kind]);
             gpu.gated_quantize(gate, up, n, q8, tokens, gelu)
                 .map_err(gpu_error)?;
+            return gpu
+                .matmul_8bit(self.kind, self.data.ptr(), q8, y, self.rows, n, tokens)
+                .map_err(gpu_error);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(q8) = q8
+            && tokens > 1
+            && Gpu::supports_8bit(self.kind)
+            && n.is_multiple_of(32)
+            && !Gpu::whole_number_products(self.kind, n, tokens)
+            && Gpu::tile_beats_few(self.kind, self.rows, n, tokens)
+            && gpu
+                .gated_quantize(gate, up, n, q8, tokens, gelu)
+                .map_err(gpu_error)?
+        {
             return gpu
                 .matmul_8bit(self.kind, self.data.ptr(), q8, y, self.rows, n, tokens)
                 .map_err(gpu_error);
@@ -418,6 +434,25 @@ impl LogitsBuffer {
             self.rows = rows;
         }
         Ok(&self.buffer)
+    }
+
+    /// The likeliest token of the one row of logits left here (the first of equals). On
+    /// the Mac found on the GPU, so 4 bytes come back, not the vocabulary's logits;
+    /// elsewhere from the row read into `host`.
+    pub fn likeliest(&self, gpu: &Gpu, vocab: usize, host: &mut Vec<f32>) -> Result<u32> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = host;
+            gpu.argmax(self.buffer.ptr(), vocab).map_err(gpu_error)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = gpu;
+            host.resize(vocab, 0.0);
+            self.read_row(0, host)?;
+            let top = host.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+            Ok(host.iter().position(|&v| v == top).unwrap_or(0) as u32)
+        }
     }
 
     /// Row `row` of the logits last left here, into `out` (a row long).

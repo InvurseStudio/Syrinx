@@ -54,7 +54,7 @@ impl Pool {
             .map(|i| {
                 let shared = Arc::clone(&shared);
                 std::thread::Builder::new()
-                    .name(format!("vireo-cpu-{i}"))
+                    .name(format!("syrinx-cpu-{i}"))
                     .spawn(move || worker(&shared))
                     .expect("couldn't start a worker thread")
             })

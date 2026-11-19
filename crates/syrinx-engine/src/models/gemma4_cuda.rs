@@ -490,13 +490,13 @@ impl<'a> Gemma4Cuda<'a> {
         let batch = batch.clamp(1, capacity.max(1));
         // At least one value each: a model without per-layer inputs has none to keep.
         let f32s = |n: usize| self.gpu.alloc(n.max(1) * 4).map_err(gpu_error);
-        // Keys and values: f16 in 8-bit mode (half the memory), f32 when exact.
+        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1 on macOS) in 8-bit mode, f32 when exact.
+        #[cfg(not(target_os = "macos"))]
         let cache_bytes = if self.precision == Precision::Int8 {
             2
         } else {
             4
         };
-        let cache_buffer = |n: usize| self.gpu.alloc(n * cache_bytes).map_err(gpu_error);
         // A sliding-window layer keeps its window and a batch's new positions (rounded to
         // the attention kernels' longest chunk, 256), not every position: for 31B at 32K
         // tokens, 1.6 GB instead of 27. On CUDA too since 2026-11-15.
@@ -513,7 +513,15 @@ impl<'a> Gemma4Cuda<'a> {
         let cache = |l: usize| -> Result<Option<Buffer>> {
             if l < c.first_shared_layer {
                 let rows = if rings[l] > 0 { rings[l] } else { capacity };
-                cache_buffer(rows * c.kv_heads_of(l) * c.head_dim_of(l)).map(Some)
+                let hd = c.head_dim_of(l);
+                #[cfg(target_os = "macos")]
+                let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, hd);
+                #[cfg(not(target_os = "macos"))]
+                let head_bytes = hd * cache_bytes;
+                self.gpu
+                    .alloc(rows * c.kv_heads_of(l) * head_bytes)
+                    .map_err(gpu_error)
+                    .map(Some)
             } else {
                 Ok(None)
             }
@@ -960,19 +968,9 @@ impl<'a> Gemma4Cuda<'a> {
                     )
                     .map_err(e)?;
                 }
-                g.moe_geglu(b.gate_up.ptr(), x.width, slots).map_err(e)?;
                 if let Some(sorted) = fast {
-                    g.moe_gather_half(
-                        b.gate_up.ptr(),
-                        sorted.ptr(),
-                        b.order.ptr(),
-                        x.used,
-                        x.width,
-                        2 * x.width,
-                        false,
-                        slots,
-                    )
-                    .map_err(e)?;
+                    g.moe_geglu_half(b.gate_up.ptr(), sorted.ptr(), x.width, slots)
+                        .map_err(e)?;
                     g.moe_matmul_fast(
                         m.down.kind,
                         m.down.data.ptr(),
@@ -987,6 +985,7 @@ impl<'a> Gemma4Cuda<'a> {
                     )
                     .map_err(e)?;
                 } else if grouped {
+                    g.moe_geglu(b.gate_up.ptr(), x.width, slots).map_err(e)?;
                     g.moe_matmul(
                         m.down.kind,
                         m.down.data.ptr(),
@@ -1005,6 +1004,7 @@ impl<'a> Gemma4Cuda<'a> {
                     )
                     .map_err(e)?;
                 } else {
+                    g.moe_geglu(b.gate_up.ptr(), x.width, slots).map_err(e)?;
                     g.moe_matvec(
                         m.down.kind,
                         m.down.data.ptr(),
@@ -1178,7 +1178,18 @@ impl<'a> Gemma4Cuda<'a> {
         out_at: usize,
     ) -> Result<()> {
         let c = &self.config;
-        let e = gpu_error;
+        self.queue_logits(s, first, rows)?;
+        if s.hold {
+            return Ok(());
+        }
+        let out = s.logits_gpu.rows(&self.gpu, rows, c.vocab)?;
+        out.read_f32(&mut s.logits[out_at..out_at + rows * c.vocab])
+            .map_err(gpu_error)
+    }
+
+    /// The logits of `rows` of the hidden rows from `first`, left on the GPU.
+    fn queue_logits(&self, s: &mut Gemma4CudaSession, first: usize, rows: usize) -> Result<()> {
+        let c = &self.config;
         let out = s.logits_gpu.rows(&self.gpu, rows, c.vocab)?;
         self.output.mul(
             &Input::new(&self.gpu, row(&s.h, first, c.dim), rows, s.q8.as_ref()),
@@ -1187,13 +1198,9 @@ impl<'a> Gemma4Cuda<'a> {
         if let Some(cap) = c.softcap {
             self.gpu
                 .softcap(out.ptr(), cap, rows * c.vocab)
-                .map_err(e)?;
+                .map_err(gpu_error)?;
         }
-        if s.hold {
-            return Ok(());
-        }
-        out.read_f32(&mut s.logits[out_at..out_at + rows * c.vocab])
-            .map_err(e)
+        Ok(())
     }
 
     /// Runs `token` at the session's next position, replaying the recorded layers.
@@ -1203,6 +1210,26 @@ impl<'a> Gemma4Cuda<'a> {
         token: u32,
         want_logits: bool,
     ) -> Result<Option<&'s [f32]>> {
+        self.step(s, token)?;
+        if !want_logits {
+            return Ok(None);
+        }
+        s.logits.resize(self.config.vocab, 0.0);
+        self.logits_into(s, 0, 1, 0)?;
+        Ok(Some(&s.logits))
+    }
+
+    /// As [`Self::forward`], for the likeliest next token alone: on the Mac it is found on
+    /// the GPU, and the vocabulary's logits aren't read back.
+    pub fn forward_greedy(&self, s: &mut Gemma4CudaSession, token: u32) -> Result<u32> {
+        self.step(s, token)?;
+        self.queue_logits(s, 0, 1)?;
+        s.logits_gpu
+            .likeliest(&self.gpu, self.config.vocab, &mut s.logits)
+    }
+
+    /// `token` through the recorded layers, at the session's next position.
+    fn step(&self, s: &mut Gemma4CudaSession, token: u32) -> Result<()> {
         assert!(
             s.len < s.capacity,
             "the session is full ({} positions)",
@@ -1218,12 +1245,7 @@ impl<'a> Gemma4Cuda<'a> {
         s.graph.as_ref().unwrap().launch().map_err(gpu_error)?;
         (s.hidden_from, s.hidden_rows) = (s.len, 1);
         s.len += 1;
-        if !want_logits {
-            return Ok(None);
-        }
-        s.logits.resize(self.config.vocab, 0.0);
-        self.logits_into(s, 0, 1, 0)?;
-        Ok(Some(&s.logits))
+        Ok(())
     }
 
     /// As [`Self::forward_batch`] for every token's logits, but they stay on the GPU:
