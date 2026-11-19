@@ -34,11 +34,13 @@ mod http;
 mod json;
 mod memory;
 mod sample;
+mod shortcuts;
 mod skills;
 mod stats;
 mod store;
 mod tasks;
 mod tools;
+mod web;
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -4860,6 +4862,20 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
                 return Some(format!("Error: {why}"));
             }
         }
+        // A skill or a shortcut is checked before anyone is asked to approve it.
+        let checked = match call.tool.as_str() {
+            "save_skill" | "update_skill" => skills::check(
+                &call.tool,
+                call.text("name").unwrap_or(""),
+                call.text("description").unwrap_or(""),
+                call.text("instructions").unwrap_or(""),
+            ),
+            "run_shortcut" => shortcuts::check(call.text("name").unwrap_or(""), call.text("input").unwrap_or("")),
+            _ => Ok(()),
+        };
+        if let Err(why) = checked {
+            return Some(format!("Error: {why}"));
+        }
         // A task's schedule is read before anyone is asked to approve it.
         if call.tool == "schedule_task"
             && let Err(why) = tasks::When::parse(call.text("when").unwrap_or(""))
@@ -4872,7 +4888,9 @@ fn run_tool(call: &tools::Call, offered: &[tools::Tool], job: &Job) -> Option<St
         {
             return Some(format!("Error: {why}"));
         }
-        match approve(call, ask, tool.runs == tools::Runs::Server, job) {
+        // Listing the shortcuts changes nothing, so it isn't asked about.
+        let listing = call.tool == "run_shortcut" && call.text("name").unwrap_or("").trim().is_empty();
+        match if listing { Some(Ok(())) } else { approve(call, ask, tool.runs == tools::Runs::Server, job) } {
             Some(Ok(())) => {}
             Some(Err(why)) => return Some(format!("Error: {why}")),
             None => return None,

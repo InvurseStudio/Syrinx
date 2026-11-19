@@ -75,6 +75,10 @@ pub enum Group {
     Calendar,
     /// Tasks Vireo runs later on its own (`schedule_task`).
     Tasks,
+    /// The web: searching it and reading a page (`web.rs`).
+    Web,
+    /// The Mac itself: its Shortcuts, its screen, Messages.
+    Mac,
 }
 
 /// The question that picks a request's groups (`--tools-shown scored`), each answer's
@@ -700,6 +704,261 @@ fn catalog() -> Vec<Tool> {
                 rememberable: false,
             }),
         },
+        Tool {
+            name: "list_scheduled_tasks",
+            description: "List the tasks you run on your own later (set up with schedule_task): each one's name, when it runs, whether it's on, and what it does.",
+            params: vec![],
+            runs: Runs::Server,
+            group: Group::Tasks,
+            asks: None,
+        },
+        // Changing part of a file, and a PDF: as write_file and create_docx are run.
+        Tool {
+            name: "edit_file",
+            description: "Change part of a text file on this PC by replacing exact text, leaving the rest as it is. Use it rather than write_file for any change to part of a file, and read the file first. Asks the user for approval.",
+            params: vec![
+                text(
+                    "path",
+                    "The file's path: a full path, or one relative to the home folder.",
+                ),
+                text(
+                    "old_text",
+                    "The text to replace, copied exactly from the file, with enough around it to appear only once.",
+                ),
+                text(
+                    "new_text",
+                    "What replaces old_text, and only that: not the rest of the file (\"\" to remove it).",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Edit files",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "create_pdf",
+            description: "Create a PDF document on this PC from a title and Markdown content (headings, lists, bold, tables). Asks the user for approval.",
+            params: vec![
+                text(
+                    "path",
+                    "Where to save it, ending in .pdf: a full path, or one relative to the home folder.",
+                ),
+                text("title", "The document's title."),
+                text("content", "The document's text in Markdown."),
+            ],
+            runs: Runs::App,
+            group: Group::Files,
+            asks: Some(Ask {
+                label: "Export a PDF document",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "run_shell_command",
+            description: "Run a shell command on this PC when no other tool can do the job. It starts in the home folder and is stopped after two minutes. The user sees the command and approves each run.",
+            params: vec![text("command", "The command, as typed at a terminal.")],
+            runs: Runs::App,
+            group: Group::Git,
+            asks: Some(Ask {
+                label: "Run shell commands",
+                rememberable: false,
+            }),
+        },
+        // The web, for an app that turns it on (`WEB`).
+        Tool {
+            name: "search_web",
+            description: "Search the web for current information, or anything you can't answer from what you know. Returns results with their addresses; read a page with fetch_url.",
+            params: vec![
+                text(
+                    "query",
+                    "A focused query with the specific names, numbers or phrase to find.",
+                ),
+                text(
+                    "domain",
+                    "One site to search within, such as wikipedia.org (no https://), or \"\" for the whole web.",
+                ),
+            ],
+            runs: Runs::Server,
+            group: Group::Web,
+            asks: None,
+        },
+        Tool {
+            name: "fetch_url",
+            description: "Read a web page: its text, without the page's menus and scripts.",
+            params: vec![text(
+                "url",
+                "The page's full address, starting with https:// or http://.",
+            )],
+            runs: Runs::Server,
+            group: Group::Web,
+            asks: None,
+        },
+        // Skills the user keeps, written by the model when asked (`skills.rs`).
+        Tool {
+            name: "save_skill",
+            description: "Save steps as a new skill the user can reuse in later chats, when they ask to keep how to do something (\"save this as a skill\"). Write the steps so a chat that never saw this one can follow them. Asks the user for approval.",
+            params: vec![
+                text(
+                    "name",
+                    "A short lowercase name with hyphens, e.g. \"weekly-report\".",
+                ),
+                text(
+                    "description",
+                    "What it does and when to use it, in one or two sentences.",
+                ),
+                text("instructions", "The steps and rules, in Markdown."),
+            ],
+            runs: Runs::Server,
+            group: Group::Memory,
+            asks: Some(Ask {
+                label: "Save skills",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "update_skill",
+            description: "Rewrite one of the user's skills, when they ask to change it or one you followed turned out wrong or missing a step. Read it with use_skill first, then send the complete new instructions, keeping what still holds. The old version is kept. Asks the user for approval.",
+            params: vec![
+                text("name", "The skill to change, e.g. \"weekly-report\"."),
+                text("instructions", "The complete new steps and rules, in Markdown."),
+                text(
+                    "description",
+                    "A new one-sentence description, or \"\" to keep the one it has.",
+                ),
+            ],
+            runs: Runs::Server,
+            group: Group::Memory,
+            asks: Some(Ask {
+                label: "Change skills",
+                rememberable: true,
+            }),
+        },
+        // The Mac's Shortcuts, run by this server there (`shortcuts.rs`).
+        Tool {
+            name: "run_shortcut",
+            description: "Run one of the user's Shortcuts on the Mac, which can reach other apps and devices. Call it with name \"\" to list them first. The user approves each run.",
+            params: vec![
+                text(
+                    "name",
+                    "The shortcut's name, as listed, or \"\" to list the shortcuts.",
+                ),
+                text("input", "Text to give the shortcut as its input, or \"\" for none."),
+            ],
+            runs: Runs::Server,
+            group: Group::Mac,
+            asks: Some(Ask {
+                label: "Run shortcuts",
+                rememberable: false,
+            }),
+        },
+        // More of the calendar and reminders, and the Mac's Messages and screen: the Mac
+        // app's, which holds the permissions.
+        Tool {
+            name: "list_reminders",
+            description: "List the user's reminders that aren't done yet, with their due dates and ids.",
+            params: vec![],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: None,
+        },
+        Tool {
+            name: "complete_reminder",
+            description: "Mark a reminder done. Use its id from list_reminders. Asks the user for approval.",
+            params: vec![
+                text("id", "The reminder's id, from list_reminders."),
+                text("title", "The reminder's title, as list_reminders shows it."),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: Some(Ask {
+                label: "Complete reminders",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "move_event",
+            description: "Move a calendar event to a new time. Use its id from list_events. Asks the user for approval.",
+            params: vec![
+                text("id", "The event's id, from list_events."),
+                text("title", "The event's title, as list_events shows it."),
+                text(
+                    "start",
+                    "Its new start, e.g. 2026-11-26T18:00, or 2026-11-26 for all day. Always with the year.",
+                ),
+                text(
+                    "end",
+                    "Its new end in the same form, or \"\" to keep its length.",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: Some(Ask {
+                label: "Move calendar events",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "delete_event",
+            description: "Delete a calendar event (only this occurrence of a repeating one). Use its id from list_events. Asks the user for approval.",
+            params: vec![
+                text("id", "The event's id, from list_events."),
+                text("title", "The event's title, as list_events shows it."),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: Some(Ask {
+                label: "Delete calendar events",
+                rememberable: false,
+            }),
+        },
+        Tool {
+            name: "find_free_time",
+            description: "Find open slots in the user's calendars between two days, within working hours (9:00 to 17:00, weekdays).",
+            params: vec![
+                text("start", "The first day to look on, e.g. 2026-11-20."),
+                text("end", "The last day to look on (it's included)."),
+                text(
+                    "minutes",
+                    "How long the slot must be, in minutes, e.g. \"30\".",
+                ),
+            ],
+            runs: Runs::App,
+            group: Group::Calendar,
+            asks: None,
+        },
+        Tool {
+            name: "send_message",
+            description: "Send a text message through the Mac's Messages app (iMessage, or SMS through the user's iPhone). Use it only when the user asks you to message someone, with the wording they want. Asks the user for approval.",
+            params: vec![
+                text(
+                    "to",
+                    "A contact's name, a phone number or an email address, or \"me\" for the user themselves.",
+                ),
+                text("text", "The message."),
+            ],
+            runs: Runs::App,
+            group: Group::Mac,
+            asks: Some(Ask {
+                label: "Send messages",
+                rememberable: true,
+            }),
+        },
+        Tool {
+            name: "read_screen",
+            description: "Read the text on the user's Mac screen: the front window of the app they used just before Vireo, or with target \"screen\" the whole display. Use it when they refer to \"this\", \"my screen\", or something open in another app. Asks the user for approval.",
+            params: vec![text(
+                "target",
+                "\"window\" for the front window of the app they were using, or \"screen\" for the whole display.",
+            )],
+            runs: Runs::App,
+            group: Group::Mac,
+            asks: Some(Ask {
+                label: "Read your screen",
+                rememberable: true,
+            }),
+        },
     ]
 }
 
@@ -767,6 +1026,27 @@ pub fn approval_preview(call: &Call, exists: impl Fn(&str) -> bool) -> String {
         ),
         "remember" => format!("Remember: {}", arg("fact")),
         "forget" => format!("Forget: {}", arg("fact")),
+        "edit_file" => format!("Edit {}", arg("path")),
+        "create_pdf" => {
+            let path = arg("path");
+            let verb = if exists(&path) { "Replace" } else { "Create" };
+            format!("{verb} the PDF {path}")
+        }
+        "run_shell_command" => format!("Run this command: {}", arg("command")),
+        "save_skill" => format!("Save the skill \u{201c}{}\u{201d}", arg("name")),
+        "update_skill" => format!("Rewrite the skill \u{201c}{}\u{201d} (the old version is kept)", arg("name")),
+        "run_shortcut" => format!("Run the shortcut \u{201c}{}\u{201d}", arg("name")),
+        "complete_reminder" => format!("Mark the reminder \u{201c}{}\u{201d} done", arg("title")),
+        "move_event" => format!("Move \u{201c}{}\u{201d} to {}", arg("title"), arg("start")),
+        "delete_event" => format!("Delete the calendar event \u{201c}{}\u{201d}", arg("title")),
+        "send_message" => format!("Send a message to {}", arg("to")),
+        "read_screen" => {
+            if arg("target") == "screen" {
+                "Read the whole screen".to_string()
+            } else {
+                "Read the window you were using before Vireo".to_string()
+            }
+        }
         other => format!("Run {other}"),
     }
 }
@@ -785,7 +1065,7 @@ const SERVER_FILE_TOOLS: [&str; 7] = [
 
 /// The changes `files.rs` makes itself on the Mac, where the app runs no tools (on Windows
 /// the app makes them, with its undo journal).
-const SERVER_CHANGE_TOOLS: [&str; 8] = [
+const SERVER_CHANGE_TOOLS: [&str; 11] = [
     "write_file",
     "rename_file",
     "move_file",
@@ -794,7 +1074,26 @@ const SERVER_CHANGE_TOOLS: [&str; 8] = [
     "create_docx",
     "fill_docx_template",
     "create_pptx",
+    "edit_file",
+    "create_pdf",
+    "run_shell_command",
 ];
+
+/// The tools offered only to an app that turns them on in `clientTools`, with the word
+/// it lists: they reach past this machine's files (the web), run anything (a shell
+/// command, a shortcut), and so stay off for an app or a test runner that doesn't ask.
+const TURNED_ON: [(&str, &str); 4] = [
+    ("search_web", WEB),
+    ("fetch_url", WEB),
+    ("run_shell_command", SHELL),
+    ("run_shortcut", SHORTCUTS),
+];
+/// The app turns on the web tools.
+pub const WEB: &str = "web";
+/// The app turns on shell commands (they run on this server's machine).
+pub const SHELL: &str = "shell";
+/// The app turns on the Mac's Shortcuts.
+pub const SHORTCUTS: &str = "shortcuts";
 
 /// What an app lists in `clientTools` besides the tools it runs, for what it does that
 /// this server's own tools lean on. Not tools the model sees.
@@ -819,7 +1118,16 @@ pub fn offered(client_tools: &[String], files_here: bool) -> Vec<Tool> {
         .filter_map(|mut t| {
             let lists = |name: &str| client_tools.iter().any(|c| c == name);
             // A task needs an app that runs it when it's due.
-            if t.name == "schedule_task" && !lists(RUNS_TASKS) {
+            if (t.name == "schedule_task" || t.name == "list_scheduled_tasks") && !lists(RUNS_TASKS) {
+                return None;
+            }
+            if let Some((_, word)) = TURNED_ON.iter().find(|(name, _)| *name == t.name)
+                && !lists(word)
+            {
+                return None;
+            }
+            // Shortcuts are the Mac's, run here.
+            if t.name == "run_shortcut" && !cfg!(target_os = "macos") {
                 return None;
             }
             if t.name == "search_chats" && !lists(t.name) && lists(CHATS_HERE) {
@@ -1931,6 +2239,26 @@ pub fn run_here(call: &Call, files: Option<&Files>) -> Result<String, String> {
         ("remember", _) => crate::memory::remember(call.text("fact").unwrap_or("")),
         ("forget", _) => crate::memory::forget(call.text("fact").unwrap_or("")),
         ("search_chats", _) => crate::chats::search(call.text("query").unwrap_or(""), None),
+        ("list_scheduled_tasks", _) => Ok(crate::tasks::listing()),
+        ("search_web", _) => crate::web::search(
+            call.text("query").unwrap_or(""),
+            call.text("domain").unwrap_or(""),
+        ),
+        ("fetch_url", _) => crate::web::fetch(call.text("url").unwrap_or("")),
+        ("save_skill", _) => crate::skills::save(
+            call.text("name").unwrap_or(""),
+            call.text("description").unwrap_or(""),
+            call.text("instructions").unwrap_or(""),
+        ),
+        ("update_skill", _) => crate::skills::update(
+            call.text("name").unwrap_or(""),
+            call.text("instructions").unwrap_or(""),
+            call.text("description").unwrap_or(""),
+        ),
+        ("run_shortcut", _) => crate::shortcuts::run(
+            call.text("name").unwrap_or(""),
+            call.text("input").unwrap_or(""),
+        ),
         (_, Some(files)) => files.run(call),
         (other, None) => Err(format!("{other} isn't one of this server's tools")),
     }
@@ -2473,8 +2801,8 @@ mod tests {
         assert_eq!(declarations(Family::Muse, &[]), "");
         assert_eq!(
             tools.len(),
-            5,
-            "read_file, and the server's own date and time, calculate, remember and forget"
+            7,
+            "read_file, and the server's own date and time, calculate, remember, forget, save_skill and update_skill"
         );
     }
 
@@ -2630,8 +2958,9 @@ mod tests {
         }
         expected.extend(["remember", "forget"]);
         if cfg!(target_os = "macos") {
-            expected.push("delete_file");
+            expected.extend(["delete_file", "edit_file", "create_pdf"]);
         }
+        expected.extend(["save_skill", "update_skill"]);
         assert_eq!(here.iter().map(|t| t.name).collect::<Vec<_>>(), expected);
         assert!(here.iter().all(|t| t.runs == Runs::Server));
         assert_eq!(
@@ -2649,8 +2978,28 @@ mod tests {
         let none = offered(&[], false);
         assert_eq!(
             none.iter().map(|t| t.name).collect::<Vec<_>>(),
-            ["get_current_datetime", "calculate", "remember", "forget"]
+            ["get_current_datetime", "calculate", "remember", "forget", "save_skill", "update_skill"]
         );
+        // The web, shell commands and shortcuts only when the app turns them on.
+        let names = |tools: &[Tool]| tools.iter().map(|t| t.name).collect::<Vec<_>>();
+        for name in ["search_web", "fetch_url", "run_shell_command", "run_shortcut", "list_scheduled_tasks"] {
+            assert!(!names(&here).contains(&name), "{name}");
+        }
+        let on = offered(
+            &[WEB.into(), SHELL.into(), SHORTCUTS.into(), RUNS_TASKS.into()],
+            true,
+        );
+        let on = names(&on);
+        for name in ["search_web", "fetch_url", "list_scheduled_tasks", "schedule_task"] {
+            assert!(on.contains(&name), "{name}");
+        }
+        assert_eq!(on.contains(&"run_shell_command"), cfg!(target_os = "macos"));
+        assert_eq!(on.contains(&"run_shortcut"), cfg!(target_os = "macos"));
+        // Calendar and Mac tools come only from an app that runs them.
+        assert!(!on.contains(&"send_message") && !on.contains(&"move_event"));
+        let app = offered(&["send_message".into(), "move_event".into()], false);
+        assert_eq!(runs(&app, "send_message"), Some(Runs::App));
+        assert_eq!(runs(&app, "move_event"), Some(Runs::App));
     }
 
     #[test]

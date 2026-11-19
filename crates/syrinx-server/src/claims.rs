@@ -8,7 +8,7 @@
 const KINDS: [(&[&str], &[&str], &str); 5] = [
     (
         &["row", "tracker", "register", "spreadsheet", "workbook", ".xlsx", "sheet"],
-        &["write_spreadsheet", "write_file"],
+        &["write_spreadsheet", "write_file", "edit_file"],
         "a spreadsheet",
     ),
     (
@@ -22,6 +22,8 @@ const KINDS: [(&[&str], &[&str], &str); 5] = [
         &["file", "folder", "word document", ".docx", ".md", ".pptx", ".pdf", ".txt", ".csv"],
         &[
             "write_file",
+            "edit_file",
+            "create_pdf",
             "write_spreadsheet",
             "create_docx",
             "fill_docx_template",
@@ -67,7 +69,7 @@ pub fn unbacked(answer: &str, done: &[String]) -> Option<&'static str> {
         // The first kind the sentence names is the one it claims.
         if let Some((_, tools, what)) = KINDS
             .iter()
-            .find(|(words, _, _)| words.iter().any(|w| sentence.contains(w)))
+            .find(|(words, _, _)| words.iter().any(|w| names(&sentence, w)))
         {
             if !tools.iter().any(|t| done.iter().any(|d| d == t)) {
                 return Some(what);
@@ -75,6 +77,32 @@ pub fn unbacked(answer: &str, done: &[String]) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Whether a sentence names a kind's word as a word of its own: "row" or "rows", not the
+/// "row" in "tomorrow" (Nov 19: a calendar event made "tomorrow" was flagged as a
+/// spreadsheet claimed). A word starting with "." (".xlsx") is a file's ending, matched as is.
+fn names(sentence: &str, word: &str) -> bool {
+    if word.starts_with('.') {
+        return sentence.contains(word);
+    }
+    let mut from = 0;
+    while let Some(at) = sentence[from..].find(word) {
+        let start = from + at;
+        let end = start + word.len();
+        let before = sentence[..start].chars().next_back();
+        let after: String = sentence[end..].chars().take(2).collect();
+        let starts = before.is_none_or(|c| !c.is_alphanumeric());
+        let ends = after.is_empty()
+            || !after.chars().next().unwrap().is_alphanumeric()
+            || after == "s"
+            || (after.starts_with('s') && !after.chars().nth(1).unwrap().is_alphanumeric());
+        if starts && ends {
+            return true;
+        }
+        from = start + word.len().max(1);
+    }
+    false
 }
 
 /// What follows such an answer.
@@ -101,6 +129,11 @@ mod tests {
         assert_eq!(unbacked("I've saved the memo as Admin/memo.docx.", &done(&[])), Some("a file"));
         assert_eq!(unbacked("The meeting has been added to your calendar.", &done(&["write_file"])), Some("the calendar"));
         assert!(note("a file").contains("this reply says a file was changed"));
+        // "tomorrow" has "row" in it, but names no spreadsheet.
+        let event = "I've added the event 'Vireo test' to your calendar for tomorrow.";
+        assert_eq!(unbacked(event, &done(&["create_event"])), None);
+        assert_eq!(unbacked("I've added two rows to the tracker.", &done(&[])), Some("a spreadsheet"));
+        assert_eq!(unbacked("I've added it to budget.xlsx.", &done(&[])), Some("a spreadsheet"));
     }
 
     #[test]
