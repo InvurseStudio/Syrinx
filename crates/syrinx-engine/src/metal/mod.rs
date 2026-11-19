@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use objc2::rc::Retained;
@@ -992,7 +992,9 @@ const I8_FROM: usize = 128;
 const I8_TOKENS: u32 = 128;
 const I8_ROWS: u32 = 32;
 const I8_K: usize = 256;
-static I8_ON: AtomicBool = AtomicBool::new(false);
+/// 0 = off, 1 = middle-layer FFN only (`VIREO_I8=ffn`), 2 = all (`VIREO_I8=on`).
+static I8_MODE: AtomicU8 = AtomicU8::new(0);
+static I8_FFN_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set to keep attention_tc for full attention too (VIREO_TCG=off, or
 /// [`Gpu::group_prompt_attention`]), to compare the two.
 static TCG_OFF: AtomicBool = AtomicBool::new(false);
@@ -1294,8 +1296,10 @@ impl Gpu {
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
-        if std::env::var("VIREO_I8").is_ok_and(|v| v == "on") {
-            I8_ON.store(true, Ordering::Relaxed);
+        match std::env::var("VIREO_I8").as_deref() {
+            Ok("on" | "all") => I8_MODE.store(2, Ordering::Relaxed),
+            Ok("ffn") => I8_MODE.store(1, Ordering::Relaxed),
+            _ => {}
         }
         if std::env::var("VIREO_TCG").is_ok_and(|v| v == "off") {
             TCG_OFF.store(true, Ordering::Relaxed);
@@ -3076,12 +3080,23 @@ impl Gpu {
         })
     }
 
+    /// Marks whether the current matrix products are in a middle-layer FFN (for
+    /// `VIREO_I8=ffn`, which keeps attention and first/last layers in f16).
+    pub fn set_i8_ffn(active: bool) {
+        I8_FFN_ACTIVE.store(active, Ordering::Relaxed);
+    }
+
     /// Whether a batch's products with weights of this kind go to the 8-bit kernel
     /// (`matmul_i8`): its sums are within the rounding of both sides of the f16 kernel's,
     /// not equal to them.
     pub fn whole_number_products(kind: TensorType, cols: usize, tokens: usize) -> bool {
+        let on = match I8_MODE.load(Ordering::Relaxed) {
+            2 => true,
+            1 => I8_FFN_ACTIVE.load(Ordering::Relaxed),
+            _ => false,
+        };
         TENSOR_OPS.load(Ordering::Relaxed)
-            && I8_ON.load(Ordering::Relaxed)
+            && on
             && tokens >= I8_FROM
             && cols.is_multiple_of(I8_K)
             && matches!(kind, TensorType::Q6_K | TensorType::Q8_0)
