@@ -438,13 +438,12 @@ impl<'a> Qwen35Cuda<'a> {
         let g = &self.gpu;
         let batch = batch.clamp(1, capacity.max(1));
         let f32s = |n: usize| g.alloc(n * 4).map_err(gpu_error);
-        // Keys and values: f16 in 8-bit mode (half the memory), f32 when exact.
-        let cache_bytes = if self.precision == Precision::Int8 {
-            2
-        } else {
-            4
-        };
-        let cache = |n: usize| g.alloc(n * cache_bytes).map_err(gpu_error);
+        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1 on macOS) in 8-bit mode, f32 when exact.
+        #[cfg(target_os = "macos")]
+        let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, c.head_dim);
+        #[cfg(not(target_os = "macos"))]
+        let head_bytes = c.head_dim * if self.precision == Precision::Int8 { 2 } else { 4 };
+        let cache = |rows: usize| g.alloc(rows * c.kv_heads * head_bytes).map_err(gpu_error);
         let zeros = |n: usize| -> Result<Buffer> {
             let b = f32s(n)?;
             g.zero(&b).map_err(gpu_error)?;
@@ -457,8 +456,8 @@ impl<'a> Qwen35Cuda<'a> {
         for l in 0..c.layers {
             memory.push(if c.is_full_attention(l) {
                 Memory::Attention {
-                    keys: cache(capacity * kv_dim)?,
-                    values: cache(capacity * kv_dim)?,
+                    keys: cache(capacity)?,
+                    values: cache(capacity)?,
                 }
             } else {
                 Memory::DeltaNet {
@@ -538,12 +537,14 @@ impl<'a> Qwen35Cuda<'a> {
         let c = &self.config;
         let g = &self.gpu;
         let f32s = |n: usize| g.alloc(n * 4).map_err(gpu_error);
-        let cache_bytes = if s.half_cache { 2 } else { 4 };
-        let kv_dim = c.kv_heads * c.head_dim;
-        let cache = |n: usize| g.alloc(n * cache_bytes).map_err(gpu_error);
+        #[cfg(target_os = "macos")]
+        let head_bytes = Gpu::kv_head_bytes(s.half_cache, c.head_dim);
+        #[cfg(not(target_os = "macos"))]
+        let head_bytes = c.head_dim * if s.half_cache { 2 } else { 4 };
+        let cache = |rows: usize| g.alloc(rows * c.kv_heads * head_bytes).map_err(gpu_error);
         s.mtp = Some(MtpSession {
-            keys: cache(s.capacity * kv_dim)?,
-            values: cache(s.capacity * kv_dim)?,
+            keys: cache(s.capacity)?,
+            values: cache(s.capacity)?,
             pos: f32s(1)?,
             x: f32s(s.batch * c.dim)?,
             h: f32s(s.batch * c.dim)?,
@@ -803,15 +804,7 @@ impl<'a> Qwen35Cuda<'a> {
             let out = s.logits_gpu.rows(g, 1, c.vocab)?;
             self.output
                 .mul(&Input::new(g, m.h.ptr(), 1, s.q8.as_ref()), out.ptr())?;
-            out.read_f32(&mut m.logits).map_err(e)?;
-            token = m
-                .logits
-                .iter()
-                .enumerate()
-                .fold((0, f32::NEG_INFINITY), |best, (i, &v)| {
-                    if v > best.1 { (i, v) } else { best }
-                })
-                .0 as u32;
+            token = s.logits_gpu.likeliest(g, c.vocab, &mut m.logits)?;
             guesses.push(token);
         }
         Ok(guesses)
@@ -1185,6 +1178,30 @@ impl<'a> Qwen35Cuda<'a> {
         token: u32,
         want_logits: bool,
     ) -> Result<Option<&'s [f32]>> {
+        self.step(s, token)?;
+        if want_logits {
+            self.queue_logits(s)?;
+            s.logits.resize(self.config.vocab, 0.0);
+            s.logits_gpu.read_row(0, &mut s.logits)?;
+        }
+        self.mtp_pairs(s, &[token])?;
+        Ok(want_logits.then_some(&s.logits[..]))
+    }
+
+    /// As [`Self::forward`], for the likeliest next token alone: on the Mac it is found on
+    /// the GPU, and the vocabulary's logits aren't read back.
+    pub fn forward_greedy(&self, s: &mut Qwen35CudaSession, token: u32) -> Result<u32> {
+        self.step(s, token)?;
+        self.queue_logits(s)?;
+        let next = s
+            .logits_gpu
+            .likeliest(&self.gpu, self.config.vocab, &mut s.logits)?;
+        self.mtp_pairs(s, &[token])?;
+        Ok(next)
+    }
+
+    /// `token` through the recorded layers, at the session's next position.
+    fn step(&self, s: &mut Qwen35CudaSession, token: u32) -> Result<()> {
         let c = &self.config;
         assert!(
             s.len < s.capacity,
@@ -1207,17 +1224,16 @@ impl<'a> Qwen35Cuda<'a> {
         s.graph.as_ref().unwrap().launch().map_err(e)?;
         s.len += 1;
         s.stepped = None;
-        if want_logits {
-            let logits = s.logits_gpu.rows(&self.gpu, 1, c.vocab)?;
-            self.output.mul(
-                &Input::new(&self.gpu, s.h.ptr(), 1, s.q8.as_ref()),
-                logits.ptr(),
-            )?;
-            s.logits.resize(c.vocab, 0.0);
-            logits.read_f32(&mut s.logits).map_err(e)?;
-        }
-        self.mtp_pairs(s, &[token])?;
-        Ok(want_logits.then_some(&s.logits[..]))
+        Ok(())
+    }
+
+    /// The last token's logits, left on the GPU.
+    fn queue_logits(&self, s: &mut Qwen35CudaSession) -> Result<()> {
+        let logits = s.logits_gpu.rows(&self.gpu, 1, self.config.vocab)?;
+        self.output.mul(
+            &Input::new(&self.gpu, s.h.ptr(), 1, s.q8.as_ref()),
+            logits.ptr(),
+        )
     }
 
     /// As [`Self::forward_batch`] for every token's logits, but they stay on the GPU:

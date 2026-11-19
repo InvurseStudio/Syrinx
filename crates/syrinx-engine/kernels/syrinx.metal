@@ -1457,12 +1457,13 @@ kernel void qkv_prep(ARGS, KP) {
             src = (kind == 1 ? k_src : v_src) + (ulong)t * kv_dim + h * hd;
             const ulong at_cache = ring_row(at, ring) * kv_dim + h * hd;
             const ulong cache = kind == 1 ? k_cache : v_cache;
-            if (half_cache)
+            if (half_cache == 1)
                 half_dst = reinterpret_cast<device half*>(cache) + at_cache;
-            else
+            else if (half_cache == 0)
                 dst = reinterpret_cast<device float*>(cache) + at_cache;
         }
-        const bool to_half = half_cache && kind != 0;
+        const bool to_half = half_cache == 1 && kind != 0;
+        const bool to_q8 = half_cache == 2 && kind != 0;
         BARRIER;  // the last token is done with buf
         float sum = 0.0f;
         for (int i = tid; i < hd; i += tpg.x) {
@@ -1478,7 +1479,7 @@ kernel void qkv_prep(ARGS, KP) {
         for (int j = tid; j < items; j += tpg.x) {
             if (j >= pairs) {
                 const int i = rotated + (j - pairs);
-                if (to_half) half_dst[i] = half(buf[i]); else dst[i] = buf[i];
+                if (to_half) half_dst[i] = half(buf[i]); else if (!to_q8) dst[i] = buf[i];
                 if (NONNULL(q2)) q2[i] = half(buf[i]);
                 continue;
             }
@@ -1490,7 +1491,10 @@ kernel void qkv_prep(ARGS, KP) {
             const float s = sincos(theta, c);
             const float a = buf[i0], b = buf[i1];
             const float r0 = a * c - b * s, r1 = a * s + b * c;
-            if (to_half) {
+            if (to_q8) {
+                buf[i0] = r0;
+                buf[i1] = r1;
+            } else if (to_half) {
                 half_dst[i0] = half(r0);
                 half_dst[i1] = half(r1);
             } else {
@@ -1502,6 +1506,52 @@ kernel void qkv_prep(ARGS, KP) {
                 q2[i1] = half(r1);
             }
         }
+        if (to_q8) {
+            BARRIER;
+            const ulong cache = kind == 1 ? k_cache : v_cache;
+            const ulong head_bytes = (ulong)hd + (ulong)(hd / 32) * 2;
+            device char* q8_dst =
+                reinterpret_cast<device char*>(cache) + (ring_row(at, ring) * (ulong)kv_heads + (ulong)h) * head_bytes;
+            device half* sc_dst = reinterpret_cast<device half*>(q8_dst + hd);
+            const int sg = (int)(tid >> 5), lane = (int)(tid & 31), nsg = (int)(tpg.x >> 5);
+            for (int b = sg; b < hd / 32; b += nsg) {
+                const float v = buf[b * 32 + lane];
+                const float amax = simd_max(fabs(v));
+                const float d = amax / 127.0f;
+                const float id = d > 0.0f ? 1.0f / d : 0.0f;
+                q8_dst[b * 32 + lane] = (char)(int)rint(v * id);
+                if (lane == 0) sc_dst[b] = half(d);
+            }
+        }
+    }
+}
+
+// Dequantize a Q8_0 KV cache (layout: per (row, kv_head), hd int8s + hd/32 half scales)
+// into a contiguous f16 KV scratch buffer for prompt attention (attention_tcg / attention_tc).
+// Grid: (kv_heads, stride_blocks), threads: 256 (8 SIMD groups, 1 SIMD group per 32-elt block).
+// With a sliding window and no ring, only the rows the batch's first token reads from on.
+kernel void dequant_kv_q8_to_half(ARGS, KP) {
+    device const char* src = ARG_PTR(const char, 0);
+    device half* dst = ARG_PTR(half, 1);
+    device const int* pos = ARG_PTR(const int, 2);
+    const int tokens = ARG_INT(3), ring = ARG_INT(4), kv_heads = ARG_INT(5), hd = ARG_INT(6);
+    const int window = ARG_INT(7);
+    const int rows = ring > 0 ? ring : (*pos + tokens);
+    const int first = ring == 0 && window > 0 ? max(0, *pos + 1 - window) : 0;
+    const int h = gid.x;
+    const ulong head_bytes = (ulong)hd + (ulong)(hd / 32) * 2;
+    const ulong row_bytes = (ulong)kv_heads * head_bytes;
+    const ulong kv_dim = (ulong)kv_heads * (ulong)hd;
+    const int sg = (int)(tid >> 5), lane = (int)(tid & 31), nsg = (int)(tpg.x >> 5);
+    const int blocks = hd / 32;
+    for (int r = first + (int)gid.y; r < rows; r += (int)ngrid.y) {
+        device const char* q8 = src + (ulong)r * row_bytes + (ulong)h * head_bytes;
+        device const half* sc = reinterpret_cast<device const half*>(q8 + hd);
+        device half* out = dst + (ulong)r * kv_dim + (ulong)h * (ulong)hd;
+        for (int b = sg; b < blocks; b += nsg) {
+            const float d = float(sc[b]);
+            out[b * 32 + lane] = half(float(q8[b * 32 + lane]) * d);
+        }
     }
 }
 
@@ -1509,8 +1559,27 @@ kernel void qkv_prep(ARGS, KP) {
 
 static inline float4 load4(device const float* p) { return f4(p); }
 static inline float4 load4(device const half* p) { return float4(*reinterpret_cast<device const half4*>(p)); }
+static inline float4 load4(device const char* p) { return float4(*reinterpret_cast<device const char4*>(p)); }
 static inline float load1(device const float* p) { return *p; }
 static inline float load1(device const half* p) { return float(*p); }
+
+template <typename KV, int D>
+struct KvAccess {
+    static inline device const KV* head_ptr(device const KV* base, ulong row, int kv_heads, int kv_head) {
+        return base + (row * (ulong)kv_heads + (ulong)kv_head) * (ulong)D;
+    }
+    static inline float lane_scale(device const KV*, int) { return 1.0f; }
+};
+template <int D>
+struct KvAccess<char, D> {
+    static inline device const char* head_ptr(device const char* base, ulong row, int kv_heads, int kv_head) {
+        constexpr ulong HEAD_BYTES = (ulong)D + (ulong)(D / 32) * 2;
+        return base + (row * (ulong)kv_heads + (ulong)kv_head) * HEAD_BYTES;
+    }
+    static inline float lane_scale(device const char* head_ptr, int d0) {
+        return float(reinterpret_cast<device const half*>(head_ptr + D)[d0 >> 5]);
+    }
+};
 
 // One threadgroup of 128 per query head and token (see attention_one in syrinx.cu).
 template <typename KV>
@@ -1871,31 +1940,37 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     const int first = window > 0 ? max(0, len - window) : 0;
     const int share = (len - first + parts - 1) / parts;
     const int lo = first + part * share, hi = min(len, lo + share);
-    const int kv = (head / group) * D + lane * DPL;
+    const int kv_heads = kv_dim / D, kv_head = head / group, d0 = (int)lane * DPL;
     float qv[DPL];
-    for (int j = 0; j < DPL; j++) qv[j] = q[head * D + lane * DPL + j] * scale;
+    const float scale_log2 = scale * 1.4426950408889634f;
+    for (int j = 0; j < DPL; j++) qv[j] = q[head * D + d0 + j] * scale_log2;
 
     float m = -INFINITY, l = 0.0f, o[DPL];
     for (int j = 0; j < DPL; j++) o[j] = 0.0f;
     for (int at = lo + (int)sg; at < hi; at += SG) {
-        device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
+        const ulong r = ring_row(at, ring);
+        device const KV* kh = KvAccess<KV, D>::head_ptr(keys, r, kv_heads, kv_head);
+        const float ks = KvAccess<KV, D>::lane_scale(kh, d0);
+        device const KV* k = kh + d0;
         float dot = 0.0f;
         for (int j = 0; j < DPL; j += 4) {
             const float4 k4 = load4(k + j);
             dot += qv[j] * k4.x + qv[j + 1] * k4.y + qv[j + 2] * k4.z + qv[j + 3] * k4.w;
         }
-        const float s = simd_sum(dot);
+        const float s = simd_sum(dot * ks);
         const float new_max = max(m, s);
-        const float correction = exp(m - new_max);
-        const float p = exp(s - new_max);
+        const float correction = metal::fast::exp2(m - new_max);
+        const float p = metal::fast::exp2(s - new_max);
         l = l * correction + p;
-        device const KV* v = values + ring_row(at, ring) * kv_dim + kv;
+        device const KV* vh = KvAccess<KV, D>::head_ptr(values, r, kv_heads, kv_head);
+        const float ps = p * KvAccess<KV, D>::lane_scale(vh, d0);
+        device const KV* v = vh + d0;
         for (int j = 0; j < DPL; j += 4) {
             const float4 v4 = load4(v + j);
-            o[j] = o[j] * correction + p * v4.x;
-            o[j + 1] = o[j + 1] * correction + p * v4.y;
-            o[j + 2] = o[j + 2] * correction + p * v4.z;
-            o[j + 3] = o[j + 3] * correction + p * v4.w;
+            o[j] = o[j] * correction + ps * v4.x;
+            o[j + 1] = o[j + 1] * correction + ps * v4.y;
+            o[j + 2] = o[j + 2] * correction + ps * v4.z;
+            o[j + 3] = o[j + 3] * correction + ps * v4.w;
         }
         m = new_max;
     }
@@ -1903,13 +1978,13 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
         sm[sg] = m;
         sl[sg] = l;
     }
-    for (int j = 0; j < DPL; j++) so[sg][lane * DPL + j] = o[j];
+    for (int j = 0; j < DPL; j++) so[sg][d0 + j] = o[j];
     BARRIER;
     float mx = -INFINITY;
     for (int g = 0; g < SG; g++) mx = max(mx, sm[g]);
     float total = 0.0f;
     for (int g = 0; g < SG; g++)
-        if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
+        if (sm[g] != -INFINITY) total += metal::fast::exp2(sm[g] - mx) * sl[g];
     device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
     if (parts > 1 && tid == 0) {
         mine[0] = mx;
@@ -1918,7 +1993,7 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     for (int d = tid; d < D; d += 256) {
         float acc = 0.0f;
         for (int g = 0; g < SG; g++)
-            if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g][d];
+            if (sm[g] != -INFINITY) acc += metal::fast::exp2(sm[g] - mx) * so[g][d];
         if (parts == 1)
             out[head * D + d] = acc / total;
         else
@@ -1941,13 +2016,13 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     float pt = 0.0f;
     for (int i = 0; i < parts; i++) {
         const float mi = all[i * (2 + D)];
-        if (mi != -INFINITY) pt += exp(mi - pm) * all[i * (2 + D) + 1];
+        if (mi != -INFINITY) pt += metal::fast::exp2(mi - pm) * all[i * (2 + D) + 1];
     }
     for (int d = tid; d < D; d += 256) {
         float acc = 0.0f;
         for (int i = 0; i < parts; i++) {
             const float mi = all[i * (2 + D)];
-            if (mi != -INFINITY) acc += exp(mi - pm) * all[i * (2 + D) + 2 + d];
+            if (mi != -INFINITY) acc += metal::fast::exp2(mi - pm) * all[i * (2 + D) + 2 + d];
         }
         out[head * D + d] = acc / pt;
     }
@@ -1959,6 +2034,9 @@ template [[host_name("attention_decode_wide_f32_512")]] kernel void attention_de
 template [[host_name("attention_decode_wide_f16_128")]] kernel void attention_decode_wide<half, 128>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_wide_f16_256")]] kernel void attention_decode_wide<half, 256>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_wide_f16_512")]] kernel void attention_decode_wide<half, 512>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_q8_128")]] kernel void attention_decode_wide<char, 128>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_q8_256")]] kernel void attention_decode_wide<char, 256>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_wide_q8_512")]] kernel void attention_decode_wide<char, 512>(ARGS, KP, uint, uint);
 
 // One token's attention for all the query heads that share a key/value head (gid.x is
 // the key/value head, gid.y the part of the context): attention_decode_wide's layout (a
@@ -2011,10 +2089,11 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
     if (part >= parts) return;
     const int share = (len - first + parts - 1) / parts;
     const int lo = first + part * share, hi = min(len, lo + share);
-    const int kv = gid.x * D + lane * DPL;
+    const int kv_heads = kv_dim / D, kv_head = (int)gid.x, d0 = (int)lane * DPL;
     threadgroup float* qs = scratch;
     threadgroup float* so = scratch + group * D;
-    for (int i = tid; i < group * D; i += 256) qs[i] = q[head0 * D + i] * scale;
+    const float scale_log2 = scale * 1.4426950408889634f;
+    for (int i = tid; i < group * D; i += 256) qs[i] = q[head0 * D + i] * scale_log2;
     BARRIER;
 
     float m[H], l[H], o[H][DPL];
@@ -2025,10 +2104,15 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
     }
     float qv[H][DPL];
     for (int h = 0; h < H; h++)
-        for (int j = 0; j < DPL; j++) qv[h][j] = qs[(slice * H + h) * D + lane * DPL + j];
+        for (int j = 0; j < DPL; j++) qv[h][j] = qs[(slice * H + h) * D + d0 + j];
     for (int at = active ? lo + stream : hi; at < hi; at += streams) {
-        device const KV* k = keys + ring_row(at, ring) * kv_dim + kv;
-        device const KV* v = values + ring_row(at, ring) * kv_dim + kv;
+        const ulong r = ring_row(at, ring);
+        device const KV* kh = KvAccess<KV, D>::head_ptr(keys, r, kv_heads, kv_head);
+        device const KV* vh = KvAccess<KV, D>::head_ptr(values, r, kv_heads, kv_head);
+        const float ks = KvAccess<KV, D>::lane_scale(kh, d0);
+        const float vs = KvAccess<KV, D>::lane_scale(vh, d0);
+        device const KV* k = kh + d0;
+        device const KV* v = vh + d0;
         float kk[DPL], vv[DPL];
         for (int j = 0; j < DPL; j += 4) {
             const float4 k4 = load4(k + j);
@@ -2042,15 +2126,16 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
         for (int h = 0; h < H; h++) {
             float dot = 0.0f;
             for (int j = 0; j < DPL; j++) dot += qv[h][j] * kk[j];
-            s[h] = dot;
+            s[h] = dot * ks;
         }
         for (int h = 0; h < H; h++) s[h] = simd_sum(s[h]);
         for (int h = 0; h < H; h++) {
             const float new_max = max(m[h], s[h]);
-            const float correction = exp(m[h] - new_max);
-            const float p = exp(s[h] - new_max);
+            const float correction = metal::fast::exp2(m[h] - new_max);
+            const float p = metal::fast::exp2(s[h] - new_max);
+            const float ps = p * vs;
             l[h] = l[h] * correction + p;
-            for (int j = 0; j < DPL; j++) o[h][j] = o[h][j] * correction + p * vv[j];
+            for (int j = 0; j < DPL; j++) o[h][j] = o[h][j] * correction + ps * vv[j];
             m[h] = new_max;
         }
     }
@@ -2073,7 +2158,7 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
             for (int g = 0; g < streams; g++) mx = max(mx, sm[g]);
             float total = 0.0f;
             for (int g = 0; g < streams; g++)
-                if (sm[g] != -INFINITY) total += exp(sm[g] - mx) * sl[g];
+                if (sm[g] != -INFINITY) total += metal::fast::exp2(sm[g] - mx) * sl[g];
             device float* mine = partial + ((ulong)head * parts + part) * (2 + D);
             if (parts > 1 && tid == 0) {
                 mine[0] = mx;
@@ -2082,7 +2167,7 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
             for (int d = tid; d < D; d += 256) {
                 float acc = 0.0f;
                 for (int g = 0; g < streams; g++)
-                    if (sm[g] != -INFINITY) acc += exp(sm[g] - mx) * so[g * D + d];
+                    if (sm[g] != -INFINITY) acc += metal::fast::exp2(sm[g] - mx) * so[g * D + d];
                 if (parts == 1)
                     out[head * D + d] = acc / total;
                 else
@@ -2113,7 +2198,7 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
         float pt = 0.0f;
         for (int i = (int)lane; i < parts; i += 32) {
             const float mi = all[i * (2 + D)];
-            const float wi = mi != -INFINITY ? exp(mi - pm) : 0.0f;
+            const float wi = mi != -INFINITY ? metal::fast::exp2(mi - pm) : 0.0f;
             w[i] = wi;
             pt += wi * all[i * (2 + D) + 1];
         }
@@ -2144,6 +2229,12 @@ template [[host_name("attention_decode_group_f16_256_3")]] kernel void attention
 template [[host_name("attention_decode_group_f16_256_4")]] kernel void attention_decode_group<half, 256, 4>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_group_f16_512_1")]] kernel void attention_decode_group<half, 512, 1>(ARGS, KP, uint, uint);
 template [[host_name("attention_decode_group_f16_512_2")]] kernel void attention_decode_group<half, 512, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_q8_256_1")]] kernel void attention_decode_group<char, 256, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_q8_256_2")]] kernel void attention_decode_group<char, 256, 2>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_q8_256_3")]] kernel void attention_decode_group<char, 256, 3>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_q8_256_4")]] kernel void attention_decode_group<char, 256, 4>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_q8_512_1")]] kernel void attention_decode_group<char, 512, 1>(ARGS, KP, uint, uint);
+template [[host_name("attention_decode_group_q8_512_2")]] kernel void attention_decode_group<char, 512, 2>(ARGS, KP, uint, uint);
 
 // A prompt's attention, tiled (see attention_tiled in syrinx.cu).
 template <typename KV, int LANES, int PER, int CHUNK>
@@ -2706,6 +2797,21 @@ kernel void moe_gather_half(ARGS, KP) {
     out[i] = half4(f4(x + row * x_stride + 4 * j));
 }
 
+// Fused moe_geglu + f32->f16 conversion for sorted slots into moe_matmul_tc's half
+// input buffer: reads [gate | up] per slot as float4 and writes half4 directly.
+kernel void moe_geglu_half(ARGS, KP) {
+    device const float* gate_up = ARG_PTR(const float, 0);
+    device half4* out = ARG_PTR(half4, 1);
+    const int width4 = ARG_INT(2) / 4, total4 = ARG_INT(3);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= total4) return;
+    const int at = i / width4, j = i % width4;
+    device const float* slot = gate_up + (ulong)at * (ulong)(width4 * 8);
+    const float4 x = f4(slot + 4 * j);
+    const float4 u = f4(slot + width4 * 4 + 4 * j);
+    out[i] = half4(0.5f * x * (1.0f + tanh(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u);
+}
+
 #define PER_NUMBER const int i = gid.x * tpg.x + tid;
 
 kernel void swiglu(ARGS, KP) {
@@ -2727,6 +2833,33 @@ kernel void geglu(ARGS, KP) {
     const float x = gate[i];
     const float u = up[(ulong)(i / n) * up_stride + i % n];
     gate[i] = 0.5f * x * (1.0f + tanh(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u;
+}
+
+// Fused SiLU/GELU activation + f32->f16 conversion for matmul_tc: reads gate and up
+// (contiguous, n4 = total / 4 float4s) and writes half4 directly into Q8's half buffer,
+// skipping both the f32 store to gate and the subsequent to_half pass.
+kernel void swiglu_half(ARGS, KP) {
+    device const float4* gate = ARG_PTR(const float4, 0);
+    device const float4* up = ARG_PTR(const float4, 1);
+    device half4* out = ARG_PTR(half4, 2);
+    const int n4 = ARG_INT(3);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= n4) return;
+    const float4 g = gate[i];
+    const float4 u = up[i];
+    out[i] = half4(g / (1.0f + metal::fast::exp2(-g * 1.4426950408889634f)) * u);
+}
+
+kernel void geglu_half(ARGS, KP) {
+    device const float4* gate = ARG_PTR(const float4, 0);
+    device const float4* up = ARG_PTR(const float4, 1);
+    device half4* out = ARG_PTR(half4, 2);
+    const int n4 = ARG_INT(3);
+    const int i = gid.x * tpg.x + tid;
+    if (i >= n4) return;
+    const float4 x = gate[i];
+    const float4 u = up[i];
+    out[i] = half4(0.5f * x * (1.0f + tanh(0.7978846f * x * (1.0f + 0.044715f * x * x))) * u);
 }
 
 kernel void add(ARGS, KP) {
@@ -3499,5 +3632,79 @@ kernel void copy_bytes(ARGS, KP) {
             reinterpret_cast<device uint4*>(dst)[i] = reinterpret_cast<device const uint4*>(src)[i];
     } else if (i < bytes) {
         reinterpret_cast<device u8*>(dst)[i] = reinterpret_cast<device const u8*>(src)[i];
+    }
+}
+
+// ---- GPU-side argmax -----------------------------------------------------------------
+
+// Stage 1: each threadgroup of 256 threads finds the largest value and its smallest index
+// across its strided slice of x[0..n], writing one (val, idx) pair per threadgroup.
+kernel void argmax_part(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    device const float* x = ARG_PTR(const float, 0);
+    device float* vals = ARG_PTR(float, 1);
+    device uint* idxs = ARG_PTR(uint, 2);
+    const uint n = (uint)ARG_INT(3);
+    float best = -INFINITY;
+    uint best_i = 0;
+    const uint stride = ngrid.x * 256u;
+    for (uint i = gid.x * 256u + tid; i < n; i += stride) {
+        const float v = x[i];
+        if (v > best) {
+            best = v;
+            best_i = i;
+        }
+    }
+    const float sg_max = simd_max(best);
+    const uint sg_idx = simd_min(best == sg_max ? best_i : 0xFFFFFFFFu);
+    threadgroup float s_val[8];
+    threadgroup uint s_idx[8];
+    if (lane == 0) {
+        s_val[sg] = sg_max;
+        s_idx[sg] = sg_idx;
+    }
+    BARRIER;
+    if (tid == 0) {
+        float m = s_val[0];
+        uint mi = s_idx[0];
+        for (int s = 1; s < 8; s++) {
+            if (s_val[s] > m || (s_val[s] == m && s_idx[s] < mi)) {
+                m = s_val[s];
+                mi = s_idx[s];
+            }
+        }
+        vals[gid.x] = m;
+        idxs[gid.x] = mi;
+    }
+}
+
+// Stage 2: single threadgroup of 256 threads reduces the stage-1 partials to out[0].
+kernel void argmax_final(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    device const float* vals = ARG_PTR(const float, 0);
+    device const uint* idxs = ARG_PTR(const uint, 1);
+    device uint* out = ARG_PTR(uint, 2);
+    const uint count = (uint)ARG_INT(3);
+    const float v = tid < count ? vals[tid] : -INFINITY;
+    const uint idx = tid < count ? idxs[tid] : 0xFFFFFFFFu;
+    const float sg_max = simd_max(v);
+    const uint sg_idx = simd_min(v == sg_max ? idx : 0xFFFFFFFFu);
+    threadgroup float s_val[8];
+    threadgroup uint s_idx[8];
+    if (lane == 0) {
+        s_val[sg] = sg_max;
+        s_idx[sg] = sg_idx;
+    }
+    BARRIER;
+    if (tid == 0) {
+        float m = s_val[0];
+        uint mi = s_idx[0];
+        for (int s = 1; s < 8; s++) {
+            if (s_val[s] > m || (s_val[s] == m && s_idx[s] < mi)) {
+                m = s_val[s];
+                mi = s_idx[s];
+            }
+        }
+        out[0] = mi == 0xFFFFFFFFu ? 0u : mi;
     }
 }
