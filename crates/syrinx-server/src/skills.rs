@@ -438,9 +438,159 @@ pub const START_THINKING: &str = "Now do the user's whole request. These steps c
                                   tools it needs. Don't describe the steps or ask whether to \
                                   go on.";
 
+// ---- Skills the model writes (save_skill, update_skill) ---------------------------------
+
+/// A SKILL.md's text, as the Mac's server writes a learned one: the description quoted
+/// as a JSON string, so any character in it reads back as it was.
+fn skill_file(name: &str, description: &str, instructions: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: {}\n---\n\n{}\n",
+        crate::json::string(description.trim()),
+        instructions.trim()
+    )
+}
+
+fn all_skills_in(user: Option<&Path>) -> Vec<Skill> {
+    let built_in = built_in_folder();
+    let mut users = user.map_or_else(Vec::new, |f| scan(f, false));
+    let built: Vec<Skill> = built_in.as_deref().map_or_else(Vec::new, |f| scan(f, true));
+    users.extend(built);
+    users
+}
+
+/// Whether a skill could be saved or changed now, before the user is asked to approve it.
+pub fn check(tool: &str, name: &str, description: &str, instructions: &str) -> Result<(), String> {
+    check_in(user_folder().as_deref(), tool, name, description, instructions)
+}
+
+fn check_in(
+    user: Option<&Path>,
+    tool: &str,
+    name: &str,
+    description: &str,
+    instructions: &str,
+) -> Result<(), String> {
+    let name = name.trim();
+    if user.is_none() {
+        return Err("This computer has no folder for skills.".into());
+    }
+    let skills = all_skills_in(user);
+    let found = skills.iter().find(|s| s.name == name);
+    if instructions.trim().is_empty() {
+        return Err("The skill needs instructions.".into());
+    }
+    if instructions.chars().count() > MAX_INSTRUCTIONS {
+        return Err(format!("The instructions are too long (over {MAX_INSTRUCTIONS} characters)."));
+    }
+    match tool {
+        "save_skill" => {
+            // The same checks a SKILL.md gets when it's read.
+            parse(&skill_file(name, description, instructions))?;
+            if found.is_some() {
+                return Err(format!(
+                    "There's already a skill called \"{name}\". Change it with update_skill, or pick another name."
+                ));
+            }
+        }
+        _ => {
+            if found.is_none() {
+                let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+                return Err(format!(
+                    "No skill called \"{name}\". Skills: {}.",
+                    if names.is_empty() { "none".to_string() } else { names.join(", ") }
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Saves a new skill in the user's folder (`save_skill`).
+pub fn save(name: &str, description: &str, instructions: &str) -> Result<String, String> {
+    let folder = user_folder().ok_or("This computer has no folder for skills.")?;
+    save_in(&folder, name, description, instructions)
+}
+
+fn save_in(folder: &Path, name: &str, description: &str, instructions: &str) -> Result<String, String> {
+    check_in(Some(folder), "save_skill", name, description, instructions)?;
+    let name = name.trim();
+    let dir = folder.join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't make the skill's folder: {e}"))?;
+    std::fs::write(dir.join("SKILL.md"), skill_file(name, description, instructions))
+        .map_err(|e| format!("Couldn't save the skill: {e}"))?;
+    Ok(format!(
+        "Saved the skill \"{name}\". It's offered in later chats when a request fits it, and the user can see it in {}.",
+        dir.display()
+    ))
+}
+
+/// Rewrites one of the skills (`update_skill`): a user's skill is replaced, its old
+/// SKILL.md kept beside it; a built-in one gets a copy of the user's own that replaces it.
+pub fn update(name: &str, instructions: &str, description: &str) -> Result<String, String> {
+    let folder = user_folder().ok_or("This computer has no folder for skills.")?;
+    update_in(&folder, name, instructions, description)
+}
+
+fn update_in(folder: &Path, name: &str, instructions: &str, description: &str) -> Result<String, String> {
+    check_in(Some(folder), "update_skill", name, description, instructions)?;
+    let name = name.trim();
+    let skills = all_skills_in(Some(folder));
+    let old = skills
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| format!("No skill called \"{name}\"."))?;
+    let description = if description.trim().is_empty() {
+        old.description.as_str()
+    } else {
+        description
+    };
+    let text = skill_file(name, description, instructions);
+    parse(&text)?;
+    let dir = folder.join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't make the skill's folder: {e}"))?;
+    let file = dir.join("SKILL.md");
+    let mut kept = String::new();
+    if file.is_file() {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let backup = dir.join(format!("SKILL.md.{secs}.old"));
+        std::fs::rename(&file, &backup).map_err(|e| format!("Couldn't keep the old version: {e}"))?;
+        kept = format!(" The old version is kept as {}.", backup.display());
+    } else if old.built_in {
+        kept = " The built-in version is still there, under this one.".into();
+    }
+    std::fs::write(&file, text).map_err(|e| format!("Couldn't save the skill: {e}"))?;
+    Ok(format!("Rewrote the skill \"{name}\".{kept}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_skill_reads_back_and_an_update_keeps_the_old_one() {
+        let folder = std::env::temp_dir().join(format!("syrinx-skills-{:x}", crate::random_u64()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let said = save_in(&folder, "weekly-report", "Write the \"weekly\" report: from notes.", "1. Read `notes.md`.").unwrap();
+        assert!(said.contains("Saved the skill \"weekly-report\""));
+        let read = scan(&folder, false);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].description, "Write the \"weekly\" report: from notes.");
+        assert_eq!(read[0].instructions, "1. Read `notes.md`.");
+        // Saving it again under the same name is refused; a bad name too.
+        assert!(save_in(&folder, "weekly-report", "d", "x").unwrap_err().contains("update_skill"));
+        assert!(save_in(&folder, "Weekly Report", "d", "x").is_err());
+        let said = update_in(&folder, "weekly-report", "1. Read `notes.md`.\n2. Sum it.", "").unwrap();
+        assert!(said.contains("old version is kept"));
+        let read = scan(&folder, false);
+        assert_eq!(read[0].description, "Write the \"weekly\" report: from notes.");
+        assert!(read[0].instructions.ends_with("2. Sum it."));
+        let olds = std::fs::read_dir(folder.join("weekly-report")).unwrap().count();
+        assert_eq!(olds, 2);
+        assert!(update_in(&folder, "no-such-skill", "x", "").unwrap_err().contains("No skill called"));
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
 
     #[test]
     fn the_shortlist_question_lists_each_skill_by_name() {

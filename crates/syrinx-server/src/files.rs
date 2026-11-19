@@ -28,6 +28,9 @@ pub const MAX_LISTING_DEPTH: usize = 3;
 pub const MAX_LISTED_ENTRIES: usize = 400;
 pub const SEARCH_TIME_LIMIT: Duration = Duration::from_secs(15);
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a shell command may run, and the most of its output a result holds.
+pub const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_SHELL_OUTPUT: usize = 20_000;
 /// Dependency and package folders, which a search or a deep listing walks past.
 const SKIPPED_FOLDERS: [&str; 4] = ["node_modules", "venv", "__pycache__", "site-packages"];
 /// Read with the Mac's document readers rather than as text.
@@ -193,6 +196,17 @@ impl Files {
                 &optional_arg(call, "start_cell").unwrap_or_default(),
                 call.json("rows").or_else(|| call.text("rows")).unwrap_or(""),
             ),
+            "edit_file" => self.edit_file(
+                &arg(call, "path")?,
+                &arg(call, "old_text")?,
+                &optional_arg(call, "new_text").unwrap_or_default(),
+            ),
+            "create_pdf" => self.create_pdf(
+                &arg(call, "path")?,
+                &optional_arg(call, "title").unwrap_or_default(),
+                &arg(call, "content")?,
+            ),
+            "run_shell_command" => self.run_shell_command(&arg(call, "command")?),
             other => Err(format!("{other} can't run on this {MACHINE}.")),
         }
     }
@@ -219,6 +233,15 @@ impl Files {
                 .map(|_| ()),
             "create_docx" => self.office_target(&arg(call, "path")?, ".docx").map(|_| ()),
             "create_pptx" => self.office_target(&arg(call, "path")?, ".pptx").map(|_| ()),
+            "create_pdf" => self.office_target(&arg(call, "path")?, ".pdf").map(|_| ()),
+            "edit_file" => self
+                .edited(
+                    &arg(call, "path")?,
+                    &arg(call, "old_text")?,
+                    &optional_arg(call, "new_text").unwrap_or_default(),
+                )
+                .map(|_| ()),
+            "run_shell_command" => self.shell_allowed(&arg(call, "command")?),
             "fill_docx_template" => self
                 .template_and_target(&arg(call, "template")?, &arg(call, "path")?)
                 .map(|_| ()),
@@ -442,6 +465,205 @@ impl Files {
         };
         let (bytes, message) = xlsx_write::write(&file, existing.as_deref(), start, &rows)?;
         Ok((file, bytes, message))
+    }
+
+    /// A file's text with `old` replaced by `new`, where `old` is in it once: the file, its
+    /// new text, and how many lines went for how many.
+    fn edited(&self, path: &str, old: &str, new: &str) -> Result<(String, String, String), String> {
+        let file = self.writable(path)?;
+        if !exists(&file) {
+            return Err(format!("File not found: {file}. To make a new file, use write_file."));
+        }
+        let size = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        if size > MAX_READ_BYTES {
+            return Err(format!("{file} is too large to edit here (over 1 MB)."));
+        }
+        let bytes = fs::read(&file).map_err(|e| format!("Couldn't read {file}: {e}"))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{file} isn't a text file, so it can't be edited by replacing text."))?;
+        if old.is_empty() {
+            return Err("old_text is empty: copy the text to replace from the file.".into());
+        }
+        // A file with Windows line ends is matched with them.
+        let (old, new) = if text.contains("\r\n") && !old.contains("\r\n") {
+            (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
+        } else {
+            (old.to_string(), new.to_string())
+        };
+        let found = text.matches(old.as_str()).count();
+        if found == 0 {
+            let trimmed = old.trim();
+            let hint = if !trimmed.is_empty() && trimmed != old && text.contains(trimmed) {
+                " It is there without the spaces or lines around it: copy it exactly."
+            } else {
+                " Read the file again and copy the text exactly, spaces and line breaks included."
+            };
+            return Err(format!("The text to replace isn't in {file}.{hint}"));
+        }
+        if found > 1 {
+            return Err(format!(
+                "The text to replace is in {file} {found} times. Include more of the text around it, so it names one place."
+            ));
+        }
+        // A model sometimes sends the whole new file, or more of it, as new_text with only a
+        // line as old_text, which would leave the lines around it twice (Gemma 4 E4B, Nov 19:
+        // "- eggs" for the whole list). A line next to the match that new_text repeats, and
+        // old_text doesn't hold, is refused.
+        let at = text.find(old.as_str()).unwrap_or(0);
+        let before = text[..at].trim_end_matches(['\r', '\n']);
+        let after = text[at + old.len()..].trim_start_matches(['\r', '\n']);
+        let neighbours = [
+            before.rsplit('\n').next().unwrap_or(""),
+            after.split('\n').next().unwrap_or(""),
+        ];
+        if let Some(line) = neighbours.iter().map(|l| l.trim_end_matches('\r')).find(|line| {
+            line.trim().chars().count() >= 3 && new.contains(*line) && !old.contains(*line)
+        }) {
+            return Err(format!(
+                "new_text repeats \"{}\", which is next to old_text in the file and would then be there twice. new_text replaces old_text only: give just the text that goes in its place, or put that line in old_text too.",
+                line.trim()
+            ));
+        }
+        let changed = text.replacen(old.as_str(), new.as_str(), 1);
+        let lines = |t: &str| if t.is_empty() { 0 } else { t.lines().count() };
+        let said = format!(
+            "{} line{} replaced with {} line{}",
+            lines(&old),
+            if lines(&old) == 1 { "" } else { "s" },
+            lines(&new),
+            if lines(&new) == 1 { "" } else { "s" }
+        );
+        Ok((file, changed, said))
+    }
+
+    fn edit_file(&self, path: &str, old: &str, new: &str) -> Result<String, String> {
+        let (file, changed, said) = self.edited(path, old, new)?;
+        self.replace(&file, changed.as_bytes())?;
+        Ok(format!("File edited successfully: {file} ({said})."))
+    }
+
+    /// A PDF from a title and Markdown (`attach::pdf_write`).
+    fn create_pdf(&self, path: &str, title: &str, content: &str) -> Result<String, String> {
+        let file = self.office_target(path, ".pdf")?;
+        let (bytes, missing) = crate::attach::pdf_write::create(title, content);
+        self.replace(&file, &bytes)?;
+        let mut said = format!("PDF saved: {file}");
+        if !missing.is_empty() {
+            let shown: String = missing.iter().take(8).collect::<Vec<_>>().iter().map(|c| format!(" {c}")).collect();
+            said.push_str(&format!(
+                "\nThe PDF's fonts don't have some characters, so they show as \"?\":{shown}. Say so to the user if it matters."
+            ));
+        }
+        Ok(said)
+    }
+
+    /// Shell commands reach the whole machine, so a chat that may reach only the folders
+    /// the user chose can't run them.
+    fn shell_allowed(&self, command: &str) -> Result<(), String> {
+        if command.trim().is_empty() {
+            return Err("The command is empty.".into());
+        }
+        if matches!(self.access, Access::Folders(_)) {
+            return Err(
+                "This chat may reach only the folders the user chose, so it can't run shell commands. The user can give it more access in the chat's settings."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Runs a command in the user's shell (zsh on the Mac, `cmd` on Windows) from the home
+    /// folder, stopping it, and what it started, after `SHELL_TIMEOUT`.
+    fn run_shell_command(&self, command: &str) -> Result<String, String> {
+        self.shell_allowed(command)?;
+        let mut shell = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", command]);
+            c
+        } else if Path::new("/bin/zsh").exists() {
+            let mut c = Command::new("/bin/zsh");
+            c.args(["-l", "-c", command]);
+            c
+        } else {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", command]);
+            c
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own process group, so a timeout stops what it started too.
+            shell.process_group(0);
+        }
+        let (mut reader, writer) = std::io::pipe().map_err(|e| format!("Couldn't run the command: {e}"))?;
+        let errors = writer.try_clone().map_err(|e| format!("Couldn't run the command: {e}"))?;
+        let mut child = shell
+            .current_dir(&self.home)
+            .stdin(Stdio::null())
+            .stdout(writer)
+            .stderr(errors)
+            .spawn()
+            .map_err(|e| format!("Couldn't run the command: {e}"))?;
+        // The command holds the pipe's write ends too: they go, so reading ends with it.
+        drop(shell);
+        let collected = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = reader.read_to_end(&mut bytes);
+            bytes
+        });
+        let deadline = Instant::now() + SHELL_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() > deadline => {
+                    #[cfg(unix)]
+                    let _ = Command::new("/bin/kill").args(["-9", &format!("-{}", child.id())]).status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "The command was stopped after {} seconds. Run a quicker one, or ask the user to run it in Terminal.",
+                        SHELL_TIMEOUT.as_secs()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(format!("Couldn't run the command: {e}")),
+            }
+        };
+        // A command that left something running in the background keeps the pipe open:
+        // the output is what came within a moment of it finishing.
+        let bytes = {
+            let waited = Instant::now();
+            while !collected.is_finished() && waited.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if collected.is_finished() {
+                collected.join().unwrap_or_default()
+            } else {
+                b"(It left something running in the background, so its output wasn't collected.)".to_vec()
+            }
+        };
+        let output = String::from_utf8_lossy(&bytes);
+        let output = output.trim();
+        let output = if output.chars().count() > MAX_SHELL_OUTPUT {
+            let head: String = output.chars().take(MAX_SHELL_OUTPUT / 2).collect();
+            let tail: Vec<char> = output.chars().rev().take(MAX_SHELL_OUTPUT / 2).collect();
+            let tail: String = tail.into_iter().rev().collect();
+            format!("{head}\n[... the middle of the output is left out ...]\n{tail}")
+        } else {
+            output.to_string()
+        };
+        let code = status.code().unwrap_or(-1);
+        if code != 0 {
+            return Err(format!(
+                "The command exited with status {code}: {}",
+                if output.is_empty() { "no output" } else { &output }
+            ));
+        }
+        Ok(if output.is_empty() {
+            "The command finished with no output.".to_string()
+        } else {
+            output
+        })
     }
 
     fn rename_file(&self, path: &str, new_name: &str) -> Result<String, String> {
@@ -1416,6 +1638,57 @@ mod tests {
 
     fn tools(home: &Home, access: Access) -> Files {
         Files::new(&home.0, access).with_trash(&format!("{}/.test-trash", home.0))
+    }
+
+    #[test]
+    fn an_edit_replaces_the_text_named_once_and_keeps_the_old_file() {
+        let h = home();
+        make(&h, "Documents/todo.md", "- milk\n- eggs\n- bread\n");
+        make(&h, "Documents/win.txt", "one\r\ntwo\r\nthree\r\n");
+        let t = tools(&h, Access::Home);
+        let home = &t.home;
+        let said = run(&t, "edit_file", &[("path", "Documents/todo.md"), ("old_text", "- eggs\n"), ("new_text", "- eggs (a dozen)\n- butter\n")]);
+        assert_eq!(said, format!("File edited successfully: {home}/Documents/todo.md (1 line replaced with 2 lines)."));
+        assert_eq!(fs::read_to_string(format!("{home}/Documents/todo.md")).unwrap(), "- milk\n- eggs (a dozen)\n- butter\n- bread\n");
+        assert_eq!(fs::read_to_string(format!("{home}/.test-trash/todo.md")).unwrap(), "- milk\n- eggs\n- bread\n");
+        // Windows line ends are matched and kept.
+        run(&t, "edit_file", &[("path", "Documents/win.txt"), ("old_text", "two\nthree"), ("new_text", "2\n3")]);
+        assert_eq!(fs::read_to_string(format!("{home}/Documents/win.txt")).unwrap(), "one\r\n2\r\n3\r\n");
+        // Text that isn't there, or is there twice, is refused before anyone approves it.
+        let missing = t.check(&call("edit_file", &[("path", "Documents/todo.md"), ("old_text", "- cheese"), ("new_text", "")]));
+        assert!(missing.unwrap_err().contains("isn't in"));
+        // The whole list as new_text for one line of it would leave the lines around it twice.
+        let whole = failure(&t, "edit_file", &[("path", "Documents/todo.md"), ("old_text", "- butter"), ("new_text", "- milk\n- eggs (a dozen)\n- cheese\n- bread")]);
+        assert!(whole.contains("repeats \"- eggs (a dozen)\""), "{whole}");
+        let twice = failure(&t, "edit_file", &[("path", "Documents/todo.md"), ("old_text", "- "), ("new_text", "* ")]);
+        assert!(twice.contains("4 times"), "{twice}");
+        let none = failure(&t, "edit_file", &[("path", "Documents/none.md"), ("old_text", "x"), ("new_text", "y")]);
+        assert!(none.contains("use write_file"), "{none}");
+    }
+
+    #[test]
+    fn a_pdf_is_saved_with_its_extension() {
+        let h = home();
+        let t = tools(&h, Access::Home);
+        let home = &t.home;
+        let said = run(&t, "create_pdf", &[("path", "Documents/plan"), ("title", "Plan"), ("content", "Go \u{2192} there.")]);
+        assert!(said.starts_with(&format!("PDF saved: {home}/Documents/plan.pdf")), "{said}");
+        assert!(said.contains("\u{2192}"));
+        assert!(fs::read(format!("{home}/Documents/plan.pdf")).unwrap().starts_with(b"%PDF-1.4"));
+    }
+
+    #[test]
+    fn a_shell_command_runs_from_home_and_fails_with_its_output() {
+        let h = home();
+        let t = tools(&h, Access::Home);
+        let home = &t.home;
+        assert_eq!(run(&t, "run_shell_command", &[("command", "pwd -P")]), fs::canonicalize(home).unwrap().to_string_lossy());
+        let failed = failure(&t, "run_shell_command", &[("command", "echo nope >&2; exit 3")]);
+        assert_eq!(failed, "The command exited with status 3: nope");
+        assert_eq!(run(&t, "run_shell_command", &[("command", "true")]), "The command finished with no output.");
+        // Not from a chat that may reach only some folders.
+        let chosen = tools(&h, Access::Folders(vec![format!("{home}/Documents")]));
+        assert!(chosen.check(&call("run_shell_command", &[("command", "ls")])).unwrap_err().contains("only the folders"));
     }
 
     #[test]
