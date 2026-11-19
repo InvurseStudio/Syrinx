@@ -981,7 +981,7 @@ const BUFFER_SLACK: usize = 128 * 1024;
 type ReadyQueries = (CuDevicePtr, usize, usize, usize, usize);
 /// attention_tcg's tiles for heads of 128, 256 and 512: query rows, positions a step and
 /// threads (see syrinx_tensor.metal).
-const TCG_TILES: [(usize, usize, u32); 3] = [(32, 128, 128), (32, 128, 256), (16, 256, 256)];
+const TCG_TILES: [(usize, usize, u32); 3] = [(32, 128, 128), (32, 128, 256), (32, 128, 256)];
 /// The most parts attention_tcg splits a short batch's context into (attention_tcg_merge's
 /// weights).
 const TCG_MAX_PARTS: u32 = 64;
