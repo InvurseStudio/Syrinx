@@ -176,7 +176,7 @@ kernel void moe_matmul_tc(ARGS, KP) {
     device const u8* w = ARG_PTR(const u8, 0) + (ulong)tile[0] * (ulong)rows * row_bytes;
     device half* x = ARG_PTR(half, 1) + (ulong)tile[1] * x_stride;
     device float* y = ARG_PTR(float, 2) + (ulong)tile[1] * y_stride;
-    threadgroup half sa[ROWS * KK];
+    threadgroup half sab[2 * ROWS * KK];
     const int row0 = gid.x * ROWS;
     constexpr int RUNS = KK / 32, PER = (ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
 
@@ -185,12 +185,14 @@ kernel void moe_matmul_tc(ARGS, KP) {
                                              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<TC_SG>>
         mm;
-    auto t_w = tensor(sa, dextents<int32_t, 2>(KK, ROWS));
+    auto t_w = tensor(sab, dextents<int32_t, 2>(KK, ROWS));
     auto t_x = tensor(x, dextents<int32_t, 2>(cols, tokens), array<int, 2>({1, x_stride}));
     auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x), decltype(t_w), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); i++) acc[i] = 0.0f;
 
-    for (int k0 = 0; k0 < cols; k0 += KK) {
+    int flip = 0;
+    for (int k0 = 0; k0 < cols; k0 += KK, flip ^= 1) {
+        threadgroup half* sa = sab + flip * (ROWS * KK);
         for (int part = 0; part < PER; part++) {
             const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
             if (lr >= ROWS) break;
@@ -206,7 +208,6 @@ kernel void moe_matmul_tc(ARGS, KP) {
         auto tile_w = tensor(sa, dextents<int32_t, 2>(k_len, ROWS), array<int, 2>({1, KK}));
         auto tile_x = tensor(x + k0, dextents<int32_t, 2>(k_len, tokens), array<int, 2>({1, x_stride}));
         mm.run(tile_x, tile_w, acc);
-        BARRIER;
     }
     auto t_y = tensor(y + row0, dextents<int32_t, 2>(min(ROWS, rows - row0), tokens), array<int, 2>({1, y_stride}));
     acc.store(t_y);
@@ -262,6 +263,7 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     device const int* pos = ARG_PTR(const int, 4);
     const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
+    const float scale_log2 = scale * 1.4426950408889634f;
     const int tokens = ARG_INT(10);
     constexpr int AC = 64, SG = 8, THREADS = 32 * SG, ROWS = AQ / SG, COLS = AC / 32;
     threadgroup half sq[AQ * D];
@@ -292,7 +294,17 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
         mm_pv;
     auto tv0 = tensor(values + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
     auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
-    for (uint16_t i = 0; i < co.get_capacity(); i++)
+    constexpr int CO_MAX = 64;
+    short co_row[CO_MAX];
+    // A thread's elements past CO_MAX (none for today's sizes) take the slow way: asked
+    // their row each time.
+    const int co_cap = (int)co.get_capacity(), co_n = min(co_cap, CO_MAX);
+    for (int i = 0; i < co_n; i++) {
+        const bool valid = co.is_valid_element(i);
+        co_row[i] = valid ? (short)co.get_multidimensional_index(i)[1] : (short)-1;
+        if (valid) co[i] = 0.0f;
+    }
+    for (int i = co_n; i < co_cap; i++)
         if (co.is_valid_element(i)) co[i] = 0.0f;
     float row_max[ROWS], row_sum[ROWS];
     for (int jj = 0; jj < ROWS; jj++) {
@@ -315,15 +327,15 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
             for (int ii = 0; ii < COLS; ii++) {
                 const int c = ii * 32 + lane, kpos = start + c;
                 const bool seen = live && c < count && kpos <= at && kpos >= first;
-                s[ii] = seen ? ss[j * AC + c] * scale : -INFINITY;
+                s[ii] = seen ? ss[j * AC + c] * scale_log2 : -INFINITY;
                 mx = max(mx, s[ii]);
             }
             mx = simd_max(mx);
             const float new_max = max(row_max[jj], mx);
-            const float correction = new_max == -INFINITY ? 1.0f : exp(row_max[jj] - new_max);
+            const float correction = new_max == -INFINITY ? 1.0f : metal::fast::exp2(row_max[jj] - new_max);
             float sum = 0.0f;
             for (int ii = 0; ii < COLS; ii++) {
-                const half p = half(s[ii] == -INFINITY ? 0.0f : exp(s[ii] - new_max));
+                const half p = half(s[ii] == -INFINITY ? 0.0f : metal::fast::exp2(s[ii] - new_max));
                 sp[j * AC + ii * 32 + lane] = p;
                 sum += float(p);
             }
@@ -332,7 +344,12 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
             if (lane == 0) sr[j] = correction;
         }
         BARRIER;
-        for (uint16_t i = 0; i < co.get_capacity(); i++)
+        for (int i = 0; i < co_n; i++) {
+            if (co_row[i] < 0) continue;
+            const float fix = sr[co_row[i]];
+            if (fix != 1.0f) co[i] *= fix;
+        }
+        for (int i = co_n; i < co_cap; i++)
             if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
         auto tv = tensor(values + ring_row(start, ring) * kv_dim + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_pv.run(tp, tv, co);
@@ -343,7 +360,10 @@ kernel void attention_tc(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
         if (lane == 0) sr[j] = row_sum[jj] == 0.0f ? 0.0f : 1.0f / row_sum[jj];
     }
     BARRIER;
-    for (uint16_t i = 0; i < co.get_capacity(); i++)
+    for (int i = 0; i < co_n; i++) {
+        if (co_row[i] >= 0) co[i] *= sr[co_row[i]];
+    }
+    for (int i = co_n; i < co_cap; i++)
         if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
     auto td = tensor(out + ((ulong)t0 * heads + head) * D, dextents<int32_t, 2>(D, tokens - t0),
                      array<int, 2>({1, heads * D}));
@@ -391,6 +411,7 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     device const int* pos = ARG_PTR(const int, 4);
     const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
+    const float scale_log2 = scale * 1.4426950408889634f;
     const int tokens = ARG_INT(10);
     constexpr int ROWS = R / SG, COLS = AC / 32;
     threadgroup float ss[R * AC];
@@ -420,12 +441,16 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     // Each of this thread's numbers of the output: its row, or -1 for one not in use.
     constexpr int CO_MAX = 64;
     short co_row[CO_MAX];
-    const int co_n = min((int)co.get_capacity(), CO_MAX);
+    // A thread's elements past CO_MAX (none for today's sizes) take the slow way: asked
+    // their row each time.
+    const int co_cap = (int)co.get_capacity(), co_n = min(co_cap, CO_MAX);
     for (int i = 0; i < co_n; i++) {
         const bool valid = co.is_valid_element(i);
         co_row[i] = valid ? (short)co.get_multidimensional_index(i)[1] : (short)-1;
         if (valid) co[i] = 0.0f;
     }
+    for (int i = co_n; i < co_cap; i++)
+        if (co.is_valid_element(i)) co[i] = 0.0f;
     float row_max[ROWS], row_sum[ROWS];
     for (int jj = 0; jj < ROWS; jj++) {
         row_max[jj] = -INFINITY;
@@ -455,15 +480,15 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
             for (int ii = 0; ii < COLS; ii++) {
                 const int c = ii * 32 + lane, kpos = from + c;
                 const bool seen = live && kpos >= first && kpos <= at;
-                s[ii] = seen ? ss[j * AC + c] * scale : -INFINITY;
+                s[ii] = seen ? ss[j * AC + c] * scale_log2 : -INFINITY;
                 mx = max(mx, s[ii]);
             }
             mx = simd_max(mx);
             const float new_max = max(row_max[jj], mx);
-            const float correction = new_max == -INFINITY ? 1.0f : exp(row_max[jj] - new_max);
+            const float correction = new_max == -INFINITY ? 1.0f : metal::fast::exp2(row_max[jj] - new_max);
             float sum = 0.0f;
             for (int ii = 0; ii < COLS; ii++) {
-                const half p = half(s[ii] == -INFINITY ? 0.0f : exp(s[ii] - new_max));
+                const half p = half(s[ii] == -INFINITY ? 0.0f : metal::fast::exp2(s[ii] - new_max));
                 sp[j * AC + ii * 32 + lane] = p;
                 sum += float(p);
             }
@@ -478,6 +503,8 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
             const float fix = sr[co_row[i]];
             if (fix != 1.0f) co[i] *= fix;
         }
+        for (int i = co_n; i < co_cap; i++)
+            if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
         auto tv = tensor(values + at_cache, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_pv.run(tp, tv, co);
         BARRIER;
@@ -537,7 +564,7 @@ kernel void attention_tcg_merge(ARGS, KP) {
     float total = 0.0f;
     for (int i = 0; i < parts; i++) {
         const float m = mine[i * stride];
-        w[i] = m == -INFINITY ? 0.0f : exp(m - mx);
+        w[i] = m == -INFINITY ? 0.0f : metal::fast::exp2(m - mx);
         total += w[i] * mine[i * stride + 1];
     }
     const float scale = total == 0.0f ? 0.0f : 1.0f / total;
@@ -697,3 +724,99 @@ kernel void to_i8(ARGS, KP) {
     out[i] = top > 0.0f ? (i8)(int)rint(v / scale) : (i8)0;
     if (tid == 0) scales[gid.x] = scale;
 }
+
+// delta_chunk_scan on Metal 4 neural accelerators (n = 128, DC = 64, COLS columns of
+// value head gid.x's state per threadgroup gid.y, 4 SIMD groups = 128 threads):
+//   WS = W · S0,  δ = U − WS
+//   O  = Q̂ · S0 + P · δ
+//   S  = γ · S0 + K̂ᵀ · δ
+// All operands and accumulators stay in f32, as in delta_chunk_scan_sg (the sums are taken
+// in another order, so the last bits can differ).
+template <int COLS>
+kernel void delta_chunk_scan_tc(ARGS, KP) {
+    device const float* scratch = ARG_PTR(const float, 0);
+    device float* state = ARG_PTR(float, 1);
+    device float* out = ARG_PTR(float, 2);
+    const int n = ARG_INT(3), tokens = ARG_INT(4);
+    constexpr int N = 128, SG = 4;
+    threadgroup float Ss[N * COLS];
+    threadgroup float ds[DC * COLS];
+    const int h = gid.x, v_heads = ngrid.x, j0 = gid.y * COLS;
+    const float inv_sqrt_n = 1.0f / sqrt((float)n);
+    for (int idx = tid; idx < N * COLS; idx += tpg.x) {
+        const int c = idx / N, r = idx % N;
+        Ss[r * COLS + c] = state[((ulong)h * N + j0 + c) * N + r];
+    }
+    BARRIER;
+
+    auto t_s = tensor(Ss, dextents<int32_t, 2>(COLS, N));
+    auto t_d = tensor(ds, dextents<int32_t, 2>(COLS, DC));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(DC, COLS, N, false, false, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<SG>>
+        mm_ws;
+    // O's two products (inner sizes N and DC) through one matmul, so its cooperative
+    // tensor is laid out for both.
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(DC, COLS, static_cast<int>(dynamic_extent), false, false, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<SG>>
+        mm_o;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(N, COLS, DC, true, false, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<SG>>
+        mm_ks;
+
+    const int chunks = (tokens + DC - 1) / DC;
+    for (int ch = 0; ch < chunks; ch++) {
+        device const float* base = scratch + ((ulong)ch * v_heads + h) * delta_chunk_stride(N);
+        device const float *W = base, *U = W + DC * N, *Qh = U + DC * N, *Kh = Qh + DC * N, *P = Kh + DC * N;
+        const float gamma = P[DC * DC];
+
+        auto t_w = tensor(const_cast<device float*>(W), dextents<int32_t, 2>(N, DC), array<int, 2>({1, N}));
+        auto t_q = tensor(const_cast<device float*>(Qh), dextents<int32_t, 2>(N, DC), array<int, 2>({1, N}));
+        auto t_k = tensor(const_cast<device float*>(Kh), dextents<int32_t, 2>(N, DC), array<int, 2>({1, N}));
+        auto t_p = tensor(const_cast<device float*>(P), dextents<int32_t, 2>(DC, DC), array<int, 2>({1, DC}));
+
+        // 1) WS = W · S0 -> ds, then δ = U − WS in place.
+        mm_ws.run(t_w, t_s, t_d);
+        BARRIER;
+        for (int e = tid; e < DC * COLS; e += tpg.x) {
+            const int i = e / COLS, c = e % COLS;
+            ds[e] = U[i * N + j0 + c] - ds[e];
+        }
+        BARRIER;
+
+        // 2) O = Q̂ · S0 + P · δ in a cooperative tensor while S0 is still intact.
+        auto co_o = mm_o.template get_destination_cooperative_tensor<decltype(t_q), decltype(t_s), float>();
+        for (uint16_t i = 0; i < co_o.get_capacity(); i++)
+            if (co_o.is_valid_element(i)) co_o[i] = 0.0f;
+        mm_o.run(t_q, t_s, co_o);
+        mm_o.run(t_p, t_d, co_o);
+        BARRIER;
+
+        // 3) S = γ · S0 + K̂ᵀ · δ in place in Ss.
+        for (int e = tid; e < N * COLS; e += tpg.x) Ss[e] *= gamma;
+        BARRIER;
+        mm_ks.run(t_k, t_d, t_s);
+        BARRIER;
+
+        // 4) Store O through ds (scaled by 1/√n) into out.
+        co_o.store(t_d);
+        BARRIER;
+        for (int e = tid; e < DC * COLS; e += tpg.x) {
+            const int i = e / COLS, c = e % COLS, t = ch * DC + i;
+            if (t < tokens) out[((ulong)t * v_heads + h) * N + j0 + c] = ds[e] * inv_sqrt_n;
+        }
+        BARRIER;
+    }
+    for (int idx = tid; idx < N * COLS; idx += tpg.x) {
+        const int c = idx / N, r = idx % N;
+        state[((ulong)h * N + j0 + c) * N + r] = Ss[r * COLS + c];
+    }
+}
+
+template [[host_name("delta_chunk_scan_tc_32")]] kernel void delta_chunk_scan_tc<32>(ARGS, KP);
