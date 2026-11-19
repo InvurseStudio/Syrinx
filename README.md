@@ -2,6 +2,8 @@
 
 **A local inference engine and agent server, written from scratch in Rust.**
 
+Follow along on X: [@InvurseNorth](https://x.com/InvurseNorth)
+
 Syrinx runs open-weight language models on your own machine (Metal on Apple silicon,
 CUDA on NVIDIA) and serves them to [Vireo](https://invursestudio.com), a private AI
 assistant that works with your files, calendar and apps without sending anything to the
@@ -149,6 +151,8 @@ eval.
 Syrinx is young and moving fast. It runs every chat in the Vireo-Proto apps for Mac and
 Windows, and will replace Vireo's current Python server and the inference runtimes it
 starts. Other GPUs and NPUs come later.
+
+Progress, benchmarks and what's next are posted on X: [@InvurseNorth](https://x.com/InvurseNorth).
 
 ## License
 
