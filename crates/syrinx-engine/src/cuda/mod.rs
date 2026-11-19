@@ -432,7 +432,7 @@ unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
 
 #[cfg(syrinx_cuda)]
-const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/vireo.ptx"));
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/syrinx.ptx"));
 /// The same kernels plus the tensor-core ones, for compute capability 8.0 and later.
 #[cfg(syrinx_cuda)]
 const PTX_SM80: &str = include_str!(concat!(env!("OUT_DIR"), "/syrinx_sm80.ptx"));

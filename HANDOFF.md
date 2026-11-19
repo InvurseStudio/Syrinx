@@ -25,7 +25,7 @@ written on one machine is written for both, and measured with `syrinx-eval` on b
 
 Done on 2026-11-11 for the one-workspace merge (PR #129): every test passes on the Mac
 (engine 69, GPU 12 on the M5 Max, server 58, eval 9; swift test 132), the app builds
-`syrinx-server` from the workspace, and the 35 cases on Metal (`evals/mac.json`) match
+`syrinx-server` from the workspace, and the 35 cases on Metal (`evals/eval-runs/mac.json`) match
 Windows but for three that tip between the two GPUs. The steps, for the next time:
 
 1. Move the local, untracked folders that were in `Mac/Engine/` up to the workspace:
@@ -41,7 +41,7 @@ Windows but for three that tip between the two GPUs. The steps, for the next tim
 4. Run the eval on Metal and save it beside the others:
    `cargo run --release -p syrinx-eval -- --full --out ../evals/eval-runs/mac.json` (a plain run is
    the short one, two models). The Mac's last run,
-   `evals/mac-baseline.json`, has only the first 24 cases.
+   `evals/eval-runs/mac-baseline.json`, has only the first 24 cases.
 
 ## What the server does now (both platforms)
 
@@ -71,7 +71,7 @@ Windows but for three that tip between the two GPUs. The steps, for the next tim
 ## Eval on Windows after the merge
 
 All 35 cases on the four eval models, after the merge, against the last run before it
-(`evals/skills.json`): every case passes or fails exactly as it did, on every model.
+(`evals/eval-runs/skills.json`): every case passes or fails exactly as it did, on every model.
 
 | Model | Older 30 | Change cases | Skill cases | All 35 | Time per case |
 |---|---|---|---|---|---|
@@ -83,7 +83,7 @@ All 35 cases on the four eval models, after the merge, against the last run befo
 Qwen 3.5 0.8B is no longer one of the eval's default models (2026-11-11): too small to use
 the tools well (it said yes to every skill, saved a poem to a file). It ran in this check
 too (22/35, as before) and still runs on request (`--models Qwen3.5-0.8B-Q4_K_M.gguf`); it
-stays one of the engine's own test models. Results: `evals/one-engine.json`.
+stays one of the engine's own test models. Results: `evals/eval-runs/one-engine.json`.
 
 ## Larger models (Mac, 2026-11-11)
 
@@ -96,7 +96,7 @@ Gemma 4 E2B guessing tokens for 31B to check (15–18% faster writing on longer 
 **Not run on CUDA yet:** the 31B itself and `--draft`. CUDA keeps full caches
 (`attention_ring` and `qkv_prep` assert a ring of 0 there; and Muse Glimmer's `sigmoid_mul`
 has no CUDA kernel). Details:
-`evals/gemma-4-31B.md`.
+`evals/eval-runs/gemma-4-31B.md`.
 
 ## After pulling on the Mac (the Windows pass of 2026-11-12)
 
@@ -208,7 +208,7 @@ Google's draft models for the small Gemmas run now, and the 31B's path runs on C
   server's `Tool:` line says how long the tool ran. Run the Mac's evals with `--out` as
   before; older result files don't have them.
 - **Measured on Windows:** E2B writes 6-26% faster and E4B 5-50% (copied code least,
-  lists and explanations most), every eval case scoring as it did (`evals/windows-small-gemma-draft.json` against `-draft-off.json`: 34 and 39 of 43 either way, all 43 answers identical, writing 11% and 16% faster over the eval).
+  lists and explanations most), every eval case scoring as it did (`evals/eval-runs/windows-small-gemma-draft.json` against `-draft-off.json`: 34 and 39 of 43 either way, all 43 answers identical, writing 11% and 16% faster over the eval).
 
 ## The Mac's speed harness on Windows (2026-11-15)
 
