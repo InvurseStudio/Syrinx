@@ -447,6 +447,40 @@ pub fn list_json() -> String {
     })
 }
 
+/// Every task, for the model (`list_scheduled_tasks`): a few lines each.
+pub fn listing() -> String {
+    with_state(|s| {
+        if s.tasks.is_empty() {
+            return "No tasks are set up.".to_string();
+        }
+        let items: Vec<String> = s
+            .tasks
+            .iter()
+            .map(|t| {
+                let mut lines = vec![format!(
+                    "- {} ({}): runs {}",
+                    t.name,
+                    if t.enabled { "on" } else { "off" },
+                    t.when.described()
+                )];
+                if !t.last_run.is_empty() {
+                    lines.push(format!("  Last run: {}", t.last_run));
+                }
+                let prompt: String = t.prompt.chars().take(300).collect();
+                let more = if t.prompt.chars().count() > 300 { "..." } else { "" };
+                lines.push(format!("  Does: {}{more}", prompt.replace('\n', " ")));
+                lines.join("\n")
+            })
+            .collect();
+        format!(
+            "{} task{} (the user can change them in Settings, under Tasks):\n{}",
+            s.tasks.len(),
+            if s.tasks.len() == 1 { "" } else { "s" },
+            items.join("\n")
+        )
+    })
+}
+
 pub fn delete(id: &str) -> bool {
     with_state(|s| {
         let before = s.tasks.len();
