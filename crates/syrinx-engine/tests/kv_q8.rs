@@ -1,7 +1,6 @@
-//! Keys and values kept in Q8_0 (`VIREO_KV_Q8=1`, the Mac only): what `qkv_prep` writes,
+//! Keys and values kept in Q8_0 (`VIREO_KV_Q8=1`): what `qkv_prep` writes,
 //! and attention over it, one token at a time and in a batch. In its own file, since the
 //! setting is read once a process. Skipped (with a note) on a computer without a GPU.
-#![cfg(target_os = "macos")]
 
 use syrinx_engine::cuda::{Gpu, QkvPrep};
 use syrinx_engine::half::f16_to_f32;

@@ -206,11 +206,8 @@ impl<'a> LlamaCuda<'a> {
         let batch = batch.clamp(1, capacity.max(1));
         let kv_dim = c.kv_heads * c.head_dim;
         let f32s = |n: usize| self.gpu.alloc(n * 4).map_err(gpu_error);
-        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1 on macOS) in 8-bit mode, f32 when exact.
-        #[cfg(target_os = "macos")]
+        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1) in 8-bit mode, f32 when exact.
         let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, c.head_dim);
-        #[cfg(not(target_os = "macos"))]
-        let head_bytes = c.head_dim * if self.precision == Precision::Int8 { 2 } else { 4 };
         let cache = |rows: usize| {
             self.gpu
                 .alloc(rows * c.kv_heads * head_bytes)

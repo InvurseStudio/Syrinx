@@ -725,18 +725,39 @@ fn held_logits_are_the_batchs_rows() {
             m.held_logits(&b, r, &mut row).unwrap();
             same(&format!("{name}, row {r}"), &row, &all[r * vocab..(r + 1) * vocab]);
         }
-        // One token at a time, in 8-bit mode: the same numbers. On CUDA: the Mac reads
-        // four tokens through the accelerators' 8-token tile, whose sums are f16 products
-        // added in another order (near the one-token kernel's, not its bits).
+        // One token at a time, in 8-bit mode: global layers for 2..=8 tokens now run on
+        // the tensor cores (`attention_mma_part` on CUDA, `attention_tcg` on Metal), so
+        // their sums differ by f16 rounding rather than matching to the bit; verify the
+        // top token matches and logits stay close.
         if cfg!(target_os = "macos") {
             continue;
         }
+        let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
         for (r, &id) in round.iter().enumerate() {
             let single = m.forward(&mut one, id, true).unwrap().unwrap().to_vec();
-            same(
-                &format!("{name}, token {r} alone against the batch"),
-                &single,
-                &all[r * vocab..(r + 1) * vocab],
+            let got = &all[r * vocab..(r + 1) * vocab];
+            let (lo, hi) = single
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+                    (a.min(v), b.max(v))
+                });
+            let range = f64::from((hi - lo).max(1.0));
+            let (worst, sum) = single
+                .iter()
+                .zip(got)
+                .fold((0f32, 0f64), |(w, s), (a, b)| {
+                    let d = (a - b).abs();
+                    (w.max(d), s + f64::from(d))
+                });
+            let mean = sum / vocab as f64;
+            assert_eq!(
+                top(&single),
+                top(got),
+                "{name}, token {r} alone against the batch: top token differs"
+            );
+            assert!(
+                f64::from(worst) <= range * 0.02 && mean <= range * 0.005,
+                "{name}, token {r} alone against the batch: logits differ by worst {worst}, mean {mean:.4} (range {range:.1})"
             );
         }
     }
@@ -2477,5 +2498,35 @@ fn the_gated_feed_forward_kernel_matches_two_products_and_the_activation() {
                 gate.kind
             );
         }
+    }
+}
+
+#[test]
+fn argmax_matches_cpu_and_breaks_ties_to_first() {
+    let Some(gpu) = open_gpu() else {
+        return;
+    };
+    let cases: Vec<Vec<f32>> = vec![
+        vec![-10.0, -3.5, -100.0, -3.5, -4.0],
+        vec![f32::NEG_INFINITY; 512],
+        (0..262_144)
+            .map(|i| {
+                if i == 123_456 || i == 250_000 {
+                    42.5
+                } else {
+                    ((i * 7919) % 1000) as f32 / 50.0 - 10.0
+                }
+            })
+            .collect(),
+        (0..248_320)
+            .map(|i| if i == 248_319 { 99.0 } else { -(i as f32) * 1e-4 })
+            .collect(),
+    ];
+    for data in cases {
+        let buf = gpu.upload_f32(&data).unwrap();
+        let got = gpu.argmax(buf.ptr(), data.len()).unwrap();
+        let top = data.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+        let want = data.iter().position(|&v| v == top).unwrap_or(0) as u32;
+        assert_eq!(got, want, "n={}", data.len());
     }
 }
