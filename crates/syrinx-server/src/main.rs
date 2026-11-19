@@ -2069,6 +2069,17 @@ impl Model {
         r.map_err(|e| e.to_string())?
             .ok_or_else(|| "no logits".into())
     }
+
+    fn next_greedy(&self, s: &mut Session, id: u32) -> Result<u32, String> {
+        let _t = TimeLog::start(self, "next_greedy", 1);
+        let r = match (self, s) {
+            (Model::Llama(m), Session::Llama(s)) => m.forward_greedy(s, id),
+            (Model::Qwen35(m), Session::Qwen35(s)) => m.forward_greedy(s, id),
+            (Model::Gemma4(m), Session::Gemma4(s)) => m.forward_greedy(s, id),
+            _ => unreachable!("a session belongs to its model"),
+        };
+        r.map_err(|e| e.to_string())
+    }
 }
 
 fn engine(
@@ -3366,6 +3377,11 @@ fn reply(
     // With a draft: the last token picked, in `kept.tokens` but not read yet. It's read
     // with the next round's guesses, in the same pass, rather than on its own.
     let mut unread: Option<u32> = None;
+    let mut pre_picked: Option<u32> = None;
+    let can_greedy = settings.temperature <= 0.0
+        && settings.repetition_penalty == 1.0
+        && serving.is_none()
+        && !debug_calls();
     if let Some(d) = drafter.as_deref_mut() {
         d.start_reply();
     }
@@ -3534,7 +3550,16 @@ fn reply(
                 }
                 _ => {
                     if let Some(u) = unread.take() {
-                        next_token(model, serving, &mut kept.session, u, &mut logits)?;
+                        if can_greedy
+                            && (may_call || offered.is_empty() || thinking)
+                            && !answer_due
+                            && !turn_start
+                            && !generated.is_empty()
+                        {
+                            pre_picked = Some(model.next_greedy(&mut kept.session, u)?);
+                        } else {
+                            next_token(model, serving, &mut kept.session, u, &mut logits)?;
+                        }
                     }
                 }
             }
@@ -3576,7 +3601,9 @@ fn reply(
         {
             logits[close as usize] = f32::NEG_INFINITY;
         }
-        let mut next = sampler.pick(&logits, &generated);
+        let mut next = pre_picked
+            .take()
+            .unwrap_or_else(|| sampler.pick(&logits, &generated));
         // A thought ends with its closing token, here even when the model would end its
         // turn inside it, or has thought as long as one thought may: its answer is still
         // to come.
@@ -3980,6 +4007,13 @@ fn reply(
             }
         } else if drafting {
             unread = Some(next);
+        } else if can_greedy
+            && (may_call || offered.is_empty() || thinking)
+            && !answer_due
+            && !turn_start
+            && !generated.is_empty()
+        {
+            pre_picked = Some(model.next_greedy(&mut kept.session, next)?);
         } else {
             next_token(model, serving, &mut kept.session, next, &mut logits)?;
         }

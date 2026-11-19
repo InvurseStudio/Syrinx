@@ -1114,6 +1114,11 @@ impl<'a> Qwen35Cuda<'a> {
             )
             .map_err(e)?;
 
+            let mid_ffn = l > 0 && l + 1 < self.layers.len();
+            #[cfg(target_os = "macos")]
+            if mid_ffn {
+                Gpu::set_i8_ffn(true);
+            }
             // One token on the Mac: gate, up and the activation in one dispatch.
             #[cfg(target_os = "macos")]
             let fused = t == 1
@@ -1150,6 +1155,10 @@ impl<'a> Qwen35Cuda<'a> {
                     &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
                     s.mixed.ptr(),
                 )?;
+            }
+            #[cfg(target_os = "macos")]
+            if mid_ffn {
+                Gpu::set_i8_ffn(false);
             }
             let next = match self.layers.get(l + 1) {
                 Some(next) => &next.attn_norm,
