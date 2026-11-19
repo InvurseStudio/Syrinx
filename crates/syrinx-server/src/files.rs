@@ -2288,7 +2288,7 @@ mod tests {
                 "run_tests",
                 &[("path", "Documents/notes.txt")]
             ),
-            "run_tests can't run on this Mac."
+            format!("run_tests can't run on this {MACHINE}.")
         );
     }
 
