@@ -1,8 +1,11 @@
 # Project Syrinx
 
-Syrinx is Vireo's own engine (this folder was `VireoPrototype/` until 2026-11-17). The chat
-apps that run on it, the Vireo-Proto Mac and Windows apps in `Mac/` and `Windows/`, keep the
-Vireo name. Evals, benchmarks and the Aurelia gauntlet live in [`../evals/`](../evals/README.md).
+Syrinx is Vireo's own engine. Since 2026-11-19 it has its own repository
+(InvurseStudio/Syrinx), mounted in the Vireo repository as a git submodule at `Syrinx/`;
+before that it was `Syrinx/` there (and `VireoPrototype/` until 2026-11-17), and its
+history came along. The chat apps that run on it, Vireo-Proto for Mac and Windows, keep the
+Vireo name and live in the Vireo repository (`Mac/`, `Windows/`), as do the evals,
+benchmarks and the Aurelia gauntlet (`evals/`, `../evals/` from here in a Vireo checkout).
 
 Work on Vireo's own stack: a Rust server and inference engine that would replace the
 Python server in `server/` and the inference servers it starts. GGUF models, read
@@ -26,12 +29,10 @@ Nothing here is used by the shipping apps.
 | `crates/syrinx-cli/` | Runs the engine from the command line, for testing and benchmarks |
 | `crates/syrinx-server/` | The server: one model over the part of the app's API that chats use. Tools: files and Git (run by the app that asks for them, as the Windows app does, or by the server itself, `files.rs`, as for the Mac app), the tools that change files with the user's approval, the date; skills (SKILL.md, picked by scoring); attachments (`attach/`). Each prototype app starts it itself; `start-server.cmd` runs it by hand on Windows. It keeps each chat's cache in the prototype's folder (`%LOCALAPPDATA%\VireoPrototype`, `~/Library/Application Support/VireoPrototype` on the Mac), so going back to a chat reads only what's new |
 | `crates/syrinx-eval/` | How well each model uses the tools and skills: `cargo run --release -p syrinx-eval -- --out ../evals/eval-runs/latest.json` runs 39 cases (twelve easy, twelve harder, six that change files, five skills, four for the later tools) through syrinx-server against a stand-in PC and scores the tools, arguments and answers: by default on Gemma 4 E2B and Qwen 3.5 4B (about 6 minutes), with `--full` on Gemma 4 E2B and E4B and Qwen 3.5 4B and 9B (about 18), for in-depth testing and before a pull request. The latest full run is `../evals/eval-runs/windows-short-batches.json` (Windows); the Mac's is `../evals/eval-runs/mac.json` (35 cases). Larger models run on request: Gemma 4 31B passes all 35 on the Mac (`../evals/eval-runs/gemma-4-31B.md`) |
-| `Windows/` | A copy of the native Windows app, the prototype's front end. It runs side by side with the Vireo app and keeps its own chats. See [Windows/README.md](Windows/README.md). |
-| `Mac/` | The Mac app, the prototype's front end on the Mac (`Mac/App/`). It builds `syrinx-server` from this workspace. See [Mac/README.md](Mac/README.md). |
 
 ## Chatting with the engine in the prototype app
 
-1. Install the app with `Windows\install-test-build.cmd`. It builds `syrinx-server` too
+1. Install the app with `Windows\install-test-build.cmd` in the Vireo repository. It builds `syrinx-server` too
    and installs it beside the app.
 2. Open **Vireo Prototype**, then Settings › Models: download one of the suggested models
    or add a folder of `.gguf` files (Llama, Qwen 3.5 or Gemma 4), make it the active model,
