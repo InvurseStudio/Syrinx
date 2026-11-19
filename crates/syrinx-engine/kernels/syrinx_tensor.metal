@@ -415,8 +415,9 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
     const int tokens = ARG_INT(10);
     constexpr int ROWS = R / SG, COLS = AC / 32;
     threadgroup float ss[R * AC];
-    threadgroup half sp[R * AC];
+    threadgroup half* sp = (threadgroup half*)ss;
     threadgroup float sr[R];
+    threadgroup atomic_uint any_fix;
     const int g = gid.x, heads = ngrid.x * group;
     const int tb = R / group, live_rows = tb * group;
     const int t0 = gid.y * tb, p0 = *pos;
@@ -470,41 +471,66 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
         const ulong at_cache = ring_row(from, ring) * kv_dim + kv;
         auto tk = tensor(keys + at_cache, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_qk.run(tq, tk, ts);
+        if (tid == 0) atomic_store_explicit(&any_fix, 0u, memory_order_relaxed);
         BARRIER;
+        half p_reg[ROWS][COLS];
+        bool local_fix = false;
         for (int jj = 0; jj < ROWS; jj++) {
             const int j = jj * SG + sg, t = t0 + j / group, at = p0 + t;
             const bool live = j < live_rows && t < tokens;
             const int first = max(start, window > 0 ? at + 1 - window : 0);
             float s[COLS];
             float mx = -INFINITY;
-            for (int ii = 0; ii < COLS; ii++) {
-                const int c = ii * 32 + lane, kpos = from + c;
-                const bool seen = live && kpos >= first && kpos <= at;
-                s[ii] = seen ? ss[j * AC + c] * scale_log2 : -INFINITY;
-                mx = max(mx, s[ii]);
+            if (live && from >= first && from + AC - 1 <= at) {
+                for (int ii = 0; ii < COLS; ii++) {
+                    s[ii] = ss[j * AC + ii * 32 + lane] * scale_log2;
+                    mx = max(mx, s[ii]);
+                }
+            } else {
+                for (int ii = 0; ii < COLS; ii++) {
+                    const int c = ii * 32 + lane, kpos = from + c;
+                    const bool seen = live && kpos >= first && kpos <= at;
+                    s[ii] = seen ? ss[j * AC + c] * scale_log2 : -INFINITY;
+                    mx = max(mx, s[ii]);
+                }
             }
             mx = simd_max(mx);
             const float new_max = max(row_max[jj], mx);
             const float correction = new_max == -INFINITY ? 1.0f : metal::fast::exp2(row_max[jj] - new_max);
             float sum = 0.0f;
-            for (int ii = 0; ii < COLS; ii++) {
-                const half p = half(s[ii] == -INFINITY ? 0.0f : metal::fast::exp2(s[ii] - new_max));
-                sp[j * AC + ii * 32 + lane] = p;
-                sum += float(p);
+            if (new_max == -INFINITY) {
+                for (int ii = 0; ii < COLS; ii++) p_reg[jj][ii] = half(0.0f);
+            } else {
+                for (int ii = 0; ii < COLS; ii++) {
+                    const half p = half(metal::fast::exp2(s[ii] - new_max));
+                    p_reg[jj][ii] = p;
+                    sum += float(p);
+                }
             }
             row_sum[jj] = row_sum[jj] * correction + simd_sum(sum);
             row_max[jj] = new_max;
-            if (lane == 0) sr[j] = correction;
+            if (lane == 0) {
+                sr[j] = correction;
+                if (correction != 1.0f) local_fix = true;
+            }
+        }
+        if (local_fix) atomic_store_explicit(&any_fix, 1u, memory_order_relaxed);
+        BARRIER;
+        for (int jj = 0; jj < ROWS; jj++) {
+            const int j = jj * SG + sg;
+            for (int ii = 0; ii < COLS; ii++) sp[j * AC + ii * 32 + lane] = p_reg[jj][ii];
         }
         BARRIER;
         // Rescaled only where a row's maximum moved: deep in a context most don't.
-        for (int i = 0; i < co_n; i++) {
-            if (co_row[i] < 0) continue;
-            const float fix = sr[co_row[i]];
-            if (fix != 1.0f) co[i] *= fix;
+        if (atomic_load_explicit(&any_fix, memory_order_relaxed) != 0u) {
+            for (int i = 0; i < co_n; i++) {
+                if (co_row[i] < 0) continue;
+                const float fix = sr[co_row[i]];
+                if (fix != 1.0f) co[i] *= fix;
+            }
+            for (int i = co_n; i < co_cap; i++)
+                if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
         }
-        for (int i = co_n; i < co_cap; i++)
-            if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
         auto tv = tensor(values + at_cache, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
         mm_pv.run(tp, tv, co);
         BARRIER;
@@ -542,7 +568,7 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
 // 64-256 positions and 4 or 8 SIMD groups: each leaves a thread 32 of the output's numbers.
 template [[host_name("attention_tcg_128")]] kernel void attention_tcg<128, 32, 128, 4>(ARGS, KP, uint, uint);
 template [[host_name("attention_tcg_256")]] kernel void attention_tcg<256, 32, 128, 8>(ARGS, KP, uint, uint);
-template [[host_name("attention_tcg_512")]] kernel void attention_tcg<512, 16, 256, 8>(ARGS, KP, uint, uint);
+template [[host_name("attention_tcg_512")]] kernel void attention_tcg<512, 32, 128, 8>(ARGS, KP, uint, uint);
 
 // attention_tcg's parts added up: a threadgroup a query row (gid.x: key/value head and
 // block of tokens, gid.y: the row in its tile), each part weighted by its maximum against
