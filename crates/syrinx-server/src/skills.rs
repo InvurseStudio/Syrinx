@@ -1,6 +1,6 @@
 //! Skills, in the open SKILL.md format the Mac's server uses (`server/skill_library.py`):
 //! a folder holding a SKILL.md with a name and a description between `---` lines, then
-//! instructions in Markdown. The built-in ones are the Mac's (`server/builtin-skills`);
+//! instructions in Markdown. The built-in ones are in `builtin-skills/` (13, as the Mac's 0.9 server had them);
 //! the user's own live where the Mac's server keeps them (on the Mac
 //! ~/Library/Application Support/InvurseChat/Skills, on Windows %APPDATA%\InvurseChat\Skills),
 //! and one named like a built-in skill replaces it. Nothing here is particular to one
@@ -214,23 +214,19 @@ pub fn load(built_in: Option<&Path>, user: Option<&Path>) -> Vec<Skill> {
     all
 }
 
-/// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`; `builtin-skills` beside this
-/// program, where an installed app keeps them (the Windows prototype's install script
-/// copies them there); or the repository's `server/builtin-skills` found above it (it
-/// runs from `target/release`).
+/// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`; or the first `builtin-skills`
+/// folder in this program's folder or above it: beside the program in an installed app
+/// (the install scripts copy it there), or this repository's own (`builtin-skills/`, found
+/// from `target/release`).
 pub fn built_in_folder() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VIREO_BUILTIN_SKILLS") {
         return Some(PathBuf::from(dir));
     }
     let exe = std::env::current_exe().ok()?;
-    let beside = exe.parent()?.join("builtin-skills");
-    if beside.is_dir() {
-        return Some(beside);
-    }
     exe.ancestors()
         .skip(1)
         .take(6)
-        .map(|dir| dir.join("server").join("builtin-skills"))
+        .map(|dir| dir.join("builtin-skills"))
         .find(|dir| dir.is_dir())
 }
 
@@ -638,8 +634,8 @@ mod tests {
     }
 
     #[test]
-    fn the_macs_built_in_skills_load_and_six_suit_this_pc() {
-        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../server/builtin-skills");
+    fn the_built_in_skills_load_and_six_suit_this_pc() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../builtin-skills");
         let all = load(Some(&folder), None);
         assert_eq!(
             all.len(),

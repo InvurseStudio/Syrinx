@@ -1,0 +1,29 @@
+name: CI
+
+# Builds the workspace and runs its tests on each platform. No GPU and no models on the
+# runners: tests that need a model file are ignored or skip, and CUDA builds without its
+# kernels when the toolkit isn't installed (see crates/syrinx-engine/build.rs).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml picks the toolchain; rustup installs it on first use.
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Test
+        run: cargo test --release --workspace
