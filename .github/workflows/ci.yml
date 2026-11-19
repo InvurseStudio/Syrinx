@@ -26,7 +26,11 @@ jobs:
       - name: Find the crashing test (temporary)
         if: runner.os == 'Linux'
         continue-on-error: true
-        run: cargo test --release -p syrinx-engine --lib -- --test-threads=1
+        run: |
+          sudo apt-get install -y -qq gdb > /dev/null
+          cargo test --release -p syrinx-engine --lib --no-run
+          bin=$(ls -t target/release/deps/syrinx_engine-* | grep -v '\.d$' | head -1)
+          gdb -batch -ex run -ex bt -ex 'info registers rip' --args "$bin" dylib --test-threads=1 --exact dylib::tests::finds_a_system_function
       - name: Build
         run: cargo build --release --workspace
       - name: Test
