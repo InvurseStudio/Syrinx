@@ -1961,6 +1961,10 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool vali
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(shared_address(dst)), "l"(src),
                  "r"(valid ? 16 : 0));
 }
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(shared_address(dst)), "l"(src),
+                 "r"(valid ? 8 : 0));
+}
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 // Waits until at most one group this thread committed is still in flight.
 __device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
@@ -2020,7 +2024,7 @@ extern "C" __global__ void q_rows_to_half(float* q, int d) {
 // numbers a register: a whole 512-wide head is then no more registers than half of one in
 // f32), merged once at the end as parts are. The weights are scaled down by 8 (POFF) so
 // the f16 sums stay well inside its range however many positions a row attends to.
-template <int D, int ROWS, int SPLIT, int KC, bool PART, bool POS = false>
+template <int D, int ROWS, int SPLIT, int KC, bool PART, bool POS = false, bool Q8 = false>
 __device__ void attention_mma(const float* q, const __half* keys, const __half* values, float* out,
                               const int* pos, int window, int all_heads, int kv_dim, int group, float scale,
                               int tokens) {
@@ -2031,7 +2035,9 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
     constexpr int DP = POS ? D : D / SPLIT;   // the numbers of a head each warp takes
     constexpr int KW = POS ? KC / SPLIT : KC;  // the positions of a chunk each warp takes
     constexpr int NS = KC / 8 * 4;       // a thread's share of S
-    constexpr float POFF = POS ? 2.0794415f : 0.0f;  // ln 8
+    constexpr float LOG2E = 1.4426950408889634f, LN2 = 0.6931471805599453f;
+    constexpr float POFF2 = POS ? 3.0f : 0.0f;  // log2(8)
+    const float scale2 = scale * LOG2E;
     static_assert(DP % 32 == 0 && KW % 16 == 0, "tile sizes");
     extern __shared__ __align__(16) unsigned char smem[];
     __half* ks = reinterpret_cast<__half*>(smem);  // KC × DS
@@ -2067,13 +2073,82 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
         end = last_row;
     }
 
+    constexpr size_t Q8_HEAD_BYTES = (size_t)D + (size_t)(D >> 4);
+    constexpr size_t Q8_RAW_OFF = (size_t)KC * DS * 2 - (size_t)KC * Q8_HEAD_BYTES;
+    const int kv_heads = kv_dim / D, kvh = kv / D;
     auto load = [&](__half* dst, const __half* src, int start) {
-        for (int i = tid; i < KC * D / 8; i += THREADS) {
-            const int r = i / (D / 8), d = (i % (D / 8)) * 8;
-            const bool valid = start + r <= last_row;
-            cp_async16(dst + r * DS + d, src + ring_row(valid ? start + r : 0, ring) * kv_dim + kv + d, valid);
+        if constexpr (Q8) {
+            const u8* base = reinterpret_cast<const u8*>(src);
+            u8* raw = reinterpret_cast<u8*>(dst) + Q8_RAW_OFF;
+            if constexpr (D >= 256) {
+                constexpr int UNITS = Q8_HEAD_BYTES / 16;
+                for (int i = tid; i < KC * UNITS; i += THREADS) {
+                    const int r = i / UNITS, u = i % UNITS;
+                    const bool valid = start + r <= last_row;
+                    const u8* hp = base + (ring_row(valid ? start + r : 0, ring) * (size_t)kv_heads + (size_t)kvh) *
+                                              Q8_HEAD_BYTES;
+                    cp_async16(raw + r * Q8_HEAD_BYTES + u * 16, hp + u * 16, valid);
+                }
+            } else {
+                constexpr int UNITS = Q8_HEAD_BYTES / 8;
+                for (int i = tid; i < KC * UNITS; i += THREADS) {
+                    const int r = i / UNITS, u = i % UNITS;
+                    const bool valid = start + r <= last_row;
+                    const u8* hp = base + (ring_row(valid ? start + r : 0, ring) * (size_t)kv_heads + (size_t)kvh) *
+                                              Q8_HEAD_BYTES;
+                    cp_async8(raw + r * Q8_HEAD_BYTES + u * 8, hp + u * 8, valid);
+                }
+            }
+            cp_async_commit();
+        } else {
+            for (int i = tid; i < KC * D / 8; i += THREADS) {
+                const int r = i / (D / 8), d = (i % (D / 8)) * 8;
+                const bool valid = start + r <= last_row;
+                cp_async16(dst + r * DS + d, src + ring_row(valid ? start + r : 0, ring) * kv_dim + kv + d, valid);
+            }
+            cp_async_commit();
         }
-        cp_async_commit();
+    };
+    auto unpack_q8 = [&](__half* dst) {
+        if constexpr (Q8) {
+            constexpr int TOTAL = KC * D / 8;
+            constexpr int ITEMS = (TOTAL + THREADS - 1) / THREADS;
+            const u8* raw = reinterpret_cast<const u8*>(dst) + Q8_RAW_OFF;
+            uint2 qa[ITEMS];
+            float sa[ITEMS];
+#pragma unroll
+            for (int k = 0; k < ITEMS; k++) {
+                const int i = tid + k * THREADS;
+                if (i < TOTAL) {
+                    const int r = i / (D / 8), d = (i % (D / 8)) * 8;
+                    const u8* hp = raw + r * Q8_HEAD_BYTES;
+                    qa[k] = *reinterpret_cast<const uint2*>(hp + d);
+                    sa[k] = __half2float(reinterpret_cast<const __half*>(hp + D)[d >> 5]);
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int k = 0; k < ITEMS; k++) {
+                const int i = tid + k * THREADS;
+                if (i < TOTAL) {
+                    const int r = i / (D / 8), d = (i % (D / 8)) * 8;
+                    const u32 w0 = qa[k].x, w1 = qa[k].y;
+                    const float sc = sa[k];
+                    const __half2 h0 = __floats2half2_rn((float)(signed char)(w0 & 0xffu) * sc,
+                                                         (float)(signed char)((w0 >> 8) & 0xffu) * sc);
+                    const __half2 h1 = __floats2half2_rn((float)(signed char)((w0 >> 16) & 0xffu) * sc,
+                                                         (float)(signed char)((w0 >> 24) & 0xffu) * sc);
+                    const __half2 h2 = __floats2half2_rn((float)(signed char)(w1 & 0xffu) * sc,
+                                                         (float)(signed char)((w1 >> 8) & 0xffu) * sc);
+                    const __half2 h3 = __floats2half2_rn((float)(signed char)((w1 >> 16) & 0xffu) * sc,
+                                                         (float)(signed char)((w1 >> 24) & 0xffu) * sc);
+                    *reinterpret_cast<uint4*>(dst + r * DS + d) =
+                        make_uint4(*reinterpret_cast<const u32*>(&h0), *reinterpret_cast<const u32*>(&h1),
+                                   *reinterpret_cast<const u32*>(&h2), *reinterpret_cast<const u32*>(&h3));
+                }
+            }
+            __syncthreads();
+        }
     };
     load(ks, keys, lo);
 
@@ -2118,6 +2193,7 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
         load(vs, values, start);  // the last chunk's P V is done with vs (the sync below)
         cp_async_wait1();         // this chunk's keys are in
         __syncthreads();
+        unpack_q8(ks);
 
         // S = Q Kᵀ for the warp's 16 rows × KC positions (over its part of the head).
         float s[KW / 8][4];
@@ -2181,34 +2257,59 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
             cp_async_commit();  // an empty group, so the waits count the same
         }
 
-        // The online softmax, per row (the row's KC positions are spread over 4 lanes).
+        // The online softmax, per row (the row's KC positions are spread over 4 lanes), in base 2.
+        const bool full_tile = live[0] && live[1] && start >= first[0] && start >= first[1] &&
+                               start + KC - 1 <= at[0] && start + KC - 1 <= at[1];
         float row_max[2] = {-INFINITY, -INFINITY};
+        if (full_tile) {
 #pragma unroll
-        for (int n = 0; n < KW / 8; n++)
+            for (int n = 0; n < KW / 8; n++)
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const int h = i >> 1, key = start + pw + n * 8 + tig * 2 + (i & 1);
-                const bool seen = live[h] && key <= at[h] && key >= first[h];
-                s[n][i] = seen ? s[n][i] * scale : -INFINITY;
-                row_max[h] = fmaxf(row_max[h], s[n][i]);
-            }
+                for (int i = 0; i < 4; i++) {
+                    const int h = i >> 1;
+                    s[n][i] *= scale2;
+                    row_max[h] = fmaxf(row_max[h], s[n][i]);
+                }
+        } else {
+#pragma unroll
+            for (int n = 0; n < KW / 8; n++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const int h = i >> 1, key = start + pw + n * 8 + tig * 2 + (i & 1);
+                    const bool seen = live[h] && key <= at[h] && key >= first[h];
+                    s[n][i] = seen ? s[n][i] * scale2 : -INFINITY;
+                    row_max[h] = fmaxf(row_max[h], s[n][i]);
+                }
+        }
         float correction[2], row_sum[2] = {0.0f, 0.0f};
 #pragma unroll
         for (int h = 0; h < 2; h++) {
             row_max[h] = fmaxf(row_max[h], __shfl_xor_sync(0xffffffffu, row_max[h], 1));
             row_max[h] = fmaxf(row_max[h], __shfl_xor_sync(0xffffffffu, row_max[h], 2));
             const float new_max = fmaxf(m[h], row_max[h]);
-            correction[h] = new_max == -INFINITY ? 1.0f : expf(m[h] - new_max);
+            correction[h] = new_max == -INFINITY ? 1.0f : exp2f(m[h] - new_max);
             m[h] = new_max;
         }
+        const float moff[2] = {m[0] + POFF2, m[1] + POFF2};
+        if (full_tile) {
 #pragma unroll
-        for (int n = 0; n < KW / 8; n++)
+            for (int n = 0; n < KW / 8; n++)
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const int h = i >> 1;
-                s[n][i] = s[n][i] == -INFINITY ? 0.0f : expf(s[n][i] - m[h] - POFF);
-                row_sum[h] += s[n][i];
-            }
+                for (int i = 0; i < 4; i++) {
+                    const int h = i >> 1;
+                    s[n][i] = exp2f(s[n][i] - moff[h]);
+                    row_sum[h] += s[n][i];
+                }
+        } else {
+#pragma unroll
+            for (int n = 0; n < KW / 8; n++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const int h = i >> 1;
+                    s[n][i] = s[n][i] == -INFINITY ? 0.0f : exp2f(s[n][i] - moff[h]);
+                    row_sum[h] += s[n][i];
+                }
+        }
 #pragma unroll
         for (int h = 0; h < 2; h++) {
             row_sum[h] += __shfl_xor_sync(0xffffffffu, row_sum[h], 1);
@@ -2237,6 +2338,7 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
 
         cp_async_wait1();  // this chunk's values are in
         __syncthreads();
+        unpack_q8(vs);
 
         // O += P V: P's numbers are already where the A operand wants them.
         const int mat = lane >> 3, mrow = lane & 7;
@@ -2286,9 +2388,9 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
 #pragma unroll
             for (int w = 0; w < SPLIT; w++) {
                 const float* e = ex + ((rw * SPLIT + w) * 16 + gid + h * 8) * 2;
-                if (e[0] != -INFINITY) total[h] += expf(e[0] - top[h]) * e[1];
+                if (e[0] != -INFINITY) total[h] += exp2f(e[0] - top[h]) * e[1];
             }
-            f[h] = m[h] == -INFINITY ? 0.0f : expf(m[h] - top[h]);
+            f[h] = m[h] == -INFINITY ? 0.0f : exp2f(m[h] - top[h]);
             if constexpr (!PART) f[h] /= total[h];
         }
         for (int w = 0; w < SPLIT; w++) {
@@ -2300,7 +2402,7 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
                     if constexpr (PART) {
                         dst = out + (((size_t)(t0 + row0 + h * 8) * heads + head) * gridDim.y + blockIdx.y) * (2 + D);
                         if (tig == 0 && w == 0) {
-                            dst[0] = top[h];  // -inf for a part the row sees nothing of
+                            dst[0] = top[h] * LN2;  // natural log; -inf for a part the row sees nothing of
                             dst[1] = total[h];
                         }
                         dst += 2;
@@ -2331,7 +2433,7 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
             if (!live[h]) continue;
             float* dst = out + (((size_t)(t0 + row0 + h * 8) * heads + head) * gridDim.y + blockIdx.y) * (2 + D);
             if (tig == 0 && sp == 0) {
-                dst[0] = m[h];  // -inf for a part the row sees nothing of
+                dst[0] = m[h] * LN2;  // natural log; -inf for a part the row sees nothing of
                 dst[1] = l[h];
             }
 #pragma unroll
@@ -2358,8 +2460,15 @@ __device__ void attention_mma(const float* q, const __half* keys, const __half* 
     extern "C" __global__ void __launch_bounds__(32 * ROWS * SPLIT) name(                                    \
         const float* q, const __half* keys, const __half* values, float* out, const int* pos, int window,    \
         int hd, int kv_dim, int group, float scale, int tokens) {                                            \
-        attention_mma<D, ROWS, SPLIT, KC, PART, POS>(q, keys, values, out, pos, window, hd, kv_dim, group,   \
-                                                     scale, tokens);                                         \
+        attention_mma<D, ROWS, SPLIT, KC, PART, POS, false>(q, keys, values, out, pos, window, hd, kv_dim,   \
+                                                            group, scale, tokens);                           \
+    }
+#define ATTENTION_MMA_Q8_AS(name, D, ROWS, SPLIT, KC, PART, POS)                                             \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS * SPLIT) name(                                    \
+        const float* q, const __half* keys, const __half* values, float* out, const int* pos, int window,    \
+        int hd, int kv_dim, int group, float scale, int tokens) {                                            \
+        attention_mma<D, ROWS, SPLIT, KC, PART, POS, true>(q, keys, values, out, pos, window, hd, kv_dim,    \
+                                                           group, scale, tokens);                            \
     }
 #define ATTENTION_MMA(name, D, ROWS, SPLIT, KC) ATTENTION_MMA_AS(name, D, ROWS, SPLIT, KC, false, false)
 
@@ -2389,6 +2498,15 @@ ATTENTION_MMA_AS(attention_mma_64_part, 64, 4, 1, 32, true, false)
 ATTENTION_MMA_AS(attention_mma_128_part, 128, 4, 1, 32, true, false)
 ATTENTION_MMA_AS(attention_mma_256_part, 256, 4, 1, 32, true, false)
 ATTENTION_MMA_AS(attention_mma_512_part, 512, 2, 2, 16, true, false)
+// Q8_0 KV cache variants (head_dim >= 128): dequantized into shared f16 tiles on load.
+ATTENTION_MMA_Q8_AS(attention_mma_q8_128, 128, 4, 1, 32, false, false)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_256, 256, 8, 1, 64, false, true)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_512, 512, 4, 2, 32, false, true)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_256_short, 256, 4, 1, 32, false, false)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_512_short, 512, 2, 2, 16, false, false)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_128_part, 128, 4, 1, 32, true, false)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_256_part, 256, 4, 1, 32, true, false)
+ATTENTION_MMA_Q8_AS(attention_mma_q8_512_part, 512, 2, 2, 16, true, false)
 #endif
 
 // ---- Everything else in a layer, for `tokens` rows at a time --------------------------
@@ -2534,20 +2652,25 @@ extern "C" __global__ void qkv_prep(const float* q_src, int q_stride, int q_head
         const float* src;
         float* dst = nullptr;
         __half* half_dst = nullptr;  // instead of dst, for an f16 cache
+        const bool q8_cache = kind != 0 && half_cache == 2;
         if (kind == 0) {
             src = q_src + (size_t)t * q_stride + (size_t)h * q_head_stride;
             dst = q_dst + ((size_t)t * heads + h) * hd;
         } else {
             src = (kind == 1 ? k_src : v_src) + (size_t)t * kv_dim + h * hd;
-            const size_t at_cache = ring_row(at, ring) * kv_dim + h * hd;
-            void* cache = kind == 1 ? k_cache : v_cache;
-            if (half_cache)
-                half_dst = static_cast<__half*>(cache) + at_cache;
-            else
-                dst = static_cast<float*>(cache) + at_cache;
+            if (!q8_cache) {
+                const size_t at_cache = ring_row(at, ring) * kv_dim + h * hd;
+                void* cache = kind == 1 ? k_cache : v_cache;
+                if (half_cache)
+                    half_dst = static_cast<__half*>(cache) + at_cache;
+                else
+                    dst = static_cast<float*>(cache) + at_cache;
+            }
         }
         auto put = [&](int i, float v) {
-            if (half_dst)
+            if (q8_cache)
+                buf[i] = v;
+            else if (half_dst)
                 half_dst[i] = __float2half(v);
             else
                 dst[i] = v;
@@ -2567,7 +2690,7 @@ extern "C" __global__ void qkv_prep(const float* q_src, int q_stride, int q_head
         for (int j = threadIdx.x; j < items; j += blockDim.x) {
             if (j >= pairs) {
                 const int i = rotated + (j - pairs);
-                put(i, buf[i]);
+                if (!q8_cache) put(i, buf[i]);
                 continue;
             }
             const int p = j;  // the pair: numbers i0 and i1 (halves with neox, else adjacent)
@@ -2579,6 +2702,24 @@ extern "C" __global__ void qkv_prep(const float* q_src, int q_stride, int q_head
             const float a = buf[i0], b = buf[i1];
             put(i0, a * c - b * s);
             put(i1, a * s + b * c);
+        }
+        if (q8_cache) {
+            __syncthreads();
+            const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+            const size_t head_bytes = (size_t)hd + (size_t)(hd >> 4);
+            void* cache = kind == 1 ? k_cache : v_cache;
+            u8* head_dst =
+                static_cast<u8*>(cache) + (ring_row(at, ring) * (size_t)kv_heads + (size_t)h) * head_bytes;
+            for (int b = warp; b < hd / 32; b += warps) {
+                const float v = buf[b * 32 + lane];
+                float amax = fabsf(v);
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+                const float d = amax / 127.0f;
+                const float inv = d != 0.0f ? 1.0f / d : 0.0f;
+                reinterpret_cast<signed char*>(head_dst)[b * 32 + lane] = (signed char)__float2int_rn(v * inv);
+                if (lane == 0) reinterpret_cast<__half*>(head_dst + hd)[b] = __float2half(d);
+            }
         }
     }
 }
@@ -2779,7 +2920,41 @@ __device__ __forceinline__ void halves_to_float(const __half* p, float (&out)[N]
     }
 }
 
-template <int HD>
+template <int HD, int N>
+__device__ __forceinline__ void q8_to_float(const u8* head_ptr, int lane, float (&out)[N]) {
+    const int off = lane * N;
+    const float d = __half2float(reinterpret_cast<const __half*>(head_ptr + HD)[off >> 5]);
+    const u8* q = head_ptr + off;
+    if constexpr (N == 16) {
+        const uint4 u = *reinterpret_cast<const uint4*>(q);
+        const u32 w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            out[i * 4 + 0] = (float)(signed char)(w[i] & 0xffu) * d;
+            out[i * 4 + 1] = (float)(signed char)((w[i] >> 8) & 0xffu) * d;
+            out[i * 4 + 2] = (float)(signed char)((w[i] >> 16) & 0xffu) * d;
+            out[i * 4 + 3] = (float)(signed char)((w[i] >> 24) & 0xffu) * d;
+        }
+    } else if constexpr (N == 8) {
+        const uint2 u = *reinterpret_cast<const uint2*>(q);
+        const u32 w[2] = {u.x, u.y};
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            out[i * 4 + 0] = (float)(signed char)(w[i] & 0xffu) * d;
+            out[i * 4 + 1] = (float)(signed char)((w[i] >> 8) & 0xffu) * d;
+            out[i * 4 + 2] = (float)(signed char)((w[i] >> 16) & 0xffu) * d;
+            out[i * 4 + 3] = (float)(signed char)((w[i] >> 24) & 0xffu) * d;
+        }
+    } else if constexpr (N == 4) {
+        const u32 w = *reinterpret_cast<const u32*>(q);
+        out[0] = (float)(signed char)(w & 0xffu) * d;
+        out[1] = (float)(signed char)((w >> 8) & 0xffu) * d;
+        out[2] = (float)(signed char)((w >> 16) & 0xffu) * d;
+        out[3] = (float)(signed char)((w >> 24) & 0xffu) * d;
+    }
+}
+
+template <int HD, bool Q8 = false>
 __device__ void attention_part_kv(const float* q, const __half* keys, const __half* values, float* partial,
                                   const int* pos, int window, int kv_dim, int group, float scale, int heads) {
     const int ring = window >> 16;  // see ring_row
@@ -2818,6 +2993,17 @@ __device__ void attention_part_kv(const float* q, const __half* keys, const __ha
         for (int e = 0; e < PER; e++) acc[g][e] = 0.0f;
     }
     const size_t off = (size_t)kvh * HD + lane * PER;
+    const int kv_heads = kv_dim / HD;
+    constexpr size_t Q8_HEAD_BYTES = (size_t)HD + (size_t)(HD >> 4);
+    auto load_kv = [&](const __half* src, int row, float (&out)[PER]) {
+        if constexpr (Q8) {
+            const u8* hp = reinterpret_cast<const u8*>(src) +
+                           (ring_row(row, ring) * (size_t)kv_heads + (size_t)kvh) * Q8_HEAD_BYTES;
+            q8_to_float<HD>(hp, lane, out);
+        } else {
+            halves_to_float(src + ring_row(row, ring) * kv_dim + off, out);
+        }
+    };
     // The scores of positions in N, all heads at once: the dot products, then their sums
     // across the warp together, so the shuffles overlap. (Heads past ng have zero queries.)
     auto scores = [&](const float (&k)[PER], float (&sc)[G]) {
@@ -2842,9 +3028,9 @@ __device__ void attention_part_kv(const float* q, const __half* keys, const __ha
     for (; at + (U - 1) * WARPS < hi; at += U * WARPS) {
         float k[U][PER], v[U][PER], sc[U][G];
 #pragma unroll
-        for (int u = 0; u < U; u++) halves_to_float(keys + ring_row(at + u * WARPS, ring) * kv_dim + off, k[u]);
+        for (int u = 0; u < U; u++) load_kv(keys, at + u * WARPS, k[u]);
 #pragma unroll
-        for (int u = 0; u < U; u++) halves_to_float(values + ring_row(at + u * WARPS, ring) * kv_dim + off, v[u]);
+        for (int u = 0; u < U; u++) load_kv(values, at + u * WARPS, v[u]);
 #pragma unroll
         for (int u = 0; u < U; u++) scores(k[u], sc[u]);
 #pragma unroll
@@ -2874,8 +3060,8 @@ __device__ void attention_part_kv(const float* q, const __half* keys, const __ha
     }
     for (; at < hi; at += WARPS) {
         float k[PER], v[PER], sc[G];
-        halves_to_float(keys + ring_row(at, ring) * kv_dim + off, k);
-        halves_to_float(values + ring_row(at, ring) * kv_dim + off, v);
+        load_kv(keys, at, k);
+        load_kv(values, at, v);
         scores(k, sc);
         reduce(sc);
 #pragma unroll
@@ -2928,12 +3114,21 @@ __device__ void attention_part_kv(const float* q, const __half* keys, const __ha
     extern "C" __global__ void __launch_bounds__(128, 2) attention_part_kv_##HD(                           \
         const float* q, const __half* keys, const __half* values, float* partial, const int* pos,           \
         int window, int kv_dim, int group, float scale, int heads) {                                        \
-        attention_part_kv<HD>(q, keys, values, partial, pos, window, kv_dim, group, scale, heads);         \
+        attention_part_kv<HD, false>(q, keys, values, partial, pos, window, kv_dim, group, scale, heads);  \
+    }
+#define ATTENTION_PART_KV_Q8(HD)                                                                          \
+    extern "C" __global__ void __launch_bounds__(128, 2) attention_part_kv_q8_##HD(                        \
+        const float* q, const __half* keys, const __half* values, float* partial, const int* pos,           \
+        int window, int kv_dim, int group, float scale, int heads) {                                        \
+        attention_part_kv<HD, true>(q, keys, values, partial, pos, window, kv_dim, group, scale, heads);   \
     }
 ATTENTION_PART_KV(64)
 ATTENTION_PART_KV(128)
 ATTENTION_PART_KV(256)
 ATTENTION_PART_KV(512)
+ATTENTION_PART_KV_Q8(128)
+ATTENTION_PART_KV_Q8(256)
+ATTENTION_PART_KV_Q8(512)
 
 // Merges attention_part's parts: one block per head.
 extern "C" __global__ void attention_combine(const float* partial, float* out, int parts, int hd) {
@@ -3951,3 +4146,70 @@ extern "C" __global__ void __launch_bounds__(128)
                 state[((size_t)h * n + j0 + col_of(ct, e)) * n + (warp + 4 * x) * 16 + row_of(e)] = s[x][ct][e];
 }
 #endif
+
+// ---- GPU argmax (greedy token pick without downloading the vocabulary's logits) -------
+
+__device__ __forceinline__ bool argmax_better(float v, u32 i, float best_v, u32 best_i) {
+    return v > best_v || (v == best_v && i < best_i);
+}
+
+__device__ __forceinline__ void argmax_block_reduce(float& v, u32& idx) {
+    __shared__ float sv[8];
+    __shared__ u32 si[8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, v, off);
+        const u32 oi = __shfl_down_sync(0xffffffffu, idx, off);
+        if (argmax_better(ov, oi, v, idx)) {
+            v = ov;
+            idx = oi;
+        }
+    }
+    if (lane == 0) {
+        sv[warp] = v;
+        si[warp] = idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        v = lane < 8 ? sv[lane] : -INFINITY;
+        idx = lane < 8 ? si[lane] : 0xffffffffu;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, v, off);
+            const u32 oi = __shfl_down_sync(0xffffffffu, idx, off);
+            if (argmax_better(ov, oi, v, idx)) {
+                v = ov;
+                idx = oi;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    argmax_part(const float* x, float* vals, u32* idxs, int n) {
+    float best_v = -INFINITY;
+    u32 best_i = 0xffffffffu;
+    const int stride = (int)gridDim.x * 256;
+    for (int i = (int)blockIdx.x * 256 + (int)threadIdx.x; i < n; i += stride) {
+        const float v = x[i];
+        if (argmax_better(v, (u32)i, best_v, best_i)) {
+            best_v = v;
+            best_i = (u32)i;
+        }
+    }
+    argmax_block_reduce(best_v, best_i);
+    if (threadIdx.x == 0) {
+        vals[blockIdx.x] = best_v;
+        idxs[blockIdx.x] = best_i;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    argmax_final(const float* vals, const u32* idxs, u32* out, int parts) {
+    const int tid = (int)threadIdx.x;
+    float best_v = tid < parts ? vals[tid] : -INFINITY;
+    u32 best_i = tid < parts ? idxs[tid] : 0xffffffffu;
+    argmax_block_reduce(best_v, best_i);
+    if (tid == 0) *out = best_i == 0xffffffffu ? 0u : best_i;
+}

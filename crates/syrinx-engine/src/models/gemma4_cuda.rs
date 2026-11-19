@@ -490,13 +490,7 @@ impl<'a> Gemma4Cuda<'a> {
         let batch = batch.clamp(1, capacity.max(1));
         // At least one value each: a model without per-layer inputs has none to keep.
         let f32s = |n: usize| self.gpu.alloc(n.max(1) * 4).map_err(gpu_error);
-        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1 on macOS) in 8-bit mode, f32 when exact.
-        #[cfg(not(target_os = "macos"))]
-        let cache_bytes = if self.precision == Precision::Int8 {
-            2
-        } else {
-            4
-        };
+        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1) in 8-bit mode, f32 when exact.
         // A sliding-window layer keeps its window and a batch's new positions (rounded to
         // the attention kernels' longest chunk, 256), not every position: for 31B at 32K
         // tokens, 1.6 GB instead of 27. On CUDA too since 2026-11-15.
@@ -514,10 +508,7 @@ impl<'a> Gemma4Cuda<'a> {
             if l < c.first_shared_layer {
                 let rows = if rings[l] > 0 { rings[l] } else { capacity };
                 let hd = c.head_dim_of(l);
-                #[cfg(target_os = "macos")]
                 let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, hd);
-                #[cfg(not(target_os = "macos"))]
-                let head_bytes = hd * cache_bytes;
                 self.gpu
                     .alloc(rows * c.kv_heads_of(l) * head_bytes)
                     .map_err(gpu_error)
@@ -823,6 +814,7 @@ impl<'a> Gemma4Cuda<'a> {
             .map_err(e)?;
 
             let f = c.ffn_dims[l];
+            #[cfg(target_os = "macos")]
             let mid_ffn = l > 0 && l + 1 < self.layers.len();
             #[cfg(target_os = "macos")]
             if mid_ffn {

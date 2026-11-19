@@ -438,11 +438,8 @@ impl<'a> Qwen35Cuda<'a> {
         let g = &self.gpu;
         let batch = batch.clamp(1, capacity.max(1));
         let f32s = |n: usize| g.alloc(n * 4).map_err(gpu_error);
-        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1 on macOS) in 8-bit mode, f32 when exact.
-        #[cfg(target_os = "macos")]
+        // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1) in 8-bit mode, f32 when exact.
         let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, c.head_dim);
-        #[cfg(not(target_os = "macos"))]
-        let head_bytes = c.head_dim * if self.precision == Precision::Int8 { 2 } else { 4 };
         let cache = |rows: usize| g.alloc(rows * c.kv_heads * head_bytes).map_err(gpu_error);
         let zeros = |n: usize| -> Result<Buffer> {
             let b = f32s(n)?;
@@ -537,10 +534,7 @@ impl<'a> Qwen35Cuda<'a> {
         let c = &self.config;
         let g = &self.gpu;
         let f32s = |n: usize| g.alloc(n * 4).map_err(gpu_error);
-        #[cfg(target_os = "macos")]
         let head_bytes = Gpu::kv_head_bytes(s.half_cache, c.head_dim);
-        #[cfg(not(target_os = "macos"))]
-        let head_bytes = c.head_dim * if s.half_cache { 2 } else { 4 };
         let cache = |rows: usize| g.alloc(rows * c.kv_heads * head_bytes).map_err(gpu_error);
         s.mtp = Some(MtpSession {
             keys: cache(s.capacity)?,
@@ -1114,6 +1108,7 @@ impl<'a> Qwen35Cuda<'a> {
             )
             .map_err(e)?;
 
+            #[cfg(target_os = "macos")]
             let mid_ffn = l > 0 && l + 1 < self.layers.len();
             #[cfg(target_os = "macos")]
             if mid_ffn {

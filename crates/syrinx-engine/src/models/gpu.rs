@@ -436,23 +436,11 @@ impl LogitsBuffer {
         Ok(&self.buffer)
     }
 
-    /// The likeliest token of the one row of logits left here (the first of equals). On
-    /// the Mac found on the GPU, so 4 bytes come back, not the vocabulary's logits;
-    /// elsewhere from the row read into `host`.
+    /// The likeliest token of the one row of logits left here (the first of equals), found
+    /// on the GPU so only 4 bytes come back instead of the vocabulary's logits.
     pub fn likeliest(&self, gpu: &Gpu, vocab: usize, host: &mut Vec<f32>) -> Result<u32> {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = host;
-            gpu.argmax(self.buffer.ptr(), vocab).map_err(gpu_error)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = gpu;
-            host.resize(vocab, 0.0);
-            self.read_row(0, host)?;
-            let top = host.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
-            Ok(host.iter().position(|&v| v == top).unwrap_or(0) as u32)
-        }
+        let _ = host;
+        gpu.argmax(self.buffer.ptr(), vocab).map_err(gpu_error)
     }
 
     /// Row `row` of the logits last left here, into `out` (a row long).
