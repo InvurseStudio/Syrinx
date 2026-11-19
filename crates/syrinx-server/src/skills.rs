@@ -215,9 +215,11 @@ pub fn load(built_in: Option<&Path>, user: Option<&Path>) -> Vec<Skill> {
 }
 
 /// Where the built-in skills are: `VIREO_BUILTIN_SKILLS`; or the first `builtin-skills`
-/// folder in this program's folder or above it: beside the program in an installed app
-/// (the install scripts copy it there), or this repository's own (`builtin-skills/`, found
-/// from `target/release`).
+/// folder in this program's folder or above it, or in a `Resources` folder there: beside
+/// the program on Windows (the install script copies it there), in a Mac app's
+/// `Contents/Resources` (only code may sit beside the program in `Contents/MacOS`, or the
+/// app's signature breaks), or this repository's own (`builtin-skills/`, found from
+/// `target/release`).
 pub fn built_in_folder() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VIREO_BUILTIN_SKILLS") {
         return Some(PathBuf::from(dir));
@@ -226,7 +228,7 @@ pub fn built_in_folder() -> Option<PathBuf> {
     exe.ancestors()
         .skip(1)
         .take(6)
-        .map(|dir| dir.join("builtin-skills"))
+        .flat_map(|dir| [dir.join("builtin-skills"), dir.join("Resources").join("builtin-skills")])
         .find(|dir| dir.is_dir())
 }
 
