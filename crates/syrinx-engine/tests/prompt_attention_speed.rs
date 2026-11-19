@@ -2,6 +2,9 @@
 //! full-attention layer shapes, the grouped tensor kernel (attention_tcg) against the
 //! one-head one (attention_tc), and how far their outputs are apart. Not a check: run with
 //! `cargo test --release --test prompt_attention_speed -- --ignored --nocapture`.
+//! `VIREO_ATT_TOKENS` sets the batch (1,024 by default), `VIREO_ATT_LENGTHS` the positions
+//! (comma-separated, e.g. `32768,65536,131072,262144` for long contexts). A long run heats
+//! the Mac and slows the later lengths: compare two builds alternately, cool between.
 #![cfg(target_os = "macos")]
 
 use std::time::Instant;
@@ -52,7 +55,11 @@ fn a_batch_of_attention_deep_in_a_context() {
         gpu.group_prompt_attention(true);
     }
     for (name, hd, heads, kv_heads, window) in shapes {
-        for len in [if few { 200usize } else { 1_100 }, 2_304, 8_000, 30_000] {
+        let lengths: Vec<usize> = std::env::var("VIREO_ATT_LENGTHS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![if few { 200 } else { 1_100 }, 2_304, 8_000, 30_000]);
+        for len in lengths {
             let kv_dim = kv_heads * hd;
             // Room for whole chunks of 128 positions past the end.
             let cache = (len + 256) * kv_dim * 2;
