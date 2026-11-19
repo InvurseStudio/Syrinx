@@ -18,6 +18,7 @@ pub mod docx_write;
 pub mod inflate;
 pub mod markdown;
 pub mod pdf;
+pub mod pdf_write;
 pub mod pptx_write;
 pub mod xlsx;
 pub mod xlsx_write;
