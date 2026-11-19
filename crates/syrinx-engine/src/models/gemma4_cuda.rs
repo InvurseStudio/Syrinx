@@ -823,6 +823,11 @@ impl<'a> Gemma4Cuda<'a> {
             .map_err(e)?;
 
             let f = c.ffn_dims[l];
+            let mid_ffn = l > 0 && l + 1 < self.layers.len();
+            #[cfg(target_os = "macos")]
+            if mid_ffn {
+                Gpu::set_i8_ffn(true);
+            }
             // One token on the Mac: gate, up and the activation in one dispatch.
             #[cfg(target_os = "macos")]
             let fused = t == 1
@@ -860,6 +865,10 @@ impl<'a> Gemma4Cuda<'a> {
                     &Input::new(g, s.gate.ptr(), t, s.q8.as_ref()),
                     s.projected.ptr(),
                 )?;
+            }
+            #[cfg(target_os = "macos")]
+            if mid_ffn {
+                Gpu::set_i8_ffn(false);
             }
             // A mixture of experts: the dense network's output, normed, plus the experts'.
             #[cfg(target_os = "macos")]
