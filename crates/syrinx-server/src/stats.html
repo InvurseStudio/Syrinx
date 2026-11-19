@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syrinx statistics</title>
+<!--
+  How Syrinx is being used since it started: the Vireo Mac app's Statistics window
+  (Vireo's Mac/Sources/VireoMac/Views/StatisticsView.swift) as a page, in its colours,
+  reading GET /api/stats (stats.rs) every 2 seconds. The API key, or the token of the app
+  that started the server, comes after #token= in the address, or is typed in here.
+-->
+<style>
+:root {
+  --bg-primary: #0b1018; --bg-secondary: #0e141e; --bg-tertiary: #111a26;
+  --text-primary: #e8f0f1; --text-secondary: #8d9ba8; --accent: #4cf0ac;
+  --border: rgba(232, 240, 241, 0.10); --danger: #f87171; --raised: rgba(232, 240, 241, 0.06);
+  --orange: #fb923c;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg-primary); color: var(--text-primary); }
+body { font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+main { padding: 24px; display: flex; flex-direction: column; gap: 24px; max-width: 1200px; margin: 0 auto; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+.sub { color: var(--text-secondary); font-size: 13px; }
+.updates { color: var(--text-secondary); font-size: 11px; display: flex; align-items: center; gap: 5px; }
+.updates .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.updates.stale .dot { background: var(--danger); }
+h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.tile { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; padding: 14px; min-width: 0; }
+.tile .t { font-size: 11px; font-weight: 500; color: var(--text-secondary); }
+.tile .v { font-size: 24px; font-weight: 600; margin: 6px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.tile .d { font-size: 11px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .d.warn::before { content: "⚠ "; color: var(--orange); }
+.controls { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+.seg { display: inline-flex; padding: 2px; border-radius: 7px; background: var(--raised); }
+.seg button { font: inherit; font-size: 12px; color: var(--text-secondary); background: none; border: 0; padding: 3px 12px; border-radius: 5px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--bg-tertiary); color: var(--text-primary); box-shadow: 0 1px 2px rgba(0,0,0,.35); }
+.chart { position: relative; height: 200px; }
+.chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.chart .axis { fill: var(--text-secondary); font-size: 10px; }
+.chart .grid-line { stroke: var(--border); }
+.chart .bar { fill: var(--accent); }
+.chart.hovering .bar { opacity: .45; }
+.chart.hovering .bar.on { opacity: 1; }
+.chart .none { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-secondary); font-size: 13px; pointer-events: none; }
+.tip { position: absolute; top: -6px; transform: translate(-50%, -100%); pointer-events: none; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 11px; white-space: nowrap; }
+.tip b { display: block; font-weight: 600; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; max-height: 260px; overflow-y: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+th { position: sticky; top: 0; background: var(--bg-secondary); text-align: left; font-weight: 500; color: var(--text-secondary); padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+td { padding: 5px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+tbody tr:nth-child(even) { background: rgba(232, 240, 241, 0.02); }
+.muted { color: var(--text-secondary); }
+.err { color: var(--danger); }
+.live { display: inline-block; width: 7px; height: 7px; border-radius: 50%; border: 1px solid rgba(141,155,168,.5); margin-right: 8px; vertical-align: 0; }
+.live.on { background: var(--accent); border-color: var(--accent); }
+.empty { background: var(--bg-secondary); border-radius: 8px; padding: 14px; color: var(--text-secondary); }
+.refused { display: flex; gap: 10px; align-items: center; padding: 4px 0; }
+.refused .addr { font-family: var(--mono); }
+.refused .when { margin-left: auto; color: var(--text-secondary); }
+.state { display: grid; place-items: center; min-height: 70vh; text-align: center; color: var(--text-secondary); }
+.state b { display: block; color: var(--text-primary); font-size: 17px; margin-bottom: 6px; }
+.state form { margin-top: 14px; display: flex; gap: 8px; justify-content: center; }
+.state input { background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; color: var(--text-primary); font: inherit; width: 260px; }
+.state button { background: var(--accent); color: #000; border: 0; border-radius: 6px; padding: 6px 12px; font: inherit; font-weight: 500; cursor: pointer; }
+@media (max-width: 760px) {
+  main { padding: 16px; }
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+<main id="root"><div class="state">Loading…</div></main>
+<script>
+(() => {
+  "use strict";
+  const root = document.getElementById("root");
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fromHash = new URLSearchParams(location.hash.slice(1)).get("token");
+  const keyStore = { get() { try { return sessionStorage.getItem("syrinx.statsKey") || ""; } catch { return ""; } }, set(v) { try { sessionStorage.setItem("syrinx.statsKey", v); } catch {} } };
+  let token = fromHash || keyStore.get();
+  let stats = null, failed = false, needsKey = false;
+  let measure = "requests", range = "hour", hover = null;
+
+  // ---- Formats (StatisticsView's) ----
+  const nf = new Intl.NumberFormat();
+  const compactF = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+  const compact = (n) => compactF.format(n);
+  const speed = (v) => `${v.toFixed(1)} tok/s`;
+  const secs = (v) => `${v.toFixed(v < 10 ? 2 : 1)} s`;
+  const pct = (f) => `${Math.round(f * 100)}%`;
+  const share = (part, whole) => whole > 0 ? part / whole : 0;
+  const dash = "—";
+  function duration(s) {
+    if (s < 60) return `${Math.floor(s)}s`;
+    if (s < 3600) return `${Math.floor(s / 60)}m`;
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    return d ? `${d}d ${h}h` : `${h}h ${m}m`;
+  }
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  function relative(ts) {
+    const ago = Date.now() / 1000 - ts;
+    if (ago < 10) return "Just now";
+    if (ago < 3600) return rtf.format(-Math.round(ago / 60), "minute");
+    if (ago < 86400) return rtf.format(-Math.round(ago / 3600), "hour");
+    return rtf.format(-Math.round(ago / 86400), "day");
+  }
+  const clock = (ts, withSeconds) => new Date(ts * 1000).toLocaleTimeString([], withSeconds ? { hour: "numeric", minute: "2-digit", second: "2-digit" } : { hour: "numeric", minute: "2-digit" });
+  const statusLabel = (s) => ({ ok: "Done", error: "Failed", cancelled: "Stopped" }[s] || s);
+
+  // ---- Fetching ----
+  async function load() {
+    try {
+      const r = await fetch("/api/stats", { headers: token ? { Authorization: "Bearer " + token } : {} });
+      if (r.status === 401) { needsKey = true; stats = null; }
+      else if (!r.ok) throw new Error(String(r.status));
+      else { stats = await r.json(); needsKey = false; failed = false; }
+    } catch {
+      failed = true;
+    }
+    render();
+  }
+
+  // ---- Pieces ----
+  const tile = (title, value, detail, warn) =>
+    `<div class="tile"><div class="t">${esc(title)}</div><div class="v" title="${esc(value)}">${esc(value)}</div><div class="d${warn ? " warn" : ""}" title="${esc(detail)}">${esc(detail)}</div></div>`;
+  const seg = (name, value, options) =>
+    `<div class="seg" role="group">${options.map(([v, label]) => `<button type="button" data-${name}="${v}" aria-pressed="${v === value}">${esc(label)}</button>`).join("")}</div>`;
+
+  function tiles(s) {
+    const t = s.totals, active = s.active[0];
+    return `<div class="grid">
+      ${tile("Requests", nf.format(t.requests), t.errors > 0 ? `${t.errors} failed` : "None failed", t.errors > 0)}
+      ${tile("Tokens generated", compact(t.completionTokens), "Replies from the model")}
+      ${tile("Average speed", t.tokensPerSecond != null ? speed(t.tokensPerSecond) : dash, t.averageDuration != null ? `${t.averageDuration.toFixed(1)} s per reply` : "No replies yet")}
+      ${tile("Active now", nf.format(s.active.length), active ? `${active.sourceName}, ${Math.floor(active.seconds)} s` : "Idle")}
+      ${tile("Up for", duration(s.uptimeSeconds), `Since ${new Date(s.startedAt * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}`)}
+      ${tile("Context window", compact(s.contextLimit), "Tokens each chat can keep")}
+    </div>`;
+  }
+
+  function tokenTiles(s) {
+    const t = s.totals, replies = Math.max(t.requests, 1);
+    const peak = t.peakContextTokens;
+    return `<section><h2>Tokens</h2><div class="grid">
+      ${tile("Tokens in", compact(t.promptTokens), t.promptTokens > 0 ? `About ${compact(Math.round(t.promptTokens / replies))} per request` : "Prompts and chat history")}
+      ${tile("From the prompt cache", t.cacheHitRate != null ? pct(t.cacheHitRate) : dash, t.cachedTokens != null ? `${compact(t.cachedTokens)} tokens reused, not processed again` : "Not reported yet")}
+      ${tile("Prompt processing", t.prefillTokensPerSecond != null ? speed(t.prefillTokensPerSecond) : dash, t.prefillTokens != null ? `${compact(t.prefillTokens)} new prompt tokens read` : "Not reported yet")}
+      ${tile("Time to first token", t.averageFirstTokenSeconds != null ? secs(t.averageFirstTokenSeconds) : dash, "Average wait before a reply starts")}
+      ${tile("Context per reply", t.averageContextTokens != null ? compact(t.averageContextTokens) : dash,
+          t.averageContextTokens != null ? `${pct(share(t.averageContextTokens, s.contextLimit))} on average; the largest ${peak != null ? pct(share(peak, s.contextLimit)) : dash}` : `Context window: ${compact(s.contextLimit)}`,
+          peak != null && share(peak, s.contextLimit) >= 0.9)}
+      ${tile("Drafted tokens taken", t.draftAcceptance != null ? pct(t.draftAcceptance) : dash,
+          t.draftGuesses > 0 ? `${compact(t.draftTaken)} of ${compact(t.draftGuesses)} guesses, written ahead to save time` : "No drafting yet")}
+    </div></section>`;
+  }
+
+  function chart(s) {
+    const buckets = range === "hour" ? s.lastHour : s.lastDay;
+    const values = buckets.map((b) => measure === "requests" ? b.requests : b.tokens);
+    const max = Math.max(1, ...values);
+    // A round top for the axis: 1, 2 or 5 times a power of ten.
+    const pow = Math.pow(10, Math.floor(Math.log10(max)));
+    const top = [1, 2, 5, 10].map((m) => m * pow).find((v) => v >= max);
+    const W = 1000, H = 180, left = 44, bottom = 22, plotW = W - left, plotH = H - bottom;
+    const slot = plotW / buckets.length, barW = slot * 0.7;
+    let svg = "";
+    for (let i = 0; i <= 4; i++) {
+      const y = plotH - (plotH * i) / 4, v = (top * i) / 4;
+      svg += `<line class="grid-line" x1="${left}" x2="${W}" y1="${y}" y2="${y}"/><text class="axis" x="${left - 8}" y="${y + 3}" text-anchor="end">${esc(compact(v))}</text>`;
+    }
+    buckets.forEach((b, i) => {
+      const v = values[i], h = (v / top) * plotH;
+      const x = left + i * slot + (slot - barW) / 2;
+      svg += `<rect class="bar${hover === i ? " on" : ""}" data-i="${i}" x="${x}" y="${plotH - h}" width="${barW}" height="${Math.max(h, 0)}" rx="2"/>`;
+      svg += `<rect data-i="${i}" x="${left + i * slot}" y="0" width="${slot}" height="${plotH}" fill="transparent"/>`;
+    });
+    const every = range === "hour" ? 10 : 4;
+    buckets.forEach((b, i) => {
+      if (i % every) return;
+      const label = range === "hour" ? clock(b.start) : new Date(b.start * 1000).toLocaleTimeString([], { hour: "numeric" });
+      svg += `<text class="axis" x="${left + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle">${esc(label)}</text>`;
+    });
+    let tip = "";
+    if (hover !== null && buckets[hover]) {
+      const b = buckets[hover], x = ((left + hover * slot + slot / 2) / W) * 100;
+      const when = range === "hour" ? clock(b.start) : new Date(b.start * 1000).toLocaleString([], { weekday: "short", hour: "numeric" });
+      tip = `<div class="tip" style="left:${Math.min(Math.max(x, 8), 92)}%"><b>${esc(when)}</b>${b.requests} request${b.requests === 1 ? "" : "s"}<br>${nf.format(b.tokens)} tokens</div>`;
+    }
+    const none = buckets.every((b) => b.requests === 0) ? `<div class="none">No requests in this period</div>` : "";
+    return `<section><h2>Activity</h2>
+      <div class="controls">${seg("measure", measure, [["requests", "Requests"], ["tokens", "Tokens"]])}${seg("range", range, [["hour", "Last hour"], ["day", "Last 24 hours"]])}</div>
+      <div class="chart${hover !== null ? " hovering" : ""}" id="chart"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${measure === "requests" ? "Requests" : "Tokens"} per ${range === "hour" ? "minute" : "hour"}">${svg}</svg>${none}${tip}</div>
+    </section>`;
+  }
+
+  function connections(s) {
+    if (!s.sources.length) return `<section><h2>Connections</h2><div class="empty">Nothing has used the model since the server started.</div></section>`;
+    return `<section><h2>Connections</h2><div class="table-wrap"><table>
+      <thead><tr><th>Source</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Cached</th><th>Speed</th><th>First token</th><th>Failed</th><th>Last active</th></tr></thead>
+      <tbody>${s.sources.map((c) => `<tr>
+        <td><span class="live${c.activeRequests > 0 ? " on" : ""}" title="${c.activeRequests > 0 ? "Using the model now" : "Idle"}"></span>${esc(c.name)}</td>
+        <td>${nf.format(c.requests)}</td><td>${nf.format(c.promptTokens)}</td><td>${nf.format(c.completionTokens)}</td>
+        <td>${c.cacheHitRate != null ? pct(c.cacheHitRate) : dash}</td>
+        <td title="${c.prefillTokensPerSecond != null ? "Prompt processing: " + speed(c.prefillTokensPerSecond) : ""}">${c.tokensPerSecond != null ? speed(c.tokensPerSecond) : dash}</td>
+        <td>${c.averageFirstTokenSeconds != null ? secs(c.averageFirstTokenSeconds) : dash}</td>
+        <td>${c.errors > 0 ? nf.format(c.errors) : dash}</td>
+        <td class="muted">${c.lastSeenAt != null ? esc(relative(c.lastSeenAt)) : dash}</td></tr>`).join("")}</tbody></table></div></section>`;
+  }
+
+  function recent(s) {
+    if (!s.recent.length) return `<section><h2>Recent requests</h2><div class="empty">No requests yet.</div></section>`;
+    const help = (r) => {
+      if (r.promptTokens == null) return "The runtime didn't say how long the prompt was";
+      const parts = [`${nf.format(r.promptTokens)} prompt tokens`];
+      if (r.cachedTokens != null) parts.push(`${nf.format(r.cachedTokens)} from the prompt cache, ${nf.format(Math.max(0, r.promptTokens - r.cachedTokens))} processed`);
+      if (r.prefillTokensPerSecond != null) parts.push(`read at ${speed(r.prefillTokensPerSecond)}`);
+      return parts.join(", ");
+    };
+    return `<section><h2>Recent requests</h2><div class="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Source</th><th>In</th><th>Out</th><th>First token</th><th>Context</th><th>Time taken</th><th>Speed</th><th>Result</th></tr></thead>
+      <tbody>${s.recent.map((r) => `<tr>
+        <td>${esc(clock(r.startedAt, true))}</td><td>${esc(r.sourceName)}</td>
+        <td title="${esc(help(r))}">${r.promptTokens != null ? nf.format(r.promptTokens) : dash}</td>
+        <td>${nf.format(r.completionTokens)}</td>
+        <td>${r.firstTokenSeconds != null ? secs(r.firstTokenSeconds) : dash}</td>
+        <td title="${r.contextTokens != null ? `${nf.format(r.contextTokens)} of ${nf.format(s.contextLimit)} tokens` : ""}">${r.contextTokens != null ? pct(share(r.contextTokens, s.contextLimit)) : dash}</td>
+        <td>${r.duration.toFixed(1)} s</td>
+        <td>${r.tokensPerSecond != null ? speed(r.tokensPerSecond) : dash}</td>
+        <td class="${r.status === "error" ? "err" : r.status === "cancelled" ? "muted" : ""}">${esc(statusLabel(r.status))}</td></tr>`).join("")}</tbody></table></div></section>`;
+  }
+
+  function refused(s) {
+    const r = s.refused;
+    if (!r.count) return `<section><h2>Refused connections</h2><div class="empty">None. Apps and devices without the API key are turned away and listed here.</div></section>`;
+    return `<section><h2>Refused connections</h2>
+      <p class="muted" style="margin:0 0 8px;font-size:11px">${r.count} request${r.count === 1 ? " was" : "s were"} turned away. If you don't recognise an address, check which devices are on your network.</p>
+      ${r.recent.map((a) => `<div class="refused"><span style="color:var(--orange)">✋</span><span class="addr">${esc(a.address)}</span><span class="muted">${esc(a.reason)}</span><span class="when">${esc(relative(a.at))}</span></div>`).join("")}</section>`;
+  }
+
+  // ---- The page ----
+  function render() {
+    if (needsKey) {
+      root.innerHTML = `<div class="state"><div><b>This server needs its API key</b>Give the key Syrinx was started with to see its statistics.
+        <form id="key-form"><input id="key" type="password" placeholder="API key" autocomplete="off"><button type="submit">Show</button></form></div></div>`;
+      document.getElementById("key-form").onsubmit = (e) => {
+        e.preventDefault();
+        token = document.getElementById("key").value.trim();
+        keyStore.set(token);
+        load();
+      };
+      return;
+    }
+    if (!stats) {
+      root.innerHTML = failed
+        ? `<div class="state"><div><b>Statistics unavailable</b>The server isn't answering. Start it again, then reload this page.</div></div>`
+        : `<div class="state">Loading…</div>`;
+      return;
+    }
+    const scroll = window.scrollY;
+    const runtime = stats.runtime.replace(/^Syrinx \((.*)\)$/, "$1");
+    root.innerHTML = `<header><div><h1>Statistics</h1>
+        <div class="sub">${esc(stats.model)} on ${esc(runtime)} · since the server started ${esc(duration(stats.uptimeSeconds))} ago</div></div>
+        <div class="updates${failed ? " stale" : ""}"><span class="dot"></span>${failed ? "Not updating: the server isn't answering" : "Updates every 2 seconds"}</div></header>
+      ${tiles(stats)}${tokenTiles(stats)}${chart(stats)}${connections(stats)}${recent(stats)}${refused(stats)}`;
+    window.scrollTo(0, scroll);
+  }
+
+  root.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-measure], button[data-range]");
+    if (!b) return;
+    if (b.dataset.measure) measure = b.dataset.measure;
+    if (b.dataset.range) range = b.dataset.range;
+    hover = null;
+    render();
+  });
+  root.addEventListener("mousemove", (e) => {
+    const r = e.target.closest("#chart rect[data-i]");
+    const next = r ? +r.dataset.i : null;
+    if (next !== hover) { hover = next; if (stats) render(); }
+  });
+  document.documentElement.addEventListener("mouseleave", () => { if (hover !== null) { hover = null; render(); } });
+
+  load();
+  setInterval(() => { if (!needsKey) load(); }, 2000);
+})();
+</script>
+</body>
+</html>

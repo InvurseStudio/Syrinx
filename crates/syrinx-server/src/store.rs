@@ -89,9 +89,19 @@ pub fn model_key(path: &Path, precision: &str) -> String {
     format!("{h:016x}")
 }
 
+/// The folder's name under the user's application data: the prototype's, or Syrinx's own
+/// when it serves on its own (`--standalone`, [`use_own_folder`]).
+static FOLDER: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Keeps everything in Syrinx's own folder, apart from the Vireo prototype's chats,
+/// memories and pairings. Before anything reads [`data_dir`].
+pub fn use_own_folder() {
+    let _ = FOLDER.set("Syrinx");
+}
+
 /// The prototype's own folder: `~/Library/Application Support/VireoPrototype` on the Mac
 /// (where the Mac prototype app keeps its chats), `%LOCALAPPDATA%\VireoPrototype`
-/// elsewhere.
+/// elsewhere; `Syrinx` in place of `VireoPrototype` when serving on its own.
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map_or_else(
@@ -105,7 +115,7 @@ pub fn data_dir() -> PathBuf {
     } else {
         std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
     };
-    base.join("VireoPrototype")
+    base.join(FOLDER.get_or_init(|| "VireoPrototype"))
 }
 
 /// The default folder for `key`'s saved chats.

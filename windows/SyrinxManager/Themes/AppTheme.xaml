@@ -1,0 +1,42 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- Vireo's colours (Vireo's Windows/Vireo.WinUI/Themes/AppTheme.xaml and the Mac's
+         AppTheme.swift): dark navy with a green accent. Dark only, as the Vireo apps are. -->
+    <Color x:Key="BgPrimaryColor">#0B1018</Color>
+    <Color x:Key="BgSecondaryColor">#0E141E</Color>
+    <Color x:Key="BgTertiaryColor">#111A26</Color>
+    <Color x:Key="TextPrimaryColor">#E8F0F1</Color>
+    <Color x:Key="TextSecondaryColor">#8D9BA8</Color>
+    <Color x:Key="AccentColor">#4CF0AC</Color>
+    <Color x:Key="BorderColor">#1AE8F0F1</Color>
+    <Color x:Key="DangerColor">#F87171</Color>
+    <Color x:Key="WarningColor">#FACC15</Color>
+    <Color x:Key="RaisedColor">#0FE8F0F1</Color>
+    <Color x:Key="AccentSoftColor">#1A4CF0AC</Color>
+
+    <SolidColorBrush x:Key="BgPrimaryBrush" Color="{StaticResource BgPrimaryColor}" />
+    <SolidColorBrush x:Key="BgSecondaryBrush" Color="{StaticResource BgSecondaryColor}" />
+    <SolidColorBrush x:Key="BgTertiaryBrush" Color="{StaticResource BgTertiaryColor}" />
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="{StaticResource TextPrimaryColor}" />
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondaryColor}" />
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
+    <SolidColorBrush x:Key="BorderBrush" Color="{StaticResource BorderColor}" />
+    <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource DangerColor}" />
+    <SolidColorBrush x:Key="WarningBrush" Color="{StaticResource WarningColor}" />
+    <SolidColorBrush x:Key="RaisedBrush" Color="{StaticResource RaisedColor}" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="{StaticResource AccentSoftColor}" />
+
+    <!-- The system accent (buttons, focus, toggles) follows the green, as in Vireo. -->
+    <Color x:Key="SystemAccentColor">#4CF0AC</Color>
+    <Color x:Key="SystemAccentColorLight1">#3FD898</Color>
+    <Color x:Key="SystemAccentColorLight2">#4CF0AC</Color>
+    <Color x:Key="SystemAccentColorLight3">#93F6CD</Color>
+    <Color x:Key="SystemAccentColorDark1">#33D693</Color>
+    <Color x:Key="SystemAccentColorDark2">#24B177</Color>
+    <Color x:Key="SystemAccentColorDark3">#1A8B5C</Color>
+    <SolidColorBrush x:Key="AccentButtonForeground" Color="Black" />
+    <SolidColorBrush x:Key="AccentButtonForegroundPointerOver" Color="Black" />
+    <SolidColorBrush x:Key="AccentButtonForegroundPressed" Color="Black" />
+</ResourceDictionary>
