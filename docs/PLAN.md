@@ -1,5 +1,15 @@
 # Vireo's own engine: plan
 
+> **Where it stands now (2026-11-19).** This is the original plan and the full record of
+> the work since (Progress), kept as written. Much of it has happened, in a different
+> order than planned: the Mac (Metal) came early, beside CUDA; the engine runs Llama 3,
+> Qwen 3.5 / 3.8, Gemma 4 (dense and mixture of experts) and Muse Glimmer; the Rust server
+> has every tool Vireo 0.9's Python server had (phase 3), serves several chats at once, and
+> runs every chat in the Vireo-Proto apps. The engine has its own repository since
+> 2026-11-19. Not started yet: the scheduler, compiled skills, Vulkan and NPUs (phases 2,
+> 4, 5 and 6). What's being worked on is at the top of [HANDOFF.md](HANDOFF.md); the
+> numbers are in the [README](../README.md).
+
 Written 2026-11-10. A prototype plan, not a commitment: each phase ends in a decision
 point, and the work continues only if the numbers hold up.
 

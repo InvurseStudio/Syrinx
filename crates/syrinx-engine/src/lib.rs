@@ -1,7 +1,7 @@
 //! Vireo's inference engine.
 //!
 //! Runs GGUF models on Vireo's own kernels: CUDA first, then Vulkan and Metal, with a
-//! CPU backend as the fallback and the reference for correctness. See `PLAN.md` at the
+//! CPU backend as the fallback and the reference for correctness. See `docs/PLAN.md` at the
 //! root of this folder.
 //!
 //! Built so far:

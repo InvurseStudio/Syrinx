@@ -1,5 +1,28 @@
 # Where things stand
 
+## Focus now (2026-11-19)
+
+In order:
+
+1. **Long-context numbers measured again.** The 19 November rerun's long-context slowdown
+   was mostly heat: the same build timed twice came out 24% apart at 256K, and a 256K
+   read takes 24 minutes. PR #202's 32x128 tile for heads of 512 was also 7-13% slower
+   for Gemma 4 31B; the 16x256 tile is back (PR #5). The README's long-context numbers
+   want measuring again with cool-downs between the sizes.
+2. **An OpenAI-compatible API** (`/v1/chat/completions`, `/v1/models`, keys), so other
+   tools can use Syrinx.
+3. **A measurement pass:** the eval on the large models (it hasn't run on the 8-bit KV
+   cache or the 0.9 tools), and an Aurelia gauntlet run in Vireo-Proto.
+4. **CUDA catching up:** the CUDA side of the Mac's last pass (`LogitsBuffer::likeliest`,
+   Llama's cache sizing) has never been compiled, and the mixture-of-experts model is
+   refused on CUDA.
+5. **Vireo 1.0 on Syrinx:** undo, approval settings and skill import, then the release
+   that Vireo 0.9 updates into.
+
+The notes below are the record by date, Windows and Mac, from 2026-11-11.
+
+---
+
 Written 2026-11-11 on the Windows machine (RTX 5060 Laptop), for whoever picks the
 prototype up next on either machine, the Mac especially. [PLAN.md](PLAN.md) has the full
 record; this is the short version and the to-do list.
@@ -341,9 +364,9 @@ only: nothing here changes on the Mac.
    tiles, Qwen going back. The full eval scores the same as before on all four models, in
    24-37% less time on the Gemmas, 4-6% on the Qwens. Next: a skill one step at a time,
    its answer's headings forced.
-5. **Skills in the packaged Mac app:** the server finds the built-in skills by walking up
-   to the repository's `server/builtin-skills`. A packaged app has to copy them in and set
-   `VIREO_BUILTIN_SKILLS`. The slash-command list should also follow the asking device's
+5. **Skills in the packaged Mac app:** done 2026-11-19: the built-in skills are in this
+   repository (`builtin-skills/`), found above `target/release` or beside an installed
+   program, where the apps' build scripts copy them. The slash-command list should also follow the asking device's
    tools.
 6. **Small things:** three clippy warnings in `attach/` (from the Mac's code), one in
    `syrinx-cli`; prompt attention on CUDA for long prompts (78–87% of

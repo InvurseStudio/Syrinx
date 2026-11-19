@@ -13,17 +13,19 @@ natively. One Cargo workspace for both platforms: on Windows the GPU backend is 
 (NVIDIA), on the Mac it's Metal (`crates/syrinx-engine/src/metal`), and that backend and
 its tuning are the only parts that differ. Other GPUs and NPUs come later.
 
-- [HANDOFF.md](HANDOFF.md): where things stand, for whoever picks it up on either machine
+- [docs/HANDOFF.md](docs/HANDOFF.md): where things stand, for whoever picks it up on either machine
 
 Nothing here is used by the shipping apps.
 
-- [PLAN.md](PLAN.md): the plan, the decisions so far, phases and open questions
+- [docs/PLAN.md](docs/PLAN.md): the plan, the decisions so far, phases and open questions
 
 ## What's here
 
 | Folder | What it is |
 |---|---|
 | `crates/syrinx-engine/` | The inference engine (a library): the GGUF reader, the tokenizers (Llama 3, Qwen 3.5, Gemma 4), the tool-call grammar, and Llama, Qwen 3.5 and Gemma 4 on the CPU and on the GPU (`--gpu`): CUDA on Windows (`src/cuda`, `kernels/syrinx.cu`), Metal on the Mac (`src/metal`, `kernels/*.metal`), the same model code on both. |
+| `builtin-skills/` | The skills Syrinx comes with, in the open SKILL.md format (13: summarizing, translating, code review, invoices, reports and more). The server finds them above `target/release`, or beside an installed program |
+| `docs/` | The plan and its full record (`PLAN.md`) and where things stand (`HANDOFF.md`) |
 | `tools/` | Scripts that generate engine source, such as the Unicode tables (the eval and benchmark runners are in `../evals/tools/`) |
 | `models/` | Test models (not in git; see `crates/syrinx-engine/tests/real_models.rs` for which) |
 | `crates/syrinx-cli/` | Runs the engine from the command line, for testing and benchmarks |
