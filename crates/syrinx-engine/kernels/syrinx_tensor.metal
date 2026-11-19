@@ -566,9 +566,12 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
 
 // The tiles (TCG_TILES in src/metal/mod.rs), the quickest on the M5 Max of 16-64 rows,
 // 64-256 positions and 4 or 8 SIMD groups: each leaves a thread 32 of the output's numbers.
+// Heads of 512 (Gemma 4 31B's global layers) keep 16 rows × 256 positions: 32 × 128 was
+// 2-30% slower at 1K-30K positions and 7-13% at 32K-256K, with 64 to 1,024 tokens a batch
+// (Nov 19, `prompt_attention_speed`, the two alternated with cool-downs between).
 template [[host_name("attention_tcg_128")]] kernel void attention_tcg<128, 32, 128, 4>(ARGS, KP, uint, uint);
 template [[host_name("attention_tcg_256")]] kernel void attention_tcg<256, 32, 128, 8>(ARGS, KP, uint, uint);
-template [[host_name("attention_tcg_512")]] kernel void attention_tcg<512, 32, 128, 8>(ARGS, KP, uint, uint);
+template [[host_name("attention_tcg_512")]] kernel void attention_tcg<512, 16, 256, 8>(ARGS, KP, uint, uint);
 
 // attention_tcg's parts added up: a threadgroup a query row (gid.x: key/value head and
 // block of tokens, gid.y: the row in its tile), each part weighted by its maximum against
