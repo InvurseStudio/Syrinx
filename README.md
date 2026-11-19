@@ -146,6 +146,43 @@ cargo build --release
 thinking and more. [DEVELOPMENT.md](DEVELOPMENT.md) covers the layout, the tests and the
 eval.
 
+## Use it from other apps
+
+`syrinx-server` speaks the OpenAI API, so tools built for OpenAI, LM Studio or
+llama.cpp's server can use it. Start it with the API on:
+
+```bash
+./target/release/syrinx-server path/to/model.gguf --port 8080 --openai on
+```
+
+Then point any OpenAI client at `http://127.0.0.1:8080/v1`:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "local",
+  "messages": [{"role": "user", "content": "Write a haiku about the north."}],
+  "stream": true
+}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
+reply = client.chat.completions.create(
+    model="local", messages=[{"role": "user", "content": "Hello!"}])
+print(reply.choices[0].message.content)
+```
+
+- **Endpoints:** `GET /v1/models` and `POST /v1/chat/completions`, whole or streamed.
+- **What carries across:** sampling settings (`temperature`, `top_p`, `top_k`, `min_p`,
+  `presence_penalty`), `max_tokens`, up to four `stop` strings, and usage with cached
+  prompt tokens.
+- **Thinking:** with `"reasoning_effort": "low"` or higher, a model that thinks sends its
+  thoughts as `reasoning_content`, apart from the answer.
+- **Not yet:** tool calls, images and JSON mode.
+- **Access:** the server listens only on this computer, and needs no API key unless
+  Vireo's settings ask for one.
+
 ## Status
 
 Syrinx is young and moving fast. It runs every chat in the Vireo-Proto apps for Mac and
