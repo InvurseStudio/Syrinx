@@ -1,61 +1,155 @@
-# Project Syrinx
+# Syrinx
 
-Syrinx is Vireo's own engine. Since 2026-11-19 it has its own repository
-(InvurseStudio/Syrinx), mounted in the Vireo repository as a git submodule at `Syrinx/`;
-before that it was `Syrinx/` there (and `VireoPrototype/` until 2026-11-17), and its
-history came along. The chat apps that run on it, Vireo-Proto for Mac and Windows, keep the
-Vireo name and live in the Vireo repository (`Mac/`, `Windows/`), as do the evals,
-benchmarks and the Aurelia gauntlet (`evals/`, `../evals/` from here in a Vireo checkout).
+**A local inference engine and agent server, written from scratch in Rust.**
 
-Work on Vireo's own stack: a Rust server and inference engine that would replace the
-Python server in `server/` and the inference servers it starts. GGUF models, read
-natively. One Cargo workspace for both platforms: on Windows the GPU backend is CUDA
-(NVIDIA), on the Mac it's Metal (`crates/syrinx-engine/src/metal`), and that backend and
-its tuning are the only parts that differ. Other GPUs and NPUs come later.
+Syrinx runs open-weight language models on your own machine (Metal on Apple silicon,
+CUDA on NVIDIA) and serves them to [Vireo](https://invursestudio.com), a private AI
+assistant that works with your files, calendar and apps without sending anything to the
+cloud. It reads GGUF models directly, with its own GPU kernels, tokenizers, sampler and
+tool-calling grammar. It doesn't wrap llama.cpp or MLX.
 
-- [HANDOFF.md](HANDOFF.md): where things stand, for whoever picks it up on either machine
+> In a syrinx, a songbird's voice box, two sides sing at once. A vireo is a songbird.
 
-Nothing here is used by the shipping apps.
+---
 
-- [PLAN.md](PLAN.md): the plan, the decisions so far, phases and open questions
+## Highlights
 
-## What's here
+- **Fast long context.** Gemma 4 31B reads a 256K-token prompt and still remembers the
+  facts planted in it, in 57 GB of memory.
+- **Built for agents.** Tool calls are written under a grammar in each model's own format,
+  so they always parse. Tools that change something wait for the user's approval, and the
+  server checks the reply for changes it claims but never made.
+- **Several people at once.** One Mac serves 64 chats together, about 250 tokens a second
+  in total, with each reply starting within about 6 seconds.
+- **Speculative decoding where it pays.** Draft models (Gemma 4 E2B for 31B, or Google's
+  draft models), Qwen's own multi-token-prediction layer, and guesses taken from the chat
+  itself. Every token is still the model's own pick.
+- **Chats pick up where they left off.** Each chat's cache is saved, so going back to a
+  conversation reads only what's new.
+- **One codebase, two GPUs.** The same model code runs on Metal and CUDA. Only the
+  backend and its tuning differ.
 
-| Folder | What it is |
+## Performance
+
+Measured on 19 November 2026 on a MacBook Pro with M5 Max and 128 GB of memory, with
+Q6_K models, on `main`.
+
+### Long context: Gemma 4 31B
+
+| Context | Reading | Time to first token | Writing | Peak memory |
+|---|---:|---:|---:|---:|
+| 32K | 629 tok/s | 47 s | 28.8 tok/s | 33.3 GB |
+| 64K | 460 tok/s | 2.2 min | 23.3 tok/s | 36.6 GB |
+| 128K | 300 tok/s | 6.9 min | 18.6 tok/s | 43.1 GB |
+| 256K | 172 tok/s | 24.6 min | 15.0 tok/s | 57.1 GB |
+
+At every size the model recalled both facts planted deep in the prompt.
+
+### Writing after 125K tokens of context
+
+| Model | Writing speed |
+|---|---:|
+| Gemma 4 E2B | 116.1 tok/s |
+| Gemma 4 E4B | 69.6 tok/s |
+| Qwen 3.5 9B | 56.2 tok/s |
+| Qwen 3.5 4B | 55.8 tok/s |
+| Gemma 4 26B-A4B (MoE) | 48.1 tok/s |
+| Qwen 3.8 27B | 27.8 tok/s |
+| Muse Glimmer 30B | 19.7 tok/s |
+| Gemma 4 31B | 16.9 tok/s |
+
+All eight recalled both planted facts.
+
+### A multi-step agent task
+
+The whole task, start to finish: finding a sales file, reading it, and working out each
+quarter's revenue and the year's total with the calculator tool.
+
+| Model | Total time |
+|---|---:|
+| Gemma 4 E2B | 4.3 s |
+| Gemma 4 E4B | 6.6 s |
+| Qwen 3.5 4B | 6.6 s |
+| Gemma 4 26B-A4B | 9.4 s |
+| Qwen 3.5 9B | 15.2 s |
+| Gemma 4 31B | 27.8 s |
+| Qwen 3.8 27B | 32.5 s |
+| Muse Glimmer 30B | 49.7 s |
+
+### Short replies, large models
+
+| Model | Writing speed |
+|---|---:|
+| Qwen 3.8 27B | 35.6 tok/s |
+| Gemma 4 31B | 35.4 tok/s |
+| Muse Glimmer 30B | 24.7 tok/s |
+
+### A long conversation
+
+A 64-turn chat with Gemma 4 31B in a 32K context, which fills and overflows the context
+as it goes: **242 seconds** in all, with 60 of 63 answers right.
+
+### Many chats at once
+
+Gemma 4 26B-A4B, 200-token replies to 3,000-token chats:
+
+| People chatting | Total writing | Each person | Longest wait for a first token |
+|---|---:|---:|---:|
+| 1 at a time | 88.9 tok/s | 91–94 tok/s | |
+| 8 | 206.8 tok/s | 26–29 tok/s | 0.7 s |
+| 16 | 224.6 tok/s | 14–16 tok/s | 1.4 s |
+| 32 | 240.9 tok/s | 7.6–8.5 tok/s | 3.1 s |
+| 48 | 250.4 tok/s | 5.2–6.0 tok/s | 4.6 s |
+| 64 (16K context each) | 253.7 tok/s | 4.0–4.5 tok/s | 6.2 s |
+
+Gemma 4 31B: 4 people together write 42.9 tok/s in total (first token within 0.9 s), and
+8 people 70.1 tok/s (within 1.9 s).
+
+<sub>The long conversation and many-chats runs use the opt-in 8-bit KV cache
+(`VIREO_KV_Q8=1`). All runs use 8-bit middle-layer feed-forward weights (`VIREO_I8=ffn`).
+"1 at a time" is eight people taking turns in one slot.</sub>
+
+## Models
+
+| Family | Tested sizes |
 |---|---|
-| `crates/syrinx-engine/` | The inference engine (a library): the GGUF reader, the tokenizers (Llama 3, Qwen 3.5, Gemma 4), the tool-call grammar, and Llama, Qwen 3.5 and Gemma 4 on the CPU and on the GPU (`--gpu`): CUDA on Windows (`src/cuda`, `kernels/syrinx.cu`), Metal on the Mac (`src/metal`, `kernels/*.metal`), the same model code on both. |
-| `tools/` | Scripts that generate engine source, such as the Unicode tables (the eval and benchmark runners are in `../evals/tools/`) |
-| `models/` | Test models (not in git; see `crates/syrinx-engine/tests/real_models.rs` for which) |
-| `crates/syrinx-cli/` | Runs the engine from the command line, for testing and benchmarks |
-| `crates/syrinx-server/` | The server: one model over the part of the app's API that chats use. Tools: files and Git (run by the app that asks for them, as the Windows app does, or by the server itself, `files.rs`, as for the Mac app), the tools that change files with the user's approval, the date; skills (SKILL.md, picked by scoring); attachments (`attach/`). Each prototype app starts it itself; `start-server.cmd` runs it by hand on Windows. It keeps each chat's cache in the prototype's folder (`%LOCALAPPDATA%\VireoPrototype`, `~/Library/Application Support/VireoPrototype` on the Mac), so going back to a chat reads only what's new |
-| `crates/syrinx-eval/` | How well each model uses the tools and skills: `cargo run --release -p syrinx-eval -- --out ../evals/eval-runs/latest.json` runs 39 cases (twelve easy, twelve harder, six that change files, five skills, four for the later tools) through syrinx-server against a stand-in PC and scores the tools, arguments and answers: by default on Gemma 4 E2B and Qwen 3.5 4B (about 6 minutes), with `--full` on Gemma 4 E2B and E4B and Qwen 3.5 4B and 9B (about 18), for in-depth testing and before a pull request. The latest full run is `../evals/eval-runs/windows-short-batches.json` (Windows); the Mac's is `../evals/eval-runs/mac.json` (35 cases). Larger models run on request: Gemma 4 31B passes all 35 on the Mac (`../evals/eval-runs/gemma-4-31B.md`) |
+| Gemma 4 | E2B, E4B, 26B-A4B (mixture of experts), 31B |
+| Qwen 3.5 / 3.8 | 0.8B, 4B, 9B, 27B (with multi-token prediction) |
+| Llama 3 | 3.2 1B |
+| Muse Glimmer | 30B |
 
-## Chatting with the engine in the prototype app
+Models are GGUF files: tested with Q4_0, Q4_K_M and Q6_K. Thinking is supported for
+Gemma 4, Qwen and Muse, with the thoughts streamed apart from the answer.
 
-1. Install the app with `Windows\install-test-build.cmd` in the Vireo repository. It builds `syrinx-server` too
-   and installs it beside the app.
-2. Open **Vireo Prototype**, then Settings › Models: download one of the suggested models
-   or add a folder of `.gguf` files (Llama, Qwen 3.5 or Gemma 4), make it the active model,
-   and **Start**.
+## What's inside
 
-The app starts `syrinx-server` with that model (any free port on 127.0.0.1, a token it
-accepts without pairing) and sends chats to it while it runs, keeping any Mac's pairing.
-With *Start the model when Vireo opens* it starts with the app; it ends with the app. The
-choice is kept in `%LOCALAPPDATA%\VireoPrototype\engine.json`.
+| Crate | What it is |
+|---|---|
+| [`syrinx-engine`](crates/syrinx-engine) | The engine: GGUF reader, tokenizers, grammar-constrained sampling, and the models on the CPU, Metal and CUDA |
+| [`syrinx-server`](crates/syrinx-server) | The agent server: chats over HTTP with streamed replies, tools (files, Git, Office documents, PDFs, calendar, the web, shell), approvals, skills, memory, scheduled tasks, attachments, and several chats at once |
+| [`syrinx-cli`](crates/syrinx-cli) | Runs a model from the command line, for testing and benchmarks |
+| [`syrinx-eval`](crates/syrinx-eval) | Scores how well each model uses the tools and skills, case by case |
 
-`start-server.cmd` runs the server by hand instead (port 3000, paired with the 6-digit
-code it prints). The full server (tools, files, skills, the scheduler) is the rest of
-phase 3.
+## Building
 
-## Setting up
-
-Install Rust with [rustup](https://rustup.rs) (the MSVC toolchain), then from this
-folder:
+You need Rust ([rustup](https://rustup.rs)). On Windows, CUDA also needs the CUDA
+Toolkit and Visual Studio's C++ workload.
 
 ```bash
-cargo run -p syrinx-cli
+cargo build --release
+./target/release/syrinx-server path/to/model.gguf --port 3000
 ```
 
-The CUDA work in phase 1 also needs Visual Studio's **Desktop development with C++**
-workload and the CUDA Toolkit (13.5 on the development PC). See "Development machine"
-in the plan.
+`syrinx-server --help` lists the options: context size, draft models, chat slots,
+thinking and more. [DEVELOPMENT.md](DEVELOPMENT.md) covers the layout, the tests and the
+eval.
+
+## Status
+
+Syrinx is young and moving fast. It runs every chat in the Vireo-Proto apps for Mac and
+Windows, and will replace Vireo's current Python server and the inference runtimes it
+starts. Other GPUs and NPUs come later.
+
+## License
+
+Copyright © 2026 Invurse Studio. All rights reserved.
