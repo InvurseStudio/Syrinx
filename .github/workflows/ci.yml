@@ -28,8 +28,8 @@ jobs:
         continue-on-error: true
         run: |
           sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq gdb > /dev/null
-          cargo test --release -p syrinx-engine --lib --no-run
-          bin=$(ls -t target/release/deps/syrinx_engine-* | grep -v '\.d$' | head -1)
+          bin=$(cargo test --release -p syrinx-engine --lib --no-run 2>&1 | grep -o '(target/[^)]*)' | tr -d '()' | head -1)
+          echo "binary: $bin"
           gdb -batch -ex run -ex bt -ex 'info registers rip' --args "$bin" dylib --test-threads=1 --exact dylib::tests::finds_a_system_function
       - name: Build
         run: cargo build --release --workspace
