@@ -315,6 +315,8 @@ struct Kernels {
     /// to 4 of its query heads), for head sizes 64, 128, 256 and 512; with how many of its
     /// blocks an SM holds at once.
     attention_part_kv: [(CuFunction, u32); 4],
+    /// Q8_0 KV cache variants of `attention_part_kv` for head sizes 128, 256 and 512.
+    attention_part_kv_q8: [(CuFunction, u32); 3],
     attention_combine: CuFunction,
     /// `attention_mma` for a batch of up to `ATTENTION_SHORT` tokens.
     attention_mma_short: Option<[AttentionMma; 4]>,
@@ -325,6 +327,10 @@ struct Kernels {
     /// On the tensor cores over an f16 cache, for head sizes 64, 128, 256 and 512:
     /// only on compute capability 8.0 and later.
     attention_mma: Option<[AttentionMma; 4]>,
+    /// Q8_0 KV cache variants of `attention_mma`, `_short`, and `_part` for head sizes 128, 256 and 512.
+    attention_mma_q8: Option<[AttentionMma; 3]>,
+    attention_mma_q8_short: Option<[AttentionMma; 3]>,
+    attention_mma_q8_part: Option<[AttentionMma; 3]>,
     /// For head sizes 64, 128, 256 and 512.
     attention_tiled: [CuFunction; 4],
     swiglu: CuFunction,
@@ -369,6 +375,9 @@ struct Kernels {
     /// product: by activation (SiLU, tanh-GELU), then tile (64 tokens, 128), then
     /// `KINDS_8`.
     matmul8_glu: Option<[[[[CuFunction; 5]; 2]; 2]; 2]>,
+    /// Two-stage argmax over a row of f32 logits (the first index on a tie).
+    argmax_part: CuFunction,
+    argmax_final: CuFunction,
 }
 
 /// A tile kernel's name for a weight type and layout: `matmul8_<tile>q4_0_h` reads a
@@ -424,6 +433,8 @@ pub struct Gpu {
     /// attention_part's partial results: room for MAX_PARTS parts of 512-wide heads, 64
     /// heads. All work goes through one stream, so one is enough for every session.
     attention_parts: Buffer,
+    /// Scratch for `Gpu::argmax`: `ARGMAX_PARTS` (f32, u32) pairs plus the final u32.
+    argmax_buf: Buffer,
     pub info: DeviceInfo,
 }
 
@@ -446,6 +457,8 @@ const MAX_PARTS: u32 = 16;
 /// The same for `attention_part_kv` (f16 cache), whose blocks each take a key/value head:
 /// fewer blocks a part, so more parts.
 const MAX_PARTS_KV: u32 = 64;
+/// Blocks for the first stage of `Gpu::argmax`.
+const ARGMAX_PARTS: u32 = 256;
 const TILE_TOKENS: u32 = 64;
 /// The K-quants' wider tile, in tokens.
 const WIDE_TOKENS: usize = 128;
@@ -612,6 +625,22 @@ impl Gpu {
                     }
                     out
                 },
+                attention_part_kv_q8: {
+                    let mut out = [(std::ptr::null_mut(), 1); 3];
+                    for (slot, hd) in out.iter_mut().zip([128, 256, 512]) {
+                        let f = function(&format!("attention_part_kv_q8_{hd}"))?;
+                        let mut blocks = 0;
+                        let r = (context.driver.cuOccupancyMaxActiveBlocksPerMultiprocessor)(
+                            &mut blocks,
+                            f,
+                            128,
+                            0,
+                        );
+                        context.check("cuOccupancyMaxActiveBlocksPerMultiprocessor", r)?;
+                        *slot = (f, blocks.max(1) as u32);
+                    }
+                    out
+                },
                 attention_combine: function("attention_combine")?,
                 q_rows_to_half: if tensor_cores {
                     Some(function("q_rows_to_half")?)
@@ -671,6 +700,80 @@ impl Gpu {
                             format!("attention_mma_{d}")
                         } else {
                             format!("attention_mma_{d}_short")
+                        };
+                        let f = function(&name)?;
+                        let bytes = attention_mma_bytes(d, rows, split, chunk);
+                        let r = (context.driver.cuFuncSetAttribute)(
+                            f,
+                            FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            bytes as i32,
+                        );
+                        context.check("cuFuncSetAttribute", r)?;
+                        *slot = AttentionMma {
+                            function: f,
+                            shared: bytes,
+                            rows: 16 * rows,
+                            threads: 32 * rows * split,
+                        };
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                attention_mma_q8: if tensor_cores {
+                    let mut out = [AttentionMma::default(); 3];
+                    for (slot, &(d, rows, split, chunk)) in out.iter_mut().zip(&ATTENTION_MMA[1..]) {
+                        let f = function(&format!("attention_mma_q8_{d}"))?;
+                        let bytes = attention_mma_bytes(d, rows, split, chunk);
+                        let r = (context.driver.cuFuncSetAttribute)(
+                            f,
+                            FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            bytes as i32,
+                        );
+                        context.check("cuFuncSetAttribute", r)?;
+                        *slot = AttentionMma {
+                            function: f,
+                            shared: bytes,
+                            rows: 16 * rows,
+                            threads: 32 * rows * split,
+                        };
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                attention_mma_q8_part: if tensor_cores {
+                    let mut out = [AttentionMma::default(); 3];
+                    for (slot, &(d, rows, split, chunk)) in
+                        out.iter_mut().zip(&ATTENTION_MMA_SHORT[1..])
+                    {
+                        let f = function(&format!("attention_mma_q8_{d}_part"))?;
+                        let bytes = attention_mma_bytes(d, rows, split, chunk);
+                        let r = (context.driver.cuFuncSetAttribute)(
+                            f,
+                            FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            bytes as i32,
+                        );
+                        context.check("cuFuncSetAttribute", r)?;
+                        *slot = AttentionMma {
+                            function: f,
+                            shared: bytes,
+                            rows: 16 * rows,
+                            threads: 32 * rows * split,
+                        };
+                    }
+                    Some(out)
+                } else {
+                    None
+                },
+                attention_mma_q8_short: if tensor_cores {
+                    let mut out = [AttentionMma::default(); 3];
+                    let shapes = ATTENTION_MMA_SHORT[1..].iter().zip(&ATTENTION_MMA[1..]);
+                    for (slot, (&(d, rows, split, chunk), long)) in out.iter_mut().zip(shapes) {
+                        let name = if (d, rows, split, chunk) == *long {
+                            format!("attention_mma_q8_{d}")
+                        } else {
+                            format!("attention_mma_q8_{d}_short")
                         };
                         let f = function(&name)?;
                         let bytes = attention_mma_bytes(d, rows, split, chunk);
@@ -803,6 +906,8 @@ impl Gpu {
                 } else {
                     None
                 },
+                argmax_part: function("argmax_part")?,
+                argmax_final: function("argmax_final")?,
             };
             // Twice what one token's 64 heads of 512 in the most parts need: a few tokens of
             // any model here fit with all their parts.
@@ -815,10 +920,20 @@ impl Gpu {
                 ptr,
                 bytes: parts_bytes,
             };
+            let argmax_bytes = ARGMAX_PARTS as usize * 8 + 4;
+            let mut argmax_ptr = 0;
+            let r = (context.driver.cuMemAlloc_v2)(&mut argmax_ptr, argmax_bytes);
+            context.check("cuMemAlloc", r)?;
+            let argmax_buf = Buffer {
+                context: Arc::clone(&context),
+                ptr: argmax_ptr,
+                bytes: argmax_bytes,
+            };
             Ok(Self {
                 context,
                 kernels,
                 attention_parts,
+                argmax_buf,
                 info,
             })
         }
@@ -1164,6 +1279,31 @@ impl Gpu {
         self.run(self.kernels.residual_norm, (tokens as u32, 1), 256, &args)
     }
 
+    /// Whether `VIREO_KV_Q8=1` is set: stores KV caches (for head_dim in 128, 256, 512 in
+    /// Int8 mode) as Q8_0 (17/16 bytes per element, 1.88× smaller than f16).
+    pub fn kv_q8_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("VIREO_KV_Q8")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+        })
+    }
+
+    fn kv_q8(half_cache: bool, head_dim: usize) -> bool {
+        half_cache && Self::kv_q8_enabled() && matches!(head_dim, 128 | 256 | 512)
+    }
+
+    /// Bytes per head-position for a KV cache of head dimension `head_dim`.
+    pub fn kv_head_bytes(half_cache: bool, head_dim: usize) -> usize {
+        if Self::kv_q8(half_cache, head_dim) {
+            head_dim * 17 / 16
+        } else if half_cache {
+            head_dim * 2
+        } else {
+            head_dim * 4
+        }
+    }
+
     /// Gets `tokens` tokens' queries, keys and values ready for attention: see
     /// [`QkvPrep`].
     pub fn qkv_prep(&self, p: &QkvPrep, tokens: usize) -> Result<()> {
@@ -1171,6 +1311,11 @@ impl Gpu {
         assert!(p.ring < 1 << 15, "a ring of {} rows", p.ring);
         let kv = p.cache.is_some();
         let (k_cache, v_cache) = p.cache.unwrap_or((0, 0));
+        let cache_mode = if Self::kv_q8(p.half_cache, p.head_dim) {
+            2i32
+        } else {
+            p.half_cache as i32
+        };
         let args = [
             Arg::Ptr(p.q),
             Arg::I32(p.q_stride as i32),
@@ -1192,7 +1337,7 @@ impl Gpu {
             Arg::I32(p.neox as i32),
             Arg::Ptr(p.pos),
             Arg::F32(p.eps),
-            Arg::I32(p.half_cache as i32),
+            Arg::I32(cache_mode),
             Arg::I32(tokens as i32),
             Arg::I32(p.ring as i32),
         ];
@@ -1306,11 +1451,23 @@ impl Gpu {
             Arg::I32(group as i32),
             Arg::F32(scale),
         ];
+        let use_q8 = Self::kv_q8(half_cache, head_dim);
         let kv_few = half_cache && matches!(head_dim, 64 | 128 | 256 | 512);
-        if (tokens == 1 || (kv_few && tokens <= Self::FEW_TOKENS)) && heads <= 64 {
+        // For 2..=FEW_TOKENS on global layers (no sliding window), `attention_mma_part`
+        // reads each key/value position once for all tokens in the batch instead of once
+        // per token, cutting deep-context speculative check time nearly in half.
+        let use_mma_part = half_cache
+            && tokens > 1
+            && window == 0
+            && ring == 0
+            && heads.is_multiple_of(group)
+            && self.kernels.attention_mma_part.is_some()
+            && matches!(head_dim, 64 | 128 | 256 | 512);
+        if (tokens == 1 || (kv_few && tokens <= Self::FEW_TOKENS && !use_mma_part)) && heads <= 64
+        {
             // One token: split each head's context into parts so every SM has work (about
-            // four blocks per SM), then merge them. A few tokens (over an f16 cache): the
-            // same, a grid layer each.
+            // four blocks per SM), then merge them. A few tokens (over an f16 or Q8_0 cache):
+            // the same, a grid layer each.
             let sms = self.info.multiprocessors.max(1) as u32;
             let kv_kernel = match head_dim {
                 64 => Some(0),
@@ -1324,7 +1481,11 @@ impl Gpu {
                 // key and value is read once a set. As many parts as fill the GPU in one
                 // wave (the blocks hold many registers: 2 an SM at head size 512), and no
                 // more than a sliding window fills 32 positions of each.
-                let (kernel, per_sm) = self.kernels.attention_part_kv[i];
+                let (kernel, per_sm) = if use_q8 {
+                    self.kernels.attention_part_kv_q8[i - 1]
+                } else {
+                    self.kernels.attention_part_kv[i]
+                };
                 let blocks = (heads / group * group.div_ceil(4)) as u32;
                 let layers = tokens as u32;
                 let mut parts = (per_sm * sms / blocks).clamp(1, MAX_PARTS_KV);
@@ -1403,17 +1564,22 @@ impl Gpu {
             // A short batch with no window: query heads that share keys and values fill
             // a block's rows, and the context is split into as many parts as give every
             // SM a block (deep in a chat the batch's few blocks each read all of it).
-            if let (true, Some(kernels), Some(i), Some(to_half)) = (
+            let mma_part_k = wide.and_then(|i| {
+                if use_q8 {
+                    self.kernels.attention_mma_q8_part.map(|k| k[i - 1])
+                } else {
+                    self.kernels.attention_mma_part.map(|k| k[i])
+                }
+            });
+            if let (true, Some(k), Some(to_half)) = (
                 tokens > 1
                     && tokens <= ATTENTION_SHORT
                     && window == 0
                     && ring == 0
                     && heads.is_multiple_of(group),
-                self.kernels.attention_mma_part,
-                wide,
+                mma_part_k,
                 self.kernels.q_rows_to_half,
             ) {
-                let k = kernels[i];
                 let units = group * tokens.div_ceil(16);
                 let blocks = (heads / group * units.div_ceil(k.rows as usize / 16)) as u32;
                 let sms = self.info.multiprocessors.max(1) as u32;
@@ -1457,15 +1623,22 @@ impl Gpu {
                     return self.run(self.kernels.attention_combine, (rows, 1), 128, &combine);
                 }
             }
-            let mma = if tokens <= ATTENTION_SHORT {
-                self.kernels.attention_mma_short
-            } else {
-                self.kernels.attention_mma
-            };
-            if let (true, Some(kernels), Some(i), Some(to_half)) =
-                (tokens > 1, mma, wide, self.kernels.q_rows_to_half)
+            let mma_k = wide.and_then(|i| {
+                if use_q8 {
+                    if tokens <= ATTENTION_SHORT {
+                        self.kernels.attention_mma_q8_short.map(|k| k[i - 1])
+                    } else {
+                        self.kernels.attention_mma_q8.map(|k| k[i - 1])
+                    }
+                } else if tokens <= ATTENTION_SHORT {
+                    self.kernels.attention_mma_short.map(|k| k[i])
+                } else {
+                    self.kernels.attention_mma.map(|k| k[i])
+                }
+            });
+            if let (true, Some(k), Some(to_half)) =
+                (tokens > 1, mma_k, self.kernels.q_rows_to_half)
             {
-                let k = kernels[i];
                 // The queries to f16 where they lie (they aren't read again as f32).
                 let rows = (heads * tokens) as u32;
                 self.run(to_half, (rows, 1), 128, &[Arg::Ptr(q), Arg::I32(head_dim as i32)])?;
@@ -2170,6 +2343,44 @@ impl Gpu {
     pub fn zero(&self, buffer: &Buffer) -> Result<()> {
         let zeros = vec![0f32; buffer.len_bytes() / 4];
         buffer.write_f32(&zeros)
+    }
+
+    /// Index of the largest f32 in `x[0..n]` (the first index on a tie), computed on the
+    /// GPU so only 4 bytes cross PCIe instead of the whole vocabulary's logits.
+    pub fn argmax(&self, x: CuDevicePtr, n: usize) -> Result<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let parts = (n as u32).div_ceil(256).min(ARGMAX_PARTS);
+        let vals = self.argmax_buf.ptr();
+        let idxs = vals + (ARGMAX_PARTS as u64) * 4;
+        let out = idxs + (ARGMAX_PARTS as u64) * 4;
+        self.run(
+            self.kernels.argmax_part,
+            (parts, 1),
+            256,
+            &[
+                Arg::Ptr(x),
+                Arg::Ptr(vals),
+                Arg::Ptr(idxs),
+                Arg::I32(n as i32),
+            ],
+        )?;
+        self.run(
+            self.kernels.argmax_final,
+            (1, 1),
+            256,
+            &[
+                Arg::Ptr(vals),
+                Arg::Ptr(idxs),
+                Arg::Ptr(out),
+                Arg::I32(parts as i32),
+            ],
+        )?;
+        let mut bytes = [0u8; 4];
+        self.argmax_buf
+            .read_bytes_at(ARGMAX_PARTS as usize * 8, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
     }
 }
 
