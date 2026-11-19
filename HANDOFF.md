@@ -35,7 +35,7 @@ Windows but for three that tip between the two GPUs. The steps, for the next tim
 2. From `Syrinx/`: `cargo test --release`. Not run on a Mac since the merge.
    Three of `files.rs`'s tests are macOS-only now (`/tmp` and `/etc`, Git where the Mac
    keeps it) and run only there.
-3. From `Mac/App/`: `swift test`, then `./build-test-app.sh`. The build script and
+3. From the Vireo repository's `Mac/`: `swift test`, then `./build-test-app.sh`. The build script and
    `LocalEngine.swift` now build and find `syrinx-server` in `Syrinx/target/release`;
    `LocalEngineTests` was updated for that layout. Not run (no Swift here).
 4. Run the eval on Metal and save it beside the others:
