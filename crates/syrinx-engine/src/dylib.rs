@@ -20,7 +20,10 @@ impl Library {
     /// installed.
     pub fn open(name: &str) -> Option<Self> {
         let handle = sys::open(name);
-        (!handle.is_null()).then_some(Self { handle })
+        // Made only for a library that loaded: a `Library` that's dropped closes its
+        // handle, and closing a null one crashes in glibc 2.43 (`then_some` would make it
+        // either way).
+        (!handle.is_null()).then(|| Self { handle })
     }
 
     /// The function `name`, as a function pointer of type `F`, or `None` if the library
@@ -46,7 +49,9 @@ impl Library {
 
 impl Drop for Library {
     fn drop(&mut self) {
-        sys::close(self.handle);
+        if !self.handle.is_null() {
+            sys::close(self.handle);
+        }
     }
 }
 

@@ -23,14 +23,6 @@ jobs:
       - uses: actions/checkout@v4
       # rust-toolchain.toml picks the toolchain; rustup installs it on first use.
       - uses: Swatinem/rust-cache@v2
-      - name: Find the crashing test (temporary)
-        if: runner.os == 'Linux'
-        continue-on-error: true
-        run: |
-          sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq gdb > /dev/null
-          bin=$(cargo test --release -p syrinx-engine --lib --no-run 2>&1 | grep -o '(target/[^)]*)' | tr -d '()' | head -1)
-          echo "binary: $bin"
-          gdb -batch -ex run -ex bt -ex 'info registers rip' --args "$bin" dylib --test-threads=1 --exact dylib::tests::finds_a_system_function
       - name: Build
         run: cargo build --release --workspace
       - name: Test
