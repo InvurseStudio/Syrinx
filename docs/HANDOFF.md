@@ -4,10 +4,11 @@
 
 In order:
 
-1. **The long-context slowdown.** The 19 November rerun found the 32x128 prompt attention
-   tile (`attention_tcg`) 5-25% slower at reading from 64K to 256K and 8-16% slower at
-   writing after 125K, which the README's numbers show. The suspect is the
-   runtime-bounded fallback loop in its inner K-tile loop.
+1. **Long-context numbers measured again.** The 19 November rerun's long-context slowdown
+   was mostly heat: the same build timed twice came out 24% apart at 256K, and a 256K
+   read takes 24 minutes. PR #202's 32x128 tile for heads of 512 was also 7-13% slower
+   for Gemma 4 31B; the 16x256 tile is back (PR #5). The README's long-context numbers
+   want measuring again with cool-downs between the sizes.
 2. **An OpenAI-compatible API** (`/v1/chat/completions`, `/v1/models`, keys), so other
    tools can use Syrinx.
 3. **A measurement pass:** the eval on the large models (it hasn't run on the 8-bit KV
