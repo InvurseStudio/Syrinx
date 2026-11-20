@@ -3129,12 +3129,20 @@ fn reply(
     }
     // What the server writes into the reply before the model does, each as a call and its
     // result. First the skill the request asks for, if one fits: its instructions come in
-    // as the result of a use_skill call.
+    // as the result of a use_skill call. Explicit slash commands match against `every_tool`
+    // (so "Use the write-document skill..." unlocks its write tool), while automatic
+    // scoring uses `offered` so a plain chat note doesn't spuriously pick a file-writing skill.
     let mut written: Vec<(tools::Call, String, bool)> = Vec::new();
     if options().skills
         && !offered.is_empty()
         && let Some(request) = job.messages.last()
-        && let Some(skill) = pick_skill(model, kept, tokenizer, family, &offered, &request.content)?
+        && let Some(skill) = {
+            let all_names: Vec<&str> = every_tool.iter().map(|t| t.name).collect();
+            match skills::named(&request.content, &pc_skills(&all_names)) {
+                Some(explicit) => Some(explicit.clone()),
+                None => pick_skill(model, kept, tokenizer, family, &offered, &request.content)?,
+            }
+        }
     {
         let call = tools::Call {
             tool: "use_skill".into(),
@@ -3157,10 +3165,13 @@ fn reply(
         eprintln!("Skill: {}", skill.name);
         written.push((call, result, false));
     }
+    // The folders whose other files a read has been told of (`beside_note`), shared across
+    // `read_ahead` and the reply's own tool calls so sibling policies/files are never missed.
+    let mut noted_folders: Vec<String> = Vec::new();
     // Then the files and folders the message names, read ahead (`read_ahead`). These are
     // kept with the reply's other steps, for the turns after it.
     if let Some(request) = job.messages.last().filter(|m| m.role == "user") {
-        for (call, result) in read_ahead(&request.content, &offered, job) {
+        for (call, result) in read_ahead(&request.content, &offered, job, &mut noted_folders) {
             written.push((call, result, true));
         }
     }
@@ -3514,10 +3525,10 @@ fn reply(
     let mut changed: Vec<String> = Vec::new();
     let started = Instant::now();
     // Tool calls: the grammar they're written under, and how one starts.
-    let grammar = Grammar::new(&tools::call_grammar(family, &callable));
+    let mut grammar = Grammar::new(&tools::call_grammar(family, &callable));
     // Muse's recipients without its reasoning (once it has used its budget), and without
     // tools (once calls are used up, or none are offered).
-    let muse_grammars = (family == Family::Muse).then(|| {
+    let mut muse_grammars = (family == Family::Muse).then(|| {
         (
             Grammar::new(&tools::muse_call_grammar(&callable, false)),
             Grammar::new(&tools::muse_call_grammar(&[], true)),
@@ -3536,8 +3547,6 @@ fn reply(
     // The calls made since the reply last changed anything: the same one again would
     // get the same answer.
     let mut seen: Vec<tools::Call> = written_calls;
-    // The folders whose other files a read has been told of (`beside_note`).
-    let mut noted_folders: Vec<String> = Vec::new();
     let (mut calls, mut call_tokens, mut repeats) = (0usize, 0usize, 0usize);
     let mut turn_start = true;
     // Once calls are used up (or the model repeats one), it may only answer: the tokens
@@ -3878,7 +3887,7 @@ fn reply(
                 }
             }
             let call_started = Instant::now();
-            let grammar = match &muse_grammars {
+            let active_grammar = match &muse_grammars {
                 Some((_, answers)) if !may_call => answers,
                 Some((no_thinking, _)) if !may_think => no_thinking,
                 _ => &grammar,
@@ -3888,7 +3897,7 @@ fn reply(
                 kept,
                 tokenizer,
                 trie,
-                grammar,
+                active_grammar,
                 &mut logits,
                 &mut call_tokens,
                 context,
@@ -3950,7 +3959,7 @@ fn reply(
                         kept,
                         tokenizer,
                         trie,
-                        grammar,
+                        active_grammar,
                         &mut logits,
                         &mut call_tokens,
                         context,
@@ -4019,11 +4028,11 @@ fn reply(
                 } else {
                     // A tool may wait on the app or the user: not with the GPU's turn.
                     let ran = match serving {
-                        Some(s) => s.turns.pause(|| run_tool(&call, &offered, job)),
-                        None => run_tool(&call, &offered, job),
+                        Some(s) => s.turns.pause(|| run_tool(&call, &every_tool, job)),
+                        None => run_tool(&call, &every_tool, job),
                     };
                     match ran {
-                        // A file read: what else is in its folder, said once a folder.
+                        // A file or spreadsheet read: what else is in its folder, said once a folder.
                         Some(r) => match beside_note(&call, &offered, job, &mut noted_folders) {
                             Some(note) => format!("{r}\n\n{note}"),
                             None => r,
@@ -4034,6 +4043,28 @@ fn reply(
                         }
                     }
                 };
+                // If a mid-reply `use_skill` loaded a skill that names a file-changing tool,
+                // or a policy/document read mid-reply instructs a file/tracker change, unlock
+                // the file-changing tools in `callable` and rebuild the grammar (each still
+                // requires user approval before running).
+                if callable.len() < every_tool.len()
+                    && !repeated
+                    && ((call.tool == "use_skill"
+                        && every_tool
+                            .iter()
+                            .any(|t| t.changes_files() && result.contains(t.name)))
+                        || (matches!(call.tool.as_str(), "read_file" | "read_spreadsheet")
+                            && tools::names_a_change(&result)))
+                {
+                    callable = every_tool.clone();
+                    grammar = Grammar::new(&tools::call_grammar(family, &callable));
+                    muse_grammars = (family == Family::Muse).then(|| {
+                        (
+                            Grammar::new(&tools::muse_call_grammar(&callable, false)),
+                            Grammar::new(&tools::muse_call_grammar(&[], true)),
+                        )
+                    });
+                }
                 if repeats >= 2 || calls == MAX_CALLS {
                     may_call = false;
                 }
@@ -4324,10 +4355,10 @@ fn beside_note(
     job: &Job,
     noted: &mut Vec<String>,
 ) -> Option<String> {
-    if call.tool != "read_file"
+    if !matches!(call.tool.as_str(), "read_file" | "read_spreadsheet")
         || !offered
             .iter()
-            .any(|t| t.name == "read_file" && t.runs == tools::Runs::Server)
+            .any(|t| t.name == call.tool && t.runs == tools::Runs::Server)
     {
         return None;
     }
@@ -4372,7 +4403,12 @@ const READ_AHEAD_CHARS: usize = 12_000;
 /// answer. Only what exists and this chat may reach, with the tools the server runs here
 /// (the Mac); a name that leads nowhere is left for the model. `VIREO_NO_READ_AHEAD` turns
 /// it off.
-fn read_ahead(request: &str, offered: &[tools::Tool], job: &Job) -> Vec<(tools::Call, String)> {
+fn read_ahead(
+    request: &str,
+    offered: &[tools::Tool],
+    job: &Job,
+    noted: &mut Vec<String>,
+) -> Vec<(tools::Call, String)> {
     let Some(files) = job.files.as_ref() else {
         return Vec::new();
     };
@@ -4391,8 +4427,12 @@ fn read_ahead(request: &str, offered: &[tools::Tool], job: &Job) -> Vec<(tools::
         if found.len() >= READ_AHEAD {
             break;
         }
+        let is_workbook = path
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| matches!(ext.to_lowercase().as_str(), "xlsx" | "xlsm"));
         let tool = match files.is_folder(&path) {
             Some(true) if here("list_directory") => "list_directory",
+            Some(false) if is_workbook && here("read_spreadsheet") => "read_spreadsheet",
             Some(false) if here("read_file") => "read_file",
             _ => continue,
         };
@@ -4400,14 +4440,18 @@ fn read_ahead(request: &str, offered: &[tools::Tool], job: &Job) -> Vec<(tools::
             tool: tool.into(),
             args: vec![("path".into(), tools::Arg::Text(path))],
         };
-        let Ok(result) = tools::run_here(&call, Some(files)) else {
+        let Ok(mut result) = tools::run_here(&call, Some(files)) else {
             continue;
         };
-        let chars = result.chars().count();
-        if chars > READ_AHEAD_CHARS.min(room) {
+        let raw_chars = result.chars().count();
+        if raw_chars > READ_AHEAD_CHARS.min(room) {
             continue;
         }
-        room -= chars;
+        if let Some(note) = beside_note(&call, offered, job, noted) {
+            result = format!("{result}\n\n{note}");
+        }
+        let chars = result.chars().count();
+        room = room.saturating_sub(chars);
         found.push((call, result));
     }
     found
@@ -5267,6 +5311,35 @@ fn shaped(result: &str, limit: usize) -> String {
     if chars <= limit {
         return result.to_string();
     }
+    // For substantial results, keep 75% head + 25% tail (snapped to newline boundaries
+    // when nearby) so totals, approval lines, footnotes and summaries at the bottom of
+    // long documents/spreadsheets aren't lost.
+    if limit >= 1000 {
+        let head_target = limit * 3 / 4;
+        let tail_target = limit - head_target;
+        let head_end = result
+            .char_indices()
+            .nth(head_target)
+            .map_or(result.len(), |(i, _)| i);
+        let head_slice = &result[..head_end];
+        let head = match head_slice.rfind('\n') {
+            Some(nl) if nl >= head_end * 3 / 4 => &head_slice[..nl],
+            _ => head_slice,
+        };
+        let tail_start = result
+            .char_indices()
+            .nth(chars - tail_target)
+            .map_or(0, |(i, _)| i);
+        let tail_slice = &result[tail_start..];
+        let tail = match tail_slice.find('\n') {
+            Some(nl) if nl <= tail_slice.len() / 4 => &tail_slice[nl + 1..],
+            _ => tail_slice,
+        };
+        let omitted = chars.saturating_sub(head.chars().count() + tail.chars().count());
+        return format!(
+            "{head}\n[... {omitted} characters omitted from middle ...]\n{tail}"
+        );
+    }
     let kept: String = result.chars().take(limit).collect();
     format!("{kept}\n[... {} more characters not shown]", chars - limit)
 }
@@ -5289,6 +5362,19 @@ mod tests {
     /// logits, in order, in its own session; tokens are run together while more than one
     /// reply is under way; a worker waiting on a tool holds nobody up; an error in a pass
     /// reaches every reply in it; and it all ends with nothing left waiting.
+    #[test]
+    fn shaped_keeps_head_and_tail_for_long_results() {
+        let mut doc = String::from("Header: Q4 Report\n");
+        for i in 0..200 {
+            doc.push_str(&format!("Line {i:03}: ordinary detail row content here\n"));
+        }
+        doc.push_str("GRAND TOTAL: $142,850.00\nApproved by: CFO\n");
+        let cut = shaped(&doc, 1200);
+        assert!(cut.contains("Header: Q4 Report"), "head preserved: {cut}");
+        assert!(cut.contains("GRAND TOTAL: $142,850.00"), "tail preserved: {cut}");
+        assert!(cut.contains("omitted from middle"), "marker shown: {cut}");
+    }
+
     #[test]
     fn replies_written_together_keep_to_their_own_chats() {
         const WORKERS: u32 = 4;

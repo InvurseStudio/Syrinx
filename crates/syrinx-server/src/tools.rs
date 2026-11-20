@@ -187,25 +187,31 @@ pub fn names_a_change(text: &str) -> bool {
 }
 
 /// The files and folders a message names, as the user writes them ("Invoices/November",
-/// "Policies/AP-Guide.md", "budget.xlsx"), in order, without repeats: for reading ahead.
-/// Not web addresses, nor words joined by a slash ("and/or", "24/7"). A name with a space
-/// in it isn't found; the model reads that one itself.
+/// "Policies/AP-Guide.md", "budget.xlsx", or quoted paths with spaces like `"Q3 Budget.xlsx"`),
+/// in order, without repeats: for reading ahead. Not web addresses, nor words joined by a
+/// slash ("and/or", "24/7").
 pub fn named_paths(message: &str) -> Vec<String> {
     const TYPES: [&str; 9] = ["md", "txt", "csv", "pdf", "docx", "xlsx", "pptx", "json", "eml"];
     const MOST: usize = 8;
-    let mut found: Vec<String> = Vec::new();
-    for word in message.split_whitespace() {
-        const AROUND: &str = "\"'`()[]{}<>*,;:!?";
-        let word = word
+    const AROUND: &str = "\"'`()[]{}<>*,;:!?";
+    let is_path = |raw: &str| -> Option<String> {
+        let word = raw
+            .trim()
             .trim_start_matches(|c: char| AROUND.contains(c))
             .trim_end_matches(|c: char| AROUND.contains(c) || c == '.' || c == '/')
             .trim_start_matches("./");
-        if word.is_empty() || word.contains("://") || word.contains('@') || word.starts_with('~') {
-            continue;
+        if word.is_empty()
+            || word.len() > 200
+            || word.contains('\n')
+            || word.contains("://")
+            || word.contains('@')
+            || word.starts_with('~')
+        {
+            return None;
         }
         let parts: Vec<&str> = word.split('/').filter(|p| !p.is_empty()).collect();
         if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == "..") {
-            continue;
+            return None;
         }
         let typed = parts
             .last()
@@ -217,13 +223,43 @@ pub fn named_paths(message: &str) -> Vec<String> {
                 .iter()
                 .all(|p| p.chars().count() <= 3 || p.chars().all(|c| c.is_ascii_digit()));
         if !(typed || word.contains('/')) || joined {
-            continue;
+            return None;
         }
-        if !found.iter().any(|f| f == word) {
-            found.push(word.to_string());
+        Some(word.to_string())
+    };
+
+    let mut found: Vec<String> = Vec::new();
+    // First scan quoted spans ("...", '...', `...`) so paths with spaces are preserved
+    // whole instead of being split on whitespace.
+    let mut i = 0;
+    let bytes = message.as_bytes();
+    while i < bytes.len() && found.len() < MOST {
+        let b = bytes[i];
+        if matches!(b, b'"' | b'\'' | b'`') {
+            if let Some(rel_end) = message[i + 1..].find(b as char) {
+                let inner = &message[i + 1..i + 1 + rel_end];
+                if inner.contains(' ')
+                    && !inner.contains('\n')
+                    && let Some(p) = is_path(inner)
+                    && !found.iter().any(|f| f == &p)
+                {
+                    found.push(p);
+                }
+                i += rel_end + 2;
+                continue;
+            }
         }
+        i += 1;
+    }
+    for word in message.split_whitespace() {
         if found.len() == MOST {
             break;
+        }
+        if let Some(p) = is_path(word) {
+            // Skip fragments that are already part of a quoted path with spaces.
+            if !found.iter().any(|f| f == &p || (f.contains(' ') && f.contains(&p))) {
+                found.push(p);
+            }
         }
     }
     found
@@ -2328,23 +2364,60 @@ fn several_limit(n: usize, one: usize) -> usize {
 }
 
 /// Several files read by `read` in one result, each under its path, sharing what one
-/// result may hold (`result_limit`): a file too long for its share is cut, and says so.
+/// result may hold (`result_limit`) by water-filling so short files don't starve long ones:
+/// every file shorter than the current equal share gets its full text, and the unused room
+/// goes to the remaining longer files.
 pub fn read_several(paths: &[String], read: impl Fn(&str) -> Result<String, String>) -> String {
     let read_now = &paths[..paths.len().min(MAX_FILES_A_CALL)];
-    let share = (several_limit(read_now.len(), one_result()) / read_now.len()).saturating_sub(120);
+    let texts: Vec<(String, usize)> = read_now
+        .iter()
+        .map(|path| {
+            let text = read(path)
+                .unwrap_or_else(|e| format!("Error: {e}"))
+                .trim_end()
+                .to_string();
+            let chars = text.chars().count();
+            (text, chars)
+        })
+        .collect();
+    let total_budget = several_limit(read_now.len(), one_result())
+        .saturating_sub(read_now.len() * 120);
+    // Water-filling: give short files their exact size and redistribute leftover budget.
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by_key(|&i| texts[i].1);
+    let mut limits = vec![0usize; texts.len()];
+    let mut remaining = total_budget;
+    for (pos, &idx) in order.iter().enumerate() {
+        let left = texts.len() - pos;
+        let fair = remaining / left;
+        let take = texts[idx].1.min(fair);
+        limits[idx] = take;
+        remaining = remaining.saturating_sub(take);
+    }
     let mut out = String::new();
-    for path in read_now {
-        let text = read(path).unwrap_or_else(|e| format!("Error: {e}"));
-        let chars = text.chars().count();
+    for ((path, (text, chars)), share) in read_now.iter().zip(&texts).zip(limits) {
         out.push_str(&format!("=== {path} ===\n"));
-        if chars > share {
-            out.extend(text.chars().take(share));
-            out.push_str(&format!(
-                "\n[... {} more characters not shown: read this file on its own for the rest]",
-                chars - share
-            ));
+        if *chars > share {
+            if share >= 800 {
+                let head_n = share * 3 / 4;
+                let tail_n = share - head_n;
+                let head: String = text.chars().take(head_n).collect();
+                let tail: String = text.chars().skip(*chars - tail_n).collect();
+                out.push_str(&head);
+                out.push_str(&format!(
+                    "\n[... {} characters omitted from middle: read this file on its own for the rest ...]\n",
+                    chars - share
+                ));
+                out.push_str(&tail);
+            } else {
+                out.extend(text.chars().take(share));
+                out.push_str(&format!(
+                    "\n[... {} more characters not shown: read this file on its own for the rest]",
+                    chars - share
+                ));
+            }
         } else {
-            out.push_str(text.trim_end());
+            out.push_str(text);
         }
         out.push_str("\n\n");
     }
@@ -3027,5 +3100,30 @@ mod tests {
         assert!(!qwen.contains(PARALLEL_CALLS));
         assert_eq!(family_notes(Family::Muse, true), None);
         assert_eq!(family_notes(Family::Llama, false), None);
+    }
+
+    #[test]
+    fn named_paths_keeps_quoted_paths_with_spaces() {
+        let msg = r#"Check "Invoices/Nov 2026/AP Policy.md" and 'Q3 Budget.xlsx' against notes.txt."#;
+        let found = named_paths(msg);
+        assert_eq!(
+            found,
+            vec!["Invoices/Nov 2026/AP Policy.md", "Q3 Budget.xlsx", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn read_several_water_fills_so_short_files_dont_starve_long_ones() {
+        let paths: Vec<String> = (0..6).map(|i| format!("file-{i}.txt")).collect();
+        let long_body = format!("START\n{}\nEND_TOTAL=999", "x".repeat(8_000));
+        let out = read_several(&paths, |p| {
+            if p == "file-5.txt" {
+                Ok(long_body.clone())
+            } else {
+                Ok("short receipt: $10".to_string())
+            }
+        });
+        assert!(out.contains("END_TOTAL=999"), "long file kept whole: len={}", out.len());
+        assert!(!out.contains("omitted"), "no unnecessary truncation");
     }
 }
