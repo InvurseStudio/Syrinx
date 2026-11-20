@@ -1615,7 +1615,7 @@ const PICKERS: usize = 4;
 /// GPU with none free (Windows then keeps GPU memory in the PC's: a token took 27 ms, not
 /// 19.5, over nine eval cases). 256 on CUDA: 0.1 GB each. The Mac keeps 1,024, as measured
 /// there.
-const PICKER_BATCH: usize = if cfg!(target_os = "macos") { 1024 } else { 256 };
+const PICKER_BATCH: usize = 256;
 /// A question goes to a new or the oldest picker unless one shares at least this many
 /// tokens with it (more than the chat template's opening).
 const PICKER_MIN_SHARED: usize = 48;

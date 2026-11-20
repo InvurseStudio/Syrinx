@@ -45,16 +45,17 @@ pub fn budget_for(full_chat: u64) -> u64 {
 /// How many saved states stay in memory whatever their size (the newest; on top of the
 /// one in use).
 const IN_MEMORY: usize = 2;
-/// The memory for saved states where the machine's memory isn't known.
+/// The memory for saved states where the machine's memory isn't known, and the cap on
+/// larger machines so saved states don't quietly grow to 16+ GB during long runs.
 const MEMORY_BUDGET: u64 = 4 << 30;
 /// The share of the machine's memory saved states may take: one part in this many.
-const MEMORY_SHARE: u64 = 8;
+const MEMORY_SHARE: u64 = 16;
 
 /// The memory the saved states may take before the oldest are written to disk and let
-/// go: an eighth of the machine's (16 GB of 128), which six 10K-token chats of Gemma 4
-/// 31B fit in several times over.
+/// go: a sixteenth of the machine's RAM, capped at 4 GB (the two newest chats always
+/// stay in memory via `IN_MEMORY`).
 pub fn memory_budget() -> u64 {
-    physical_memory().map_or(MEMORY_BUDGET, |m| m / MEMORY_SHARE)
+    physical_memory().map_or(MEMORY_BUDGET, |m| (m / MEMORY_SHARE).min(MEMORY_BUDGET))
 }
 
 fn physical_memory() -> Option<u64> {
@@ -293,10 +294,19 @@ impl Store {
     }
 
     /// Sends every state that has no file yet to be written, without waiting (the
-    /// server idle).
+    /// server idle), and drops from memory any older state past `IN_MEMORY` whose file
+    /// has already finished writing.
     pub fn save_idle(&mut self) {
         for i in 0..self.entries.len() {
             self.file(i);
+        }
+        self.entries.sort_by_key(|e| e.used);
+        let n = self.entries.len();
+        for i in 0..n.saturating_sub(IN_MEMORY) {
+            let e = &mut self.entries[i];
+            if e.filed && e.data.as_ref().is_some_and(|d| Arc::strong_count(d) == 1) {
+                e.data = None;
+            }
         }
     }
 
@@ -556,6 +566,30 @@ mod tests {
         let s = Store::open(d.clone(), 250, 1 << 20);
         assert_eq!(s.entries().len(), 2);
         assert!(!d.join("junk.kv").exists() && !d.join("half.part").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn save_idle_releases_written_states_past_in_memory() {
+        let d = dir("idle-release");
+        let mut s = Store::open(d.clone(), DISK_BUDGET, 1 << 20);
+        for i in 1..=4u32 {
+            s.put(vec![i], state(&[i], i as u8, 100));
+        }
+        s.save_idle();
+        s.flush();
+        // Second idle tick after writes finish: oldest 2 released, newest IN_MEMORY (2) kept.
+        s.save_idle();
+        let in_ram: Vec<u32> = s
+            .entries()
+            .iter()
+            .filter(|e| e.data.is_some())
+            .map(|e| e.tokens[0])
+            .collect();
+        assert_eq!(in_ram, vec![3, 4]);
+        // Released entries still load cleanly from disk.
+        let i = s.entries().iter().position(|e| e.tokens == [1]).unwrap();
+        assert_eq!(s.get(i).unwrap().bytes(), &[1u8; 100][..]);
         let _ = std::fs::remove_dir_all(d);
     }
 }
