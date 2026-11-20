@@ -96,9 +96,14 @@ pub fn all() -> Vec<Case> {
                         .any(|c| c.tool == "read_file" && c.points_at("path", "gift-policy.md")),
                     "didn't read the policy",
                 )?;
+                let files_read: usize = r
+                    .calls
+                    .iter()
+                    .filter(|c| c.tool == "read_file")
+                    .map(|c| c.arg("path").lines().filter(|l| !l.trim().is_empty()).count())
+                    .sum();
                 need(
-                    r.calls.iter().filter(|c| c.tool == "read_file").count() >= 4
-                        || r.called("search_files").len() + r.called("read_file").len() >= 4,
+                    files_read >= 4 || r.called("search_files").len() + files_read >= 4,
                     "didn't read every request",
                 )?;
                 need(r.says(&["160", "over the", "exceed", "above"]), "missed DentaSupply's yearly limit")?;

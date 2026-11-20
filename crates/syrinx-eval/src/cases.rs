@@ -20,8 +20,10 @@ impl Call {
 
     /// Whether its `name` argument names this path's end (any case, either slash).
     pub fn points_at(&self, name: &str, end: &str) -> bool {
+        let end = end.to_lowercase();
         let a = self.arg(name).replace('/', "\\").to_lowercase();
-        a.trim_end_matches('\\').ends_with(&end.to_lowercase())
+        a.lines()
+            .any(|line| line.trim().trim_end_matches('\\').ends_with(&end))
     }
 }
 
