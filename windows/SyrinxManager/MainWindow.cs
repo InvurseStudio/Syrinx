@@ -29,6 +29,9 @@ public sealed partial class MainWindow : Window
         Title = "Syrinx";
         App.MainWindowHandle = WindowNative.GetWindowHandle(this);
         ExtendsContentIntoTitleBar = true;
+        // The taskbar and Alt+Tab icon; the .exe gets the same one from ApplicationIcon.
+        var icon = Path.Combine(AppContext.BaseDirectory, "assets", "Syrinx.ico");
+        if (File.Exists(icon)) AppWindow.SetIcon(icon);
         AppWindow.TitleBar.ButtonBackgroundColor = Colors.Transparent;
         AppWindow.TitleBar.ButtonInactiveBackgroundColor = Colors.Transparent;
         double scale = GetDpiForWindow(App.MainWindowHandle) / 96.0;

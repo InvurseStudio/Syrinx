@@ -26,6 +26,8 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/SyrinxManager" "$APP/Contents/MacOS/Syrinx"
 cp "$ROOT/target/release/syrinx-server" "$APP/Contents/MacOS/syrinx-server"
+echo "Generating the app icon..."
+./make-icons.sh mac "$APP/Contents/Resources"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/syrinx-server/Cargo.toml" | head -1)"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -36,6 +38,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>Syrinx</string>
     <key>CFBundleIdentifier</key><string>com.invursestudio.syrinx</string>
     <key>CFBundleExecutable</key><string>Syrinx</string>
+    <key>CFBundleIconFile</key><string>Syrinx</string>
+    <key>CFBundleIconName</key><string>Syrinx</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>${VERSION:-0.1.0}</string>
     <key>CFBundleVersion</key><string>${VERSION:-0.1.0}</string>
