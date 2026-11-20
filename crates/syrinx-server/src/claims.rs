@@ -66,14 +66,19 @@ pub fn unbacked(answer: &str, done: &[String]) -> Option<&'static str> {
         {
             continue;
         }
-        // The first kind the sentence names is the one it claims.
-        if let Some((_, tools, what)) = KINDS
+        // A sentence may name several kinds, not all of them changed: "the drafts for
+        // Harbourfront Events Centre have been saved to followups.md" names the calendar
+        // (in a vendor's name) and a file (Nov 19 gauntlet, 2.2). It's backed when a tool of
+        // any kind it names ran; otherwise the first kind it names is the one it claims.
+        let named: Vec<_> = KINDS
             .iter()
-            .find(|(words, _, _)| words.iter().any(|w| names(&sentence, w)))
-        {
-            if !tools.iter().any(|t| done.iter().any(|d| d == t)) {
-                return Some(what);
-            }
+            .filter(|(words, _, _)| words.iter().any(|w| names(&sentence, w)))
+            .collect();
+        let backed = named
+            .iter()
+            .any(|(_, tools, _)| tools.iter().any(|t| done.iter().any(|d| d == t)));
+        if let (Some((_, _, what)), false) = (named.first(), backed) {
+            return Some(what);
         }
     }
     None
@@ -134,6 +139,15 @@ mod tests {
         assert_eq!(unbacked(event, &done(&["create_event"])), None);
         assert_eq!(unbacked("I've added two rows to the tracker.", &done(&[])), Some("a spreadsheet"));
         assert_eq!(unbacked("I've added it to budget.xlsx.", &done(&[])), Some("a spreadsheet"));
+    }
+
+    #[test]
+    fn a_claim_backed_by_any_kind_it_names_is_left_alone() {
+        // Nov 19 gauntlet, 2.2: "Events" in a vendor's name isn't a calendar change.
+        let said = "The drafts for Coastal Catering Co. and Harbourfront Events Centre have been saved to `Invoices/November/vendor-followups.md`.";
+        assert_eq!(unbacked(said, &done(&["write_file"])), None);
+        // With nothing written, it's still caught (as the first kind it names).
+        assert_eq!(unbacked(said, &done(&[])), Some("the calendar"));
     }
 
     #[test]
