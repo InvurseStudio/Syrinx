@@ -2407,19 +2407,16 @@ fn short_batch_tiles_match_the_64_token_tile() {
 /// Gemma 4 26B-A4B (a mixture of experts) on the GPU against the CPU reference, in exact
 /// mode: a prompt read as one batch, then token by token, must give the CPU's
 /// probabilities, and 8-bit mode the same next token. The Mac only (the experts' kernels
-/// are Metal's); skipped without the file, which is in the Vireo app's model folder or
-/// where `VIREO_GEMMA_26B` says.
+/// are Metal's); skipped without the file, which is in Syrinx's models folder or where
+/// `VIREO_GEMMA_26B` says.
 #[test]
 #[cfg(target_os = "macos")]
 fn gemma4_26b_a4b_on_the_gpu_matches_the_cpu() {
     use syrinx_engine::models::gemma4::Gemma4;
     let path = std::env::var_os("VIREO_GEMMA_26B").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h).join(
-                "Library/Application Support/InvurseChat/models/unsloth/\
-                 gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf",
-            )
-        })
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../models/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf",
+        ))
     });
     let Some(path) = path.filter(|p| p.exists()) else {
         eprintln!("skipped: the Gemma 4 26B-A4B file isn't on this machine");

@@ -5,6 +5,7 @@
 
 pub mod gemma4;
 pub mod gemma4_cuda;
+pub mod gemma4_vision;
 mod gpu;
 pub mod llama;
 pub mod llama_cuda;

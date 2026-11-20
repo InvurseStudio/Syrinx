@@ -369,16 +369,13 @@ What is the capital of France? Answer in one sentence.<turn|>
 /// way, is within 0.03, and E2B within 0.0002, so some of this is a difference the large
 /// models share. An expert's rows read up-first instead give " a" 24.9%, and the router's
 /// scale without 1/sqrt(dim) a perplexity in the hundreds of thousands. The file is in
-/// the Vireo app's model folder, or where `VIREO_GEMMA_26B` says.
+/// Syrinx's models folder, or where `VIREO_GEMMA_26B` says.
 #[test]
 fn gemma4_26b_a4b_forward_pass_matches_llama_cpp() {
     let path = std::env::var_os("VIREO_GEMMA_26B").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h).join(
-                "Library/Application Support/InvurseChat/models/unsloth/\
-                 gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf",
-            )
-        })
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../models/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K.gguf",
+        ))
     });
     let Some(path) = path.filter(|p| p.exists()) else {
         eprintln!("skipped: the Gemma 4 26B-A4B file isn't on this machine");

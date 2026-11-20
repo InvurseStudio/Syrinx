@@ -578,6 +578,14 @@ kernel void attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
 // Heads of 512 (Gemma 4 31B's global layers) keep 16 rows × 256 positions: 32 × 128 was
 // 2-30% slower at 1K-30K positions and 7-13% at 32K-256K, with 64 to 1,024 tokens a batch
 // (Nov 19, `prompt_attention_speed`, the two alternated with cool-downs between).
+// Heads of 256 on 4 SIMD groups looked 11-19% quicker in `prompt_attention_speed` on Qwen's
+// full attention (Nov 20), but in a real prompt the kernel was only 3% quicker and Qwen 3.5
+// 4B read 118K tokens 6% slower in all (52.8 → 56.0 s, alternated twice): the test's keys
+// repeat every 2,048 positions, so its rows' maxima rarely move. Check a tile end to end.
+// Slower in the test as well: 64 rows × 64 positions (24 TFLOPS against 32-34), 16 × 256,
+// and a kernel keeping the scores in registers, each SIMD group 16 rows of its own a step
+// of 32 positions with no threadgroup memory (mlx's design): 13 TFLOPS on heads of 256 (128
+// numbers of output a thread, spilling), 37 against 45 on heads of 128.
 template [[host_name("attention_tcg_128")]] kernel void attention_tcg<128, 32, 128, 4>(ARGS, KP, uint, uint);
 template [[host_name("attention_tcg_256")]] kernel void attention_tcg<256, 32, 128, 8>(ARGS, KP, uint, uint);
 template [[host_name("attention_tcg_512")]] kernel void attention_tcg<512, 16, 256, 8>(ARGS, KP, uint, uint);
