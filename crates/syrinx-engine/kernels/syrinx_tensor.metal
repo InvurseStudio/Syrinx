@@ -663,14 +663,23 @@ inline float decode32_i8<K_Q6_K>(device const u8* row, int k, threadgroup i8* ou
 }
 
 // Q8_0's are d × q, a d for every 32: rounded against the step's largest |d|.
+// The 8 consecutive lanes decoding one row's 256-column step find max|d| via SIMD shuffles
+// (1 half load per thread instead of 8), and pack 4 weights at a time.
 template <>
 inline float decode32_i8<K_Q8_0>(device const u8* row, int k, threadgroup i8* out) {
-    device const u8* first = row + (k / I8_K) * (I8_K / 32) * 34;
-    float top = 0.0f;
-    for (int b = 0; b < I8_K / 32; b++) top = max(top, fabs(half_at(first + b * 34)));
     device const u8* block = row + (k / 32) * 34;
-    const float mul = top > 0.0f ? half_at(block) / top : 0.0f;
-    for (int i = 0; i < 32; i++) out[i] = (i8)(int)rint((float)(char)block[2 + i] * mul);
+    const float d = half_at(block);
+    float top = fabs(d);
+    top = max(top, simd_shuffle_xor(top, 1));
+    top = max(top, simd_shuffle_xor(top, 2));
+    top = max(top, simd_shuffle_xor(top, 4));
+    const float mul = top > 0.0f ? d / top : 0.0f;
+    threadgroup u32* o = reinterpret_cast<threadgroup u32*>(out);
+    for (int i = 0; i < 8; i++) {
+        const u32 qv = u32_at2(block + 2 + i * 4);
+        const float4 v = float4(as_type<char4>(qv)) * mul;
+        o[i] = as_type<u32>(char4(rint(v)));
+    }
     return top;
 }
 

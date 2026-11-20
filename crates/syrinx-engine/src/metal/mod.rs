@@ -760,6 +760,9 @@ struct Kernels {
     /// A mixture of experts' kernels: its pick, its products for Q8_0 and Q6_K matrices,
     /// its activation and its sum.
     moe_pick: Pso,
+    moe_matvec_q4_0: Pso,
+    moe_matvec_q4_k: Pso,
+    moe_matvec_q5_k: Pso,
     moe_matvec_q8_0: Pso,
     moe_matvec_q6_k: Pso,
     moe_geglu: Pso,
@@ -1172,6 +1175,9 @@ impl Gpu {
             },
             rms_norm: pipeline("rms_norm")?,
             moe_pick: pipeline("moe_pick")?,
+            moe_matvec_q4_0: pipeline("moe_matvec_q4_0")?,
+            moe_matvec_q4_k: pipeline("moe_matvec_q4_k")?,
+            moe_matvec_q5_k: pipeline("moe_matvec_q5_k")?,
             moe_matvec_q8_0: pipeline("moe_matvec_q8_0")?,
             moe_matvec_q6_k: pipeline("moe_matvec_q6_k")?,
             moe_geglu: pipeline("moe_geglu")?,
@@ -1885,7 +1891,10 @@ impl Gpu {
     /// or 0 for none. In place is fine.
     /// Whether a mixture of experts' matrices of this type have a kernel (`moe_matvec`).
     pub fn supports_experts(kind: TensorType) -> bool {
-        matches!(kind, TensorType::Q8_0 | TensorType::Q6_K)
+        matches!(
+            kind,
+            TensorType::Q4_0 | TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K | TensorType::Q8_0
+        )
     }
 
     /// For each of `tokens` rows of `experts` scores: the `used` highest into `idx`, and
@@ -1934,6 +1943,9 @@ impl Gpu {
         slots: usize,
     ) -> Result<()> {
         let kernel = match kind {
+            TensorType::Q4_0 => &self.kernels.moe_matvec_q4_0,
+            TensorType::Q4_K => &self.kernels.moe_matvec_q4_k,
+            TensorType::Q5_K => &self.kernels.moe_matvec_q5_k,
             TensorType::Q8_0 => &self.kernels.moe_matvec_q8_0,
             TensorType::Q6_K => &self.kernels.moe_matvec_q6_k,
             other => return Err(Error::Unsupported(other)),

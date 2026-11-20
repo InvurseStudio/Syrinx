@@ -2736,6 +2736,81 @@ kernel void moe_pick(ARGS, KP) {
     device const float* x = ARG_PTR(const float, 1) + (ulong)(x_per_slot ? slot : slot / used) * x_stride; \
     device float* y = ARG_PTR(float, 2) + (ulong)slot * y_stride;
 
+kernel void moe_matvec_q4_0(ARGS, KP) {
+    MOE_ARGS(q4_0_row_bytes(ARG_INT(4)))
+    MATVEC_ROWS
+    const int blocks = cols / 32;
+    const int sub = lane >> 1, j = (lane & 1) * 8;
+    for (int b = sub; b < blocks; b += 16) {
+        device const float* xb = x + b * 32 + j;
+        const float4 lo0 = f4(xb), lo1 = f4(xb + 4), hi0 = f4(xb + 16), hi1 = f4(xb + 20);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* row = w + (row0 + r) * row_bytes;
+            const uint2 q = *reinterpret_cast<device const uint2*>(row + b * 16 + j);
+            const float dot = nibble_dot8(q, 0, lo0, lo1) + nibble_dot8(q, 4, hi0, hi1) -
+                              8.0f * ((lo0.x + lo0.y) + (lo0.z + lo0.w) + (lo1.x + lo1.y) + (lo1.z + lo1.w) +
+                                      (hi0.x + hi0.y) + (hi0.z + hi0.w) + (hi1.x + hi1.y) + (hi1.z + hi1.w));
+            sum[r] += q4_0_scale(row, blocks, b) * dot;
+        }
+    }
+    MATVEC_STORE
+}
+
+kernel void moe_matvec_q4_k(ARGS, KP) {
+    MOE_ARGS((ulong)(ARG_INT(4) / 256) * 144)
+    MATVEC_ROWS
+    const int blocks = cols / 256;
+    const int sub = lane >> 4, pair = (lane & 15) >> 2, part = (lane & 3) * 8;
+    for (int b = sub; b < blocks; b += 2) {
+        device const float* xb = x + b * 256 + pair * 64 + part;
+        const float4 a1 = f4(xb), b1 = f4(xb + 4), a2 = f4(xb + 32), b2 = f4(xb + 36);
+        const float x1 = (a1.x + a1.y) + (a1.z + a1.w) + (b1.x + b1.y) + (b1.z + b1.w);
+        const float x2 = (a2.x + a2.y) + (a2.z + a2.w) + (b2.x + b2.y) + (b2.z + b2.w);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * 144;
+            const uint4 head = *reinterpret_cast<device const uint4*>(block);
+            float s1, m1, s2, m2;
+            q4_k_scale_min_w(2 * pair, head.y, head.z, head.w, s1, m1);
+            q4_k_scale_min_w(2 * pair + 1, head.y, head.z, head.w, s2, m2);
+            const float d = half_lo(head.x), dmin = half_hi(head.x);
+            const uint2 q = *reinterpret_cast<device const uint2*>(block + 16 + pair * 32 + part);
+            sum[r] += d * s1 * nibble_dot8(q, 0, a1, b1) - dmin * m1 * x1 + d * s2 * nibble_dot8(q, 4, a2, b2) -
+                      dmin * m2 * x2;
+        }
+    }
+    MATVEC_STORE
+}
+
+kernel void moe_matvec_q5_k(ARGS, KP) {
+    MOE_ARGS((ulong)(ARG_INT(4) / 256) * 176)
+    MATVEC_ROWS
+    const int blocks = cols / 256;
+    const int sub = lane >> 4, pair = (lane & 15) >> 2, part = (lane & 3) * 8;
+    for (int b = sub; b < blocks; b += 2) {
+        device const float* xb = x + b * 256 + pair * 64 + part;
+        const float4 a1 = f4(xb), b1 = f4(xb + 4), a2 = f4(xb + 32), b2 = f4(xb + 36);
+        const float x1 = (a1.x + a1.y) + (a1.z + a1.w) + (b1.x + b1.y) + (b1.z + b1.w);
+        const float x2 = (a2.x + a2.y) + (a2.z + a2.w) + (b2.x + b2.y) + (b2.z + b2.w);
+        for (int r = 0; r < MV_ROWS; r++) {
+            if (r >= nrows) break;
+            device const u8* block = w + (row0 + r) * row_bytes + b * 176;
+            const uint4 head = *reinterpret_cast<device const uint4*>(block);
+            float s1, m1, s2, m2;
+            q4_k_scale_min_w(2 * pair, head.y, head.z, head.w, s1, m1);
+            q4_k_scale_min_w(2 * pair + 1, head.y, head.z, head.w, s2, m2);
+            const float d = half_lo(head.x), dmin = half_hi(head.x);
+            const uint2 q = *reinterpret_cast<device const uint2*>(block + 48 + pair * 32 + part);
+            const uint2 qh = *reinterpret_cast<device const uint2*>(block + 16 + part);
+            const float dot1 = nibble_dot8(q, 0, a1, b1) + 16.0f * bit_dot8(qh, 2 * pair, a1, b1);
+            const float dot2 = nibble_dot8(q, 4, a2, b2) + 16.0f * bit_dot8(qh, 2 * pair + 1, a2, b2);
+            sum[r] += d * s1 * dot1 - dmin * m1 * x1 + d * s2 * dot2 - dmin * m2 * x2;
+        }
+    }
+    MATVEC_STORE
+}
+
 kernel void moe_matvec_q8_0(ARGS, KP) {
     MOE_ARGS((ulong)(ARG_INT(4) / 32) * 34)
     MATVEC_ROWS
