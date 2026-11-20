@@ -1716,6 +1716,24 @@ impl Model {
     /// The session chats run in: on a Qwen model with a multi-token-prediction layer
     /// (and `--mtp on`), one that keeps the layer's cache up, to draft with; on a Gemma 4
     /// with its draft model loaded, one with room for it.
+    /// A chat slot's session (`--slots`): as [`Self::chat_session`], but a Gemma 4's
+    /// caches start with room for [`SLOT_START_ROWS`] positions and grow with its chat,
+    /// so slots take the memory their chats use, not the whole context each.
+    fn slot_session(&self, capacity: usize) -> Result<Session, String> {
+        match self {
+            Model::Gemma4(m) => {
+                let mut s = m
+                    .session_growing(capacity, SLOT_START_ROWS)
+                    .map_err(|e| e.to_string())?;
+                if m.has_mtp() {
+                    m.use_mtp(&mut s).map_err(|e| e.to_string())?;
+                }
+                Ok(Session::Gemma4(s))
+            }
+            _ => self.chat_session(capacity),
+        }
+    }
+
     fn chat_session(&self, capacity: usize) -> Result<Session, String> {
         let mut session = self.session(capacity)?;
         match (self, &mut session) {
@@ -1893,7 +1911,7 @@ impl Model {
             }
             // Back to the shared start, or to the beginning when the sliding-window
             // layers no longer hold the window before it.
-            (Model::Gemma4(_), Session::Gemma4(s)) => {
+            (Model::Gemma4(m), Session::Gemma4(s)) => {
                 let mut kept_len = s.truncate(shared);
                 // The rings no longer hold the window there: the longest saved start
                 // this prompt begins with.
@@ -1903,7 +1921,7 @@ impl Model {
                         .max_by_key(|&i| kept.heads[i].0.len())
                 {
                     let (tokens, state) = kept.heads.remove(i);
-                    s.import(&state, tokens.len()).map_err(e)?;
+                    m.import(s, &state, tokens.len()).map_err(e)?;
                     kept_len = tokens.len();
                     kept.tokens.clone_from(&tokens);
                     kept.heads.push((tokens, state));
@@ -2125,7 +2143,7 @@ impl Model {
         let e = |e: syrinx_engine::models::Error| e.to_string();
         match (self, &mut kept.session) {
             (Model::Llama(_), Session::Llama(s)) => s.import(state, tokens.len()).map_err(e)?,
-            (Model::Gemma4(_), Session::Gemma4(s)) => s.import(state, tokens.len()).map_err(e)?,
+            (Model::Gemma4(m), Session::Gemma4(s)) => m.import(s, state, tokens.len()).map_err(e)?,
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 s.import(state).map_err(e)?;
                 m.save(s, &mut kept.checkpoint).map_err(e)?;
@@ -2442,11 +2460,12 @@ fn engine(
     let mut seed = random_u64();
     if slots > 1 {
         eprintln!(
-            "{slots} chat slots: up to {slots} replies written at once, each slot's chat taking up to {:.1} GB of the GPU's memory.",
+            "{slots} chat slots: up to {slots} replies written at once, each slot's chat taking up to {:.1} GB of the GPU's memory as it grows.",
             kept.as_ref().map_or(0.0, |k| (model.cache_bytes_per_position(&k.session) * context)
                 as f64
                 / 1e9)
         );
+        drop(kept.take());
         let serving = Serving {
             turns: Together::new(),
             work: Mutex::new(None),
@@ -2457,7 +2476,9 @@ fn engine(
             for slot in 0..slots {
                 let (tx, rx) = channel::<Job>();
                 senders.push(tx);
-                let kept = if slot == 0 { kept.take() } else { None };
+                // Each slot makes a session that grows with its chat (the full one made at
+                // the start only checked that the context fits).
+                let kept: Option<Kept> = None;
                 let seed = seed.wrapping_add(slot as u64);
                 let (back, model, serving, store) = (back.clone(), &model, &serving, store.as_ref());
                 let (tokenizer, trie) = (&tokenizer, &trie);
@@ -2599,7 +2620,7 @@ fn worker(
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         if kept.is_none() {
             let _turn = serving.turns.enter();
-            match model.chat_session(context) {
+            match model.slot_session(context) {
                 Ok(session) => kept = Some(Kept::new(session)),
                 Err(e) => {
                     let _ = job.out.send(Out::Error(format!(
@@ -2971,6 +2992,11 @@ const OLDER_FACTS: usize = 8;
 /// few tenths of a second, about what loading it takes, and its file would still be
 /// megabytes (Qwen's DeltaNet state alone is 18 MB on the 0.8B).
 const MIN_SAVED: usize = 1024;
+
+/// The positions a chat slot's caches have room for at first (`--slots`); they double as
+/// its chat grows past them. Most chats are shorter than a long context: on Gemma 4
+/// 26B-A4B at 32K tokens a slot's caches took 1.04 GB, 0.48 GB with room for 4,096.
+const SLOT_START_ROWS: usize = 4096;
 
 /// How many more tokens a saved chat must spare reading, over the session in use, to be
 /// loaded instead: loading one costs about as much as reading a few dozen tokens.

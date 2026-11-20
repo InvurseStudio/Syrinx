@@ -139,6 +139,10 @@ pub struct Gemma4CudaSession {
     floor: usize,
     len: usize,
     capacity: usize,
+    /// The positions the layers that keep every position have room for now: `capacity`,
+    /// or fewer in a session made by [`Gemma4Cuda::session_growing`], whose caches grow
+    /// as its chat does ([`Gemma4Cuda::reserve`]).
+    rows: usize,
     batch: usize,
     embedding: Vec<f32>,
     per_layer_host: Vec<f32>,
@@ -212,12 +216,25 @@ impl Gemma4CudaSession {
 
     /// The GPU memory each position takes in this session's caches (keys and values): a
     /// ring's rows spread over the session's positions.
+    /// Counted at its full capacity, for a session whose caches grow.
     pub fn cache_bytes_per_position(&self) -> usize {
         self.cache_buffers()
             .iter()
-            .map(|(b, _, _)| b.len_bytes())
+            .map(|(b, _, r)| {
+                if *r > 0 {
+                    b.len_bytes()
+                } else {
+                    b.len_bytes() / self.rows.max(1) * self.capacity
+                }
+            })
             .sum::<usize>()
             / self.capacity.max(1)
+    }
+
+    /// The GPU memory its caches take now (less than at full capacity while a growing
+    /// session's chat is short).
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_buffers().iter().map(|(b, _, _)| b.len_bytes()).sum()
     }
 
     /// Whether a sliding-window layer keeps only a ring of its positions here (a session
@@ -263,15 +280,23 @@ impl Gemma4CudaSession {
             "{len} positions of a session of {}",
             self.len
         );
-        save_state(&self.cache_buffers(), self.capacity, len, &[])
+        save_state(&self.cache_buffers(), self.rows, len, &[])
     }
 
     /// Loads the first `upto` positions of a state `export` made from a session of the
     /// same model and precision (of any capacity is fine as long as it fits), in place of
     /// what this session held. Only all of it once the saved positions outran the
-    /// sliding window (the older ones weren't kept).
+    /// sliding window (the older ones weren't kept). A growing session needs room for
+    /// them first: [`Gemma4Cuda::import`] makes it.
     pub fn import(&mut self, saved: &SavedState, upto: usize) -> Result<()> {
-        load_state(saved, upto, &self.cache_buffers(), self.capacity, &[])?;
+        if saved.len() > self.capacity {
+            return Err(Error::Invalid(format!(
+                "a saved state of {} positions doesn't fit a session of {}",
+                saved.len(),
+                self.capacity
+            )));
+        }
+        load_state(saved, upto, &self.cache_buffers(), self.rows, &[])?;
         self.len = upto;
         self.hidden_rows = 0;
         self.high = upto;
@@ -484,10 +509,76 @@ impl<'a> Gemma4Cuda<'a> {
         self.session_with_batch(capacity, DEFAULT_BATCH)
     }
 
+    /// Makes room in `s` for its first `positions` positions, if it's a growing session
+    /// with less: the layers that keep every position move to buffers twice as large (or
+    /// as many as asked, in thousands, up to its capacity), with the positions it has
+    /// copied over. Its recorded graphs name the old buffers, so they're recorded again.
+    pub fn reserve(&self, s: &mut Gemma4CudaSession, positions: usize) -> Result<()> {
+        if positions <= s.rows || s.rows >= s.capacity {
+            return Ok(());
+        }
+        let rows = positions
+            .max(s.rows * 2)
+            .next_multiple_of(1024)
+            .min(s.capacity);
+        let mut old = Vec::new();
+        for (cache, ring) in [&mut s.keys, &mut s.values]
+            .into_iter()
+            .flat_map(|caches| caches.iter_mut().zip(s.rings.iter()))
+        {
+            let Some(buffer) = cache.as_mut() else {
+                continue;
+            };
+            if *ring > 0 {
+                continue;
+            }
+            let per = buffer.len_bytes() / s.rows;
+            let grown = self.gpu.alloc(rows * per).map_err(gpu_error)?;
+            self.gpu
+                .copy(grown.ptr(), buffer.ptr(), s.len * per)
+                .map_err(gpu_error)?;
+            old.push(std::mem::replace(buffer, grown));
+        }
+        // The copies read the old buffers: they go once the GPU is done with them.
+        self.gpu.synchronize().map_err(gpu_error)?;
+        drop(old);
+        s.rows = rows;
+        s.graph = None;
+        s.few_graphs.clear();
+        s.each_graphs.clear();
+        Ok(())
+    }
+
+    /// [`Gemma4CudaSession::import`], with room made for the state first.
+    pub fn import(&self, s: &mut Gemma4CudaSession, saved: &SavedState, upto: usize) -> Result<()> {
+        self.reserve(s, saved.len().min(s.capacity))?;
+        s.import(saved, upto)
+    }
+
     /// A new, empty conversation that reads up to `batch` tokens at once.
     pub fn session_with_batch(&self, capacity: usize, batch: usize) -> Result<Gemma4CudaSession> {
+        self.session_reserving(capacity, batch, capacity)
+    }
+
+    /// A conversation of up to `capacity` positions whose caches start with room for
+    /// `rows` and grow as it does ([`Self::reserve`], called by everything that runs
+    /// tokens or loads a state), so many conversations of a long context take only the
+    /// memory their chats use: 32 chat slots of 32K tokens on Gemma 4 26B-A4B reserved
+    /// 18 GB more than their 3,000-token chats needed. Reading is as fast as in a full
+    /// session; growing copies what the chat has so far, once each time its room doubles.
+    pub fn session_growing(&self, capacity: usize, rows: usize) -> Result<Gemma4CudaSession> {
+        self.session_reserving(capacity, DEFAULT_BATCH, rows)
+    }
+
+    fn session_reserving(
+        &self,
+        capacity: usize,
+        batch: usize,
+        rows: usize,
+    ) -> Result<Gemma4CudaSession> {
         let c = &self.config;
         let batch = batch.clamp(1, capacity.max(1));
+        let reserved = rows.clamp(1, capacity.max(1));
         // At least one value each: a model without per-layer inputs has none to keep.
         let f32s = |n: usize| self.gpu.alloc(n.max(1) * 4).map_err(gpu_error);
         // Keys and values: f16 (or Q8_0 with VIREO_KV_Q8=1) in 8-bit mode, f32 when exact.
@@ -506,7 +597,7 @@ impl<'a> Gemma4Cuda<'a> {
             .collect();
         let cache = |l: usize| -> Result<Option<Buffer>> {
             if l < c.first_shared_layer {
-                let rows = if rings[l] > 0 { rings[l] } else { capacity };
+                let rows = if rings[l] > 0 { rings[l] } else { reserved };
                 let hd = c.head_dim_of(l);
                 let head_bytes = Gpu::kv_head_bytes(self.precision == Precision::Int8, hd);
                 self.gpu
@@ -537,6 +628,7 @@ impl<'a> Gemma4Cuda<'a> {
             floor: 0,
             len: 0,
             capacity,
+            rows: reserved,
             batch,
             embedding: vec![0.0; batch * c.dim],
             per_layer_host: vec![0.0; batch * per_layer],
@@ -1231,6 +1323,7 @@ impl<'a> Gemma4Cuda<'a> {
 
     /// `token` through the recorded layers, at the session's next position.
     fn step(&self, s: &mut Gemma4CudaSession, token: u32) -> Result<()> {
+        self.reserve(s, s.len + 1)?;
         assert!(
             s.len < s.capacity,
             "the session is full ({} positions)",
@@ -1287,6 +1380,7 @@ impl<'a> Gemma4Cuda<'a> {
         logits: Logits,
     ) -> Result<Option<&'s [f32]>> {
         let vocab = self.config.vocab;
+        self.reserve(s, s.len + tokens.len())?;
         assert!(
             s.len + tokens.len() <= s.capacity,
             "{} more tokens don't fit in the session ({} of {} positions used)",
@@ -1381,6 +1475,10 @@ impl<'a> Gemma4Cuda<'a> {
     ) -> Result<()> {
         let t = tokens.len();
         assert_eq!(t, chats.len(), "a token for each conversation");
+        for chat in chats.iter_mut() {
+            let next = chat.len + 1;
+            self.reserve(chat, next)?;
+        }
         assert!(
             t >= 1 && t <= work.batch,
             "{t} conversations, in batches of {}",

@@ -654,6 +654,143 @@ fn chats_written_together_match_alone() {
     }
 }
 
+/// A session whose caches grow with its chat (`session_growing`, for chat slots) gives
+/// the same logits, to the bit, as one made at its full capacity: read in pieces that
+/// cross each growth, one token at a time, after its state is saved and loaded into
+/// another growing session, and written together with others (`forward_each`) at the
+/// step that makes it grow. Until it grows it takes a fraction of the memory.
+#[test]
+fn growing_sessions_match_full_ones() {
+    fn same(what: &str, a: &[f32], b: &[f32]) {
+        let differ = a
+            .iter()
+            .zip(b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(differ, 0, "{what}: {differ} of {} logits differ", a.len());
+    }
+    for name in ["gemma-4-E2B-it-Q6_K.gguf", "gemma-4-E4B-it-Q6_K.gguf"] {
+        let Some(file) = model(name) else { continue };
+        let Some(gpu) = open_gpu() else { return };
+        let paragraph = "The engine reads a prompt in batches: every weight is decoded once for many \
+                         tokens, and attention looks at a block of keys for a block of queries. When \
+                         it writes a reply, it replays one recorded graph per token. ";
+        let ids = Tokenizer::from_gguf(&file)
+            .unwrap()
+            .encode(&paragraph.repeat(70), true, false);
+        let m = Gemma4Cuda::load(&file, gpu).unwrap();
+        let capacity = 3072;
+        assert!(ids.len() > 2500, "{} tokens of text", ids.len());
+        let mut full = m.session(capacity).unwrap();
+        let mut grow = m.session_growing(capacity, 256).unwrap();
+        assert_eq!(
+            grow.cache_bytes_per_position(),
+            full.cache_bytes_per_position()
+        );
+        eprintln!(
+            "{name}: {} MB at first, {} MB at {capacity} positions",
+            grow.cache_bytes() >> 20,
+            full.cache_bytes() >> 20
+        );
+        assert!(
+            grow.cache_bytes() < full.cache_bytes(),
+            "{name}: a short chat takes less"
+        );
+
+        // 256 rows, then 1,024, 2,048 and 3,072, with single tokens between the pieces.
+        let mut at = 0;
+        for piece in [200, 700, 9, 600, 900] {
+            let tokens = &ids[at..at + piece];
+            let a = m
+                .forward_batch(&mut full, tokens, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let b = m
+                .forward_batch(&mut grow, tokens, Logits::Last)
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            same(&format!("{name}, a batch to {}", at + piece), &a, &b);
+            at += piece;
+            for _ in 0..3 {
+                let a = m
+                    .forward(&mut full, ids[at], true)
+                    .unwrap()
+                    .unwrap()
+                    .to_vec();
+                let b = m
+                    .forward(&mut grow, ids[at], true)
+                    .unwrap()
+                    .unwrap()
+                    .to_vec();
+                same(&format!("{name}, a token at {at}"), &a, &b);
+                at += 1;
+            }
+        }
+        assert_eq!(grow.len(), full.len());
+        assert_eq!(
+            grow.cache_bytes(),
+            full.cache_bytes(),
+            "{name}: grown to its capacity"
+        );
+
+        // Saved, and loaded into a new growing session: room is made for it.
+        let state = grow.export(grow.len()).unwrap();
+        let mut loaded = m.session_growing(capacity, 256).unwrap();
+        m.import(&mut loaded, &state, state.len()).unwrap();
+        let a = m
+            .forward(&mut full, ids[at], true)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let b = m
+            .forward(&mut loaded, ids[at], true)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        same(&format!("{name}, after loading"), &a, &b);
+
+        // Two chats exactly filling their room, written together: both grow at that step.
+        let mut alone: Vec<_> = (0..2).map(|_| m.session(capacity).unwrap()).collect();
+        let mut together: Vec<_> = (0..2)
+            .map(|_| m.session_growing(capacity, 1024).unwrap())
+            .collect();
+        for (i, from) in [0, 37].into_iter().enumerate() {
+            m.forward_batch(&mut alone[i], &ids[from..from + 1024], Logits::None)
+                .unwrap();
+            m.forward_batch(&mut together[i], &ids[from..from + 1024], Logits::None)
+                .unwrap();
+        }
+        let before = together[0].cache_bytes();
+        let mut work = m.session_with_batch(8, 2).unwrap();
+        let mut row = vec![0f32; m.config.vocab];
+        for step in 0..3 {
+            let tokens = [ids[1024 + step], ids[37 + 1024 + step]];
+            let mut refs: Vec<&mut _> = together.iter_mut().collect();
+            m.forward_each(&mut work, &mut refs, &tokens).unwrap();
+            for (i, &token) in tokens.iter().enumerate() {
+                let want = m.forward(&mut alone[i], token, true).unwrap().unwrap();
+                m.held_logits(&work, i, &mut row).unwrap();
+                let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
+                let worst = row
+                    .iter()
+                    .zip(want)
+                    .fold(0f32, |w, (a, b)| w.max((a - b).abs()));
+                assert_eq!(top(&row), top(want), "{name}, chat {i}, step {step}");
+                assert!(
+                    worst < 0.25,
+                    "{name}, chat {i}, step {step}: logits differ by {worst}"
+                );
+            }
+        }
+        assert!(
+            together[0].cache_bytes() > before,
+            "{name}: grown at the first step"
+        );
+    }
+}
+
 /// A round of guesses' logits left on the GPU (`forward_batch_held`) are the rows
 /// `forward_batch` hands back, to the bit, whichever rows are fetched and in whatever
 /// order. And on a Q6_K Gemma 4 (whose per-layer projection is f16: the few-token f16
