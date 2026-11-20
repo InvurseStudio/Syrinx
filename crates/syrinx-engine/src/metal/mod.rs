@@ -139,6 +139,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         n if n.starts_with("attention") => &[3],
         "swiglu" | "geglu" | "add" | "softcap" | "apply_gate" => &[0],
         "swiglu_half" | "geglu_half" => &[2],
+        "swiglu_i8" | "geglu_i8" => &[2, 3],
         "conv_silu" => &[1, 3],
         "conv_silu_parallel" => &[3],
         "conv_history" => &[1],
@@ -152,6 +153,7 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "argmax_part" => &[1, 2],
         "argmax_final" => &[2],
         "to_half" | "q_group_half" => &[1],
+        "to_i8" => &[1, 2],
         _ => return None,
     })
 }
@@ -747,9 +749,9 @@ struct Kernels {
     /// Adds up matmul_tc's splits (Gpu::matmul_8bit).
     sum_parts: Option<Pso>,
     /// A long batch's products in 8-bit whole numbers on the neural accelerators
-    /// (matmul_i8 in syrinx_tensor.metal): for Q6_K and Q8_0 weights, and the kernel that
-    /// rounds the activations.
-    matmul_i8: Option<(Pso, Pso, Pso)>,
+    /// (matmul_i8 in syrinx_tensor.metal): for Q6_K and Q8_0 weights (128- and 256-token
+    /// tiles), and the kernels that round the activations.
+    matmul_i8: Option<MatmulI8>,
     /// The same with the wide tile, for long batches (TC_WIDE).
     matmul_tc_wide: Option<[Pso; 7]>,
     /// The same with 8- to 192-token tiles, for short batches (SMALL_TILES).
@@ -769,6 +771,7 @@ struct Kernels {
     moe_gather_half: Pso,
     /// `moe_matmul` on the neural accelerators, where the GPU has them.
     moe_matmul_tc: Option<[Pso; 7]>,
+    moe_matmul_tc_small: Option<[Pso; 7]>,
     residual_norm: Pso,
     qkv_prep: Pso,
     dequant_kv_q8_to_half: Pso,
@@ -900,8 +903,10 @@ const FIRST_COMMIT: usize = 16;
 const ROWS_PER_BLOCK: u32 = 4;
 /// The slots in a tile of `moe_matmul` (SG_TOKENS in syrinx.metal).
 const MOE_TILE_SLOTS: usize = 32;
-/// The slots in a tile of `moe_matmul_tc` (MOE_TC_TOKENS in syrinx_tensor.metal).
+/// The slots in a tile of `moe_matmul_tc` (MOE_TC_TOKENS in syrinx_tensor.metal), and
+/// its smaller tile for multi-chat decode / short batches where each expert gets few slots.
 const MOE_TC_SLOTS: usize = 64;
+const MOE_TC_SMALL_SLOTS: usize = 16;
 /// The matrix-matrix kernel's tile (matmul_sg): rows of weights by tokens.
 const TILE_ROWS: u32 = 64;
 const TILE_TOKENS: u32 = 32;
@@ -988,8 +993,19 @@ const TCG_MAX_PARTS: u32 = 64;
 /// The experimental 8-bit products (matmul_i8 in syrinx_tensor.metal, which says what they
 /// cost in accuracy): the fewest tokens that go to them (the tile is I8_TOKENS tokens by
 /// I8_ROWS rows, a step I8_K columns), and whether any do: only with VIREO_I8=on.
+struct MatmulI8 {
+    q6_k: Pso,
+    q8_0: Pso,
+    wide_q6_k: Pso,
+    wide_q8_0: Pso,
+    to_i8: Pso,
+    swiglu_i8: Pso,
+    geglu_i8: Pso,
+}
+
 const I8_FROM: usize = 128;
 const I8_TOKENS: u32 = 128;
+const I8_WIDE_TOKENS: u32 = 256;
 const I8_ROWS: u32 = 32;
 const I8_K: usize = 256;
 /// 0 = off, 1 = middle-layer FFN only (`VIREO_I8=ffn`), 2 = all (`VIREO_I8=on`).
@@ -1120,11 +1136,15 @@ impl Gpu {
                 None
             },
             matmul_i8: if tensor_ops {
-                Some((
-                    pipeline("matmul_i8_q6_k")?,
-                    pipeline("matmul_i8_q8_0")?,
-                    pipeline("to_i8")?,
-                ))
+                Some(MatmulI8 {
+                    q6_k: pipeline("matmul_i8_q6_k")?,
+                    q8_0: pipeline("matmul_i8_q8_0")?,
+                    wide_q6_k: pipeline("matmul_i8_wide_q6_k")?,
+                    wide_q8_0: pipeline("matmul_i8_wide_q8_0")?,
+                    to_i8: pipeline("to_i8")?,
+                    swiglu_i8: pipeline("swiglu_i8")?,
+                    geglu_i8: pipeline("geglu_i8")?,
+                })
             } else {
                 None
             },
@@ -1162,6 +1182,11 @@ impl Gpu {
             moe_gather_half: pipeline("moe_gather_half")?,
             moe_matmul_tc: if tensor_ops {
                 Some(per_kind("moe_matmul_tc")?)
+            } else {
+                None
+            },
+            moe_matmul_tc_small: if tensor_ops {
+                Some(per_kind("moe_matmul_tc_t16")?)
             } else {
                 None
             },
@@ -1359,8 +1384,8 @@ impl Gpu {
         let parts_bytes = 64 * MAX_DECODE_PARTS as usize * (2 + 512) * 4;
         let attention_parts = Self::alloc_in(&context, parts_bytes)?;
         // A counter a threadgroup column (up to 64 heads) and token (up to 8).
-        let attention_counters = Self::alloc_in(&context, 64 * 8 * 4)?;
-        attention_counters.write_bytes_at(0, &[0u8; 64 * 8 * 4])?;
+        let attention_counters = Self::alloc_in(&context, 64 * 64 * 4)?;
+        attention_counters.write_bytes_at(0, &[0u8; 64 * 64 * 4])?;
         let matmul_parts = Self::alloc_in(&context, MATMUL_PARTS_BYTES)?;
         let argmax_vals = Self::alloc_in(&context, 256 * 4)?;
         let argmax_idxs = Self::alloc_in(&context, 256 * 4)?;
@@ -1931,10 +1956,10 @@ impl Gpu {
     }
 
     /// How many tiles `moe_group` may cut `slots` slots of `experts` experts into: the
-    /// full ones, and a part-filled one an expert. (Counted for the smaller tile, of
-    /// `moe_matmul`: room for either kind.)
+    /// full ones, and a part-filled one an expert. (Counted for the smallest tile so the
+    /// buffer fits every tile size.)
     pub fn moe_tiles(slots: usize, experts: usize) -> usize {
-        slots / MOE_TILE_SLOTS + experts
+        slots / MOE_TC_SMALL_SLOTS + experts
     }
 
     /// Whether a batch's experts can run on the neural accelerators (`moe_matmul_fast`),
@@ -1943,9 +1968,17 @@ impl Gpu {
         self.kernels.moe_matmul_tc.is_some() && KINDS.contains(&kind)
     }
 
-    /// The slots in one of `moe_group`'s tiles: for `moe_matmul_fast` or `moe_matmul`.
-    fn moe_tile_slots(fast: bool) -> usize {
-        if fast { MOE_TC_SLOTS } else { MOE_TILE_SLOTS }
+    /// The slots in one of `moe_group`'s tiles: for `moe_matmul_fast` (16 for short/sparse
+    /// batches where each expert averages ≤ 8 slots, 64 for dense prompt batches) or
+    /// `moe_matmul`.
+    fn moe_tile_slots(fast: bool, slots: usize, experts: usize) -> usize {
+        if !fast {
+            MOE_TILE_SLOTS
+        } else if slots <= experts * 8 {
+            MOE_TC_SMALL_SLOTS
+        } else {
+            MOE_TC_SLOTS
+        }
     }
 
     /// A batch's `slots` slots sorted by their expert into `order` (an i32 each, and
@@ -1963,7 +1996,7 @@ impl Gpu {
         fast: bool,
     ) -> Result<()> {
         assert!(experts <= 512, "moe_group holds up to 512 experts");
-        let tile = Self::moe_tile_slots(fast);
+        let tile = Self::moe_tile_slots(fast, slots, experts);
         let args = [
             Arg::Ptr(idx),
             Arg::Ptr(order),
@@ -2028,11 +2061,18 @@ impl Gpu {
         slots: usize,
         experts: usize,
     ) -> Result<()> {
-        let kernels = self
-            .kernels
-            .moe_matmul_tc
-            .as_ref()
-            .expect("checked with moe_fast");
+        let tile_slots = Self::moe_tile_slots(true, slots, experts);
+        let kernels = if tile_slots == MOE_TC_SMALL_SLOTS {
+            self.kernels
+                .moe_matmul_tc_small
+                .as_ref()
+                .expect("checked with moe_fast")
+        } else {
+            self.kernels
+                .moe_matmul_tc
+                .as_ref()
+                .expect("checked with moe_fast")
+        };
         let (tc_rows, _, tc_sg) = tensor_tile();
         let args = [
             Arg::Ptr(w),
@@ -2046,7 +2086,7 @@ impl Gpu {
         ];
         let grid = (
             (rows as u32).div_ceil(tc_rows),
-            (slots / MOE_TC_SLOTS + experts) as u32,
+            (slots / tile_slots + experts) as u32,
         );
         self.run(&kernels[Self::kind_index(kind)?], grid, 32 * tc_sg, &args)
     }
@@ -2259,6 +2299,130 @@ impl Gpu {
             threads,
             &args,
         )
+    }
+
+    /// [`QkvPrep`] for a batch of independent chats in one dispatch: `table` points to
+    /// `chats` [`BatchChat`] entries in GPU memory (each chat's own KV cache addresses,
+    /// position and ring). `own` is whether this layer writes its own keys and values.
+    pub fn qkv_prep_batch(
+        &self,
+        p: &QkvPrep,
+        table: CuDevicePtr,
+        own: bool,
+        chats: usize,
+    ) -> Result<()> {
+        assert!(p.head_dim <= 512, "head size {} is over 512", p.head_dim);
+        *self.qh_ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let cache_mode = if Self::kv_q8(p.half_cache, p.head_dim) {
+            2i32
+        } else {
+            p.half_cache as i32
+        };
+        let args = [
+            Arg::Ptr(p.q),
+            Arg::I32(p.q_stride as i32),
+            Arg::I32(p.q_head_stride as i32),
+            Arg::Ptr(p.q_norm.unwrap_or(0)),
+            Arg::Ptr(p.q_out),
+            Arg::Ptr(p.k),
+            Arg::Ptr(p.k_norm.unwrap_or(0)),
+            Arg::Ptr(p.v),
+            Arg::I32(p.v_norm as i32),
+            Arg::Ptr(table),
+            Arg::Ptr(0),
+            Arg::I32(p.heads as i32),
+            Arg::I32(p.kv_heads as i32),
+            Arg::I32(p.head_dim as i32),
+            Arg::I32(p.rope_dims as i32),
+            Arg::F32(p.rope_base),
+            Arg::Ptr(p.rope_factors.unwrap_or(0)),
+            Arg::I32(p.neox as i32),
+            Arg::Ptr(0), // null pos -> read per-chat pos/keys/values/ring from `table`
+            Arg::F32(p.eps),
+            Arg::I32(cache_mode),
+            Arg::I32(chats as i32),
+            Arg::I32(0),
+            Arg::Ptr(0),
+        ];
+        let slots = p.heads + if own { 2 * p.kv_heads } else { 0 };
+        let threads = (p.head_dim.div_ceil(32) * 32).min(256) as u32;
+        self.run(
+            &self.kernels.qkv_prep,
+            (slots as u32, (chats as u32).div_ceil(8)),
+            threads,
+            &args,
+        )
+    }
+
+    /// One-token decode attention for `chats` independent conversations in one dispatch:
+    /// `table` points to `chats` [`BatchChat`] entries (each chat's own KV cache, position
+    /// and ring). Returns `false` when the shape isn't handled by the batched decode kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_batch(
+        &self,
+        half_cache: bool,
+        q: CuDevicePtr,
+        table: CuDevicePtr,
+        out: CuDevicePtr,
+        window: usize,
+        heads: usize,
+        chats: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        group: usize,
+        scale: f32,
+    ) -> Result<bool> {
+        let wide_idx = match head_dim {
+            128 => 0,
+            256 => 1,
+            512 => 2,
+            _ => return Ok(false),
+        };
+        if chats == 0 || chats > 64 || heads > 64 {
+            return Ok(false);
+        }
+        let use_q8 = Self::kv_q8(half_cache, head_dim);
+        let cache_idx = if use_q8 { 2 } else { usize::from(half_cache) };
+        let base_args = [
+            Arg::Ptr(q),
+            Arg::Ptr(table),
+            Arg::Ptr(0),
+            Arg::Ptr(out),
+            Arg::Ptr(0), // null pos -> read per-chat keys/values/pos/ring from `table`
+            Arg::I32(window as i32),
+            Arg::I32(head_dim as i32),
+            Arg::I32(kv_dim as i32),
+            Arg::I32(group as i32),
+            Arg::F32(scale),
+        ];
+        let cores = self.info.multiprocessors.max(1) as u32;
+        let cap_parts = ((64 * MAX_DECODE_PARTS) / (heads as u32 * chats as u32)).max(1);
+        if let Some(kernel) = self.group_kernel(cache_idx, head_dim, group, heads, window) {
+            let kv_heads = (heads / group) as u32;
+            let parts = (3 * cores)
+                .div_ceil(kv_heads * chats as u32)
+                .clamp(1, cap_parts)
+                .min(MAX_DECODE_PARTS);
+            let mut args = base_args.to_vec();
+            args.push(Arg::Ptr(self.attention_parts.ptr()));
+            args.push(Arg::Ptr(self.attention_counters.ptr()));
+            args.push(Arg::I32(64));
+            self.run_3d(kernel, (kv_heads, parts, chats as u32), 256, 0, &args)?;
+            return Ok(true);
+        }
+        let spread: u32 = if head_dim <= 128 { 4 } else { 2 };
+        let threadgroups = heads as u32;
+        let parts = (spread * cores)
+            .div_ceil(threadgroups * chats as u32)
+            .clamp(1, cap_parts)
+            .min(MAX_DECODE_PARTS);
+        let mut args = base_args.to_vec();
+        args.push(Arg::Ptr(self.attention_parts.ptr()));
+        args.push(Arg::Ptr(self.attention_counters.ptr()));
+        let kernel = &self.kernels.attention_decode_wide[cache_idx][wide_idx];
+        assert!(threadgroups * parts * chats as u32 <= 64 * MAX_DECODE_PARTS);
+        self.run_3d(kernel, (threadgroups, parts, chats as u32), 256, 0, &args)?;
+        Ok(true)
     }
 
     /// attention_tcg's kernel and tile (rows, positions a step, threads) for a batch of
@@ -3160,6 +3324,40 @@ impl Gpu {
         Ok(true)
     }
 
+    /// Fused `act(gate) × up` directly into `q8`'s i8 buffer for `matmul_i8`, leaving
+    /// `gate` untouched and skipping both the f32 store and `to_i8`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_quantize_i8(
+        &self,
+        gate: CuDevicePtr,
+        up: CuDevicePtr,
+        cols: usize,
+        q8: &Q8,
+        tokens: usize,
+        gelu: bool,
+    ) -> Result<bool> {
+        let (Some(i8k), Some((bytes, scales))) = (&self.kernels.matmul_i8, &q8.i8) else {
+            return Ok(false);
+        };
+        if tokens < I8_FROM || !cols.is_multiple_of(I8_K) {
+            return Ok(false);
+        }
+        let n = tokens * cols;
+        assert!(n <= bytes.len_bytes(), "the 8-bit buffer is too small");
+        let kernel = if gelu { &i8k.geglu_i8 } else { &i8k.swiglu_i8 };
+        let args = [
+            Arg::Ptr(gate),
+            Arg::Ptr(up),
+            Arg::Ptr(bytes.ptr()),
+            Arg::Ptr(scales.ptr()),
+        ];
+        self.run(kernel, ((n / I8_K) as u32, 1), I8_K as u32, &args)?;
+        q8.x.store(0, Ordering::Relaxed);
+        q8.half_ready.store(false, Ordering::Relaxed);
+        q8.i8_ready.store(true, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// What [`Gpu::matmul_8bit`] says when asked for a product that reads the f32
     /// activations after [`Gpu::gated_quantize`], which leaves only the f16 copy.
     const NO_F32: &'static str =
@@ -3179,8 +3377,7 @@ impl Gpu {
         tokens: usize,
     ) -> Result<()> {
         let x = q8.x.load(Ordering::Relaxed);
-        if let (Some((q6_k, q8_0, to_i8)), Some((bytes, scales))) =
-            (&self.kernels.matmul_i8, &q8.i8)
+        if let (Some(i8k), Some((bytes, scales))) = (&self.kernels.matmul_i8, &q8.i8)
             && Self::whole_number_products(kind, cols, tokens)
         {
             let n = tokens * cols;
@@ -3188,12 +3385,18 @@ impl Gpu {
                 assert!(x != 0, "{}", Self::NO_F32);
                 assert!(n <= bytes.len_bytes(), "the 8-bit buffer is too small");
                 let args = [Arg::Ptr(x), Arg::Ptr(bytes.ptr()), Arg::Ptr(scales.ptr())];
-                self.run(to_i8, ((n / I8_K) as u32, 1), I8_K as u32, &args)?;
+                self.run(&i8k.to_i8, ((n / I8_K) as u32, 1), I8_K as u32, &args)?;
             }
-            let kernel = if kind == TensorType::Q6_K { q6_k } else { q8_0 };
+            let wide = tokens >= WIDE_TOKENS;
+            let (kernel, tok_tile, threads) = match (kind == TensorType::Q6_K, wide) {
+                (true, true) => (&i8k.wide_q6_k, I8_WIDE_TOKENS, 256),
+                (false, true) => (&i8k.wide_q8_0, I8_WIDE_TOKENS, 256),
+                (true, false) => (&i8k.q6_k, I8_TOKENS, 128),
+                (false, false) => (&i8k.q8_0, I8_TOKENS, 128),
+            };
             let grid = (
                 (rows as u32).div_ceil(I8_ROWS),
-                (tokens as u32).div_ceil(I8_TOKENS),
+                (tokens as u32).div_ceil(tok_tile),
             );
             let args = [
                 Arg::Ptr(w),
@@ -3204,7 +3407,7 @@ impl Gpu {
                 Arg::I32(tokens as i32),
                 Arg::Ptr(scales.ptr()),
             ];
-            return self.run(kernel, grid, 32 * tensor_tile().2, &args);
+            return self.run(kernel, grid, threads, &args);
         }
         let (kernels, half) = match (&self.kernels.matmul_tc, &q8.half) {
             (Some((k, _)), Some(half)) if tokens > 1 && cols.is_multiple_of(32) => (k, half),
