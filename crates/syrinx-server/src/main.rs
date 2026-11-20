@@ -1,5 +1,5 @@
 //! `syrinx-server`: serves one GGUF model on this PC over the part of the Vireo app's API
-//! that chats use, with Vireo's own engine on the GPU. The prototype app pairs with it as
+//! that chats use, with Vireo's own engine on the GPU. The Vireo app pairs with it as
 //! it would with the Mac (address `localhost`, the code this prints) and chats with it.
 //! Replies can call tools (reading, finding and changing files and Git's status and
 //! diff, which the app runs on the PC, and the date and time), each call written under its
@@ -17,6 +17,7 @@
 //!   POST   /api/agent/confirm          {id, approved, remember}: the user's answer to an approval
 //!   GET    /api/skill-library/commands the skills this PC can follow, for slash commands
 //!   GET    /api/assistant/approvals    and /activity: empty
+//!   GET    /api/preview/office?path=   a Word, Excel or PowerPoint file as Markdown (the app's)
 //!   GET    /api/approvals              the kinds always allowed; DELETE /api/approvals/{tool}
 //!   GET    /api/memory                 the remembered facts; POST, PUT /{id}, DELETE /{id},
 //!                                      PUT /api/memory/settings {enabled}
@@ -37,6 +38,7 @@ mod developer;
 mod draft;
 mod files;
 mod http;
+mod iwork;
 mod json;
 mod memory;
 mod openai;
@@ -84,7 +86,7 @@ Usage: syrinx-server <model.gguf> [--port <n>] [--context <tokens>|auto] [--exac
                     [--api-key <key>] [and the options above]
 
 Serves the model on http://127.0.0.1:<port> (3000 by default; 0 for any free port) for
-the Vireo Prototype app: in its Settings, connect to \"localhost\" with the code this
+the Vireo app: in its Settings, connect to \"localhost\" with the code this
 prints. --context is the most tokens a chat keeps: auto (the default) is as many as the
 GPU's free memory holds once the model is loaded, up to the model's own limit; --exact runs f32
 arithmetic. Chats' caches are saved in the prototype's folder (on Windows
@@ -454,7 +456,7 @@ fn main() -> ExitCode {
             println!("OpenAI-compatible API: http://127.0.0.1:{port}/v1");
         }
         println!(
-            "To pair the Vireo Prototype app: Settings, connect to \"localhost\" with the code {}",
+            "To pair the Vireo app: Settings, connect to \"localhost\" with the code {}",
             pairing.code
         );
     }
@@ -906,6 +908,25 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                     404,
                     &error("Confirmation request not found or already resolved."),
                 ),
+            }
+        }
+        // The preview pane's Contents view, for the app on this Mac alone (as 0.9's).
+        ("GET", "/api/preview/office") => {
+            let is_app = shared.pairing.lock().unwrap().app_token.is_some()
+                && shared.pairing.lock().unwrap().app_token == request.bearer;
+            if !is_app {
+                return http::respond(&mut stream, 403, &error("Only the Vireo app on this Mac can preview files."));
+            }
+            let path = request
+                .query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("path="))
+                .map(http::percent_decoded)
+                .unwrap_or_default();
+            match files::office_preview(&path) {
+                Ok(markdown) => http::respond(&mut stream, 200, &format!("{{\"markdown\":{}}}", json::string(&markdown))),
+                Err(why) if why == "File not found." => http::respond(&mut stream, 404, &error(&why)),
+                Err(why) => http::respond(&mut stream, 422, &error(&why)),
             }
         }
         // Settings > Approvals: the kinds of change the user said not to ask about again.

@@ -19,6 +19,7 @@ pub mod inflate;
 pub mod markdown;
 pub mod pdf;
 pub mod pdf_write;
+pub mod pptx;
 pub mod pptx_write;
 pub mod xlsx;
 pub mod xlsx_write;
@@ -44,7 +45,7 @@ fn fail(status: u16, detail: impl Into<String>) -> Failure {
     }
 }
 
-const READS: &str = "It reads text, Markdown, PDF and Word (.docx) files.";
+const READS: &str = "It reads text, Markdown, PDF, Word, Excel and PowerPoint files, and Pages, Numbers and Keynote on a Mac.";
 
 // ---- The form ------------------------------------------------------------------------------
 
@@ -166,10 +167,7 @@ fn not_read_yet(ext: &str) -> Option<&'static str> {
     Some(match ext {
         "doc" => "old Word (.doc)",
         "xls" => "old Excel (.xls)",
-        "pptx" | "ppt" => "PowerPoint",
-        "pages" => "Pages",
-        "numbers" => "Numbers",
-        "key" => "Keynote",
+        "ppt" => "old PowerPoint (.ppt)",
         "rtf" | "rtfd" => "RTF",
         "odt" | "ods" | "odp" => "OpenDocument",
         "epub" => "EPUB",
@@ -199,6 +197,30 @@ pub fn extract(name: &str, bytes: &[u8]) -> Result<Extracted, Failure> {
             "xlsx",
             xlsx::open(bytes).map_err(|e| fail(422, e))?.describe(),
         )
+    } else if matches!(ext.as_str(), "pptx" | "pptm" | "potx") {
+        ("pptx", pptx::text(bytes).map_err(|e| fail(422, e))?)
+    } else if let Some(app) = crate::iwork::app_for(&ext) {
+        // Exported by its app from a copy of the upload, as read_file does.
+        let folder = std::env::temp_dir().join(format!("vireo-upload-{:016x}", crate::random_u64()));
+        let own = std::path::Path::new(name).file_name().map(|n| n.to_string_lossy().into_owned());
+        let file = folder.join(own.filter(|n| !n.starts_with('.')).unwrap_or_else(|| format!("upload.{ext}")));
+        let read = std::fs::create_dir_all(&folder)
+            .and_then(|_| std::fs::write(&file, bytes))
+            .map_err(|e| e.to_string())
+            .and_then(|_| crate::iwork::export(&file));
+        let copy = read.map_err(|e| {
+            let _ = std::fs::remove_dir_all(&folder);
+            fail(422, e)
+        })?;
+        let data = std::fs::read(&copy.path).map_err(|e| fail(422, e.to_string()))?;
+        let text = match app.extension {
+            "docx" => docx::text(&data),
+            "xlsx" => xlsx::open(&data).map(|w| w.describe()),
+            _ => pptx::text(&data),
+        };
+        drop(copy);
+        let _ = std::fs::remove_dir_all(&folder);
+        (app.extension, text.map_err(|e| fail(422, e))?)
     } else if let Some(what) = not_read_yet(&ext) {
         return Err(fail(
             415,

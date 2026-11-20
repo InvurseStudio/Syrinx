@@ -40,7 +40,7 @@ fn u32_at(d: &[u8], i: usize) -> Option<u32> {
     Some(u32::from_le_bytes(d.get(i..i + 4)?.try_into().ok()?))
 }
 
-const BROKEN: &str = "This .docx isn't a readable ZIP file: it may be damaged.";
+const BROKEN: &str = "This file isn't a readable ZIP file: it may be damaged.";
 
 impl<'a> Zip<'a> {
     pub fn open(data: &'a [u8]) -> Result<Self, String> {
@@ -103,21 +103,21 @@ impl<'a> Zip<'a> {
             + u16_at(d, offset + 28).ok_or(BROKEN)? as usize;
         let raw = d.get(start..start + packed).ok_or(BROKEN)?;
         if size > MAX_UNPACKED {
-            return Err(format!("{name} in this .docx is too large to read."));
+            return Err(format!("{name} in this file is too large to read."));
         }
         let bytes = match method {
             0 => raw.to_vec(),
             8 => inflate::inflate(raw, MAX_UNPACKED)
-                .map_err(|e| format!("{name} in this .docx can't be unpacked: {e}."))?,
+                .map_err(|e| format!("{name} in this file can't be unpacked: {e}."))?,
             m => {
                 return Err(format!(
-                    "{name} in this .docx is packed in a way Vireo can't read ({m})."
+                    "{name} in this file is packed in a way Vireo can't read ({m})."
                 ));
             }
         };
         if inflate::crc32(&bytes) != crc {
             return Err(format!(
-                "{name} in this .docx is damaged (its checksum is wrong)."
+                "{name} in this file is damaged (its checksum is wrong)."
             ));
         }
         Ok(Some(bytes))

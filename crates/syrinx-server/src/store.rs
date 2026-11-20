@@ -99,9 +99,11 @@ pub fn use_own_folder() {
     let _ = FOLDER.set("Syrinx");
 }
 
-/// The prototype's own folder: `~/Library/Application Support/VireoPrototype` on the Mac
-/// (where the Mac prototype app keeps its chats), `%LOCALAPPDATA%\VireoPrototype`
-/// elsewhere; `Syrinx` in place of `VireoPrototype` when serving on its own.
+/// The app's folder: `~/Library/Application Support/<folder>` on the Mac (where the Mac
+/// app keeps its chats), `%LOCALAPPDATA%\<folder>` elsewhere. The folder is the one the app
+/// names (`VIREO_DATA_FOLDER`: the released Mac app's is `Vireo`), `VireoPrototype` by
+/// default (a development build's, and the Windows app's), or `Syrinx` when serving on
+/// its own.
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map_or_else(

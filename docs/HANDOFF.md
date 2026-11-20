@@ -58,7 +58,7 @@ Windows but for three that tip between the two GPUs. The steps, for the next tim
 2. From `Syrinx/`: `cargo test --release`. Not run on a Mac since the merge.
    Three of `files.rs`'s tests are macOS-only now (`/tmp` and `/etc`, Git where the Mac
    keeps it) and run only there.
-3. From the Vireo repository's `Mac/`: `swift test`, then `./build-test-app.sh`. The build script and
+3. From the Vireo repository's `Mac/`: `swift test`, then `./build-app.sh`. The build script and
    `LocalEngine.swift` now build and find `syrinx-server` in `Syrinx/target/release`;
    `LocalEngineTests` was updated for that layout. Not run (no Swift here).
 4. Run the eval on Metal and save it beside the others:
@@ -157,7 +157,7 @@ models, thinking off and on, and the gauntlet (`evals/tools/aurelia_run.py`, whi
   while an app asks `GET /api/tasks/due` (the Mac app, every 10 s). A link task's link is
   `POST /api/tasks/link/<token>`, which needs no pairing: the token is the key, and the
   server listens on this machine only.
-- **Calendar and reminders** need the usage texts `build-test-app.sh` now writes into the
+- **Calendar and reminders** need the usage texts `build-app.sh` now writes into the
   app's Info.plist; a build without them (`swift run`) offers no calendar tools. The first
   real use asks for the Mac's permission. A test script's runs are dry.
 

@@ -36,7 +36,9 @@ const SKIPPED_FOLDERS: [&str; 4] = ["node_modules", "venv", "__pycache__", "site
 /// Read with the Mac's document readers rather than as text.
 const RICH_TEXT_EXTENSIONS: [&str; 5] = ["docx", "doc", "rtf", "rtfd", "odt"];
 /// Documents these tools can't read yet.
-const UNREAD_DOCUMENTS: [&str; 5] = ["xls", "pptx", "pages", "numbers", "key"];
+const UNREAD_DOCUMENTS: [&str; 2] = ["xls", "ppt"];
+/// PowerPoint decks, read by `attach::pptx`.
+const DECKS: [&str; 3] = ["pptx", "pptm", "potx"];
 /// Excel workbooks, read by `attach::xlsx`.
 const WORKBOOKS: [&str; 2] = ["xlsx", "xlsm"];
 
@@ -62,6 +64,60 @@ fn can_move_to(source: &str, destination: &str) -> Result<(), String> {
         return Err(format!("Folder not found: {folder}"));
     }
     Ok(())
+}
+
+/// A Word, Excel or PowerPoint file on this Mac as Markdown, for the app's preview pane
+/// (`GET /api/preview/office`), as 0.9 showed it: every sheet as a table, every slide with
+/// its notes.
+pub fn office_preview(path: &str) -> Result<String, String> {
+    let file = Path::new(path);
+    if !file.is_absolute() || !file.is_file() {
+        return Err("File not found.".into());
+    }
+    let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let size = fs::metadata(file).map_or(0, |m| m.len());
+    if size > crate::attach::xlsx::MAX_FILE {
+        return Err("This file is too large to preview.".into());
+    }
+    let data = fs::read(file).map_err(|e| format!("Couldn't read it: {e}"))?;
+    match ext.as_str() {
+        "docx" | "dotx" | "docm" => crate::attach::docx::text(&data),
+        "xlsx" | "xlsm" => crate::attach::xlsx::open(&data).map(|w| w.markdown()),
+        "pptx" | "pptm" | "potx" => crate::attach::pptx::markdown(&data),
+        _ => Err("Only Word, Excel and PowerPoint files are previewed here.".into()),
+    }
+}
+
+/// A Pages, Numbers or Keynote file's text, read from the Office copy its app exports
+/// (`iwork`); `None` for any other file.
+fn iwork_text(file: &str) -> Result<Option<String>, String> {
+    let ext = Path::new(file).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let Some(app) = crate::iwork::app_for(&ext) else { return Ok(None) };
+    let copy = crate::iwork::export(Path::new(file))?;
+    let copied = copy.path.to_string_lossy().into_owned();
+    let size = fs::metadata(&copy.path).map_or(0, |m| m.len());
+    let text = match app.extension {
+        "docx" => {
+            let data = fs::read(&copy.path).map_err(|e| e.to_string())?;
+            crate::attach::docx::text(&data)?
+        }
+        "xlsx" => workbook(&copied, size)?.describe(),
+        _ => deck(&copied, size)?,
+    };
+    Ok(Some(format!(
+        "{} document, read from a copy {} exported in {} format.\n\n{text}",
+        app.name, app.name, app.office
+    )))
+}
+
+/// A PowerPoint deck's slides, text, tables and notes.
+fn deck(file: &str, size: u64) -> Result<String, String> {
+    let name = file_name(file);
+    if size > crate::attach::xlsx::MAX_FILE {
+        return Err(format!("{name} is too large to read ({} MB). The most is 30 MB.", size >> 20));
+    }
+    let data = fs::read(file).map_err(|_| format!("Couldn't read {file}."))?;
+    crate::attach::pptx::text(&data).map_err(|e| format!("Couldn't read {name}: {e}"))
 }
 
 /// Opens the workbook at `file` (`size` bytes).
@@ -377,13 +433,14 @@ impl Files {
     /// means beside the template, and never over the template itself.
     fn template_and_target(&self, template: &str, path: &str) -> Result<(String, String), String> {
         let template = self.resolve(template)?;
-        if !exists(&template) || is_dir(&template) {
+        let lower = template.to_lowercase();
+        // A Pages template may be a folder (a package).
+        if !exists(&template) || (is_dir(&template) && !lower.ends_with(".pages")) {
             return Err(format!("File not found: {template}"));
         }
-        let lower = template.to_lowercase();
-        if !(lower.ends_with(".docx") || lower.ends_with(".dotx")) {
+        if !(lower.ends_with(".docx") || lower.ends_with(".dotx") || lower.ends_with(".pages")) {
             return Err(format!(
-                "{} isn't a Word template (.docx or .dotx).",
+                "{} isn't a Word or Pages template (.docx, .dotx or .pages).",
                 file_name(&template)
             ));
         }
@@ -431,7 +488,13 @@ impl Files {
                 (k.clone(), text)
             })
             .collect();
-        let data = fs::read(&template).map_err(|_| format!("Couldn't read {template}."))?;
+        // A Pages template is filled from the Word copy Pages exports, and saved as Word.
+        let data = if template.to_lowercase().ends_with(".pages") {
+            let copy = crate::iwork::export(Path::new(&template))?;
+            fs::read(&copy.path).map_err(|_| format!("Couldn't read the Word copy of {}.", file_name(&template)))?
+        } else {
+            fs::read(&template).map_err(|_| format!("Couldn't read {template}."))?
+        };
         let (bytes, result) = crate::attach::docx_write::fill(&data, &values)
             .map_err(|e| format!("Couldn't fill {}: {e}", file_name(&template)))?;
         self.replace(&file, &bytes)?;
@@ -908,6 +971,10 @@ impl Files {
         let Ok(meta) = fs::metadata(&file) else {
             return Err(format!("File not found: {file}"));
         };
+        // Pages, Numbers and Keynote (an older one is a folder, a package).
+        if let Some(text) = iwork_text(&file)? {
+            return Ok(text);
+        }
         if meta.is_dir() {
             return Err(format!(
                 "{file} is a folder. Use list_directory to see what's in it."
@@ -932,9 +999,12 @@ impl Files {
         if WORKBOOKS.contains(&ext.as_str()) {
             return Ok(workbook(&file, meta.len())?.describe());
         }
+        if DECKS.contains(&ext.as_str()) {
+            return deck(&file, meta.len());
+        }
         if UNREAD_DOCUMENTS.contains(&ext.as_str()) {
             return Err(format!(
-                "{name} is a document this {MACHINE}'s tools can't read yet. read_file can read text files, PDFs, Word documents and Excel workbooks."
+                "{name} is in an old Office format. Saving it as .{ext}x in Office makes it readable."
             ));
         }
         let size = meta.len();
@@ -947,7 +1017,7 @@ impl Files {
         let data = fs::read(&file).map_err(|_| format!("Couldn't read {file}."))?;
         let text = String::from_utf8(data).map_err(|_| {
             format!(
-                "{name} is not a text file. read_file can read text files, PDFs, Word documents and Excel workbooks."
+                "{name} is not a text file. read_file can read text files, PDFs, and Word, Excel and PowerPoint documents."
             )
         })?;
         Ok(text
@@ -967,9 +1037,15 @@ impl Files {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        if ext == "numbers" {
+            let copy = crate::iwork::export(Path::new(&file))?;
+            let size = fs::metadata(&copy.path).map_or(0, |m| m.len());
+            let sheets = workbook(&copy.path.to_string_lossy(), size)?.read();
+            return Ok(format!("Numbers spreadsheet, read from a copy Numbers exported in Excel format.\n\n{sheets}"));
+        }
         if meta.is_dir() || !WORKBOOKS.contains(&ext.as_str()) {
             return Err(format!(
-                "{name} isn't an Excel workbook (.xlsx). Use read_file for other files."
+                "{name} isn't an Excel workbook (.xlsx) or Numbers spreadsheet. Use read_file for other files."
             ));
         }
         Ok(workbook(&file, meta.len())?.read())
@@ -2087,7 +2163,10 @@ mod tests {
         .unwrap();
         let t = tools(&h, Access::Home);
         let deck = failure(&t, "read_file", &[("path", "Documents/budget.pptx")]);
-        assert!(deck.contains("can't read yet"), "{deck}");
+        assert!(deck.starts_with("Couldn't read budget.pptx:"), "{deck}");
+        make(&h, "Documents/old.ppt", "x");
+        let old = failure(&t, "read_file", &[("path", "Documents/old.ppt")]);
+        assert_eq!(old, "old.ppt is in an old Office format. Saving it as .pptx in Office makes it readable.");
         make(&h, "Documents/broken.xlsx", "PK");
         let broken = failure(&t, "read_file", &[("path", "Documents/broken.xlsx")]);
         assert!(broken.starts_with("Couldn't read broken.xlsx:"), "{broken}");
@@ -2096,7 +2175,7 @@ mod tests {
         let binary = failure(&t, "read_file", &[("path", "Documents/photo.bin")]);
         assert_eq!(
             binary,
-            "photo.bin is not a text file. read_file can read text files, PDFs, Word documents and Excel workbooks."
+            "photo.bin is not a text file. read_file can read text files, PDFs, and Word, Excel and PowerPoint documents."
         );
     }
 
