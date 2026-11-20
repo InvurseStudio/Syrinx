@@ -1404,6 +1404,13 @@ inline ulong ring_row(int t, int ring) { return (ulong)(ring > 0 ? t % ring : t)
 
 // See qkv_prep in syrinx.cu.
 #define QKV_TOKENS 8
+struct BatchChat {
+    ulong keys;
+    ulong values;
+    int pos;
+    int ring;
+};
+
 kernel void qkv_prep(ARGS, KP) {
     device const float* q_src = ARG_PTR(const float, 0);
     const int q_stride = ARG_INT(1), q_head_stride = ARG_INT(2);
@@ -1443,7 +1450,20 @@ kernel void qkv_prep(ARGS, KP) {
     if ((int)tid < pairs) freq = pow(base, -2.0f * (float)tid / (float)rope_dims);
 
     for (int t = t0; t < t1; t++) {
-        const int at = *pos + t;
+        int at, c_ring;
+        ulong c_k, c_v;
+        if (NONNULL(pos)) {
+            at = *pos + t;
+            c_ring = ring;
+            c_k = k_cache;
+            c_v = v_cache;
+        } else {
+            device const BatchChat* bc = reinterpret_cast<device const BatchChat*>(k_cache) + t;
+            at = bc->pos;
+            c_ring = bc->ring;
+            c_k = bc->keys;
+            c_v = bc->values;
+        }
         device const float* src;
         device float* dst = nullptr;
         device half* half_dst = nullptr;
@@ -1455,8 +1475,8 @@ kernel void qkv_prep(ARGS, KP) {
             if (NONNULL(q_half)) q2 = q_half + (((ulong)(h / group) * tokens + t) * group + h % group) * hd;
         } else {
             src = (kind == 1 ? k_src : v_src) + (ulong)t * kv_dim + h * hd;
-            const ulong at_cache = ring_row(at, ring) * kv_dim + h * hd;
-            const ulong cache = kind == 1 ? k_cache : v_cache;
+            const ulong at_cache = ring_row(at, c_ring) * kv_dim + h * hd;
+            const ulong cache = kind == 1 ? c_k : c_v;
             if (half_cache == 1)
                 half_dst = reinterpret_cast<device half*>(cache) + at_cache;
             else if (half_cache == 0)
@@ -1508,10 +1528,10 @@ kernel void qkv_prep(ARGS, KP) {
         }
         if (to_q8) {
             BARRIER;
-            const ulong cache = kind == 1 ? k_cache : v_cache;
+            const ulong cache = kind == 1 ? c_k : c_v;
             const ulong head_bytes = (ulong)hd + (ulong)(hd / 32) * 2;
             device char* q8_dst =
-                reinterpret_cast<device char*>(cache) + (ring_row(at, ring) * (ulong)kv_heads + (ulong)h) * head_bytes;
+                reinterpret_cast<device char*>(cache) + (ring_row(at, c_ring) * (ulong)kv_heads + (ulong)h) * head_bytes;
             device half* sc_dst = reinterpret_cast<device half*>(q8_dst + hd);
             const int sg = (int)(tid >> 5), lane = (int)(tid & 31), nsg = (int)(tpg.x >> 5);
             for (int b = sg; b < hd / 32; b += nsg) {
@@ -1918,25 +1938,36 @@ kernel void attention_decode_wide(ARGS, KP, uint sg [[simdgroup_index_in_threadg
     device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF;
+    int ring = ARG_INT(5) >> 16;
+    const int kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
-    // A few tokens at once (gid.z: a draft's guesses, a short batch): each its own query
-    // and output rows, its own length (causal), and its own share of the scratch.
+    // A few tokens at once (gid.z: a draft's guesses, a short batch), or one token for
+    // each of several chats (when pos is null and arg 1 is a BatchChat table).
+    int len;
     {
         const int z = (int)gid.z, nheads = (int)ngrid.x;
         q += (ulong)z * nheads * D;
         out += (ulong)z * nheads * D;
         partial += (ulong)z * nheads * ngrid.y * (2 + D);
         counters += (ulong)z * ngrid.x;
+        if (NONNULL(pos)) {
+            len = *pos + 1 + z;
+        } else {
+            device const BatchChat* bc = reinterpret_cast<device const BatchChat*>(ARG_PTR(const u8, 1)) + z;
+            keys = reinterpret_cast<device const KV*>(bc->keys);
+            values = reinterpret_cast<device const KV*>(bc->values);
+            len = bc->pos + 1;
+            ring = bc->ring;
+        }
     }
     constexpr int SG = 8, DPL = D / 32;
     threadgroup float sm[SG], sl[SG];
     threadgroup float so[SG][D];
     threadgroup bool last;
     const int head = gid.x, part = gid.y, parts = ngrid.y;
-    const int len = *pos + 1 + (int)gid.z;
     const int first = window > 0 ? max(0, len - window) : 0;
     const int share = (len - first + parts - 1) / parts;
     const int lo = first + part * share, hi = min(len, lo + share);
@@ -2058,16 +2089,28 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
     device const KV* values = ARG_PTR(const KV, 2);
     device float* out = ARG_PTR(float, 3);
     device const int* pos = ARG_PTR(const int, 4);
-    const int window = ARG_INT(5) & 0xFFFF, ring = ARG_INT(5) >> 16, kv_dim = ARG_INT(7), group = ARG_INT(8);
+    const int window = ARG_INT(5) & 0xFFFF;
+    int ring = ARG_INT(5) >> 16;
+    const int kv_dim = ARG_INT(7), group = ARG_INT(8);
     const float scale = ARG_F32(9);
     device float* partial = ARG_PTR(float, 10);
     device atomic_uint* counters = ARG_PTR(atomic_uint, 11);
+    int len;
     {
         const int z = (int)gid.z, nheads = (int)ngrid.x * group;
         q += (ulong)z * nheads * D;
         out += (ulong)z * nheads * D;
         partial += (ulong)z * nheads * ngrid.y * (2 + D);
         counters += (ulong)z * ngrid.x;
+        if (NONNULL(pos)) {
+            len = *pos + 1 + z;
+        } else {
+            device const BatchChat* bc = reinterpret_cast<device const BatchChat*>(ARG_PTR(const u8, 1)) + z;
+            keys = reinterpret_cast<device const KV*>(bc->keys);
+            values = reinterpret_cast<device const KV*>(bc->values);
+            len = bc->pos + 1;
+            ring = bc->ring;
+        }
     }
     constexpr int SG = 8, DPL = D / 32;
     // The group's queries, then the streams' outputs being merged: the host keeps
@@ -2079,7 +2122,6 @@ kernel void attention_decode_group(ARGS, KP, uint sg [[simdgroup_index_in_thread
     const int slices = group / H, streams = SG / slices;
     const int slice = (int)sg % slices, stream = (int)sg / slices;
     const bool active = stream < streams;
-    const int len = *pos + 1 + (int)gid.z;
     const int first = window > 0 ? max(0, len - window) : 0;
     // A short context in fewer parts (at least min_share positions each): the rest of the
     // grid has nothing to do, and the merge has less.

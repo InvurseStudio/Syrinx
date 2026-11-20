@@ -187,6 +187,10 @@ pub struct Gemma4CudaSession {
     /// After `forward_each`: the row of the held logits that is each conversation's, in
     /// the order they were given (the rows are in the order of the graph's key).
     each_rows: Vec<usize>,
+    /// Per-layer table of `[layer][chat]` `(keys, values, pos, ring)` descriptors for
+    /// batched `qkv_prep` + `attention_decode` in `forward_each` (Metal).
+    #[cfg(target_os = "macos")]
+    batch_chats: Option<Buffer>,
     /// The positions whose final states (after the final norm) the last read left in
     /// `h`'s rows, from row 0: `hidden_rows` of them from `hidden_from`. The draft model
     /// starts from the last position's.
@@ -707,6 +711,8 @@ impl<'a> Gemma4Cuda<'a> {
             few_graphs: Vec::new(),
             each_graphs: std::collections::HashMap::new(),
             each_rows: Vec::new(),
+            #[cfg(target_os = "macos")]
+            batch_chats: None,
             hidden_from: 0,
             hidden_rows: 0,
             assistant: None,
@@ -813,73 +819,133 @@ impl<'a> Gemma4Cuda<'a> {
                 _ => false,
             };
             let source = c.kv_source(l);
-            for &(chat, at, rows, pos) in &parts {
-                let q = s.q.f32_at(at * c.heads * hd);
-                g.qkv_prep(
+            let scale = if c.muse {
+                1.0 / (hd as f32).sqrt()
+            } else {
+                1.0
+            };
+            let window = if c.is_swa[l] { c.sliding_window } else { 0 };
+            #[cfg(target_os = "macos")]
+            let batched = if chats.len() > 1
+                && chats.len() <= 64
+                && matches!(hd, 128 | 256 | 512)
+                && c.heads <= 64
+                && let Some(bc) = &s.batch_chats
+            {
+                let table = bc.ptr() + (l * t * 24) as u64;
+                g.qkv_prep_batch(
                     &QkvPrep {
-                        q,
+                        q: s.q.ptr(),
                         q_stride: c.heads * hd,
                         q_head_stride: hd,
                         q_norm: Some(layer.q_norm.ptr()),
-                        q_out: q,
-                        k: s.k_new.f32_at(at * kv_dim),
+                        q_out: s.q.ptr(),
+                        k: s.k_new.ptr(),
                         k_norm: layer.k_norm.as_ref().map(Buffer::ptr),
-                        v: s.v_new.f32_at(at * kv_dim),
+                        v: s.v_new.ptr(),
                         v_norm: !c.muse,
-                        cache: own.then(|| {
-                            (
-                                chat.keys[l].as_ref().expect("its own keys").ptr(),
-                                chat.values[l].as_ref().expect("and values").ptr(),
-                            )
-                        }),
+                        cache: None,
                         heads: c.heads,
                         kv_heads: c.kv_heads_of(l),
                         head_dim: hd,
-                        // Muse's global layers have no RoPE.
                         rope_dims: if c.muse && !c.is_swa[l] { 0 } else { hd },
                         rope_base: base,
                         rope_factors: factors,
-                        // Muse's converter permutes its queries and keys for RoPE on pairs of
-                        // neighbours (llama.cpp's "normal"), as for Llama; Gemma's rotates halves.
                         neox: !c.muse,
-                        pos,
+                        pos: 0,
                         eps,
                         half_cache: s.half_cache,
-                        ring: chat.rings[l],
+                        ring: 0,
                     },
-                    rows,
+                    table,
+                    own,
+                    t,
                 )
                 .map_err(e)?;
-
-                let (keys, values) = (
-                    chat.keys[source]
-                        .as_ref()
-                        .expect("a source layer has its own keys"),
-                    chat.values[source].as_ref().expect("and values"),
-                );
-                g.attention_ring(
+                g.attention_decode_batch(
                     s.half_cache,
-                    q,
-                    keys.ptr(),
-                    values.ptr(),
-                    s.attention.f32_at(at * c.heads * hd),
-                    pos,
-                    if c.is_swa[l] { c.sliding_window } else { 0 },
-                    chat.rings[source],
+                    s.q.ptr(),
+                    table,
+                    s.attention.ptr(),
+                    window,
                     c.heads,
-                    rows,
+                    t,
                     hd,
                     kv_dim,
                     c.heads / c.kv_heads_of(l),
-                    // Gemma's queries and keys are normed (scale 1); Muse's queries carry
-                    // their scale in q_norm.
-                    if c.muse {
-                        1.0 / (hd as f32).sqrt()
-                    } else {
-                        1.0
-                    },
+                    scale,
                 )
-                .map_err(e)?;
+                .map_err(e)?
+            } else {
+                false
+            };
+            #[cfg(not(target_os = "macos"))]
+            let batched = false;
+            if !batched {
+                for &(chat, at, rows, pos) in &parts {
+                    let q = s.q.f32_at(at * c.heads * hd);
+                    g.qkv_prep(
+                        &QkvPrep {
+                            q,
+                            q_stride: c.heads * hd,
+                            q_head_stride: hd,
+                            q_norm: Some(layer.q_norm.ptr()),
+                            q_out: q,
+                            k: s.k_new.f32_at(at * kv_dim),
+                            k_norm: layer.k_norm.as_ref().map(Buffer::ptr),
+                            v: s.v_new.f32_at(at * kv_dim),
+                            v_norm: !c.muse,
+                            cache: own.then(|| {
+                                (
+                                    chat.keys[l].as_ref().expect("its own keys").ptr(),
+                                    chat.values[l].as_ref().expect("and values").ptr(),
+                                )
+                            }),
+                            heads: c.heads,
+                            kv_heads: c.kv_heads_of(l),
+                            head_dim: hd,
+                            // Muse's global layers have no RoPE.
+                            rope_dims: if c.muse && !c.is_swa[l] { 0 } else { hd },
+                            rope_base: base,
+                            rope_factors: factors,
+                            // Muse's converter permutes its queries and keys for RoPE on pairs of
+                            // neighbours (llama.cpp's "normal"), as for Llama; Gemma's rotates halves.
+                            neox: !c.muse,
+                            pos,
+                            eps,
+                            half_cache: s.half_cache,
+                            ring: chat.rings[l],
+                        },
+                        rows,
+                    )
+                    .map_err(e)?;
+
+                    let (keys, values) = (
+                        chat.keys[source]
+                            .as_ref()
+                            .expect("a source layer has its own keys"),
+                        chat.values[source].as_ref().expect("and values"),
+                    );
+                    g.attention_ring(
+                        s.half_cache,
+                        q,
+                        keys.ptr(),
+                        values.ptr(),
+                        s.attention.f32_at(at * c.heads * hd),
+                        pos,
+                        window,
+                        chat.rings[source],
+                        c.heads,
+                        rows,
+                        hd,
+                        kv_dim,
+                        c.heads / c.kv_heads_of(l),
+                        // Gemma's queries and keys are normed (scale 1); Muse's queries carry
+                        // their scale in q_norm.
+                        scale,
+                    )
+                    .map_err(e)?;
+                }
             }
             if let Some(gate) = &layer.attn_gate {
                 // s.h still holds the layer's normed input; s.gate is free until the FFN.
@@ -1486,6 +1552,7 @@ impl<'a> Gemma4Cuda<'a> {
         );
         // The rows in the order of the conversations' positions' addresses (CUDA), so a
         // set of conversations replays one graph whichever order they come in.
+        #[cfg_attr(target_os = "macos", allow(unused_mut))]
         let mut order: Vec<usize> = (0..t).collect();
         #[cfg(not(target_os = "macos"))]
         order.sort_by_key(|&i| chats[i].pos.ptr());
@@ -1498,6 +1565,34 @@ impl<'a> Gemma4Cuda<'a> {
                 chat.capacity
             );
             chat.pos.write_i32(&[chat.len as i32]).map_err(gpu_error)?;
+        }
+        #[cfg(target_os = "macos")]
+        if t > 1 && t <= 64 {
+            let need = self.config.layers * t * 24;
+            if work.batch_chats.as_ref().is_none_or(|b| b.len_bytes() < need) {
+                work.batch_chats = Some(self.gpu.alloc(need).map_err(gpu_error)?);
+            }
+            let mut table = Vec::with_capacity(need);
+            for l in 0..self.config.layers {
+                let source = self.config.kv_source(l);
+                for &i in &order {
+                    let chat = &chats[i];
+                    let k = chat.keys[source]
+                        .as_ref()
+                        .expect("a source layer has its own keys")
+                        .ptr();
+                    let v = chat.values[source].as_ref().expect("and values").ptr();
+                    table.extend_from_slice(&k.to_le_bytes());
+                    table.extend_from_slice(&v.to_le_bytes());
+                    table.extend_from_slice(&(chat.len as i32).to_le_bytes());
+                    table.extend_from_slice(&(chat.rings[source] as i32).to_le_bytes());
+                }
+            }
+            work.batch_chats
+                .as_ref()
+                .unwrap()
+                .write_bytes_at(0, &table)
+                .map_err(gpu_error)?;
         }
         {
             let rows: Vec<&Gemma4CudaSession> = order.iter().map(|&i| &*chats[i]).collect();

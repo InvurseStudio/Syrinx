@@ -192,15 +192,20 @@ impl GpuMatrix {
             && tokens > 1
             && Gpu::supports_8bit(self.kind)
             && n.is_multiple_of(32)
-            && !Gpu::whole_number_products(self.kind, n, tokens)
             && Gpu::tile_beats_few(self.kind, self.rows, n, tokens)
-            && gpu
-                .gated_quantize(gate, up, n, q8, tokens, gelu)
-                .map_err(gpu_error)?
         {
-            return gpu
-                .matmul_8bit(self.kind, self.data.ptr(), q8, y, self.rows, n, tokens)
-                .map_err(gpu_error);
+            let fused = if Gpu::whole_number_products(self.kind, n, tokens) {
+                gpu.gated_quantize_i8(gate, up, n, q8, tokens, gelu)
+                    .map_err(gpu_error)?
+            } else {
+                gpu.gated_quantize(gate, up, n, q8, tokens, gelu)
+                    .map_err(gpu_error)?
+            };
+            if fused {
+                return gpu
+                    .matmul_8bit(self.kind, self.data.ptr(), q8, y, self.rows, n, tokens)
+                    .map_err(gpu_error);
+            }
         }
         if gelu {
             gpu.geglu(gate, up, n, n, tokens).map_err(gpu_error)?;

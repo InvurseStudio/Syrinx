@@ -165,7 +165,7 @@ template [[host_name("matmul_tc_wide_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_W
 #ifndef MOE_TC_TOKENS
 #define MOE_TC_TOKENS 64
 #endif
-template <int KIND, int TOK, int ROWS = TC_ROWS, int KK = TC_K>
+template <int KIND, int TOK, int ROWS = TC_ROWS, int KK = TC_K, int BUFS = 2>
 kernel void moe_matmul_tc(ARGS, KP) {
     const int rows = ARG_INT(3), cols = ARG_INT(4);
     device const int* tile = ARG_PTR(const int, 5) + 3 * gid.y;
@@ -176,7 +176,7 @@ kernel void moe_matmul_tc(ARGS, KP) {
     device const u8* w = ARG_PTR(const u8, 0) + (ulong)tile[0] * (ulong)rows * row_bytes;
     device half* x = ARG_PTR(half, 1) + (ulong)tile[1] * x_stride;
     device float* y = ARG_PTR(float, 2) + (ulong)tile[1] * y_stride;
-    threadgroup half sab[2 * ROWS * KK];
+    threadgroup half sab[BUFS * ROWS * KK];
     const int row0 = gid.x * ROWS;
     constexpr int RUNS = KK / 32, PER = (ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
 
@@ -192,7 +192,7 @@ kernel void moe_matmul_tc(ARGS, KP) {
 
     int flip = 0;
     for (int k0 = 0; k0 < cols; k0 += KK, flip ^= 1) {
-        threadgroup half* sa = sab + flip * (ROWS * KK);
+        threadgroup half* sa = sab + (BUFS > 1 ? flip : 0) * (ROWS * KK);
         for (int part = 0; part < PER; part++) {
             const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
             if (lr >= ROWS) break;
@@ -208,6 +208,7 @@ kernel void moe_matmul_tc(ARGS, KP) {
         auto tile_w = tensor(sa, dextents<int32_t, 2>(k_len, ROWS), array<int, 2>({1, KK}));
         auto tile_x = tensor(x + k0, dextents<int32_t, 2>(k_len, tokens), array<int, 2>({1, x_stride}));
         mm.run(tile_x, tile_w, acc);
+        if (BUFS == 1) BARRIER;
     }
     auto t_y = tensor(y + row0, dextents<int32_t, 2>(min(ROWS, rows - row0), tokens), array<int, 2>({1, y_stride}));
     acc.store(t_y);
@@ -219,6 +220,14 @@ template [[host_name("moe_matmul_tc_q8_0")]] kernel void moe_matmul_tc<K_Q8_0, M
 template [[host_name("moe_matmul_tc_q4_k")]] kernel void moe_matmul_tc<K_Q4_K, MOE_TC_TOKENS>(ARGS, KP);
 template [[host_name("moe_matmul_tc_q5_k")]] kernel void moe_matmul_tc<K_Q5_K, MOE_TC_TOKENS>(ARGS, KP);
 template [[host_name("moe_matmul_tc_q6_k")]] kernel void moe_matmul_tc<K_Q6_K, MOE_TC_TOKENS>(ARGS, KP);
+// Small tile for multi-chat decode / short batches where each expert only gets a few slots.
+template [[host_name("moe_matmul_tc_t16_f32")]] kernel void moe_matmul_tc<K_F32, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_f16")]] kernel void moe_matmul_tc<K_F16, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_q4_0")]] kernel void moe_matmul_tc<K_Q4_0, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_q8_0")]] kernel void moe_matmul_tc<K_Q8_0, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_q4_k")]] kernel void moe_matmul_tc<K_Q4_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_q5_k")]] kernel void moe_matmul_tc<K_Q5_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_q6_k")]] kernel void moe_matmul_tc<K_Q6_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
 
 // matmul_tc's splits added up, in order: y[i] = parts[0][i] + parts[1][i] + ...
 kernel void sum_parts(ARGS, KP) {
@@ -646,10 +655,8 @@ inline float decode32_i8<K_Q6_K>(device const u8* row, int k, threadgroup i8* ou
         const u32 lw[4] = {lq.x, lq.y, lq.z, lq.w}, hw[4] = {hq.x, hq.y, hq.z, hq.w};
         for (int i = 0; i < 4; i++) {
             const u32 qv = ((lw[i] >> shift) & 0x0F0F0F0Fu) | (((hw[i] >> (2 * run)) & 0x03030303u) << 4);
-            const float4 v = (float4((float)(qv & 0xFF), (float)((qv >> 8) & 0xFF), (float)((qv >> 16) & 0xFF),
-                                     (float)(qv >> 24)) - 32.0f) * s;
-            const uint4 r = uint4(int4(rint(v))) & 0xFFu;
-            o[4 * h + i] = r.x | (r.y << 8) | (r.z << 16) | (r.w << 24);
+            const float4 v = (float4(as_type<uchar4>(qv)) - 32.0f) * s;
+            o[4 * h + i] = as_type<u32>(char4(rint(v)));
         }
     }
     return half_at(block + 208) * (32.0f * top / 127.0f);
@@ -667,7 +674,7 @@ inline float decode32_i8<K_Q8_0>(device const u8* row, int k, threadgroup i8* ou
     return top;
 }
 
-template <int KIND, int TOK, int ROWS>
+template <int KIND, int TOK, int ROWS, int SG = TC_SG>
 kernel void matmul_i8(ARGS, KP) {
     device const u8* w = ARG_PTR(const u8, 0);
     device i8* x = ARG_PTR(i8, 1);  // the activations in 8 bits (to_i8)
@@ -675,36 +682,43 @@ kernel void matmul_i8(ARGS, KP) {
     const int rows = ARG_INT(3), cols = ARG_INT(4), tokens = ARG_INT(5);
     device const float* xs = ARG_PTR(const float, 6);  // their scales: [token][step]
     const ulong row_bytes = mm_row_bytes<KIND>(cols);
-    threadgroup i8 sa[ROWS * I8_K];  // the weights' tile: [row][k]
-    threadgroup float sw[ROWS];      // and its rows' scales
+    // Double-buffered weight tile + row scales + activation scales so decoding overlaps
+    // the previous step's product with a single barrier per step.
+    threadgroup i8 sab[2 * ROWS * I8_K];
+    threadgroup float swb[2 * ROWS];
+    threadgroup float sxsb[2 * TOK];
     const int row0 = gid.x * ROWS, tok0 = gid.y * TOK, steps = cols / I8_K;
-    constexpr int RUNS = I8_K / 32, PER = (ROWS * RUNS + TC_THREADS - 1) / TC_THREADS;
+    constexpr int THREADS = 32 * SG;
+    constexpr int RUNS = I8_K / 32, PER = (ROWS * RUNS + THREADS - 1) / THREADS;
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(TOK, ROWS, I8_K, false, true, true,
-                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<TC_SG>>
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<SG>>
         mm;
-    auto t_w = tensor(sa, dextents<int32_t, 2>(I8_K, ROWS));
-    auto t_x = tensor(x, dextents<int32_t, 2>(I8_K, tokens), array<int, 2>({1, cols}));
-    auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x), decltype(t_w), int>();
-    // This thread's share of the tile's sums: each one's token and row.
-    constexpr int MINE = TOK * ROWS / TC_THREADS;
+    auto t_w0 = tensor(sab, dextents<int32_t, 2>(I8_K, ROWS));
+    auto t_x0 = tensor(x, dextents<int32_t, 2>(I8_K, tokens), array<int, 2>({1, cols}));
+    auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x0), decltype(t_w0), int>();
+    // This thread's share of the tile's sums: each one's local token and row.
+    constexpr int MINE = TOK * ROWS / THREADS;
     float sum[MINE];
-    ushort at_t[MINE], at_r[MINE];
+    uchar at_t[MINE], at_r[MINE];
     const int mine = min((int)acc.get_capacity(), MINE);
     for (int i = 0; i < mine; i++) {
         const auto at = acc.get_multidimensional_index(i);
-        at_r[i] = at[0];
-        at_t[i] = min(tok0 + (int)at[1], tokens - 1);
+        at_r[i] = (uchar)at[0];
+        at_t[i] = (uchar)at[1];
         sum[i] = 0.0f;
-        acc[i] = 0;
     }
 
-    for (int step = 0; step < steps; step++) {
+    int flip = 0;
+    for (int step = 0; step < steps; step++, flip ^= 1) {
         const int k0 = step * I8_K;
+        threadgroup i8* sa = sab + flip * (ROWS * I8_K);
+        threadgroup float* sw = swb + flip * ROWS;
+        threadgroup float* sxs = sxsb + flip * TOK;
         for (int part = 0; part < PER; part++) {
-            const int run = tid + part * TC_THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
+            const int run = tid + part * THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
             if (lr >= ROWS) break;
             threadgroup i8* dst = sa + lr * I8_K + lk;
             float scale = 0.0f;
@@ -715,28 +729,32 @@ kernel void matmul_i8(ARGS, KP) {
             }
             if (lk == 0) sw[lr] = scale;
         }
-        BARRIER;
-        auto tile_x = tensor(x + (ulong)tok0 * cols + k0, dextents<int32_t, 2>(I8_K, tokens - tok0),
-                             array<int, 2>({1, cols}));
-        mm.run(tile_x, t_w, acc);
-        for (int i = 0; i < mine; i++) {
-            sum[i] += (float)acc[i] * (xs[(ulong)at_t[i] * steps + step] * sw[at_r[i]]);
-            acc[i] = 0;
+        for (int lt = tid; lt < TOK; lt += THREADS) {
+            const int gt = tok0 + lt;
+            sxs[lt] = gt < tokens ? xs[(ulong)gt * steps + step] : 0.0f;
         }
         BARRIER;
+        auto tile_w = tensor(sa, dextents<int32_t, 2>(I8_K, ROWS));
+        auto tile_x = tensor(x + (ulong)tok0 * cols + k0, dextents<int32_t, 2>(I8_K, tokens - tok0),
+                             array<int, 2>({1, cols}));
+        mm.run(tile_x, tile_w, acc);
+        for (int i = 0; i < mine; i++) {
+            sum[i] += (float)acc[i] * (sxs[at_t[i]] * sw[at_r[i]]);
+        }
     }
     for (int i = 0; i < mine; i++) {
-        const auto at = acc.get_multidimensional_index(i);
-        const int t = tok0 + (int)at[1], r = row0 + (int)at[0];
+        const int t = tok0 + (int)at_t[i], r = row0 + (int)at_r[i];
         if (t < tokens && r < rows) y[(ulong)t * rows + r] = sum[i];
     }
 }
-template [[host_name("matmul_i8_q6_k")]] kernel void matmul_i8<K_Q6_K, 128, 32>(ARGS, KP);
-template [[host_name("matmul_i8_q8_0")]] kernel void matmul_i8<K_Q8_0, 128, 32>(ARGS, KP);
+template [[host_name("matmul_i8_q6_k")]] kernel void matmul_i8<K_Q6_K, 128, 32, 4>(ARGS, KP);
+template [[host_name("matmul_i8_q8_0")]] kernel void matmul_i8<K_Q8_0, 128, 32, 4>(ARGS, KP);
+template [[host_name("matmul_i8_wide_q6_k")]] kernel void matmul_i8<K_Q6_K, 256, 32, 8>(ARGS, KP);
+template [[host_name("matmul_i8_wide_q8_0")]] kernel void matmul_i8<K_Q8_0, 256, 32, 8>(ARGS, KP);
 
 // f32 activations to 8 bits for matmul_i8: a threadgroup of 256 threads takes one token's
 // I8_K columns, rounds them against the largest of them and notes the scale.
-// Arguments: x, the 8-bit copy, the scales, how many numbers.
+// Arguments: x, the 8-bit copy, the scales.
 kernel void to_i8(ARGS, KP) {
     device const float* x = ARG_PTR(const float, 0);
     device i8* out = ARG_PTR(i8, 1);
@@ -753,6 +771,33 @@ kernel void to_i8(ARGS, KP) {
     out[i] = top > 0.0f ? (i8)(int)rint(v / scale) : (i8)0;
     if (tid == 0) scales[gid.x] = scale;
 }
+
+// Fused act(gate) * up -> i8 + per-256 scale for matmul_i8, skipping the f32 store/reload
+// of the FFN intermediate. Arguments: gate, up, out (i8), scales (f32).
+template <bool GELU>
+kernel void gated_i8(ARGS, KP) {
+    device const float* gate = ARG_PTR(const float, 0);
+    device const float* up = ARG_PTR(const float, 1);
+    device i8* out = ARG_PTR(i8, 2);
+    device float* scales = ARG_PTR(float, 3);
+    threadgroup float most[I8_K / 32];
+    const ulong i = (ulong)gid.x * I8_K + tid;
+    const float g = gate[i];
+    const float act = GELU
+        ? (0.5f * g * (1.0f + tanh(0.7978846f * g * (1.0f + 0.044715f * g * g))))
+        : (g / (1.0f + metal::fast::exp2(-g * 1.4426950408889634f)));
+    const float v = act * up[i];
+    const float m = simd_max(fabs(v));
+    const uint lane = tid & 31;
+    if (lane == 0) most[tid >> 5] = m;
+    BARRIER;
+    const float top = simd_max(lane < I8_K / 32 ? most[lane] : 0.0f);
+    const float scale = top / 127.0f;
+    out[i] = top > 0.0f ? (i8)(int)rint(v / scale) : (i8)0;
+    if (tid == 0) scales[gid.x] = scale;
+}
+template [[host_name("swiglu_i8")]] kernel void gated_i8<false>(ARGS, KP);
+template [[host_name("geglu_i8")]] kernel void gated_i8<true>(ARGS, KP);
 
 // delta_chunk_scan on Metal 4 neural accelerators (n = 128, DC = 64, COLS columns of
 // value head gid.x's state per threadgroup gid.y, 4 SIMD groups = 128 threads):
