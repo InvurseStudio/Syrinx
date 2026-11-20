@@ -4484,7 +4484,7 @@ fn pick_skill(
     offered: &[tools::Tool],
     request: &str,
 ) -> Result<Option<skills::Skill>, String> {
-    const SKILL_SHARE: f64 = 0.5;
+    const SKILL_SHARE: f64 = 0.75;
     const OVER_CONTROL: f64 = 0.4;
     let names: Vec<&str> = offered.iter().map(|t| t.name).collect();
     let mut skills = pc_skills(&names);
@@ -4506,23 +4506,46 @@ fn pick_skill(
     }
     let asked: Vec<usize> = if let Some(ids) = shortlist_ids.filter(|ids| ids.len() <= 1000) {
         let logits = model.ask(kept, &ids)?;
-        let mut ranked: Vec<(f32, usize)> = (0..skills.len().min(skills::SHORTLISTED))
+        let none_id = tokenizer.encode(" none", false, false)[0];
+        let none_logit = logits[none_id as usize];
+        let mut ranked: Vec<(f32, u32, usize)> = (0..skills.len().min(skills::SHORTLISTED))
             .map(|i| {
                 // The first token of the skill's name, as the next word.
                 let id = tokenizer.encode(&format!(" {}", skills[i].name), false, false)[0];
-                (logits[id as usize], i)
+                (logits[id as usize], id, i)
             })
             .collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // If the shortlist strongly prefers "none" over every skill (>20×), skip per-skill
+        // questions altogether: saves two forward passes and prevents false-positive loads.
+        if ranked.first().is_none_or(|&(top, _, _)| none_logit - top >= 3.0) {
+            if debug_calls() {
+                let top = ranked.first().map_or(f32::NEG_INFINITY, |r| r.0);
+                eprintln!("[calls] shortlist chose none ({none_logit:.2} vs top {top:.2})");
+            }
+            return Ok(None);
+        }
+        // Take the top SKILLS_ASKED distinct first-token groups so user skills sharing a
+        // prefix (e.g. `write-memo` and `write-document`) are both disambiguated.
+        let mut chosen_tokens: Vec<u32> = Vec::with_capacity(SKILLS_ASKED);
+        let mut out: Vec<usize> = Vec::new();
+        for &(_, tok, idx) in &ranked {
+            if !chosen_tokens.contains(&tok) {
+                if chosen_tokens.len() >= SKILLS_ASKED {
+                    break;
+                }
+                chosen_tokens.push(tok);
+            }
+            out.push(idx);
+            if out.len() >= SKILLS_ASKED + 2 {
+                break;
+            }
+        }
         if debug_calls() {
-            let names: Vec<&str> = ranked
-                .iter()
-                .take(SKILLS_ASKED)
-                .map(|&(_, i)| skills[i].name.as_str())
-                .collect();
+            let names: Vec<&str> = out.iter().map(|&i| skills[i].name.as_str()).collect();
             eprintln!("[calls] skills shortlisted: {}", names.join(", "));
         }
-        ranked.iter().take(SKILLS_ASKED).map(|&(_, i)| i).collect()
+        out
     } else {
         (0..skills.len()).collect()
     };

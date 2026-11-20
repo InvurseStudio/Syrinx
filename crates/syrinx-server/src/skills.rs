@@ -284,9 +284,10 @@ pub fn named<'a>(request: &str, skills: &'a [Skill]) -> Option<&'a Skill> {
 /// said yes to it there); someone saying who they are, which Gemma 4 E2B took for
 /// `fill-template` in the test gauntlet. (A short note to write was tried as a third: it
 /// stopped `write-document` from fitting a memo, on Gemma 4 E2B and Qwen 3.5 4B alike.)
-pub const CONTROLS: [&str; 2] = [
+pub const CONTROLS: [&str; 3] = [
     "What's the capital of France?",
     "I'm Sam Reyes, I run the front desk at a bakery in Leeds.",
+    "What's the phone number in contacts.txt?",
 ];
 
 /// The question that scores whether one skill fits a request, with worked examples (of
