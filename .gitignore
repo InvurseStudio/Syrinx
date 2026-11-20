@@ -11,3 +11,7 @@
 # The Windows app's build output
 bin/
 obj/
+
+# The Mac app's build output
+/macos/SyrinxManager/.build/
+/macos/SyrinxManager/build/
