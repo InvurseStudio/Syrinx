@@ -83,9 +83,6 @@ pub fn export(path: &Path) -> Result<Copy, String> {
         "key" => (2, &KEYNOTE),
         _ => return Err(format!("{file_name} isn't a Pages, Numbers or Keynote file.")),
     };
-    if !cfg!(target_os = "macos") {
-        return Err(format!("{file_name} needs {} on a Mac to read it.", app.name));
-    }
     if !path.exists() {
         return Err(format!("File not found: {}", path.display()));
     }
@@ -95,6 +92,9 @@ pub fn export(path: &Path) -> Result<Copy, String> {
              and remove the password, or export a copy.",
             app.name
         ));
+    }
+    if !cfg!(target_os = "macos") {
+        return Err(format!("{file_name} needs {} on a Mac to read it.", app.name));
     }
     if !installed(app) {
         return Err(format!(
