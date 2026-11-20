@@ -351,11 +351,16 @@ impl Tool {
 /// Every tool this server knows. Optional arguments are left out for now: small models
 /// fill them in where they shouldn't (Llama 3.2 1B asked for one line of a file), so
 /// they'll come back where the eval says a model uses them well.
+/// What Settings and approvals call a tool's kind of change ("Rename files").
+pub fn approval_label(tool: &str) -> Option<&'static str> {
+    catalog().into_iter().find(|t| t.name == tool).and_then(|t| t.asks).map(|a| a.label)
+}
+
 fn catalog() -> Vec<Tool> {
     vec![
         Tool {
             name: "read_file",
-            description: "Read a text file, PDF, or Word, Excel or PowerPoint document on this PC. To read several files, give all their paths in one call, one a line, rather than a call for each.",
+            description: "Read a text file, PDF, or Word, Excel, PowerPoint, Pages, Numbers or Keynote document on this PC. To read several files, give all their paths in one call, one a line, rather than a call for each.",
             params: vec![text(
                 "path",
                 "The file's path: a full path, or one relative to the home folder (Documents/report.pdf). Several files: one path a line. Don't make one up.",
@@ -436,7 +441,7 @@ fn catalog() -> Vec<Tool> {
         // the app says it runs them. `files.rs` doesn't have them, so on the Mac they wait.
         Tool {
             name: "read_spreadsheet",
-            description: "Read an Excel workbook (.xlsx) on this PC: its sheet names, then the cells of its first sheet, row by row.",
+            description: "Read an Excel workbook (.xlsx) or Numbers spreadsheet on this PC: its sheet names, then the cells of its first sheet, row by row.",
             params: vec![text(
                 "path",
                 "The workbook's path: a full path, or one relative to the home folder (Documents/budget.xlsx).",
@@ -490,7 +495,7 @@ fn catalog() -> Vec<Tool> {
         },
         Tool {
             name: "fill_docx_template",
-            description: "Fill a Word template on this PC: replace each {{placeholder}} in a .docx with a value, keeping its formatting, and save the result as a new document. Read the template first to see its placeholders. Asks the user for approval.",
+            description: "Fill a Word or Pages template on this PC: replace each {{placeholder}} in a .docx or .pages file with a value, keeping its formatting, and save the result as a new document. Read the template first to see its placeholders. Asks the user for approval.",
             params: vec![
                 text("template", "The template's path (.docx)."),
                 text(

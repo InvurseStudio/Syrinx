@@ -99,9 +99,11 @@ pub fn use_own_folder() {
     let _ = FOLDER.set("Syrinx");
 }
 
-/// The prototype's own folder: `~/Library/Application Support/VireoPrototype` on the Mac
-/// (where the Mac prototype app keeps its chats), `%LOCALAPPDATA%\VireoPrototype`
-/// elsewhere; `Syrinx` in place of `VireoPrototype` when serving on its own.
+/// The app's folder: `~/Library/Application Support/<folder>` on the Mac (where the Mac
+/// app keeps its chats), `%LOCALAPPDATA%\<folder>` elsewhere. The folder is the one the app
+/// names (`VIREO_DATA_FOLDER`: the released Mac app's is `Vireo`), `VireoPrototype` by
+/// default (a development build's, and the Windows app's), or `Syrinx` when serving on
+/// its own.
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map_or_else(
@@ -115,7 +117,15 @@ pub fn data_dir() -> PathBuf {
     } else {
         std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
     };
-    base.join(FOLDER.get_or_init(|| "VireoPrototype"))
+    // The app names its folder (`VIREO_DATA_FOLDER`: Vireo's is `Vireo`).
+    base.join(FOLDER.get_or_init(|| {
+        match std::env::var("VIREO_DATA_FOLDER") {
+            Ok(name) if !name.is_empty() && !name.contains(['/', '\\']) && name != ".." => {
+                Box::leak(name.into_boxed_str())
+            }
+            _ => "VireoPrototype",
+        }
+    }))
 }
 
 /// The default folder for `key`'s saved chats.

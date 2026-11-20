@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="macos/SyrinxManager/assets/SyrinxIcon.svg" alt="Syrinx icon" width="120" height="120">
+</p>
+
 # Syrinx
 
 **A local inference engine and agent server, written from scratch in Rust.**
@@ -243,9 +247,9 @@ even if the app is force-quit.
 
 ## Status
 
-Syrinx is young and moving fast. It runs every chat in the Vireo-Proto apps for Mac and
-Windows, and will replace Vireo's current Python server and the inference runtimes it
-starts. Other GPUs and NPUs come later.
+Syrinx is young and moving fast. It runs every chat in Vireo for Mac (from 0.9.1, where it
+replaced Vireo's Python server and the inference runtimes it started) and in the Windows
+app. Other GPUs and NPUs come later.
 
 Progress, benchmarks and what's next are posted on X: [@InvurseNorth](https://x.com/InvurseNorth).
 

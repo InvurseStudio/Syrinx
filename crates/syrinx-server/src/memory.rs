@@ -114,6 +114,89 @@ pub fn forget(fact: &str) -> Result<String, String> {
     }
 }
 
+// ---- Settings > Memory -----------------------------------------------------------------
+//
+// The app's Memory page, as 0.9's: the list, adding, editing and deleting a fact, and
+// turning memory off (no facts in chats, and no remember or forget tools).
+
+/// The marker that memory is off, beside the facts.
+fn off_marker() -> PathBuf {
+    path().with_file_name("memory-off")
+}
+
+pub fn enabled() -> bool {
+    !off_marker().exists()
+}
+
+pub fn set_enabled(on: bool) -> Result<(), String> {
+    let marker = off_marker();
+    if on {
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Couldn't turn memory on: {e}")),
+            _ => Ok(()),
+        }
+    } else {
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&marker, "").map_err(|e| format!("Couldn't turn memory off: {e}"))
+    }
+}
+
+/// A fact's id: the start of its text's hash, so it stays the same while the text does.
+pub fn id_of(fact: &str) -> String {
+    crate::developer::sha256_hex(fact.as_bytes())[..12].to_string()
+}
+
+/// `GET /api/memory`: `{settings: {enabled}, memories: [{id, text, source}]}`.
+pub fn overview_json() -> String {
+    let memories: Vec<String> = all()
+        .iter()
+        .map(|f| {
+            format!(
+                "{{\"id\":{},\"text\":{},\"source\":\"chat\"}}",
+                crate::json::string(&id_of(f)),
+                crate::json::string(f)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"settings\":{{\"enabled\":{}}},\"memories\":[{}]}}",
+        enabled(),
+        memories.join(",")
+    )
+}
+
+/// Adds a fact the user typed.
+pub fn add(text: &str) -> Result<(), String> {
+    remember(text).map(|_| ())
+}
+
+/// Changes the fact with `id` to `text`. `Ok(false)` if there's no such fact.
+pub fn edit(id: &str, text: &str) -> Result<bool, String> {
+    let text = clean(text);
+    if text.is_empty() {
+        return Err("A memory can't be empty.".into());
+    }
+    let mut facts = all();
+    let Some(i) = facts.iter().position(|f| id_of(f) == id) else {
+        return Ok(false);
+    };
+    facts[i] = text;
+    save(&facts).map(|_| true)
+}
+
+/// Deletes the fact with `id`. `Ok(false)` if there's no such fact.
+pub fn delete(id: &str) -> Result<bool, String> {
+    let mut facts = all();
+    let before = facts.len();
+    facts.retain(|f| id_of(f) != id);
+    if facts.len() == before {
+        return Ok(false);
+    }
+    save(&facts).map(|_| true)
+}
+
 /// The lines for a chat's instructions, or `None` when nothing is remembered.
 #[cfg(test)]
 pub fn instructions() -> Option<String> {
@@ -192,6 +275,18 @@ mod tests {
             since(&facts[1..]),
             "\n\n(Remembered since this chat began, as background about the user:\n- Her files are in Documents/Comms.)"
         );
+        // Settings > Memory: edit, delete, and turning it off.
+        let id = id_of("Her files are in Documents/Comms.");
+        assert!(overview_json().contains(&id));
+        assert!(edit(&id, "Her files are in Documents/Comms 2026.").unwrap());
+        assert!(!delete(&id).unwrap());
+        assert!(delete(&id_of("Her files are in Documents/Comms 2026.")).unwrap());
+        assert_eq!(all(), ["Maya is the Communications Coordinator."]);
+        assert!(enabled());
+        set_enabled(false).unwrap();
+        assert!(!enabled() && overview_json().contains("\"enabled\":false"));
+        set_enabled(true).unwrap();
+        assert!(enabled());
         let _ = std::fs::remove_file(&file);
     }
 }

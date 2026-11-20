@@ -3,7 +3,7 @@
 Syrinx is Vireo's own engine. Since 2026-11-19 it has its own repository
 (InvurseStudio/Syrinx), mounted in the Vireo repository as a git submodule at `Syrinx/`;
 before that it was `Syrinx/` there (and `VireoPrototype/` until 2026-11-17), and its
-history came along. The chat apps that run on it, Vireo-Proto for Mac and Windows, keep the
+history came along. The chat apps that run on it, Vireo for Mac (from 0.9.1) and Windows, keep the
 Vireo name and live in the Vireo repository (`Mac/`, `Windows/`), as do the evals,
 benchmarks and the Aurelia gauntlet (`evals/`, `../evals/` from here in a Vireo checkout).
 

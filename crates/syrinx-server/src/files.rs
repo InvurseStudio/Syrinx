@@ -36,7 +36,9 @@ const SKIPPED_FOLDERS: [&str; 4] = ["node_modules", "venv", "__pycache__", "site
 /// Read with the Mac's document readers rather than as text.
 const RICH_TEXT_EXTENSIONS: [&str; 5] = ["docx", "doc", "rtf", "rtfd", "odt"];
 /// Documents these tools can't read yet.
-const UNREAD_DOCUMENTS: [&str; 5] = ["xls", "pptx", "pages", "numbers", "key"];
+const UNREAD_DOCUMENTS: [&str; 2] = ["xls", "ppt"];
+/// PowerPoint decks, read by `attach::pptx`.
+const DECKS: [&str; 3] = ["pptx", "pptm", "potx"];
 /// Excel workbooks, read by `attach::xlsx`.
 const WORKBOOKS: [&str; 2] = ["xlsx", "xlsm"];
 
@@ -62,6 +64,60 @@ fn can_move_to(source: &str, destination: &str) -> Result<(), String> {
         return Err(format!("Folder not found: {folder}"));
     }
     Ok(())
+}
+
+/// A Word, Excel or PowerPoint file on this Mac as Markdown, for the app's preview pane
+/// (`GET /api/preview/office`), as 0.9 showed it: every sheet as a table, every slide with
+/// its notes.
+pub fn office_preview(path: &str) -> Result<String, String> {
+    let file = Path::new(path);
+    if !file.is_absolute() || !file.is_file() {
+        return Err("File not found.".into());
+    }
+    let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let size = fs::metadata(file).map_or(0, |m| m.len());
+    if size > crate::attach::xlsx::MAX_FILE {
+        return Err("This file is too large to preview.".into());
+    }
+    let data = fs::read(file).map_err(|e| format!("Couldn't read it: {e}"))?;
+    match ext.as_str() {
+        "docx" | "dotx" | "docm" => crate::attach::docx::text(&data),
+        "xlsx" | "xlsm" => crate::attach::xlsx::open(&data).map(|w| w.markdown()),
+        "pptx" | "pptm" | "potx" => crate::attach::pptx::markdown(&data),
+        _ => Err("Only Word, Excel and PowerPoint files are previewed here.".into()),
+    }
+}
+
+/// A Pages, Numbers or Keynote file's text, read from the Office copy its app exports
+/// (`iwork`); `None` for any other file.
+fn iwork_text(file: &str) -> Result<Option<String>, String> {
+    let ext = Path::new(file).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let Some(app) = crate::iwork::app_for(&ext) else { return Ok(None) };
+    let copy = crate::iwork::export(Path::new(file))?;
+    let copied = copy.path.to_string_lossy().into_owned();
+    let size = fs::metadata(&copy.path).map_or(0, |m| m.len());
+    let text = match app.extension {
+        "docx" => {
+            let data = fs::read(&copy.path).map_err(|e| e.to_string())?;
+            crate::attach::docx::text(&data)?
+        }
+        "xlsx" => workbook(&copied, size)?.describe(),
+        _ => deck(&copied, size)?,
+    };
+    Ok(Some(format!(
+        "{} document, read from a copy {} exported in {} format.\n\n{text}",
+        app.name, app.name, app.office
+    )))
+}
+
+/// A PowerPoint deck's slides, text, tables and notes.
+fn deck(file: &str, size: u64) -> Result<String, String> {
+    let name = file_name(file);
+    if size > crate::attach::xlsx::MAX_FILE {
+        return Err(format!("{name} is too large to read ({} MB). The most is 30 MB.", size >> 20));
+    }
+    let data = fs::read(file).map_err(|_| format!("Couldn't read {file}."))?;
+    crate::attach::pptx::text(&data).map_err(|e| format!("Couldn't read {name}: {e}"))
 }
 
 /// Opens the workbook at `file` (`size` bytes).
@@ -120,6 +176,8 @@ pub struct Files {
     access: Access,
     /// Where deleted and replaced files go instead of the system's Trash (tests).
     trash_folder: Option<String>,
+    /// The reply's undo journal (`undo.rs`): what its changes were, to reverse them.
+    journal: Option<std::sync::Arc<std::sync::Mutex<crate::undo::Journal>>>,
 }
 
 impl Files {
@@ -134,7 +192,21 @@ impl Files {
             home: standardized(&long_form(home)),
             access,
             trash_folder: None,
+            journal: None,
         }
+    }
+
+    /// The changes these tools make are kept in `journal`, so they can be undone.
+    pub fn with_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<crate::undo::Journal>>,
+    ) -> Files {
+        self.journal = Some(journal);
+        self
+    }
+
+    fn journal(&self) -> Option<std::sync::MutexGuard<'_, crate::undo::Journal>> {
+        self.journal.as_ref().map(|j| j.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Deleted and replaced files go into `folder`, not the system's Trash.
@@ -314,6 +386,18 @@ impl Files {
     /// beside it first, so a failed write leaves the old one whole, and the old one goes
     /// to the Trash, not away.
     fn replace(&self, file: &str, bytes: &[u8]) -> Result<(), String> {
+        let pending = match self.journal() {
+            Some(mut j) => Some(j.before_write(file)?),
+            None => None,
+        };
+        let written = self.replace_now(file, bytes);
+        if let (Some(pending), Some(mut j)) = (pending, self.journal()) {
+            j.after_write(pending);
+        }
+        written
+    }
+
+    fn replace_now(&self, file: &str, bytes: &[u8]) -> Result<(), String> {
         fs::create_dir_all(parent(file))
             .map_err(|e| format!("Couldn't make the folder for {file}: {e}"))?;
         let temp = format!("{file}.vireo-writing");
@@ -349,13 +433,14 @@ impl Files {
     /// means beside the template, and never over the template itself.
     fn template_and_target(&self, template: &str, path: &str) -> Result<(String, String), String> {
         let template = self.resolve(template)?;
-        if !exists(&template) || is_dir(&template) {
+        let lower = template.to_lowercase();
+        // A Pages template may be a folder (a package).
+        if !exists(&template) || (is_dir(&template) && !lower.ends_with(".pages")) {
             return Err(format!("File not found: {template}"));
         }
-        let lower = template.to_lowercase();
-        if !(lower.ends_with(".docx") || lower.ends_with(".dotx")) {
+        if !(lower.ends_with(".docx") || lower.ends_with(".dotx") || lower.ends_with(".pages")) {
             return Err(format!(
-                "{} isn't a Word template (.docx or .dotx).",
+                "{} isn't a Word or Pages template (.docx, .dotx or .pages).",
                 file_name(&template)
             ));
         }
@@ -403,7 +488,13 @@ impl Files {
                 (k.clone(), text)
             })
             .collect();
-        let data = fs::read(&template).map_err(|_| format!("Couldn't read {template}."))?;
+        // A Pages template is filled from the Word copy Pages exports, and saved as Word.
+        let data = if template.to_lowercase().ends_with(".pages") {
+            let copy = crate::iwork::export(Path::new(&template))?;
+            fs::read(&copy.path).map_err(|_| format!("Couldn't read the Word copy of {}.", file_name(&template)))?
+        } else {
+            fs::read(&template).map_err(|_| format!("Couldn't read {template}."))?
+        };
         let (bytes, result) = crate::attach::docx_write::fill(&data, &values)
             .map_err(|e| format!("Couldn't fill {}: {e}", file_name(&template)))?;
         self.replace(&file, &bytes)?;
@@ -578,6 +669,9 @@ impl Files {
     /// folder, stopping it, and what it started, after `SHELL_TIMEOUT`.
     fn run_shell_command(&self, command: &str) -> Result<String, String> {
         self.shell_allowed(command)?;
+        if let Some(mut j) = self.journal() {
+            j.note_shell(command);
+        }
         let mut shell = if cfg!(windows) {
             let mut c = Command::new("cmd");
             c.args(["/C", command]);
@@ -672,6 +766,9 @@ impl Files {
         let (source, destination) = self.rename_target(path, new_name)?;
         fs::rename(&source, &destination)
             .map_err(|e| format!("Couldn't rename {source}: {e}"))?;
+        if let Some(mut j) = self.journal() {
+            j.moved(&source, &destination);
+        }
         Ok(format!(
             "Renamed successfully: {} -> {}",
             file_name(&source),
@@ -682,18 +779,26 @@ impl Files {
     fn move_file(&self, source: &str, destination: &str) -> Result<String, String> {
         let (source, destination) = self.move_target(source, destination)?;
         fs::rename(&source, &destination).map_err(|e| format!("Couldn't move {source}: {e}"))?;
+        if let Some(mut j) = self.journal() {
+            j.moved(&source, &destination);
+        }
         Ok(format!("Moved successfully: {source} -> {destination}"))
     }
 
     fn delete_file(&self, path: &str) -> Result<String, String> {
         let file = self.deletable(path)?;
-        self.to_trash(&file)
+        let in_trash = self
+            .to_trash(&file)
             .map_err(|e| format!("Couldn't move {file} to the {TRASH}: {e}"))?;
+        if let Some(mut j) = self.journal() {
+            j.trashed(&file, &in_trash);
+        }
         Ok(format!("File moved to the {TRASH}: {file}"))
     }
 
-    /// Moves a file to the Trash (in tests, to their own folder).
-    fn to_trash(&self, file: &str) -> Result<(), String> {
+    /// Moves a file to the Trash (in tests, to their own folder): where it is there, or
+    /// empty if the Trash didn't say.
+    fn to_trash(&self, file: &str) -> Result<String, String> {
         match &self.trash_folder {
             Some(folder) => {
                 fs::create_dir_all(folder).map_err(|e| e.to_string())?;
@@ -703,10 +808,13 @@ impl Files {
                     n += 1;
                     target = join(folder, &format!("{} {n}", file_name(file)));
                 }
-                fs::rename(file, target).map_err(|e| e.to_string())
+                fs::rename(file, &target).map_err(|e| e.to_string())?;
+                Ok(target)
             }
-            None if documents::trash(file) => Ok(()),
-            None => Err(format!("this {MACHINE}'s {TRASH} didn't take it")),
+            None => match documents::trash(file) {
+                Some(in_trash) => Ok(in_trash),
+                None => Err(format!("this {MACHINE}'s {TRASH} didn't take it")),
+            },
         }
     }
 
@@ -863,6 +971,10 @@ impl Files {
         let Ok(meta) = fs::metadata(&file) else {
             return Err(format!("File not found: {file}"));
         };
+        // Pages, Numbers and Keynote (an older one is a folder, a package).
+        if let Some(text) = iwork_text(&file)? {
+            return Ok(text);
+        }
         if meta.is_dir() {
             return Err(format!(
                 "{file} is a folder. Use list_directory to see what's in it."
@@ -887,9 +999,12 @@ impl Files {
         if WORKBOOKS.contains(&ext.as_str()) {
             return Ok(workbook(&file, meta.len())?.describe());
         }
+        if DECKS.contains(&ext.as_str()) {
+            return deck(&file, meta.len());
+        }
         if UNREAD_DOCUMENTS.contains(&ext.as_str()) {
             return Err(format!(
-                "{name} is a document this {MACHINE}'s tools can't read yet. read_file can read text files, PDFs, Word documents and Excel workbooks."
+                "{name} is in an old Office format. Saving it as .{ext}x in Office makes it readable."
             ));
         }
         let size = meta.len();
@@ -902,7 +1017,7 @@ impl Files {
         let data = fs::read(&file).map_err(|_| format!("Couldn't read {file}."))?;
         let text = String::from_utf8(data).map_err(|_| {
             format!(
-                "{name} is not a text file. read_file can read text files, PDFs, Word documents and Excel workbooks."
+                "{name} is not a text file. read_file can read text files, PDFs, and Word, Excel and PowerPoint documents."
             )
         })?;
         Ok(text
@@ -922,9 +1037,15 @@ impl Files {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        if ext == "numbers" {
+            let copy = crate::iwork::export(Path::new(&file))?;
+            let size = fs::metadata(&copy.path).map_or(0, |m| m.len());
+            let sheets = workbook(&copy.path.to_string_lossy(), size)?.read();
+            return Ok(format!("Numbers spreadsheet, read from a copy Numbers exported in Excel format.\n\n{sheets}"));
+        }
         if meta.is_dir() || !WORKBOOKS.contains(&ext.as_str()) {
             return Err(format!(
-                "{name} isn't an Excel workbook (.xlsx). Use read_file for other files."
+                "{name} isn't an Excel workbook (.xlsx) or Numbers spreadsheet. Use read_file for other files."
             ));
         }
         Ok(workbook(&file, meta.len())?.read())
@@ -1538,6 +1659,13 @@ fn arg(call: &Call, name: &str) -> Result<String, String> {
     optional_arg(call, name).ok_or(format!("Missing argument: {name}"))
 }
 
+/// Moves a file to the user's Trash, as undoing a file a reply made does (`undo.rs`).
+pub fn trash_file(path: &str) -> Result<(), String> {
+    documents::trash(path)
+        .map(|_| ())
+        .ok_or_else(|| format!("this {MACHINE}'s {TRASH} didn't take it"))
+}
+
 /// A whole number, sent as a number or as text ("2").
 fn int_arg(call: &Call, name: &str) -> Option<i64> {
     let number: f64 = optional_arg(call, name)?.trim().parse().ok()?;
@@ -1576,22 +1704,31 @@ mod documents {
     }
 
     /// To the user's Trash, as Finder's Move to Trash: it can be put back from there.
-    pub fn trash(path: &str) -> bool {
+    /// Where it is in the Trash (empty if the Trash didn't say), or `None` if it wasn't
+    /// moved.
+    pub fn trash(path: &str) -> Option<String> {
         autoreleasepool(|_| {
             let class = AnyClass::get(c"NSFileManager")?;
             let url = url(path);
             unsafe {
                 let manager: Option<Retained<AnyObject>> = msg_send![class, defaultManager];
+                let mut resulting: *mut AnyObject = std::ptr::null_mut();
                 let done: bool = msg_send![
                     &*manager?,
                     trashItemAtURL: &*url,
-                    resultingItemURL: std::ptr::null_mut::<*mut AnyObject>(),
+                    resultingItemURL: &mut resulting,
                     error: std::ptr::null_mut::<*mut AnyObject>()
                 ];
-                Some(done)
+                if !done {
+                    return None;
+                }
+                if resulting.is_null() {
+                    return Some(String::new());
+                }
+                let in_trash: Option<Retained<NSString>> = msg_send![&*resulting, path];
+                Some(in_trash.map(|p| p.to_string()).unwrap_or_default())
             }
         })
-        .unwrap_or(false)
     }
 
     pub fn rich_text(path: &str) -> Option<String> {
@@ -1624,8 +1761,8 @@ mod documents {
         crate::attach::pdf::text(&bytes).ok()
     }
     /// The server makes no changes on this machine: the app does, to its Recycle Bin.
-    pub fn trash(_path: &str) -> bool {
-        false
+    pub fn trash(_path: &str) -> Option<String> {
+        None
     }
     pub fn rich_text(path: &str) -> Option<String> {
         if !path.to_lowercase().ends_with(".docx") {
@@ -2026,7 +2163,10 @@ mod tests {
         .unwrap();
         let t = tools(&h, Access::Home);
         let deck = failure(&t, "read_file", &[("path", "Documents/budget.pptx")]);
-        assert!(deck.contains("can't read yet"), "{deck}");
+        assert!(deck.starts_with("Couldn't read budget.pptx:"), "{deck}");
+        make(&h, "Documents/old.ppt", "x");
+        let old = failure(&t, "read_file", &[("path", "Documents/old.ppt")]);
+        assert_eq!(old, "old.ppt is in an old Office format. Saving it as .pptx in Office makes it readable.");
         make(&h, "Documents/broken.xlsx", "PK");
         let broken = failure(&t, "read_file", &[("path", "Documents/broken.xlsx")]);
         assert!(broken.starts_with("Couldn't read broken.xlsx:"), "{broken}");
@@ -2035,7 +2175,7 @@ mod tests {
         let binary = failure(&t, "read_file", &[("path", "Documents/photo.bin")]);
         assert_eq!(
             binary,
-            "photo.bin is not a text file. read_file can read text files, PDFs, Word documents and Excel workbooks."
+            "photo.bin is not a text file. read_file can read text files, PDFs, and Word, Excel and PowerPoint documents."
         );
     }
 

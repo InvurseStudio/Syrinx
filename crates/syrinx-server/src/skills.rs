@@ -251,6 +251,140 @@ pub fn user_folder() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("InvurseChat").join("Skills"))
 }
 
+// ---- Settings > Skills -------------------------------------------------------------------
+//
+// The app's Skills page, as 0.9's (`skill_library.py`): every skill, valid or not, turning
+// one off, and importing a skill folder.
+
+/// The skills turned off in Settings, a name a line, in this server's data folder.
+fn off_file() -> PathBuf {
+    crate::store::data_dir().join("skills-off.txt")
+}
+
+pub fn turned_off() -> Vec<String> {
+    std::fs::read_to_string(off_file())
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn set_enabled(name: &str, on: bool) -> Result<(), String> {
+    let mut off = turned_off();
+    off.retain(|n| n != name);
+    if !on {
+        off.push(name.to_string());
+    }
+    let file = off_file();
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text = if off.is_empty() { String::new() } else { off.join("\n") + "\n" };
+    std::fs::write(file, text).map_err(|e| format!("Couldn't save the setting: {e}"))
+}
+
+/// One skill folder as the Skills page lists it, valid or not.
+fn entries_in(folder: Option<&Path>, built_in: bool, off: &[String]) -> Vec<(String, String)> {
+    let Some(folder) = folder else { return Vec::new() };
+    let Ok(dirs) = std::fs::read_dir(folder) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = dirs.flatten().map(|e| e.path().join("SKILL.md")).filter(|p| p.is_file()).collect();
+    files.sort();
+    files
+        .iter()
+        .map(|file| {
+            let dir = file.parent().unwrap_or(folder);
+            let folder_name = dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            let parsed = std::fs::read_to_string(file).map_err(|e| e.to_string()).and_then(|t| parse(&t));
+            let (name, description, valid, problem) = match parsed {
+                Ok((name, description, _)) => (name, description, true, None),
+                Err(why) => (folder_name.clone(), String::new(), false, Some(why)),
+            };
+            let enabled = valid && !off.contains(&name);
+            let json = format!(
+                "{{\"folder\":{},\"path\":{},\"name\":{},\"description\":{},\"valid\":{valid},\"problem\":{},\"enabled\":{enabled},\"builtIn\":{built_in}}}",
+                crate::json::string(&folder_name),
+                crate::json::string(&dir.to_string_lossy()),
+                crate::json::string(&name),
+                crate::json::string(&description),
+                problem.as_deref().map_or("null".to_string(), crate::json::string),
+            );
+            (name, json)
+        })
+        .collect()
+}
+
+/// `GET /api/skill-library`: `{folder, skills: [...]}`, built-in skills (but those the
+/// user's replace) then the user's.
+pub fn library_json() -> String {
+    let off = turned_off();
+    let user = user_folder();
+    let users = entries_in(user.as_deref(), false, &off);
+    let built = built_in_folder();
+    let mut all: Vec<String> = entries_in(built.as_deref(), true, &off)
+        .into_iter()
+        .filter(|(name, _)| !users.iter().any(|(u, _)| u == name))
+        .map(|(_, json)| json)
+        .collect();
+    all.extend(users.into_iter().map(|(_, json)| json));
+    format!(
+        "{{\"folder\":{},\"skills\":[{}]}}",
+        crate::json::string(&user.map_or(String::new(), |f| f.to_string_lossy().into_owned())),
+        all.join(",")
+    )
+}
+
+/// Copies a skill folder (one with a SKILL.md) into the user's skills. One named like a
+/// built-in skill replaces it. Hidden files and `__pycache__` are left behind.
+pub fn import(source: &str) -> Result<String, String> {
+    let folder = user_folder().ok_or("This computer has no folder for skills.")?;
+    import_into(&folder, Path::new(source))
+}
+
+fn import_into(folder: &Path, source: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(source.join("SKILL.md"))
+        .map_err(|_| "That folder has no SKILL.md file.".to_string())?;
+    let (name, _, _) = parse(&text)?;
+    if name.is_empty()
+        || name.chars().count() > MAX_NAME
+        || name.starts_with('.')
+        || name.contains(['/', '\\', ':'])
+    {
+        return Err(format!("\"{name}\" can't be used as a skill's name."));
+    }
+    let target = folder.join(&name);
+    if target.exists() {
+        return Err(format!("A skill called \"{name}\" is already installed."));
+    }
+    copy_folder(source, &target, 0).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&target);
+        format!("Couldn't copy the skill: {e}")
+    })?;
+    Ok(name)
+}
+
+fn copy_folder(from: &Path, to: &Path, depth: usize) -> std::io::Result<()> {
+    if depth > 8 {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if text.starts_with('.') || text == "__pycache__" {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_folder(&entry.path(), &to.join(&name), depth + 1)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), to.join(&name))?;
+        }
+    }
+    Ok(())
+}
+
 /// The tools a skill's instructions name, in order: words in backticks that are tools.
 pub fn tools_named(skill: &Skill) -> Vec<&'static str> {
     skill
@@ -748,5 +882,28 @@ mod tests {
             &skill("x", "Call `list_events`, then `read_file`."),
             &["read_file"]
         ));
+    }
+
+    #[test]
+    fn imports_a_skill_folder_once() {
+        let base = std::env::temp_dir().join(format!("skill-import-{:016x}", crate::random_u64()));
+        let source = base.join("download/tidy-notes");
+        std::fs::create_dir_all(source.join("__pycache__")).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: tidy-notes\ndescription: Tidy a notes file.\n---\n\nRead it with `read_file`.\n",
+        )
+        .unwrap();
+        std::fs::write(source.join(".DS_Store"), "x").unwrap();
+        std::fs::write(source.join("example.md"), "notes").unwrap();
+        let library = base.join("Skills");
+        assert_eq!(import_into(&library, &source).unwrap(), "tidy-notes");
+        assert!(library.join("tidy-notes/SKILL.md").is_file());
+        assert!(library.join("tidy-notes/example.md").is_file());
+        assert!(!library.join("tidy-notes/.DS_Store").exists());
+        assert!(!library.join("tidy-notes/__pycache__").exists());
+        assert!(import_into(&library, &source).unwrap_err().contains("already installed"));
+        assert!(import_into(&library, &base).unwrap_err().contains("no SKILL.md"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

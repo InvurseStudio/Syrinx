@@ -135,6 +135,50 @@ impl Workbook {
         text.trim_end().to_string()
     }
 
+    /// The app's preview pane: each sheet as a Markdown table (its first row as the
+    /// header), the first `PREVIEW_ROWS` rows, as 0.9 showed it.
+    pub fn markdown(&self) -> String {
+        const PREVIEW_ROWS: usize = 200;
+        let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ");
+        let parts: Vec<String> = self
+            .sheets
+            .iter()
+            .map(|sheet| {
+                let mut part = format!("## {}\n\n", sheet.name);
+                if sheet.chart {
+                    part.push_str("*Chart sheet*");
+                    return part;
+                }
+                let columns = sheet.rows.iter().flat_map(|r| r.1.iter().map(|c| c.0));
+                let (Some(first), Some(last)) = (columns.clone().min(), columns.max()) else {
+                    part.push_str("*Empty sheet*");
+                    return part;
+                };
+                let last = last.min(first + MAX_COLUMNS - 1);
+                let width = (last - first + 1) as usize;
+                let line = |cells: &[(u32, String)]| {
+                    let texts: Vec<String> = (first..=last)
+                        .map(|c| cells.iter().find(|x| x.0 == c).map_or(String::new(), |x| cell(&x.1)))
+                        .collect();
+                    format!("| {} |", texts.join(" | "))
+                };
+                let mut lines = Vec::new();
+                for (i, (_, cells)) in sheet.rows.iter().take(PREVIEW_ROWS).enumerate() {
+                    lines.push(line(cells));
+                    if i == 0 {
+                        lines.push(format!("|{}", " --- |".repeat(width)));
+                    }
+                }
+                part.push_str(&lines.join("\n"));
+                if sheet.rows.len() > PREVIEW_ROWS {
+                    part.push_str(&format!("\n\n*First {PREVIEW_ROWS} rows*"));
+                }
+                part
+            })
+            .collect();
+        parts.join("\n\n")
+    }
+
     /// `read_spreadsheet`: the sheets' names, then the first sheet's cells.
     pub fn read(&self) -> String {
         format!("Sheets: {}\n\n{}", self.names(), self.sheets[0].text(MAX_ROWS))
