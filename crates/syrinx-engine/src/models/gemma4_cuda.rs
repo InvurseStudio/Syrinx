@@ -399,7 +399,7 @@ impl<'a> Gemma4Cuda<'a> {
                         for m in [&gate_up, &down] {
                             if !Gpu::supports_experts(m.kind) {
                                 return Err(Error::Unsupported(format!(
-                                    "experts stored as {:?} on the GPU (Q6_K and Q8_0 are)",
+                                    "experts stored as {:?} on the GPU (Q4_0, Q4_K, Q5_K, Q6_K and Q8_0 are)",
                                     m.kind
                                 )));
                             }
