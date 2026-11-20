@@ -17,10 +17,15 @@
 //!   POST   /api/agent/confirm          {id, approved, remember}: the user's answer to an approval
 //!   GET    /api/skill-library/commands the skills this PC can follow, for slash commands
 //!   GET    /api/assistant/approvals    and /activity: empty
+//!   GET    /api/approvals              the kinds always allowed; DELETE /api/approvals/{tool}
+//!   GET    /api/memory                 the remembered facts; POST, PUT /{id}, DELETE /{id},
+//!                                      PUT /api/memory/settings {enabled}
+//!   GET    /api/skill-library          every skill; POST /import {path}, PUT /{name} {enabled}
 //!   POST   /api/upload                 an attachment (multipart) → {path, docId, extractedText}
 //!   GET    /uploads/{id}-{name}        a kept attachment's file
 //!   POST   /api/chat/completions       the reply as server-sent events
 //!   POST   /api/chat/runs/{id}/stop    stops a reply
+//!   POST   /api/chat/runs/{id}/undo    reverses a reply's file changes (`undo.rs`)
 //! Anything else answers 404, which the app takes as "not on this server".
 
 mod attach;
@@ -43,6 +48,7 @@ mod stats;
 mod store;
 mod tasks;
 mod tools;
+mod undo;
 mod web;
 
 use std::collections::HashMap;
@@ -550,6 +556,17 @@ impl Approvals {
             .collect()
     }
 
+    /// Settings > Approvals' Ask Again.
+    fn ask_again(&self, tool: &str) {
+        let mut always = self.always.lock().unwrap();
+        let before = always.len();
+        always.retain(|t| t != tool);
+        if always.len() != before {
+            let text = if always.is_empty() { String::new() } else { always.join("\n") + "\n" };
+            let _ = std::fs::write(Self::file(), text);
+        }
+    }
+
     fn always_allow(&self, tool: &str) {
         let mut always = self.always.lock().unwrap();
         if !always.iter().any(|t| t == tool) {
@@ -891,6 +908,76 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 ),
             }
         }
+        // Settings > Approvals: the kinds of change the user said not to ask about again.
+        ("GET", "/api/approvals") => {
+            let always = shared.approvals.always.lock().unwrap().clone();
+            let listed: Vec<String> = always
+                .iter()
+                .map(|tool| {
+                    format!(
+                        "{{\"tool\":{},\"label\":{}}}",
+                        json::string(tool),
+                        json::string(tools::approval_label(tool).unwrap_or(tool))
+                    )
+                })
+                .collect();
+            http::respond(&mut stream, 200, &format!("{{\"alwaysAllow\":[{}]}}", listed.join(",")))
+        }
+        ("DELETE", p) if p.starts_with("/api/approvals/") => {
+            let tool = http::percent_decoded(&p["/api/approvals/".len()..]);
+            shared.approvals.ask_again(&tool);
+            http::respond(&mut stream, 200, "{\"success\":true}")
+        }
+        // Settings > Memory.
+        ("GET", "/api/memory") => http::respond(&mut stream, 200, &memory::overview_json()),
+        ("POST", "/api/memory") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            match memory::add(body.str("text").unwrap_or("")) {
+                Ok(()) => http::respond(&mut stream, 200, &memory::overview_json()),
+                Err(why) => http::respond(&mut stream, 400, &error(&why)),
+            }
+        }
+        ("PUT", "/api/memory/settings") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            let done = match body.get("enabled") {
+                Some(Value::Bool(on)) => memory::set_enabled(*on),
+                _ => Ok(()),
+            };
+            match done {
+                Ok(()) => http::respond(&mut stream, 200, &memory::overview_json()),
+                Err(why) => http::respond(&mut stream, 500, &error(&why)),
+            }
+        }
+        ("PUT", p) if p.starts_with("/api/memory/") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            match memory::edit(&p["/api/memory/".len()..], body.str("text").unwrap_or("")) {
+                Ok(true) => http::respond(&mut stream, 200, &memory::overview_json()),
+                Ok(false) => http::respond(&mut stream, 404, &error("That memory is gone.")),
+                Err(why) => http::respond(&mut stream, 400, &error(&why)),
+            }
+        }
+        ("DELETE", p) if p.starts_with("/api/memory/") => match memory::delete(&p["/api/memory/".len()..]) {
+            Ok(_) => http::respond(&mut stream, 200, &memory::overview_json()),
+            Err(why) => http::respond(&mut stream, 500, &error(&why)),
+        },
+        // Settings > Skills.
+        ("GET", "/api/skill-library") => http::respond(&mut stream, 200, &skills::library_json()),
+        ("POST", "/api/skill-library/import") => {
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            match skills::import(body.str("path").unwrap_or("")) {
+                Ok(_) => http::respond(&mut stream, 200, &skills::library_json()),
+                Err(why) => http::respond(&mut stream, 400, &error(&why)),
+            }
+        }
+        ("PUT", p) if p.starts_with("/api/skill-library/") => {
+            let name = http::percent_decoded(&p["/api/skill-library/".len()..]);
+            let body = json::parse(&String::from_utf8_lossy(&request.body)).unwrap_or(Value::Null);
+            let on = !matches!(body.get("enabled"), Some(Value::Bool(false)));
+            match skills::set_enabled(&name, on) {
+                Ok(()) => http::respond(&mut stream, 200, &skills::library_json()),
+                Err(why) => http::respond(&mut stream, 500, &error(&why)),
+            }
+        }
         // The OpenAI-compatible API's settings and keys, for the app's Settings.
         ("GET", "/api/developer") => {
             http::respond(&mut stream, 200, &developer::load().public_json(&shared.info.model))
@@ -924,6 +1011,11 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 Ok(false) => http::respond(&mut stream, 404, &error("Key not found.")),
                 Err(why) => http::respond(&mut stream, 500, &error(&why)),
             }
+        }
+        ("POST", p) if p.starts_with("/api/chat/runs/") && p.ends_with("/undo") => {
+            let id = &p["/api/chat/runs/".len()..p.len() - "/undo".len()];
+            let (status, body) = undo::undo_run(id, &files::trash_file);
+            http::respond(&mut stream, status, &body);
         }
         ("POST", p) if p.starts_with("/api/chat/runs/") && p.ends_with("/stop") => {
             let id = &p["/api/chat/runs/".len()..p.len() - "/stop".len()];
@@ -1011,8 +1103,24 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8], source: stats
             _ => None,
         })
         .collect();
+    // What the reply changes is journaled, so "Undo this run" can reverse it (`undo.rs`).
+    let journal = files::Access::from_request(body.str("access"), Vec::new()).map(|_| {
+        Arc::new(Mutex::new(undo::Journal::new(
+            undo::root(),
+            &undo::new_run_id(),
+            body.str("chatId").unwrap_or(""),
+        )))
+    });
     let files = files::Access::from_request(body.str("access"), folders.clone())
-        .map(files::Files::for_user);
+        .map(files::Files::for_user)
+        .map(|f| match &journal {
+            Some(j) => f.with_journal(j.clone()),
+            None => f,
+        });
+    let undo_id = journal.as_ref().map(|j| j.lock().unwrap().run_id.clone());
+    if let Some(id) = &undo_id {
+        undo::set_busy(id, true);
+    }
     let thinking = match body.get("thinking") {
         Some(Value::Bool(on)) => *on,
         _ => options().thinking,
@@ -1041,6 +1149,9 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8], source: stats
     let asked = Instant::now();
     if shared.jobs.lock().unwrap().send(Work::Reply(job)).is_err() {
         shared.runs.lock().unwrap().remove(&run_id);
+        if let Some(id) = &undo_id {
+            undo::set_busy(id, false);
+        }
         stats::finish(
             counted,
             stats::Outcome {
@@ -1050,8 +1161,11 @@ fn completion(mut stream: TcpStream, shared: &Shared, body: &[u8], source: stats
         );
         return http::respond(&mut stream, 500, &error("The engine has stopped."));
     }
-    let outcome = stream_reply(&mut stream, &run_id, &events, &stop, asked);
+    let outcome = stream_reply(&mut stream, &run_id, &events, &stop, asked, journal.as_ref());
     shared.runs.lock().unwrap().remove(&run_id);
+    if let Some(id) = &undo_id {
+        undo::set_busy(id, false);
+    }
     stats::finish(counted, outcome);
 }
 
@@ -1127,6 +1241,7 @@ fn stream_reply(
     events: &Receiver<Out>,
     stop: &AtomicBool,
     asked: Instant,
+    journal: Option<&Arc<Mutex<undo::Journal>>>,
 ) -> stats::Outcome {
     let mut outcome = stats::Outcome::default();
     if http::start_events(stream).is_err() {
@@ -1143,7 +1258,26 @@ fn stream_reply(
         "{{\"type\":\"run\",\"runId\":{}}}",
         json::string(run_id)
     ));
+    // Once the reply ends, if it changed files: the run id "Undo this run" sends back.
+    let mut announced = false;
+    let mut announce = |send: &mut dyn FnMut(&str)| {
+        if announced {
+            return;
+        }
+        announced = true;
+        if let Some(j) = journal.map(|j| j.lock().unwrap_or_else(|e| e.into_inner()))
+            && j.has_changes()
+        {
+            send(&format!(
+                "{{\"type\":\"undoable\",\"runId\":{}}}",
+                json::string(&j.run_id)
+            ));
+        }
+    };
     for event in events {
+        if matches!(event, Out::Done { .. } | Out::Error(_)) {
+            announce(&mut send);
+        }
         if matches!(event, Out::Text(_) | Out::Event(_)) && outcome.first_token_seconds.is_none() {
             outcome.first_token_seconds = Some(asked.elapsed().as_secs_f64());
         }
@@ -1170,6 +1304,7 @@ fn stream_reply(
             }
         }
     }
+    announce(&mut send);
     send("[DONE]");
     if outcome.status.is_empty() || (outcome.status == "ok" && stop.load(Ordering::Relaxed)) {
         outcome.status = if stop.load(Ordering::Relaxed) {
@@ -3086,6 +3221,10 @@ fn reply(
     } else {
         tools::offered(&job.client_tools, job.files.is_some())
     };
+    // Memory turned off in Settings: nothing to remember or forget with.
+    if !memory::enabled() {
+        offered.retain(|t| t.name != "remember" && t.name != "forget");
+    }
     if options().scored_groups
         && !offered.is_empty()
         && let Some(request) = job.messages.last()
@@ -3218,7 +3357,7 @@ fn reply(
     // callable now), and its instructions keep the facts they began with, the newer
     // ones told at the end of the request.
     // What the user asked to be remembered is theirs, not an API caller's.
-    let facts = if job.api { Vec::new() } else { memory::all() };
+    let facts = if job.api || !memory::enabled() { Vec::new() } else { memory::all() };
     // A skill written in comes before any thought: the turn opens without one, and the
     // thought follows the skill's instructions, as it follows any tool's result.
     let opening_text = if skill_ids.is_empty() {
@@ -4461,8 +4600,10 @@ fn read_ahead(
 fn pc_skills(tools: &[&str]) -> Vec<skills::Skill> {
     let built_in = skills::built_in_folder();
     let user = skills::user_folder();
+    let off = skills::turned_off();
     skills::load(built_in.as_deref(), user.as_deref())
         .into_iter()
+        .filter(|s| !off.contains(&s.name))
         .filter(|s| skills::usable(s, tools))
         .collect()
 }

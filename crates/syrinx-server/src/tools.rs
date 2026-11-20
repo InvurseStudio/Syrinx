@@ -351,6 +351,11 @@ impl Tool {
 /// Every tool this server knows. Optional arguments are left out for now: small models
 /// fill them in where they shouldn't (Llama 3.2 1B asked for one line of a file), so
 /// they'll come back where the eval says a model uses them well.
+/// What Settings and approvals call a tool's kind of change ("Rename files").
+pub fn approval_label(tool: &str) -> Option<&'static str> {
+    catalog().into_iter().find(|t| t.name == tool).and_then(|t| t.asks).map(|a| a.label)
+}
+
 fn catalog() -> Vec<Tool> {
     vec![
         Tool {

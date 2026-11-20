@@ -120,6 +120,8 @@ pub struct Files {
     access: Access,
     /// Where deleted and replaced files go instead of the system's Trash (tests).
     trash_folder: Option<String>,
+    /// The reply's undo journal (`undo.rs`): what its changes were, to reverse them.
+    journal: Option<std::sync::Arc<std::sync::Mutex<crate::undo::Journal>>>,
 }
 
 impl Files {
@@ -134,7 +136,21 @@ impl Files {
             home: standardized(&long_form(home)),
             access,
             trash_folder: None,
+            journal: None,
         }
+    }
+
+    /// The changes these tools make are kept in `journal`, so they can be undone.
+    pub fn with_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<crate::undo::Journal>>,
+    ) -> Files {
+        self.journal = Some(journal);
+        self
+    }
+
+    fn journal(&self) -> Option<std::sync::MutexGuard<'_, crate::undo::Journal>> {
+        self.journal.as_ref().map(|j| j.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Deleted and replaced files go into `folder`, not the system's Trash.
@@ -314,6 +330,18 @@ impl Files {
     /// beside it first, so a failed write leaves the old one whole, and the old one goes
     /// to the Trash, not away.
     fn replace(&self, file: &str, bytes: &[u8]) -> Result<(), String> {
+        let pending = match self.journal() {
+            Some(mut j) => Some(j.before_write(file)?),
+            None => None,
+        };
+        let written = self.replace_now(file, bytes);
+        if let (Some(pending), Some(mut j)) = (pending, self.journal()) {
+            j.after_write(pending);
+        }
+        written
+    }
+
+    fn replace_now(&self, file: &str, bytes: &[u8]) -> Result<(), String> {
         fs::create_dir_all(parent(file))
             .map_err(|e| format!("Couldn't make the folder for {file}: {e}"))?;
         let temp = format!("{file}.vireo-writing");
@@ -578,6 +606,9 @@ impl Files {
     /// folder, stopping it, and what it started, after `SHELL_TIMEOUT`.
     fn run_shell_command(&self, command: &str) -> Result<String, String> {
         self.shell_allowed(command)?;
+        if let Some(mut j) = self.journal() {
+            j.note_shell(command);
+        }
         let mut shell = if cfg!(windows) {
             let mut c = Command::new("cmd");
             c.args(["/C", command]);
@@ -672,6 +703,9 @@ impl Files {
         let (source, destination) = self.rename_target(path, new_name)?;
         fs::rename(&source, &destination)
             .map_err(|e| format!("Couldn't rename {source}: {e}"))?;
+        if let Some(mut j) = self.journal() {
+            j.moved(&source, &destination);
+        }
         Ok(format!(
             "Renamed successfully: {} -> {}",
             file_name(&source),
@@ -682,18 +716,26 @@ impl Files {
     fn move_file(&self, source: &str, destination: &str) -> Result<String, String> {
         let (source, destination) = self.move_target(source, destination)?;
         fs::rename(&source, &destination).map_err(|e| format!("Couldn't move {source}: {e}"))?;
+        if let Some(mut j) = self.journal() {
+            j.moved(&source, &destination);
+        }
         Ok(format!("Moved successfully: {source} -> {destination}"))
     }
 
     fn delete_file(&self, path: &str) -> Result<String, String> {
         let file = self.deletable(path)?;
-        self.to_trash(&file)
+        let in_trash = self
+            .to_trash(&file)
             .map_err(|e| format!("Couldn't move {file} to the {TRASH}: {e}"))?;
+        if let Some(mut j) = self.journal() {
+            j.trashed(&file, &in_trash);
+        }
         Ok(format!("File moved to the {TRASH}: {file}"))
     }
 
-    /// Moves a file to the Trash (in tests, to their own folder).
-    fn to_trash(&self, file: &str) -> Result<(), String> {
+    /// Moves a file to the Trash (in tests, to their own folder): where it is there, or
+    /// empty if the Trash didn't say.
+    fn to_trash(&self, file: &str) -> Result<String, String> {
         match &self.trash_folder {
             Some(folder) => {
                 fs::create_dir_all(folder).map_err(|e| e.to_string())?;
@@ -703,10 +745,13 @@ impl Files {
                     n += 1;
                     target = join(folder, &format!("{} {n}", file_name(file)));
                 }
-                fs::rename(file, target).map_err(|e| e.to_string())
+                fs::rename(file, &target).map_err(|e| e.to_string())?;
+                Ok(target)
             }
-            None if documents::trash(file) => Ok(()),
-            None => Err(format!("this {MACHINE}'s {TRASH} didn't take it")),
+            None => match documents::trash(file) {
+                Some(in_trash) => Ok(in_trash),
+                None => Err(format!("this {MACHINE}'s {TRASH} didn't take it")),
+            },
         }
     }
 
@@ -1538,6 +1583,13 @@ fn arg(call: &Call, name: &str) -> Result<String, String> {
     optional_arg(call, name).ok_or(format!("Missing argument: {name}"))
 }
 
+/// Moves a file to the user's Trash, as undoing a file a reply made does (`undo.rs`).
+pub fn trash_file(path: &str) -> Result<(), String> {
+    documents::trash(path)
+        .map(|_| ())
+        .ok_or_else(|| format!("this {MACHINE}'s {TRASH} didn't take it"))
+}
+
 /// A whole number, sent as a number or as text ("2").
 fn int_arg(call: &Call, name: &str) -> Option<i64> {
     let number: f64 = optional_arg(call, name)?.trim().parse().ok()?;
@@ -1576,22 +1628,31 @@ mod documents {
     }
 
     /// To the user's Trash, as Finder's Move to Trash: it can be put back from there.
-    pub fn trash(path: &str) -> bool {
+    /// Where it is in the Trash (empty if the Trash didn't say), or `None` if it wasn't
+    /// moved.
+    pub fn trash(path: &str) -> Option<String> {
         autoreleasepool(|_| {
             let class = AnyClass::get(c"NSFileManager")?;
             let url = url(path);
             unsafe {
                 let manager: Option<Retained<AnyObject>> = msg_send![class, defaultManager];
+                let mut resulting: *mut AnyObject = std::ptr::null_mut();
                 let done: bool = msg_send![
                     &*manager?,
                     trashItemAtURL: &*url,
-                    resultingItemURL: std::ptr::null_mut::<*mut AnyObject>(),
+                    resultingItemURL: &mut resulting,
                     error: std::ptr::null_mut::<*mut AnyObject>()
                 ];
-                Some(done)
+                if !done {
+                    return None;
+                }
+                if resulting.is_null() {
+                    return Some(String::new());
+                }
+                let in_trash: Option<Retained<NSString>> = msg_send![&*resulting, path];
+                Some(in_trash.map(|p| p.to_string()).unwrap_or_default())
             }
         })
-        .unwrap_or(false)
     }
 
     pub fn rich_text(path: &str) -> Option<String> {
@@ -1624,8 +1685,8 @@ mod documents {
         crate::attach::pdf::text(&bytes).ok()
     }
     /// The server makes no changes on this machine: the app does, to its Recycle Bin.
-    pub fn trash(_path: &str) -> bool {
-        false
+    pub fn trash(_path: &str) -> Option<String> {
+        None
     }
     pub fn rich_text(path: &str) -> Option<String> {
         if !path.to_lowercase().ends_with(".docx") {

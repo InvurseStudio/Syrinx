@@ -115,7 +115,15 @@ pub fn data_dir() -> PathBuf {
     } else {
         std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
     };
-    base.join(FOLDER.get_or_init(|| "VireoPrototype"))
+    // The app names its folder (`VIREO_DATA_FOLDER`: Vireo's is `Vireo`).
+    base.join(FOLDER.get_or_init(|| {
+        match std::env::var("VIREO_DATA_FOLDER") {
+            Ok(name) if !name.is_empty() && !name.contains(['/', '\\']) && name != ".." => {
+                Box::leak(name.into_boxed_str())
+            }
+            _ => "VireoPrototype",
+        }
+    }))
 }
 
 /// The default folder for `key`'s saved chats.
