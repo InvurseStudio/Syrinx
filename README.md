@@ -194,7 +194,8 @@ caches are kept in Syrinx's own folder (`%LOCALAPPDATA%\Syrinx`, or
 ./target/release/syrinx-server --standalone path/to/model.gguf
 ```
 
-On Windows, `serve.cmd path\to\model.gguf` builds it and starts it. Then:
+`./serve.sh path/to/model.gguf` (Mac) or `serve.cmd path\to\model.gguf` (Windows) builds it
+and starts it. Then:
 
 | Address | What it is |
 |---|---|
@@ -207,28 +208,38 @@ It listens only on this computer unless you give `--host` (for example `0.0.0.0`
 network), and that needs an API key: `--api-key <key>` or `SYRINX_API_KEY`, which callers
 send as a bearer token.
 
-### The Windows app
+### The Mac and Windows apps
 
-`windows/SyrinxManager` is a Windows app that runs the server for you, in Vireo's look:
+`macos/SyrinxManager` (SwiftUI) and `windows/SyrinxManager` (WinUI 3) run the server for
+you, in Vireo's look. They have the same four pages:
 
 - **Server:** start and stop it, with the port, network access, API key, context length,
   thinking and chat slots, and the server's output.
 - **Models:** Vireo's model manager. Suggested small models and a Hugging Face search that
   shows only repositories whose architecture Syrinx runs (as Hugging Face read it from
   their GGUF files), with resumable downloads checked against Hugging Face's SHA-256, and
-  each file on this PC checked against what the engine reads.
+  each file on this computer checked against what the engine reads.
 - **Connect:** the base URL, key and model name other chat apps need, with examples.
 - **Statistics:** the dashboard above.
 
-Build the server first, then run the app:
+On the Mac, `build-app.sh` builds the server and the app into `Syrinx.app`, with
+`syrinx-server` inside it:
+
+```bash
+macos/SyrinxManager/build-app.sh --open
+```
+
+On Windows, build the server first, then run the app:
 
 ```bash
 cargo build --release -p syrinx-server
 dotnet run -c Release --project windows/SyrinxManager
 ```
 
-It finds `syrinx-server.exe` beside itself or in this checkout's `target/release`, and
-keeps models in `%LOCALAPPDATA%\Syrinx\Models` and any folders you add.
+Each finds `syrinx-server` beside itself or in this checkout's `target/release`, and keeps
+models in Syrinx's folder (`~/Library/Application Support/Syrinx/Models`,
+`%LOCALAPPDATA%\Syrinx\Models`) and any folders you add. The server stops with the app,
+even if the app is force-quit.
 
 ## Status
 
