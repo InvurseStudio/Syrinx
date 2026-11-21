@@ -70,6 +70,7 @@ use syrinx_engine::grammar::{Grammar, TokenTrie};
 use syrinx_engine::models::gemma4_cuda::{Gemma4Cuda, assistant as gemma4_assistant};
 use syrinx_engine::models::llama_cuda::LlamaCuda;
 use syrinx_engine::models::inkling2_cuda::{Inkling2Checkpoint, Inkling2Cuda};
+use syrinx_engine::models::inkling2_dspark_cuda::DSparkCuda;
 use syrinx_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
 use syrinx_engine::models::{Logits, Precision, SavedState};
 use syrinx_engine::{GgufFile, Tokenizer};
@@ -1545,6 +1546,46 @@ const MTP_GUESSES: usize = 3;
 /// / 27.0 / 25.8 / 23.4, the rest level. Two more after a round all taken (tried both):
 /// less on the 31B than 4 every round, and a story 3-6% slower on each.
 const GEMMA_MTP_GUESSES: usize = if cfg!(target_os = "macos") { 4 } else { MTP_GUESSES };
+/// Guesses a round from Inkling 2's DSpark drafter. Inkling 2 Mini Q8_0 on the M5 Max,
+/// 128-token replies, 1 / 2 / 3 a round (`syrinx-cli generate-drafted`): code 83.7 /
+/// 89.5-96.2 / 89.0 tokens/s against 78.5 without, prose 72.9 / 70.4 / 64.5 against 72.9.
+const INK_GUESSES: usize = 2;
+/// Inkling drafts while its rounds keep this many of their guesses lately (a weighted
+/// average): a round of 2 costs about 1.9 tokens' time (Q8_0, the M5 Max: guessing 1.8
+/// ms, checking 22.8, a token 13), so fewer than ~0.9 taken is slower than none. Below
+/// it, `INK_BACKOFF_FIRST` tokens without, doubled each time up to `INK_BACKOFF_MOST`.
+/// Through the server, 400-token replies with thinking, without / drafting always / with
+/// this: code 74.7 / 94.1 / 94.0, a story 74.9 / 68.4 / 72.0; an explanation 72.9 / - /
+/// 74.2, a document rewritten as a list 66.9 / - / 95.4 (the chat's own guesses too).
+const INK_KEPT_FLOOR: f64 = 0.8;
+const INK_BACKOFF_FIRST: usize = 3;
+const INK_BACKOFF_MOST: usize = 24;
+/// The most tokens in an Inkling round (the token picked and its guesses): what its
+/// session can take back (`LOG_ROWS`: the convolutions' history is rebuilt from the
+/// round's logged inputs).
+const INK_ROUND: usize = syrinx_engine::models::inkling2_cuda::LOG_ROWS;
+
+/// Inkling 2's DSpark drafter beside `model`: a `dspark-*.gguf` in its folder whose name
+/// holds the model's own name up to its quantization ("Inkling-2-Mini"), else the only one.
+fn find_dspark(model: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stem = model.file_stem()?.to_string_lossy().into_owned();
+    let base = stem.rsplit_once('-').map_or(stem.as_str(), |(b, _)| b).to_lowercase();
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(model.parent()?)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            name.starts_with("dspark-") && name.ends_with(".gguf")
+        })
+        .collect();
+    found.sort();
+    let named = found.iter().find(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&base))
+    });
+    named.cloned().or_else(|| (found.len() == 1).then(|| found[0].clone()))
+}
+
 /// The chat's length, in tokens, from which Gemma 4's draft model is back to `MTP_GUESSES`:
 /// a guess not taken costs its share of a check, and a check costs more the more there is
 /// to attend to, while fewer of four are taken than of three (40-46% against 52-62%).
@@ -1951,6 +1992,9 @@ impl Model {
             (Model::Gemma4(m), Session::Gemma4(s)) if m.has_mtp() => {
                 m.use_mtp(s).map_err(|e| e.to_string())?;
             }
+            (Model::Inkling2(m), Session::Inkling2(s)) if m.has_drafter() => {
+                m.keep_drafting(s).map_err(|e| e.to_string())?;
+            }
             _ => {}
         }
         Ok(session)
@@ -1967,6 +2011,9 @@ impl Model {
             (Model::Gemma4(m), Session::Gemma4(s)) => m
                 .mtp_draft_sure(s, first, k, MTP_FLOOR)
                 .map(|g| g.into_iter().map(|(token, _)| token).collect())
+                .map_err(|e| e.to_string()),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m
+                .draft(s, first, k.min(INK_ROUND - 1))
                 .map_err(|e| e.to_string()),
             _ => Ok(Vec::new()),
         }
@@ -2217,6 +2264,22 @@ impl Model {
                         }
                     }
                 }
+                // Else the longest saved start this prompt begins with (another system
+                // turn than the session's, or one the rings no longer hold), as Qwen's.
+                if from.is_none()
+                    && let Some(i) = (0..kept.heads.len())
+                        .filter(|&i| ids.starts_with(&kept.heads[i].0))
+                        .max_by_key(|&i| kept.heads[i].0.len())
+                        .filter(|&i| kept.heads[i].0.len() >= 64)
+                {
+                    let (tokens, state) = kept.heads.remove(i);
+                    m.import(s, &state).map_err(e)?;
+                    *ink = InkPoints::default();
+                    m.save(s, &mut ink.turn).map_err(e)?;
+                    kept.tokens.clone_from(&tokens);
+                    from = Some(tokens.len());
+                    kept.heads.push((tokens, state));
+                }
                 match from {
                     Some(n) => n,
                     None => {
@@ -2298,6 +2361,13 @@ impl Model {
                 m.forward_batch(s, &ids[from..head_at], Logits::None)
                     .map_err(e)?;
                 m.save(s, &mut kept.ink.turn).map_err(e)?;
+                // And in system memory, for a chat whose system turn the session no longer
+                // holds (as Qwen's).
+                if let Some(cp) = kept.ink.turn.as_ref()
+                    && let Some(state) = m.export(s, cp).map_err(e)?
+                {
+                    keep_head(&mut kept.heads, &ids[..head_at], state);
+                }
                 kept.tokens.extend_from_slice(&ids[from..head_at]);
                 from = head_at;
             }
@@ -2348,6 +2418,10 @@ impl Model {
             (Model::Qwen35(m), Session::Qwen35(s)) => {
                 m.rewind(s, len).map_err(|e| e.to_string())?
             }
+            // Inside the last round checked, in a session that keeps drafting.
+            (Model::Inkling2(m), Session::Inkling2(s)) => {
+                m.rewind_held(s, len).map_err(|e| e.to_string())?
+            }
             _ => false,
         };
         if ok {
@@ -2390,8 +2464,7 @@ impl Model {
             Session::Qwen35(_) => kept.checkpoint.as_ref().map_or(0, |c| c.len()),
             Session::Gemma4(_) => kept.history_end,
             Session::Llama(_) => kept.tokens.len(),
-            // Its chats aren't saved yet.
-            Session::Inkling2(_) => 0,
+            Session::Inkling2(_) => kept.ink.checkpoint.as_ref().map_or(0, |c| c.len()),
         }
     }
 
@@ -2401,8 +2474,8 @@ impl Model {
     fn usable(&self, tokens: &[u32], ids: &[u32], context: usize) -> usize {
         let shared = shared_start(tokens, ids);
         let n = match self {
-            Model::Qwen35(_) if shared != tokens.len() => 0,
-            Model::Inkling2(_) => 0,
+            // Their state is for the end (Inkling's convolution histories too).
+            Model::Qwen35(_) | Model::Inkling2(_) if shared != tokens.len() => 0,
             Model::Gemma4(m)
                 if shared != tokens.len() && tokens.len() > m.config.sliding_window =>
             {
@@ -2417,6 +2490,16 @@ impl Model {
     /// last history's end), and the state after them. `None` when there's nothing to save.
     fn export(&self, kept: &Kept) -> Result<Option<(Vec<u32>, SavedState)>, String> {
         let e = |e: syrinx_engine::models::Error| e.to_string();
+        // Inkling: up to its last history's end, where its histories were saved.
+        if let (Model::Inkling2(m), Session::Inkling2(s)) = (self, &kept.session) {
+            let Some(cp) = &kept.ink.checkpoint else {
+                return Ok(None);
+            };
+            return Ok(m
+                .export(s, cp)
+                .map_err(e)?
+                .map(|state| (kept.tokens[..state.len()].to_vec(), state)));
+        }
         let state = match &kept.session {
             Session::Llama(s) => s.export().map_err(e)?,
             Session::Gemma4(s) => s.export(kept.history_end).map_err(e)?,
@@ -2444,8 +2527,10 @@ impl Model {
                 kept.base = None;
                 kept.turn = None;
             }
-            (Model::Inkling2(_), Session::Inkling2(_)) => {
-                return Err("Inkling 2's chats aren't saved yet.".into());
+            (Model::Inkling2(m), Session::Inkling2(s)) => {
+                m.import(s, state).map_err(e)?;
+                kept.ink = InkPoints::default();
+                m.save(s, &mut kept.ink.checkpoint).map_err(e)?;
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -2623,10 +2708,34 @@ fn engine(
                 Model::Gemma4(m)
             }
             Family::Inkling => {
-                Model::Inkling2(Inkling2Cuda::load(file, gpu).map_err(e).map(|mut m| {
-                    m.set_precision(precision);
-                    m
-                })?)
+                let mut m = Inkling2Cuda::load(file, gpu).map_err(e)?;
+                m.set_precision(precision);
+                // Its DSpark drafter: --draft's GGUF, else one beside the model (--mtp on).
+                let given = options().draft.as_deref().map(std::path::PathBuf::from);
+                let found = match &options().draft {
+                    None if options().mtp => find_dspark(std::path::Path::new(path)),
+                    _ => None,
+                };
+                if let Some(draft) = given.clone().or(found) {
+                    let started = Instant::now();
+                    let loaded = GgufFile::open(&draft).map_err(|e| e.to_string()).and_then(|f| {
+                        let f: &'static GgufFile = Box::leak(Box::new(f));
+                        let d = DSparkCuda::load(f, m.gpu()).map_err(e)?;
+                        m.set_drafter(d).map_err(e)
+                    });
+                    match loaded {
+                        Ok(()) => eprintln!(
+                            "Drafting with {}, {INK_GUESSES} tokens a round (loaded in {:.1?}).",
+                            draft.display(),
+                            started.elapsed()
+                        ),
+                        Err(err) if given.is_some() => {
+                            return Err(format!("Couldn't load the drafter {}: {err}", draft.display()));
+                        }
+                        Err(err) => eprintln!("Not drafting with {} ({err}).", draft.display()),
+                    }
+                }
+                Model::Inkling2(m)
             }
         };
         Ok((model, tokenizer, family, gpu_name))
@@ -2696,8 +2805,9 @@ fn engine(
         }
     };
     let mut drafter = match &options().draft {
-        // Google's draft model, loaded with the model.
+        // Google's draft model, or Inkling's drafter, loaded with the model.
         Some(draft_path) if is_assistant(draft_path) => None,
+        Some(_) if family == Family::Inkling => None,
         Some(draft_path) if family == Family::Gemma4 => {
             let started = Instant::now();
             match draft::Drafter::load(
@@ -3783,8 +3893,8 @@ fn reply(
     } else {
         (ids, mark)
     };
-    // Qwen and Gemma: where the system turn ends, for a saved start for new chats.
-    let head = if matches!(family, Family::Qwen35 | Family::Gemma4) {
+    // Qwen, Gemma and Inkling: where the system turn ends, for a saved start for new chats.
+    let head = if matches!(family, Family::Qwen35 | Family::Gemma4 | Family::Inkling) {
         let turn = chat::history(
             family,
             system.as_deref(),
@@ -3905,26 +4015,35 @@ fn reply(
                 || m.gpu().free_memory() >= m.steps_bytes() + STEPS_HEADROOM;
             room && m.keep_steps(s).is_ok()
         }
+        (Model::Inkling2(m), Session::Inkling2(s)) => m.keeps_drafting(s),
         _ => false,
     };
     // Qwen with its multi-token-prediction layer kept up: guesses from that, not the chat.
     let mtp = drafter.is_none()
         && can_go_back
-        && match &kept.session {
-            Session::Qwen35(s) => s.keeps_mtp(),
-            Session::Gemma4(s) => s.keeps_mtp(),
+        && match (model, &kept.session) {
+            (_, Session::Qwen35(s)) => s.keeps_mtp(),
+            (_, Session::Gemma4(s)) => s.keeps_mtp(),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m.keeps_drafting(s),
             _ => false,
         };
     let mut mtp_stats = (0usize, 0usize); // guessed, taken
+    // Inkling's drafter: guesses taken a round lately, the round under way (the count
+    // taken when it began), plain tokens left before the next round, and how many next.
+    let (mut ink_kept, mut ink_round) = (1.0f64, None::<usize>);
+    let (mut ink_rest, mut ink_backoff) = (0usize, INK_BACKOFF_FIRST);
     // VIREO_MTP_GUESSES: another count at every depth, to measure one against another.
     let mtp_fixed: Option<usize> = std::env::var("VIREO_MTP_GUESSES")
         .ok()
         .and_then(|n| n.parse().ok())
         .filter(|n| (1..=7).contains(n));
     let gemma = matches!(kept.session, Session::Gemma4(_));
+    let inkling = matches!(kept.session, Session::Inkling2(_));
     // A round's guesses for a chat of `depth` tokens.
     let mtp_guesses = |depth: usize| {
-        mtp_fixed.unwrap_or(if gemma && depth < GEMMA_MTP_GUESSES_UNTIL {
+        mtp_fixed.unwrap_or(if inkling {
+            INK_GUESSES
+        } else if gemma && depth < GEMMA_MTP_GUESSES_UNTIL {
             GEMMA_MTP_GUESSES
         } else {
             MTP_GUESSES
@@ -3940,12 +4059,18 @@ fn reply(
     };
     // Gemma 4 and Llama go back any number of tokens, so a running copy is guessed
     // further; Qwen only through the steps it keeps (a round of 8).
+    // Inkling only inside a round it can take back (`INK_ROUND`).
     let long = match kept.session {
-        Session::Qwen35(_) => 0,
+        Session::Qwen35(_) | Session::Inkling2(_) => 0,
         _ => draft::LONG_LOOKUP,
     };
-    let mut lookup = (drafter.is_none() && (!mtp || both) && options().lookup > 0 && can_go_back)
-        .then(|| draft::Lookup::new(options().lookup).with_long(long));
+    let most = if inkling {
+        options().lookup.min(INK_ROUND - 1)
+    } else {
+        options().lookup
+    };
+    let mut lookup = (drafter.is_none() && (!mtp || both) && most > 0 && can_go_back)
+        .then(|| draft::Lookup::new(most).with_long(long));
     // Whether the guesses read ahead are the draft model's (or the layer's), not the chat's.
     let mut ahead_drafted = false;
     let drafting = drafter.is_some() || lookup.is_some() || mtp;
@@ -4015,6 +4140,21 @@ fn reply(
                 _ => Vec::new(),
             };
             ahead_drafted = false;
+            // Inkling: how many of its last round's guesses were taken, lately; while
+            // too few, a few rounds without (more each time it still doesn't pay).
+            if let Some(start) = ink_round.take() {
+                ink_kept = 0.7 * ink_kept + 0.3 * (mtp_stats.1 - start) as f64;
+                if ink_kept < INK_KEPT_FLOOR {
+                    ink_rest = ink_backoff;
+                    ink_backoff = (ink_backoff * 2).min(INK_BACKOFF_MOST);
+                } else {
+                    ink_backoff = INK_BACKOFF_FIRST;
+                }
+            }
+            let resting = inkling && ink_rest > 0;
+            if resting {
+                ink_rest -= 1;
+            }
             let guesses = match (drafter.as_deref_mut(), unread) {
                 (Some(d), _) if room > 1 => d.guess(&kept.tokens, d.guesses.min(room - 1))?,
                 (None, _) if !from_chat.is_empty() => from_chat,
@@ -4022,6 +4162,7 @@ fn reply(
                 (None, Some(first))
                     if mtp
                         && alone
+                        && !resting
                         && room > 1
                         && guesses_pay(
                             kept.tokens.len(),
@@ -4036,6 +4177,9 @@ fn reply(
                     let g = model.mtp_draft(kept, first, n.min(room - 1))?;
                     mtp_stats.0 += g.len();
                     ahead_drafted = true;
+                    if inkling && !g.is_empty() {
+                        ink_round = Some(mtp_stats.1);
+                    }
                     g
                 }
                 _ => Vec::new(),
@@ -4124,6 +4268,11 @@ fn reply(
                 false,
                 true,
             );
+            // Guesses read past the thought's last token: taken back first.
+            if !ahead.is_empty() {
+                ahead.clear();
+                model.rewind(kept)?;
+            }
             if kept.tokens.len() + ids.len() + 64 > context {
                 break;
             }

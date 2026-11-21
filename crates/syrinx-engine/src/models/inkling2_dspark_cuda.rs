@@ -127,6 +127,10 @@ impl<'a> DSparkCuda<'a> {
         let g = gpu;
         let up = |name: &str, cols: usize, rows: usize| -> Result<GpuMatrix> {
             let m = matrix(file, name, cols, rows)?;
+            // Unsloth's Q8_0 drafter goes up as it is; BF16 and F16 are rounded to it.
+            if m.kind == crate::TensorType::Q8_0 {
+                return GpuMatrix::upload(g, m);
+            }
             GpuMatrix::upload_q8_0(g, &m)?
                 .ok_or_else(|| Error::Unsupported(format!("{name} to Q8_0")))
         };
@@ -279,6 +283,48 @@ impl<'a> DSparkCuda<'a> {
         })
     }
 
+    /// The cache's first `len` positions, appended to `out` (each layer's keys and
+    /// values, then the recurrent head's context).
+    pub fn export(&self, s: &DSparkCudaState, len: usize, out: &mut Vec<u8>) -> Result<()> {
+        let c = &self.config;
+        assert!(len <= s.len, "{len} positions of a drafter's cache of {}", s.len);
+        let kv = c.kv_heads * c.head_dim * if s.half { 2 } else { 4 };
+        let mut part = |b: &Buffer, n: usize| -> Result<()> {
+            let at = out.len();
+            out.resize(at + n, 0);
+            b.read_bytes_at(0, &mut out[at..]).map_err(gpu_error)
+        };
+        for l in 0..c.layers {
+            part(&s.keys[l], len * kv)?;
+            part(&s.values[l], len * kv)?;
+        }
+        part(&s.context, len * c.dim * 4)
+    }
+
+    /// Puts back what `export` saved of `len` positions: an error, changing nothing, when
+    /// it doesn't fit this cache (another drafter's, or too long).
+    pub fn import(&self, s: &mut DSparkCudaState, len: usize, bytes: &[u8]) -> Result<()> {
+        let c = &self.config;
+        let kv = c.kv_heads * c.head_dim * if s.half { 2 } else { 4 };
+        let ctx = len * c.dim * 4;
+        if len > s.capacity || bytes.len() != c.layers * 2 * len * kv + ctx {
+            return Err(Error::Invalid("a drafter's cache from another drafter".into()));
+        }
+        let mut at = 0;
+        let mut put = |b: &Buffer, n: usize| -> Result<()> {
+            b.write_bytes_at(0, &bytes[at..at + n]).map_err(gpu_error)?;
+            at += n;
+            Ok(())
+        };
+        for l in 0..c.layers {
+            put(&s.keys[l], len * kv)?;
+            put(&s.values[l], len * kv)?;
+        }
+        put(&s.context, ctx)?;
+        s.len = len;
+        Ok(())
+    }
+
     /// The features of the first `rows` of the tokens Inkling just read (at positions
     /// `s.len()` on), as [`Inkling2Cuda::features`] gives them (a batch of `batch_rows`),
     /// into the cache.
@@ -289,11 +335,24 @@ impl<'a> DSparkCuda<'a> {
         features: (crate::cuda::CuDevicePtr, usize),
         rows: usize,
     ) -> Result<()> {
+        self.add_from(target, s, features, 0, rows)
+    }
+
+    /// As [`add`](Self::add), for the batch's rows `from..from + rows`.
+    pub fn add_from(
+        &self,
+        target: &Inkling2Cuda,
+        s: &mut DSparkCudaState,
+        features: (crate::cuda::CuDevicePtr, usize),
+        from: usize,
+        rows: usize,
+    ) -> Result<()> {
         let c = &self.config;
         let g = target.gpu();
         let e = gpu_error;
         let (ptr, batch_rows) = features;
-        assert!(rows <= batch_rows, "{rows} of a batch of {batch_rows}");
+        assert!(from + rows <= batch_rows, "{rows} from {from} of a batch of {batch_rows}");
+        let ptr = ptr + (from * c.dim * 4) as u64;
         if rows == 0 {
             return Ok(());
         }
