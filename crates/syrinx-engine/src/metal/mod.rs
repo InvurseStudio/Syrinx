@@ -154,6 +154,20 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "argmax_final" => &[2],
         "to_half" | "q_group_half" => &[1],
         "to_i8" => &[1, 2],
+        "ink_mix" => &[2],
+        "ink_pair_norm" => &[2],
+        "ink_control" => &[4],
+        "ink_clip" => &[0],
+        "ink_conv" => &[1, 9],
+        "ink_attention_part" => &[3, 16],
+        "ink_kv" => &[1, 4],
+        "ink_kv_parallel" => &[4],
+        "ink_conv_parallel" => &[9],
+        "ink_conv_history" => &[1],
+        "ink_attention_flash" => &[3],
+        "ink_attention_merge" => &[1],
+        "ink_moe_pick" => &[2, 3],
+        "ink_situ" | "ink_situ_half" => &[1],
         _ => return None,
     })
 }
@@ -833,6 +847,22 @@ struct Kernels {
     delta_chunk_scan_tc: Option<Pso>,
     argmax_part: Pso,
     argmax_final: Pso,
+    /// Inkling 2's own steps (see the `ink_` kernels and the `ink_*` methods).
+    ink_mix: Pso,
+    ink_pair_norm: Pso,
+    ink_control: Pso,
+    ink_clip: Pso,
+    ink_conv: Pso,
+    ink_attention_part: Pso,
+    ink_attention_merge: Pso,
+    ink_kv: Pso,
+    ink_kv_parallel: Pso,
+    ink_conv_parallel: Pso,
+    ink_conv_history: Pso,
+    ink_attention_flash: Pso,
+    ink_moe_pick: Pso,
+    ink_situ: Pso,
+    ink_situ_half: Pso,
 }
 
 /// The weight types with kernels, in the order of `Kernels::matvec` and `matmul`.
@@ -1324,6 +1354,21 @@ impl Gpu {
             },
             argmax_part: pipeline("argmax_part")?,
             argmax_final: pipeline("argmax_final")?,
+            ink_mix: pipeline("ink_mix")?,
+            ink_pair_norm: pipeline("ink_pair_norm")?,
+            ink_control: pipeline("ink_control")?,
+            ink_clip: pipeline("ink_clip")?,
+            ink_conv: pipeline("ink_conv")?,
+            ink_attention_part: pipeline("ink_attention_part")?,
+            ink_attention_merge: pipeline("ink_attention_merge")?,
+            ink_kv: pipeline("ink_kv")?,
+            ink_kv_parallel: pipeline("ink_kv_parallel")?,
+            ink_conv_parallel: pipeline("ink_conv_parallel")?,
+            ink_conv_history: pipeline("ink_conv_history")?,
+            ink_attention_flash: pipeline("ink_attention_flash")?,
+            ink_moe_pick: pipeline("ink_moe_pick")?,
+            ink_situ: pipeline("ink_situ")?,
+            ink_situ_half: pipeline("ink_situ_half")?,
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
@@ -3502,6 +3547,388 @@ impl Gpu {
     }
 
     /// Fills a buffer with zeros.
+    /// Inkling 2's attention over depth for `tokens` tokens: for each of `queries` rows of
+    /// `query`, a softmax over each token's RMS-normed states and their weighted sum, into
+    /// row q × stride + t of `out`. The states are `blocks` blocks of `states` (block s's
+    /// row for token t at row s × stride + t) and the token's row of `cur`. `stride` is the
+    /// batch's token count the rows are laid out by, when only the first `tokens` of them
+    /// are wanted (from offset addresses); otherwise `tokens`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_mix(
+        &self,
+        states: CuDevicePtr,
+        blocks: usize,
+        cur: CuDevicePtr,
+        query: CuDevicePtr,
+        queries: usize,
+        out: CuDevicePtr,
+        dim: usize,
+        tokens: usize,
+        stride: usize,
+    ) -> Result<()> {
+        assert!(blocks < 16, "ink_mix of {} states", blocks + 1);
+        let args = [
+            Arg::Ptr(states),
+            Arg::Ptr(query),
+            Arg::Ptr(out),
+            Arg::I32(blocks as i32),
+            Arg::I32(dim as i32),
+            Arg::I32(stride as i32),
+            Arg::Ptr(cur),
+        ];
+        // A batch has threadgroups enough in its tokens; one token gets wide ones.
+        let threads = if tokens == 1 { 1024 } else { 256 };
+        self.run(&self.kernels.ink_mix, (queries as u32, tokens as u32), threads, &args)
+    }
+
+    /// Each token's rows of `cur` and `message` RMS-normed (no weight) side by side, a row of
+    /// 2 × `dim` a token: the input of Inkling 2's loop controllers.
+    pub fn ink_pair_norm(
+        &self,
+        cur: CuDevicePtr,
+        message: CuDevicePtr,
+        out: CuDevicePtr,
+        dim: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(cur),
+            Arg::Ptr(message),
+            Arg::Ptr(out),
+            Arg::I32(dim as i32),
+        ];
+        self.run(&self.kernels.ink_pair_norm, (tokens as u32, 1), 256, &args)
+    }
+
+    /// `out = cur − tanh(forget) cur + tanh(gain) message` over `n` numbers (Inkling 2's
+    /// loop controller).
+    pub fn ink_control(
+        &self,
+        cur: CuDevicePtr,
+        message: CuDevicePtr,
+        gain: CuDevicePtr,
+        forget: CuDevicePtr,
+        out: CuDevicePtr,
+        n: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(cur),
+            Arg::Ptr(message),
+            Arg::Ptr(gain),
+            Arg::Ptr(forget),
+            Arg::Ptr(out),
+            Arg::I32(n as i32),
+        ];
+        self.run_per_number(&self.kernels.ink_control, n, &args)
+    }
+
+    /// Each of `rows` rows of `n` in place (`per_token` rows a token): times `scale`'s row
+    /// (if given), clipped to an L2 norm of `threshold`, and with `log_scale` (alpha,
+    /// floor) times 1 + alpha ln(max(1, (pos + 1) / floor)) at the row's token's position
+    /// (`pos0` on).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_clip(
+        &self,
+        x: CuDevicePtr,
+        scale: Option<CuDevicePtr>,
+        rows: usize,
+        n: usize,
+        threshold: f32,
+        per_token: usize,
+        pos0: usize,
+        log_scale: Option<(f32, f32)>,
+    ) -> Result<()> {
+        let (alpha, floor) = log_scale.unwrap_or((0.0, 1.0));
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(scale.unwrap_or(0)),
+            Arg::I32(n as i32),
+            Arg::F32(threshold),
+            Arg::I32(per_token as i32),
+            Arg::I32(pos0 as i32),
+            Arg::I32(i32::from(log_scale.is_some())),
+            Arg::F32(alpha),
+            Arg::F32(floor),
+        ];
+        self.run(&self.kernels.ink_clip, (rows as u32, 1), 128, &args)
+    }
+
+    /// Inkling 2's causal convolution of `tokens` rows of `x` (`n` channels each), in
+    /// order, the last inputs in `history` (rows `channels` apart), with input-dependent
+    /// `taps` if given: into `out`'s rows (x itself for in place), added to them with
+    /// `accumulate`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_conv(
+        &self,
+        x: CuDevicePtr,
+        history: CuDevicePtr,
+        weight: CuDevicePtr,
+        taps: Option<CuDevicePtr>,
+        n: usize,
+        channels: usize,
+        conv: usize,
+        head_width: usize,
+        tokens: usize,
+        out: CuDevicePtr,
+        accumulate: bool,
+    ) -> Result<()> {
+        assert!((2..=8).contains(&conv), "convolution of {conv}");
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(history),
+            Arg::Ptr(weight),
+            Arg::Ptr(taps.unwrap_or(0)),
+            Arg::I32(n as i32),
+            Arg::I32(channels as i32),
+            Arg::I32(conv as i32),
+            Arg::I32(head_width.max(1) as i32),
+            Arg::I32(tokens as i32),
+            Arg::Ptr(out),
+            Arg::I32(i32::from(accumulate)),
+        ];
+        if tokens > 1 && out != x {
+            // Every token at once (each reads its own inputs), then the history.
+            let grid = ((n as u32).div_ceil(256), tokens as u32);
+            self.run(&self.kernels.ink_conv_parallel, grid, 256, &args)?;
+            return self.ink_conv_history(x, history, n, channels, conv, tokens);
+        }
+        self.run_per_number(&self.kernels.ink_conv, n, &args)
+    }
+
+    /// The convolution history after `tokens` rows of `x` (rows of `n`): their last
+    /// `conv` − 1 inputs.
+    fn ink_conv_history(
+        &self,
+        x: CuDevicePtr,
+        history: CuDevicePtr,
+        n: usize,
+        channels: usize,
+        conv: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(history),
+            Arg::I32(n as i32),
+            Arg::I32(channels as i32),
+            Arg::I32(conv as i32),
+            Arg::I32(tokens as i32),
+        ];
+        self.run_per_number(&self.kernels.ink_conv_history, n, &args)
+    }
+
+    /// A layer's keys (`clip`: Some(threshold)) or values (None: RMS-normed with `eps`) for
+    /// `tokens` tokens at positions `pos0` on: the projections in `x` (rows of `kv_dim`)
+    /// through the causal convolution (its history in `history`, rows `channels` apart,
+    /// with input-dependent `taps` if given), into the cache's rows (a ring of `ring` rows,
+    /// or 0 for a row a position). Heads of 128.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_kv(
+        &self,
+        x: CuDevicePtr,
+        history: CuDevicePtr,
+        weight: CuDevicePtr,
+        taps: Option<CuDevicePtr>,
+        cache: CuDevicePtr,
+        channels: usize,
+        conv: usize,
+        tokens: usize,
+        pos0: usize,
+        ring: usize,
+        kv_dim: usize,
+        clip: Option<f32>,
+        eps: f32,
+    ) -> Result<()> {
+        assert!((2..=8).contains(&conv), "convolution of {conv}");
+        assert!(kv_dim.is_multiple_of(128), "ink_kv takes heads of 128");
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(history),
+            Arg::Ptr(weight),
+            Arg::Ptr(taps.unwrap_or(0)),
+            Arg::Ptr(cache),
+            Arg::I32(channels as i32),
+            Arg::I32(conv as i32),
+            Arg::I32(tokens as i32),
+            Arg::I32(pos0 as i32),
+            Arg::I32(ring as i32),
+            Arg::I32(kv_dim as i32),
+            Arg::I32(i32::from(clip.is_none())),
+            Arg::F32(clip.unwrap_or(eps)),
+        ];
+        if tokens > 1 {
+            // Every token at once, then the history.
+            let grid = ((kv_dim / 128) as u32, tokens as u32);
+            self.run(&self.kernels.ink_kv_parallel, grid, 128, &args)?;
+            return self.ink_conv_history(x, history, kv_dim, channels, conv, tokens);
+        }
+        self.run(&self.kernels.ink_kv, ((kv_dim / 128) as u32, 1), 128, &args)
+    }
+
+    /// The most parts [`Gpu::ink_attention`] splits a head's positions into.
+    pub const INK_ATTENTION_PARTS: usize = 32;
+
+    /// How many parts a batch of `tokens` with up to `count` positions each is split into,
+    /// and the threads of each part: one token, 16 SIMD groups and a part per 1,024
+    /// positions (a sliding window's in one, which then writes the output itself); a
+    /// batch, 4 SIMD groups and a part per 64 positions up to INK_ATTENTION_PARTS / tokens
+    /// (a batch gives the GPU threadgroups enough with its tokens).
+    pub fn ink_attention_parts(tokens: usize, count: usize) -> (usize, u32) {
+        if tokens == 1 {
+            return (count.div_ceil(1024).clamp(1, Self::INK_ATTENTION_PARTS), 512);
+        }
+        let most = (Self::INK_ATTENTION_PARTS / tokens).max(1);
+        (count.div_ceil(64).clamp(1, most), 128)
+    }
+
+    /// Floats `InkAttention::parts` needs for batches of up to `batch` tokens of `heads`
+    /// heads.
+    pub fn ink_attention_scratch(heads: usize, batch: usize) -> usize {
+        heads * (128 + 2) * batch.max(Self::INK_ATTENTION_PARTS)
+    }
+
+    /// A batch's Inkling 2 attention, heads of 128: split over the positions
+    /// (`ink_attention_part`) and put together with the sink and times the gate
+    /// (`ink_attention_merge`).
+    pub fn ink_attention(&self, a: &InkAttention) -> Result<()> {
+        assert_eq!(a.head_dim, 128, "ink_attention takes heads of 128");
+        assert!(a.rel_dim <= 32, "ink_attention takes up to 32 bias numbers a head");
+        if a.flash && a.tokens > 1 {
+            let args = [
+                Arg::Ptr(a.q),
+                Arg::Ptr(a.keys),
+                Arg::Ptr(a.values),
+                Arg::Ptr(a.out),
+                Arg::Ptr(a.r),
+                Arg::Ptr(a.bias),
+                Arg::Ptr(a.sink),
+                Arg::Ptr(a.gate),
+                Arg::I32(a.pos0 as i32),
+                Arg::I32(a.window as i32),
+                Arg::I32(a.extent as i32),
+                Arg::I32(a.ring as i32),
+                Arg::I32(a.kv_dim as i32),
+                Arg::I32(a.group as i32),
+                Arg::I32(a.rel_dim as i32),
+                Arg::F32(a.scale),
+                Arg::I32(a.tokens as i32),
+            ];
+            let grid = (a.heads as u32, (a.tokens as u32).div_ceil(32));
+            return self.run(&self.kernels.ink_attention_flash, grid, 128, &args);
+        }
+        let last = a.pos0 + a.tokens - 1;
+        let count = if a.window > 0 {
+            (last + 1).min(a.window)
+        } else {
+            last + 1
+        };
+        let (parts, threads) = Self::ink_attention_parts(a.tokens, count);
+        let args = [
+            Arg::Ptr(a.q),
+            Arg::Ptr(a.keys),
+            Arg::Ptr(a.values),
+            Arg::Ptr(a.parts),
+            Arg::Ptr(a.r),
+            Arg::Ptr(a.bias),
+            Arg::Ptr(a.sink),
+            Arg::I32(a.pos0 as i32),
+            Arg::I32(a.window as i32),
+            Arg::I32(a.extent as i32),
+            Arg::I32(a.ring as i32),
+            Arg::I32(a.kv_dim as i32),
+            Arg::I32(a.group as i32),
+            Arg::I32(a.rel_dim as i32),
+            Arg::F32(a.scale),
+            Arg::I32(a.heads as i32),
+            Arg::Ptr(a.out),
+            Arg::Ptr(a.gate),
+        ];
+        self.run_3d(
+            &self.kernels.ink_attention_part,
+            (a.heads as u32, parts as u32, a.tokens as u32),
+            threads,
+            0,
+            &args,
+        )?;
+        if parts == 1 {
+            return Ok(());
+        }
+        let merge = [
+            Arg::Ptr(a.parts),
+            Arg::Ptr(a.out),
+            Arg::I32(parts as i32),
+            Arg::I32(a.heads as i32),
+            Arg::Ptr(a.gate),
+        ];
+        self.run(
+            &self.kernels.ink_attention_merge,
+            (a.heads as u32, a.tokens as u32),
+            128,
+            &merge,
+        )
+    }
+
+    /// Inkling 2's experts' pick for each of `tokens` tokens: sigmoid scores, the `used`
+    /// highest after `bias`, normalized and times `scale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_moe_pick(
+        &self,
+        logits: CuDevicePtr,
+        bias: CuDevicePtr,
+        idx: CuDevicePtr,
+        share: CuDevicePtr,
+        experts: usize,
+        used: usize,
+        scale: f32,
+        tokens: usize,
+    ) -> Result<()> {
+        assert!(used <= 32, "ink_moe_pick holds up to 32 picks (MOE_MAX_USED)");
+        assert!(experts <= 512, "ink_moe_pick holds up to 512 experts");
+        let args = [
+            Arg::Ptr(logits),
+            Arg::Ptr(bias),
+            Arg::Ptr(idx),
+            Arg::Ptr(share),
+            Arg::I32(experts as i32),
+            Arg::I32(used as i32),
+            Arg::F32(scale),
+        ];
+        self.run(&self.kernels.ink_moe_pick, (tokens as u32, 1), 128, &args)
+    }
+
+    /// SiTU of each of `slots` rows of `gate_up` (2 × `width`) into `act`'s rows, `stride`
+    /// apart (`act` may be `gate_up`, stride 2 × width); with `half`, into f16 rows of
+    /// `width` (moe_matmul_fast's input).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_situ(
+        &self,
+        gate_up: CuDevicePtr,
+        act: CuDevicePtr,
+        width: usize,
+        slots: usize,
+        beta: f32,
+        linear_beta: f32,
+        stride: usize,
+        half: bool,
+    ) -> Result<()> {
+        let total = width * slots;
+        let args = [
+            Arg::Ptr(gate_up),
+            Arg::Ptr(act),
+            Arg::I32(width as i32),
+            Arg::I32(total as i32),
+            Arg::F32(beta),
+            Arg::F32(linear_beta),
+            Arg::I32(stride as i32),
+        ];
+        let kernel = if half {
+            &self.kernels.ink_situ_half
+        } else {
+            &self.kernels.ink_situ
+        };
+        self.run_per_number(kernel, total, &args)
+    }
+
     pub fn zero(&self, buffer: &Buffer) -> Result<()> {
         let zeros = vec![0u8; buffer.len_bytes()];
         buffer.write_bytes_at(0, &zeros)
@@ -3541,6 +3968,39 @@ impl Drop for Gpu {
 }
 
 /// What [`Gpu::qkv_prep`] works on (see the CUDA backend's `QkvPrep`).
+/// A batch's Inkling 2 attention ([`Gpu::ink_attention`]): `tokens` tokens at positions
+/// `pos0` on, `heads` query heads each (rows of `q`, `r` and `sink` a token), over the
+/// cache's rows (a ring of `ring` rows, or 0 for a row a position) of the positions each
+/// token sees (the last `window`, or all for 0), with the relative-position bias
+/// `r · bias[distance]` (row `extent` past the table) less each head's sink.
+pub struct InkAttention {
+    pub q: CuDevicePtr,
+    pub keys: CuDevicePtr,
+    pub values: CuDevicePtr,
+    pub out: CuDevicePtr,
+    pub r: CuDevicePtr,
+    pub bias: CuDevicePtr,
+    pub sink: CuDevicePtr,
+    /// The output gate: the output is times sigmoid(gate), a number each.
+    pub gate: CuDevicePtr,
+    /// [`Gpu::ink_attention_scratch`] floats.
+    pub parts: CuDevicePtr,
+    pub pos0: usize,
+    pub tokens: usize,
+    pub window: usize,
+    pub extent: usize,
+    pub ring: usize,
+    pub kv_dim: usize,
+    pub group: usize,
+    pub head_dim: usize,
+    pub rel_dim: usize,
+    pub heads: usize,
+    pub scale: f32,
+    /// A batch on the SIMD-group matrix units (`ink_attention_flash`), with the keys,
+    /// values and queries rounded to f16: the default mode's prompts.
+    pub flash: bool,
+}
+
 pub struct QkvPrep {
     pub q: CuDevicePtr,
     pub q_stride: usize,

@@ -135,10 +135,10 @@ impl Tokenizer {
             "gemma4" => true,
             other => return Err(Error::Unsupported(format!("The \"{other}\" tokenizer"))),
         };
+        let pre_name = gguf.get_str("tokenizer.ggml.pre").unwrap_or("default");
         let pre = if metaspace {
             PreTokenizer::Gemma4
         } else {
-            let pre_name = gguf.get_str("tokenizer.ggml.pre").unwrap_or("default");
             PreTokenizer::from_gguf_name(pre_name)
                 .ok_or_else(|| Error::Unsupported(format!("The \"{pre_name}\" pre-tokenizer")))?
         };
@@ -187,6 +187,8 @@ impl Tokenizer {
 
         // llama.cpp's defaults for each pre-tokenizer, then the file's own settings.
         let (default_add_bos, ignore_merges) = match pre {
+            // Inkling 2 splits words as Llama 4 does, but has no BOS and merges every word.
+            PreTokenizer::Llama4 if pre_name == "inkling2" => (false, false),
             PreTokenizer::Llama3 | PreTokenizer::Llama4 => (true, true),
             PreTokenizer::Qwen2 | PreTokenizer::Qwen35 => (false, false),
             PreTokenizer::Gemma4 => (true, false),

@@ -44,7 +44,8 @@ pub enum PreTokenizer {
     Qwen2,
     /// Qwen 3.5 to 3.8 ("qwen35"): Qwen 2's split, with combining marks part of words.
     Qwen35,
-    /// Llama 4 and Muse Glimmer ("llama4"): words split at case changes, numbers up to
+    /// Llama 4, Muse Glimmer ("llama4") and Inkling 2 ("inkling2", llama.cpp's GPT-4o
+    /// split as well): words split at case changes, numbers up to
     /// 3 digits, contractions kept on their word ([`split_llama4`]).
     Llama4,
     /// Gemma 4: only newlines split the text (`[^\n]+|[\n]+`); BPE merges run over
@@ -59,7 +60,7 @@ impl PreTokenizer {
             "llama3" | "llama-v3" | "llama-bpe" => Some(Self::Llama3),
             "qwen2" | "deepseek-r1-qwen" => Some(Self::Qwen2),
             "qwen35" => Some(Self::Qwen35),
-            "llama4" => Some(Self::Llama4),
+            "llama4" | "inkling2" => Some(Self::Llama4),
             _ => None,
         }
     }

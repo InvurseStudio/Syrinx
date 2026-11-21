@@ -69,6 +69,7 @@ use syrinx_engine::cuda::Gpu;
 use syrinx_engine::grammar::{Grammar, TokenTrie};
 use syrinx_engine::models::gemma4_cuda::{Gemma4Cuda, assistant as gemma4_assistant};
 use syrinx_engine::models::llama_cuda::LlamaCuda;
+use syrinx_engine::models::inkling2_cuda::{Inkling2Checkpoint, Inkling2Cuda};
 use syrinx_engine::models::qwen35_cuda::{Qwen35Checkpoint, Qwen35Cuda};
 use syrinx_engine::models::{Logits, Precision, SavedState};
 use syrinx_engine::{GgufFile, Tokenizer};
@@ -1396,6 +1397,7 @@ enum Model {
     Llama(LlamaCuda<'static>),
     Qwen35(Qwen35Cuda<'static>),
     Gemma4(Gemma4Cuda<'static>),
+    Inkling2(Inkling2Cuda<'static>),
 }
 
 #[allow(clippy::large_enum_variant)] // a few, for the life of the server
@@ -1403,6 +1405,7 @@ enum Session {
     Llama(syrinx_engine::models::llama_cuda::CudaSession),
     Qwen35(syrinx_engine::models::qwen35_cuda::Qwen35CudaSession),
     Gemma4(syrinx_engine::models::gemma4_cuda::Gemma4CudaSession),
+    Inkling2(syrinx_engine::models::inkling2_cuda::Inkling2CudaSession),
 }
 
 /// The one session the server keeps between replies, so a chat's next turn reads only
@@ -1422,6 +1425,9 @@ struct Kept {
     turn: Option<Qwen35Checkpoint>,
     /// Qwen: its DeltaNet layers where scoring started, to go back to after each try.
     scratch: Option<Qwen35Checkpoint>,
+    /// Inkling 2's convolution histories at the same places as Qwen's four above (its
+    /// caches can't be cut back either: see `Inkling2Checkpoint`).
+    ink: InkPoints,
     /// The starts of the last few system turns read, each its tokens and the state after
     /// them in system memory, the latest used last (`keep_head`). Qwen: a system turn's
     /// end, for when another turn has been read over it in the session (its checkpoints
@@ -1458,6 +1464,7 @@ impl Kept {
             base: None,
             turn: None,
             scratch: None,
+            ink: InkPoints::default(),
             heads: Vec::new(),
             pickers: Vec::new(),
             skill_controls: HashMap::new(),
@@ -1491,6 +1498,15 @@ fn keep_head(heads: &mut Vec<(Vec<u32>, SavedState)>, tokens: &[u32], state: Sav
     );
 }
 
+/// Inkling 2's checkpoints in a chat session (`Kept::ink`), as Qwen's.
+#[derive(Default)]
+struct InkPoints {
+    checkpoint: Option<Inkling2Checkpoint>,
+    base: Option<Inkling2Checkpoint>,
+    turn: Option<Inkling2Checkpoint>,
+    scratch: Option<Inkling2Checkpoint>,
+}
+
 /// A session for the server's own questions, and what's in it.
 struct Picker {
     session: Session,
@@ -1498,6 +1514,8 @@ struct Picker {
     tokens: Vec<u32>,
     /// Qwen: its DeltaNet layers where the last two questions part (their shared start).
     checkpoint: Option<Qwen35Checkpoint>,
+    /// Inkling 2: the same.
+    ink_checkpoint: Option<Inkling2Checkpoint>,
     /// When it was last used (a count of questions), to reuse the oldest.
     used: u64,
 }
@@ -1702,6 +1720,7 @@ impl TimeLog {
                 Model::Llama(m) => m.gpu().synchronize(),
                 Model::Qwen35(m) => m.gpu().synchronize(),
                 Model::Gemma4(m) => m.gpu().synchronize(),
+                Model::Inkling2(m) => m.gpu().synchronize(),
             };
         }
         TimeLog(kind, n, std::time::Instant::now())
@@ -1739,6 +1758,7 @@ impl Model {
             Model::Llama(m) => m.gpu().free_memory(),
             Model::Qwen35(m) => m.gpu().free_memory(),
             Model::Gemma4(m) => m.gpu().free_memory(),
+            Model::Inkling2(m) => m.gpu().free_memory(),
         };
         let room = free.saturating_sub(GPU_HEADROOM + free / 10);
         let n = (room / per).min(trained).min(AUTO_CONTEXT_MAX) / 1024 * 1024;
@@ -1769,6 +1789,7 @@ impl Model {
                     session: self.picker_session()?,
                     tokens: Vec::new(),
                     checkpoint: None,
+                    ink_checkpoint: None,
                     used: 0,
                 });
                 kept.pickers.len() - 1
@@ -1798,6 +1819,19 @@ impl Model {
                     0
                 }
             }
+            (Model::Inkling2(m), Session::Inkling2(s)) => {
+                if shared == s.len() {
+                    shared
+                } else if let Some(cp) = p.ink_checkpoint.as_ref().filter(|c| c.len() <= shared)
+                    && m.restore(s, cp).map_err(e)?
+                {
+                    cp.len()
+                } else {
+                    m.reset(s).map_err(e)?;
+                    p.ink_checkpoint = None;
+                    0
+                }
+            }
             _ => unreachable!("a session belongs to its model"),
         };
         // Qwen: a checkpoint where this question parts from the last, a few tokens early
@@ -1811,6 +1845,15 @@ impl Model {
                 from = mark;
             }
         }
+        if let (Model::Inkling2(m), Session::Inkling2(s)) = (self, &mut p.session) {
+            let mark = shared.saturating_sub(8);
+            if mark >= from + 32 {
+                m.forward_batch(s, &ids[from..mark], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut p.ink_checkpoint).map_err(e)?;
+                from = mark;
+            }
+        }
         p.tokens.clear();
         let logits = self.read(&mut p.session, &ids[from..]);
         if logits.is_ok() {
@@ -1818,6 +1861,7 @@ impl Model {
         } else {
             // Unknown contents: start over next time.
             p.checkpoint = None;
+            p.ink_checkpoint = None;
             self.empty(&mut p.session)?;
         }
         logits
@@ -1831,6 +1875,9 @@ impl Model {
                 s.truncate(0);
             }
             (Model::Qwen35(m), Session::Qwen35(s)) => m.reset(s).map_err(|e| e.to_string())?,
+            (Model::Inkling2(m), Session::Inkling2(s)) => {
+                m.reset(s).map_err(|e| e.to_string())?
+            }
             _ => unreachable!("a session belongs to its model"),
         }
         Ok(())
@@ -1841,6 +1888,7 @@ impl Model {
             Session::Llama(s) => s.cache_bytes_per_position(),
             Session::Qwen35(s) => s.cache_bytes_per_position(),
             Session::Gemma4(s) => s.cache_bytes_per_position(),
+            Session::Inkling2(s) => s.cache_bytes_per_position(),
         }
     }
 
@@ -1850,6 +1898,7 @@ impl Model {
             Model::Llama(m) => Session::Llama(m.session(capacity).map_err(e)?),
             Model::Qwen35(m) => Session::Qwen35(m.session(capacity).map_err(e)?),
             Model::Gemma4(m) => Session::Gemma4(m.session(capacity).map_err(e)?),
+            Model::Inkling2(m) => Session::Inkling2(m.session(capacity).map_err(e)?),
         })
     }
 
@@ -1865,6 +1914,9 @@ impl Model {
             }
             Model::Gemma4(m) => {
                 Session::Gemma4(m.session_with_batch(capacity, batch).map_err(e)?)
+            }
+            Model::Inkling2(m) => {
+                Session::Inkling2(m.session_with_batch(capacity, batch).map_err(e)?)
             }
         })
     }
@@ -1959,6 +2011,9 @@ impl Model {
             (Model::Gemma4(m), Session::Gemma4(s)) => m
                 .forward_batch(s, ids, Logits::Last)
                 .map(|l| l.map(<[f32]>::to_vec)),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m
+                .forward_batch(s, ids, Logits::Last)
+                .map(|l| l.map(<[f32]>::to_vec)),
             _ => unreachable!("a session belongs to its model"),
         };
         r.map_err(|e| e.to_string())?
@@ -1978,6 +2033,9 @@ impl Model {
             (Model::Gemma4(m), Session::Gemma4(s)) => m
                 .forward_batch(s, ids, Logits::All)
                 .map(|l| l.map(<[f32]>::to_vec)),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m
+                .forward_batch(s, ids, Logits::All)
+                .map(|l| l.map(<[f32]>::to_vec)),
             _ => unreachable!("a session belongs to its model"),
         };
         r.map_err(|e| e.to_string())?
@@ -1995,6 +2053,7 @@ impl Model {
             (Model::Llama(m), Session::Llama(s)) => m.forward_batch_held(s, ids),
             (Model::Qwen35(m), Session::Qwen35(s)) => m.forward_batch_held(s, ids),
             (Model::Gemma4(m), Session::Gemma4(s)) => m.forward_batch_held(s, ids),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m.forward_batch_held(s, ids),
             _ => unreachable!("a session belongs to its model"),
         }
         .map_err(|e| e.to_string())
@@ -2006,6 +2065,7 @@ impl Model {
             (Model::Llama(m), Session::Llama(s)) => m.held_logits(s, row, logits),
             (Model::Qwen35(m), Session::Qwen35(s)) => m.held_logits(s, row, logits),
             (Model::Gemma4(m), Session::Gemma4(s)) => m.held_logits(s, row, logits),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m.held_logits(s, row, logits),
             _ => unreachable!("a session belongs to its model"),
         }
         .map_err(|e| e.to_string())
@@ -2020,6 +2080,9 @@ impl Model {
             let len = kept.tokens.len();
             if let (Model::Qwen35(m), Session::Qwen35(s)) = (self, &kept.session) {
                 m.save(s, &mut kept.scratch).map_err(e)?;
+            }
+            if let (Model::Inkling2(m), Session::Inkling2(s)) = (self, &kept.session) {
+                m.save(s, &mut kept.ink.scratch).map_err(e)?;
             }
             let rows = self.read_all(&mut kept.session, &ids[..ids.len() - 1])?;
             let vocab = logits.len();
@@ -2038,6 +2101,13 @@ impl Model {
                 }
                 (Model::Qwen35(m), Session::Qwen35(s)) => {
                     m.restore(s, kept.scratch.as_ref().unwrap()).map_err(e)?
+                }
+                (Model::Inkling2(m), Session::Inkling2(s)) => {
+                    if !m.restore(s, kept.ink.scratch.as_ref().unwrap()).map_err(e)? {
+                        return Err(
+                            "The chat's cache couldn't go back to before the choices.".into()
+                        );
+                    }
                 }
                 _ => unreachable!("a session belongs to its model"),
             }
@@ -2132,6 +2202,30 @@ impl Model {
                     0
                 }
             }
+            // As Qwen's: on from the end, or back to a checkpoint the caches still hold
+            // (the last history's end, the system turn's, where chats part), or empty.
+            (Model::Inkling2(m), Session::Inkling2(s)) => {
+                let ink = &mut kept.ink;
+                let mut from = None;
+                if shared == s.len() {
+                    from = Some(shared);
+                } else {
+                    for cp in [&ink.checkpoint, &ink.turn, &ink.base].into_iter().flatten() {
+                        if cp.len() <= shared && m.restore(s, cp).map_err(e)? {
+                            from = Some(cp.len());
+                            break;
+                        }
+                    }
+                }
+                match from {
+                    Some(n) => n,
+                    None => {
+                        m.reset(s).map_err(e)?;
+                        *ink = InkPoints::default();
+                        0
+                    }
+                }
+            }
             _ => unreachable!("a session belongs to its model"),
         };
         kept.tokens.truncate(from);
@@ -2188,6 +2282,26 @@ impl Model {
                 }
             }
         }
+        // Inkling: as Qwen's, checkpoints where this prompt parts from the last and at the
+        // system turn's end, read up to on the way.
+        if let (Model::Inkling2(m), Session::Inkling2(s)) = (self, &mut kept.session) {
+            let head_at = head.saturating_sub(8);
+            let parted_at = shared.saturating_sub(8);
+            if kept.ink.base.is_none() && parted_at >= from + 64 && parted_at < mark {
+                m.forward_batch(s, &ids[from..parted_at], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut kept.ink.base).map_err(e)?;
+                kept.tokens.extend_from_slice(&ids[from..parted_at]);
+                from = parted_at;
+            }
+            if head_at >= from + 64 && head_at < mark {
+                m.forward_batch(s, &ids[from..head_at], Logits::None)
+                    .map_err(e)?;
+                m.save(s, &mut kept.ink.turn).map_err(e)?;
+                kept.tokens.extend_from_slice(&ids[from..head_at]);
+                from = head_at;
+            }
+        }
         // Qwen: the history read on its own, and its DeltaNet saved where the next
         // turn's prompt will part from this one.
         let mut start = from;
@@ -2197,6 +2311,14 @@ impl Model {
             m.forward_batch(s, &ids[from..mark], Logits::None)
                 .map_err(e)?;
             m.save(s, &mut kept.checkpoint).map_err(e)?;
+            start = mark;
+        }
+        if let (Model::Inkling2(m), Session::Inkling2(s)) = (self, &mut kept.session)
+            && mark > from
+        {
+            m.forward_batch(s, &ids[from..mark], Logits::None)
+                .map_err(e)?;
+            m.save(s, &mut kept.ink.checkpoint).map_err(e)?;
             start = mark;
         }
         let logits = self.read_in_turns(&mut kept.session, &ids[start..], serving)?;
@@ -2246,6 +2368,18 @@ impl Model {
                 .filter(|&n| n <= shared)
                 .max()
                 .unwrap_or(0),
+            Session::Inkling2(s) if shared != s.len() => {
+                let Model::Inkling2(m) = self else {
+                    unreachable!("a session belongs to its model")
+                };
+                [&kept.ink.checkpoint, &kept.ink.turn, &kept.ink.base]
+                    .into_iter()
+                    .flatten()
+                    .map(|c| c.len())
+                    .filter(|&n| n <= shared && m.can_restore(s, n))
+                    .max()
+                    .unwrap_or(0)
+            }
             _ => shared,
         }
     }
@@ -2256,6 +2390,8 @@ impl Model {
             Session::Qwen35(_) => kept.checkpoint.as_ref().map_or(0, |c| c.len()),
             Session::Gemma4(_) => kept.history_end,
             Session::Llama(_) => kept.tokens.len(),
+            // Its chats aren't saved yet.
+            Session::Inkling2(_) => 0,
         }
     }
 
@@ -2266,6 +2402,7 @@ impl Model {
         let shared = shared_start(tokens, ids);
         let n = match self {
             Model::Qwen35(_) if shared != tokens.len() => 0,
+            Model::Inkling2(_) => 0,
             Model::Gemma4(m)
                 if shared != tokens.len() && tokens.len() > m.config.sliding_window =>
             {
@@ -2287,6 +2424,7 @@ impl Model {
                 Some(cp) => s.export(cp).map_err(e)?,
                 None => return Ok(None),
             },
+            Session::Inkling2(_) => return Ok(None),
         };
         if state.is_empty() {
             return Ok(None);
@@ -2305,6 +2443,9 @@ impl Model {
                 m.save(s, &mut kept.checkpoint).map_err(e)?;
                 kept.base = None;
                 kept.turn = None;
+            }
+            (Model::Inkling2(_), Session::Inkling2(_)) => {
+                return Err("Inkling 2's chats aren't saved yet.".into());
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -2325,6 +2466,10 @@ impl Model {
                 kept.checkpoint = None;
                 kept.base = None;
                 kept.turn = None;
+            }
+            (Model::Inkling2(m), Session::Inkling2(s)) => {
+                m.reset(s).map_err(|e| e.to_string())?;
+                kept.ink = InkPoints::default();
             }
             _ => unreachable!("a session belongs to its model"),
         }
@@ -2384,6 +2529,9 @@ impl Model {
             (Model::Gemma4(m), Session::Gemma4(s)) => m
                 .forward(s, id, true)
                 .map(|l| l.map(|l| logits.copy_from_slice(l))),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m
+                .forward(s, id, true)
+                .map(|l| l.map(|l| logits.copy_from_slice(l))),
             _ => unreachable!("a session belongs to its model"),
         };
         r.map_err(|e| e.to_string())?
@@ -2396,6 +2544,7 @@ impl Model {
             (Model::Llama(m), Session::Llama(s)) => m.forward_greedy(s, id),
             (Model::Qwen35(m), Session::Qwen35(s)) => m.forward_greedy(s, id),
             (Model::Gemma4(m), Session::Gemma4(s)) => m.forward_greedy(s, id),
+            (Model::Inkling2(m), Session::Inkling2(s)) => m.forward_greedy(s, id),
             _ => unreachable!("a session belongs to its model"),
         };
         r.map_err(|e| e.to_string())
@@ -2421,7 +2570,7 @@ fn engine(
     };
     let loaded = (|| -> Result<(Model, Tokenizer, Family, String), String> {
         let family = Family::of(file.architecture()).ok_or_else(|| {
-            format!("{path} isn't a Llama, Qwen 3.5, Gemma 4 or Muse Glimmer model")
+            format!("{path} isn't a Llama, Qwen 3.5, Gemma 4, Muse Glimmer or Inkling 2 model")
         })?;
         let tokenizer = Tokenizer::from_gguf(file).map_err(|e| e.to_string())?;
         chat::follow_template(file.get_str("tokenizer.chat_template"));
@@ -2473,6 +2622,12 @@ fn engine(
                 }
                 Model::Gemma4(m)
             }
+            Family::Inkling => {
+                Model::Inkling2(Inkling2Cuda::load(file, gpu).map_err(e).map(|mut m| {
+                    m.set_precision(precision);
+                    m
+                })?)
+            }
         };
         Ok((model, tokenizer, family, gpu_name))
     })();
@@ -2499,6 +2654,7 @@ fn engine(
         Model::Llama(m) => m.gpu().settle(),
         Model::Qwen35(m) => m.gpu().settle(),
         Model::Gemma4(m) => m.gpu().settle(),
+        Model::Inkling2(m) => m.gpu().settle(),
     }
     // The weights are in GPU memory now: let go of the file's pages read on the way.
     file.release_pages();
@@ -3236,7 +3392,11 @@ fn reply(
         .and_then(|(open, close)| Some((tokenizer.token_id(open)?, tokenizer.token_id(close)?)));
     let thinking_on = think.is_some();
     // What the prompt says of it (Muse's is its reasoning strength).
-    let prompt_thinking = thinking_on || (job.thinking && family == Family::Muse);
+    let prompt_thinking =
+        thinking_on || (job.thinking && matches!(family, Family::Muse | Family::Inkling));
+    // Families whose reply is a run of messages, each opened with its kind (Muse's
+    // recipient, Inkling's text, thought or call) chosen at its start.
+    let by_message = matches!(family, Family::Muse | Family::Inkling);
     let mut offered = if job.no_tools {
         Vec::new()
     } else {
@@ -3688,12 +3848,7 @@ fn reply(
     let mut grammar = Grammar::new(&tools::call_grammar(family, &callable));
     // Muse's recipients without its reasoning (once it has used its budget), and without
     // tools (once calls are used up, or none are offered).
-    let mut muse_grammars = (family == Family::Muse).then(|| {
-        (
-            Grammar::new(&tools::muse_call_grammar(&callable, false)),
-            Grammar::new(&tools::muse_call_grammar(&[], true)),
-        )
-    });
+    let mut muse_grammars = by_message.then(|| message_grammars(family, &callable));
     // Muse writing to itself, and the tokens it has so far this reply.
     let mut thinking = false;
     let mut thought = 0usize;
@@ -3704,6 +3859,10 @@ fn reply(
     };
     let start = tools::call_start(family);
     let start_token = tokenizer.token_id(start.token);
+    // What ends one of Inkling's messages (a thought's, here).
+    let ink_end = (family == Family::Inkling)
+        .then(|| tokenizer.token_id(tools::INK_END))
+        .flatten();
     // The calls made since the reply last changed anything: the same one again would
     // get the same answer.
     let mut seen: Vec<tools::Call> = written_calls;
@@ -3807,10 +3966,15 @@ fn reply(
         // Muse names each message's recipient first. With no call to make, the user: the
         // model writes to them from here. Otherwise the call's grammar has it choose (the
         // user is one of its options), below.
-        let muse_turn = family == Family::Muse && turn_start;
+        let muse_turn = by_message && turn_start;
         let may_think = thought < muse_thought_tokens;
         if muse_turn && !may_call && !may_think {
-            let ids = tokenizer.encode(tools::MUSE_TO_USER, false, true);
+            let to_user = if family == Family::Inkling {
+                tools::INK_TO_USER
+            } else {
+                tools::MUSE_TO_USER
+            };
+            let ids = tokenizer.encode(to_user, false, true);
             if kept.tokens.len() + ids.len() + 64 > context {
                 break;
             }
@@ -3946,6 +4110,29 @@ fn reply(
         let mut next = pre_picked
             .take()
             .unwrap_or_else(|| sampler.pick(&logits, &generated));
+        // Inkling's thought ends with its message (here too when it would end the turn
+        // in it, or has thought as long as a reply may): the next message opens, its kind
+        // the model's choice, as after any message.
+        if family == Family::Inkling
+            && thinking
+            && (Some(next) == ink_end
+                || tokenizer.is_end_of_generation(next)
+                || thought >= muse_thought_tokens)
+        {
+            let ids = tokenizer.encode(
+                &format!("{}{}", tools::INK_END, chat::opening(family, false)),
+                false,
+                true,
+            );
+            if kept.tokens.len() + ids.len() + 64 > context {
+                break;
+            }
+            logits = model.feed(kept, &ids)?;
+            thought += ids.len();
+            turn_start = true;
+            thinking = false;
+            continue;
+        }
         // A thought ends with its closing token, here even when the model would end its
         // turn inside it, or has thought as long as one thought may: its answer is still
         // to come.
@@ -4010,7 +4197,7 @@ fn reply(
             };
         // Muse's message start is always a choice, and its <|eom|> (taken away unless it
         // may call or is thinking) always opens another message.
-        let opens_call = if family == Family::Muse {
+        let opens_call = if by_message {
             muse_turn || by_token
         } else {
             may_call && (by_token || by_brace)
@@ -4036,6 +4223,12 @@ fn reply(
                 model.next(&mut kept.session, next, &mut logits)?;
                 kept.tokens.push(next);
                 call_tokens += 1;
+                if family == Family::Inkling {
+                    // Inkling's <|message_model|>: its kind is chosen next.
+                    turn_start = true;
+                    thinking = false;
+                    continue;
+                }
                 if family == Family::Muse {
                     // Muse's <|eom|>: another message follows, its recipient chosen at its start.
                     let ids = tokenizer.encode(chat::opening(family, false), false, true);
@@ -4086,10 +4279,18 @@ fn reply(
                 thinking = text == tools::MUSE_TO_SELF;
                 continue;
             }
+            if family == Family::Inkling
+                && (text == tools::INK_TO_USER || text == tools::INK_TO_SELF)
+            {
+                // Text for the user, or a thought (not shown): plain text from here.
+                turn_start = false;
+                thinking = text == tools::INK_TO_SELF;
+                continue;
+            }
             let call = tools::parse_call(family, &text, &callable)
                 .ok_or_else(|| format!("Couldn't read back a tool call: {text:?}"))?;
             // The call as it was written, from its start token (Muse's from its recipient).
-            let written_call = if by_token && family != Family::Muse {
+            let written_call = if by_token && !by_message {
                 format!("{}{text}", start.token)
             } else {
                 text.clone()
@@ -4218,12 +4419,7 @@ fn reply(
                 {
                     callable = every_tool.clone();
                     grammar = Grammar::new(&tools::call_grammar(family, &callable));
-                    muse_grammars = (family == Family::Muse).then(|| {
-                        (
-                            Grammar::new(&tools::muse_call_grammar(&callable, false)),
-                            Grammar::new(&tools::muse_call_grammar(&[], true)),
-                        )
-                    });
+                    muse_grammars = by_message.then(|| message_grammars(family, &callable));
                 }
                 if repeats >= 2 || calls == MAX_CALLS {
                     may_call = false;
@@ -5012,11 +5208,42 @@ fn call_draft<'a>(
 /// Takes the session back to its first `len` tokens (a call that ran too long, from its
 /// start token on): the last of them's logits. Whatever the model's cache can't be cut
 /// back to is read again from the chat's last kept point.
+/// A message-by-message family's grammars at a message's start without its thoughts (once
+/// it has thought its share) and without tools (once calls are used up, or none are
+/// offered): Muse's recipients, Inkling's message kinds.
+fn message_grammars(family: Family, callable: &[tools::Tool]) -> (Grammar, Grammar) {
+    if family == Family::Inkling {
+        (
+            Grammar::new(&tools::ink_call_grammar(callable, false)),
+            Grammar::new(&tools::ink_call_grammar(&[], true)),
+        )
+    } else {
+        (
+            Grammar::new(&tools::muse_call_grammar(callable, false)),
+            Grammar::new(&tools::muse_call_grammar(&[], true)),
+        )
+    }
+}
+
 fn take_back(model: &Model, kept: &mut Kept, len: usize) -> Result<Vec<f32>, String> {
     let ids = kept.tokens[..len].to_vec();
     let mark = kept.history_end.min(len);
     let (logits, _) = model.continue_with(kept, &ids, mark, 0, None)?;
     Ok(logits)
+}
+
+/// A token's bytes as the grammar reads them: its text, and for a special token a call's
+/// format uses (`tools::call_tokens`, in the trie as the text it's written as) that text
+/// too, not nothing as in the reply's shown text. Without it, Inkling's message kinds
+/// went unread and the grammar went on to a tool's name.
+fn grammar_bytes(tokenizer: &Tokenizer, id: u32, out: &mut Vec<u8>) {
+    let before = out.len();
+    tokenizer.token_bytes(id, false, out);
+    if out.len() == before
+        && let Some(text) = tokenizer.token_text(id)
+    {
+        out.extend_from_slice(text.as_bytes());
+    }
 }
 
 /// Writes a tool call under `grammar`: what the grammar forces goes in without asking the
@@ -5149,7 +5376,7 @@ fn write_call(
             );
         }
         let mut bytes = Vec::new();
-        tokenizer.token_bytes(next, false, &mut bytes);
+        grammar_bytes(tokenizer, next, &mut bytes);
         if !m.advance_all(&bytes) {
             return Err("A token the grammar allowed didn't fit it.".into());
         }
@@ -5201,7 +5428,7 @@ fn write_call(
                     break;
                 }
                 bytes.clear();
-                tokenizer.token_bytes(guess, false, &mut bytes);
+                grammar_bytes(tokenizer, guess, &mut bytes);
                 if !m.advance_all(&bytes) {
                     return Err("A token the grammar allowed didn't fit it.".into());
                 }
