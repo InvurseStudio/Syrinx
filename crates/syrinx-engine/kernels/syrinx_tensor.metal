@@ -105,6 +105,7 @@ template [[host_name("matmul_tc_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_TOKENS
 template [[host_name("matmul_tc_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_TOKENS>(ARGS, KP);
 template [[host_name("matmul_tc_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_TOKENS>(ARGS, KP);
 template [[host_name("matmul_tc_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_TOKENS>(ARGS, KP);
+template [[host_name("matmul_tc_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, TC_TOKENS>(ARGS, KP);
 // 8 to 64 tokens: 256 columns a step and one tile of weights (see SMALL_TILES in
 // src/metal/mod.rs).
 template [[host_name("matmul_tc_t8_f32")]] kernel void matmul_tc<K_F32, 8, TC_ROWS, 256, 1>(ARGS, KP);
@@ -114,6 +115,7 @@ template [[host_name("matmul_tc_t8_q8_0")]] kernel void matmul_tc<K_Q8_0, 8, TC_
 template [[host_name("matmul_tc_t8_q4_k")]] kernel void matmul_tc<K_Q4_K, 8, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t8_q5_k")]] kernel void matmul_tc<K_Q5_K, 8, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t8_q6_k")]] kernel void matmul_tc<K_Q6_K, 8, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t8_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, 8, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t16_f32")]] kernel void matmul_tc<K_F32, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t16_f16")]] kernel void matmul_tc<K_F16, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t16_q4_0")]] kernel void matmul_tc<K_Q4_0, 16, TC_ROWS, 256, 1>(ARGS, KP);
@@ -121,6 +123,7 @@ template [[host_name("matmul_tc_t16_q8_0")]] kernel void matmul_tc<K_Q8_0, 16, T
 template [[host_name("matmul_tc_t16_q4_k")]] kernel void matmul_tc<K_Q4_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t16_q5_k")]] kernel void matmul_tc<K_Q5_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t16_q6_k")]] kernel void matmul_tc<K_Q6_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t16_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t32_f32")]] kernel void matmul_tc<K_F32, 32, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t32_f16")]] kernel void matmul_tc<K_F16, 32, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t32_q4_0")]] kernel void matmul_tc<K_Q4_0, 32, TC_ROWS, 256, 1>(ARGS, KP);
@@ -128,6 +131,7 @@ template [[host_name("matmul_tc_t32_q8_0")]] kernel void matmul_tc<K_Q8_0, 32, T
 template [[host_name("matmul_tc_t32_q4_k")]] kernel void matmul_tc<K_Q4_K, 32, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t32_q5_k")]] kernel void matmul_tc<K_Q5_K, 32, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t32_q6_k")]] kernel void matmul_tc<K_Q6_K, 32, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t32_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, 32, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t64_f32")]] kernel void matmul_tc<K_F32, 64, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t64_f16")]] kernel void matmul_tc<K_F16, 64, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t64_q4_0")]] kernel void matmul_tc<K_Q4_0, 64, TC_ROWS, 256, 1>(ARGS, KP);
@@ -135,6 +139,7 @@ template [[host_name("matmul_tc_t64_q8_0")]] kernel void matmul_tc<K_Q8_0, 64, T
 template [[host_name("matmul_tc_t64_q4_k")]] kernel void matmul_tc<K_Q4_K, 64, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t64_q5_k")]] kernel void matmul_tc<K_Q5_K, 64, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t64_q6_k")]] kernel void matmul_tc<K_Q6_K, 64, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("matmul_tc_t64_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, 64, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("matmul_tc_t96_f32")]] kernel void matmul_tc<K_F32, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t96_f16")]] kernel void matmul_tc<K_F16, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t96_q4_0")]] kernel void matmul_tc<K_Q4_0, 96>(ARGS, KP);
@@ -142,6 +147,7 @@ template [[host_name("matmul_tc_t96_q8_0")]] kernel void matmul_tc<K_Q8_0, 96>(A
 template [[host_name("matmul_tc_t96_q4_k")]] kernel void matmul_tc<K_Q4_K, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t96_q5_k")]] kernel void matmul_tc<K_Q5_K, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t96_q6_k")]] kernel void matmul_tc<K_Q6_K, 96>(ARGS, KP);
+template [[host_name("matmul_tc_t96_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, 96>(ARGS, KP);
 template [[host_name("matmul_tc_t192_f32")]] kernel void matmul_tc<K_F32, 192>(ARGS, KP);
 template [[host_name("matmul_tc_t192_f16")]] kernel void matmul_tc<K_F16, 192>(ARGS, KP);
 template [[host_name("matmul_tc_t192_q4_0")]] kernel void matmul_tc<K_Q4_0, 192>(ARGS, KP);
@@ -149,6 +155,7 @@ template [[host_name("matmul_tc_t192_q8_0")]] kernel void matmul_tc<K_Q8_0, 192>
 template [[host_name("matmul_tc_t192_q4_k")]] kernel void matmul_tc<K_Q4_K, 192>(ARGS, KP);
 template [[host_name("matmul_tc_t192_q5_k")]] kernel void matmul_tc<K_Q5_K, 192>(ARGS, KP);
 template [[host_name("matmul_tc_t192_q6_k")]] kernel void matmul_tc<K_Q6_K, 192>(ARGS, KP);
+template [[host_name("matmul_tc_t192_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, 192>(ARGS, KP);
 template [[host_name("matmul_tc_wide_f32")]] kernel void matmul_tc<K_F32, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_f16")]] kernel void matmul_tc<K_F16, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q4_0")]] kernel void matmul_tc<K_Q4_0, TC_WIDE>(ARGS, KP);
@@ -156,6 +163,7 @@ template [[host_name("matmul_tc_wide_q8_0")]] kernel void matmul_tc<K_Q8_0, TC_W
 template [[host_name("matmul_tc_wide_q4_k")]] kernel void matmul_tc<K_Q4_K, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q5_k")]] kernel void matmul_tc<K_Q5_K, TC_WIDE>(ARGS, KP);
 template [[host_name("matmul_tc_wide_q6_k")]] kernel void matmul_tc<K_Q6_K, TC_WIDE>(ARGS, KP);
+template [[host_name("matmul_tc_wide_iq4_nl")]] kernel void matmul_tc<K_IQ4_NL, TC_WIDE>(ARGS, KP);
 
 // matmul_tc for one tile of moe_group's (syrinx.metal): its expert's rows × its slots, the
 // tile a threadgroup row (gid.y). The slots' inputs and products lie in moe_group's order
@@ -213,13 +221,14 @@ kernel void moe_matmul_tc(ARGS, KP) {
     auto t_y = tensor(y + row0, dextents<int32_t, 2>(min(ROWS, rows - row0), tokens), array<int, 2>({1, y_stride}));
     acc.store(t_y);
 }
-template [[host_name("moe_matmul_tc_f32")]] kernel void moe_matmul_tc<K_F32, MOE_TC_TOKENS>(ARGS, KP);
-template [[host_name("moe_matmul_tc_f16")]] kernel void moe_matmul_tc<K_F16, MOE_TC_TOKENS>(ARGS, KP);
-template [[host_name("moe_matmul_tc_q4_0")]] kernel void moe_matmul_tc<K_Q4_0, MOE_TC_TOKENS>(ARGS, KP);
-template [[host_name("moe_matmul_tc_q8_0")]] kernel void moe_matmul_tc<K_Q8_0, MOE_TC_TOKENS>(ARGS, KP);
-template [[host_name("moe_matmul_tc_q4_k")]] kernel void moe_matmul_tc<K_Q4_K, MOE_TC_TOKENS>(ARGS, KP);
-template [[host_name("moe_matmul_tc_q5_k")]] kernel void moe_matmul_tc<K_Q5_K, MOE_TC_TOKENS>(ARGS, KP);
-template [[host_name("moe_matmul_tc_q6_k")]] kernel void moe_matmul_tc<K_Q6_K, MOE_TC_TOKENS>(ARGS, KP);
+template [[host_name("moe_matmul_tc_f32")]] kernel void moe_matmul_tc<K_F32, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_f16")]] kernel void moe_matmul_tc<K_F16, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q4_0")]] kernel void moe_matmul_tc<K_Q4_0, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q8_0")]] kernel void moe_matmul_tc<K_Q8_0, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q4_k")]] kernel void moe_matmul_tc<K_Q4_K, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q5_k")]] kernel void moe_matmul_tc<K_Q5_K, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_q6_k")]] kernel void moe_matmul_tc<K_Q6_K, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_iq4_nl")]] kernel void moe_matmul_tc<K_IQ4_NL, MOE_TC_TOKENS, 64, 128, 1>(ARGS, KP);
 // Small tile for multi-chat decode / short batches where each expert only gets a few slots.
 template [[host_name("moe_matmul_tc_t16_f32")]] kernel void moe_matmul_tc<K_F32, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("moe_matmul_tc_t16_f16")]] kernel void moe_matmul_tc<K_F16, 16, TC_ROWS, 256, 1>(ARGS, KP);
@@ -228,6 +237,7 @@ template [[host_name("moe_matmul_tc_t16_q8_0")]] kernel void moe_matmul_tc<K_Q8_
 template [[host_name("moe_matmul_tc_t16_q4_k")]] kernel void moe_matmul_tc<K_Q4_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("moe_matmul_tc_t16_q5_k")]] kernel void moe_matmul_tc<K_Q5_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
 template [[host_name("moe_matmul_tc_t16_q6_k")]] kernel void moe_matmul_tc<K_Q6_K, 16, TC_ROWS, 256, 1>(ARGS, KP);
+template [[host_name("moe_matmul_tc_t16_iq4_nl")]] kernel void moe_matmul_tc<K_IQ4_NL, 16, TC_ROWS, 256, 1>(ARGS, KP);
 
 // matmul_tc's splits added up, in order: y[i] = parts[0][i] + parts[1][i] + ...
 kernel void sum_parts(ARGS, KP) {
@@ -641,13 +651,14 @@ typedef signed char i8;
 // Thirty-two numbers of a row from column k (a multiple of 32) as 8-bit numbers of the
 // scale returned, which is the same for the whole I8_K-column step k is in.
 template <int KIND>
-static inline float decode32_i8(device const u8* row, int k, threadgroup i8* out);
+static inline float decode32_i8(device const u8* row, int blocks, int k, threadgroup i8* out);
 
 // Q6_K's numbers are d × scale × (q − 32) with |q − 32| ≤ 32: they are rounded against the
 // block's largest scale (kept in the block's padding by Gpu::upload_weights), so the 16
 // numbers under it keep 4 steps to each of their own.
 template <>
-inline float decode32_i8<K_Q6_K>(device const u8* row, int k, threadgroup i8* out) {
+inline float decode32_i8<K_Q6_K>(device const u8* row, int blocks, int k, threadgroup i8* out) {
+    (void)blocks;
     device const u8* block = row + (k / 256) * Q6K_BYTES;
     const int n = k % 256, hf = n / 128, run = (n % 128) / 32;
     const float top = (float)block[210];
@@ -672,22 +683,27 @@ inline float decode32_i8<K_Q6_K>(device const u8* row, int k, threadgroup i8* ou
 
 // Q8_0's are d × q, a d for every 32: rounded against the step's largest |d|.
 // The 8 consecutive lanes decoding one row's 256-column step find max|d| via SIMD shuffles
-// (1 half load per thread instead of 8), and pack 4 weights at a time.
+// (1 half load per thread instead of 8), and load 32 weights in two 16-byte aligned uint4s.
 template <>
-inline float decode32_i8<K_Q8_0>(device const u8* row, int k, threadgroup i8* out) {
-    device const u8* block = row + (k / 32) * 34;
-    const float d = half_at(block);
+inline float decode32_i8<K_Q8_0>(device const u8* row, int blocks, int k, threadgroup i8* out) {
+    const int b = k / 32;
+    const float d = q8_0_scale(row, blocks, b);
     float top = fabs(d);
     top = max(top, simd_shuffle_xor(top, 1));
     top = max(top, simd_shuffle_xor(top, 2));
     top = max(top, simd_shuffle_xor(top, 4));
     const float mul = top > 0.0f ? d / top : 0.0f;
+    device const uint4* q = reinterpret_cast<device const uint4*>(row + (ulong)b * 32);
+    const uint4 q0 = q[0], q1 = q[1];
     threadgroup u32* o = reinterpret_cast<threadgroup u32*>(out);
-    for (int i = 0; i < 8; i++) {
-        const u32 qv = u32_at2(block + 2 + i * 4);
-        const float4 v = float4(as_type<char4>(qv)) * mul;
-        o[i] = as_type<u32>(char4(rint(v)));
-    }
+    o[0] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.x)) * mul)));
+    o[1] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.y)) * mul)));
+    o[2] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.z)) * mul)));
+    o[3] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.w)) * mul)));
+    o[4] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.x)) * mul)));
+    o[5] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.y)) * mul)));
+    o[6] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.z)) * mul)));
+    o[7] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.w)) * mul)));
     return top;
 }
 
@@ -740,7 +756,7 @@ kernel void matmul_i8(ARGS, KP) {
             threadgroup i8* dst = sa + lr * I8_K + lk;
             float scale = 0.0f;
             if (row0 + lr < rows) {
-                scale = decode32_i8<KIND>(w + (ulong)(row0 + lr) * row_bytes, k0 + lk, dst);
+                scale = decode32_i8<KIND>(w + (ulong)(row0 + lr) * row_bytes, cols / 32, k0 + lk, dst);
             } else {
                 for (int i = 0; i < 32; i++) dst[i] = 0;
             }
@@ -911,3 +927,394 @@ kernel void delta_chunk_scan_tc(ARGS, KP) {
 }
 
 template [[host_name("delta_chunk_scan_tc_32")]] kernel void delta_chunk_scan_tc<32>(ARGS, KP);
+
+// Inkling 2 prompt attention on the neural accelerators (GQA-grouped, f16 KV cache,
+// heads of 128): as attention_tcg<128, 32, 128, 4>, with relative-position bias
+// r·bias[min(d, extent)] - sink, sink's logit of 0 as the softmax starting point
+// (row_max = 0, row_sum = 1), and output times sigmoid(gate). Far chunks (d >= extent)
+// use a precomputed scalar offset per query row with zero bias reads.
+template <int D, int R, int AC, int SG>
+kernel void ink_attention_tcg(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    device half* qh = ARG_PTR(half, 0);
+    device half* keys = ARG_PTR(half, 1);
+    device half* values = ARG_PTR(half, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const float* r = ARG_PTR(const float, 4);
+    device const float* bias = ARG_PTR(const float, 5);
+    device const float* sink = ARG_PTR(const float, 6);
+    device const float* gate = ARG_PTR(const float, 7);
+    const int p0 = ARG_INT(8), window = ARG_INT(9), extent = ARG_INT(10), ring = ARG_INT(11);
+    const int kv_dim = ARG_INT(12), group = ARG_INT(13), rd = ARG_INT(14);
+    const float scale = ARG_F32(15);
+    const int tokens = ARG_INT(16);
+    constexpr float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+    constexpr int ROWS = R / SG, COLS = AC / 32;
+    threadgroup float ss[R * AC];
+    threadgroup half* sp = (threadgroup half*)ss;
+    threadgroup float sr[R];
+    threadgroup float sr_bias[R][32];
+    threadgroup atomic_uint any_fix;
+    const int g = gid.x, heads = ngrid.x * group;
+    const int tb = R / group, live_rows = tb * group;
+    const int t0 = gid.y * tb;
+    const int kv = g * D;
+    const int last_row = p0 + min(t0 + tb, tokens) - 1;
+    const int lo = window > 0 ? max(0, p0 + t0 + 1 - window) : 0;
+
+    for (int i = tid; i < R * 32; i += SG * 32) {
+        const int j = i / 32, k = i % 32;
+        const int t = t0 + j / group, h = g * group + j % group;
+        sr_bias[j][k] = (j < live_rows && t < tokens && k < rd) ? r[((ulong)t * heads + h) * rd + k] : 0.0f;
+    }
+    BARRIER;
+
+    auto tq = tensor(qh + ((ulong)g * tokens + t0) * group * D, dextents<int32_t, 2>(D, R));
+    auto ts = tensor(ss, dextents<int32_t, 2>(AC, R));
+    auto tp = tensor(sp, dextents<int32_t, 2>(AC, R));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(R, AC, D, false, true, false,
+                                                                   mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+                              execution_simdgroups<SG>>
+        mm_qk;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(R, D, AC, false, false, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<SG>>
+        mm_pv;
+    auto tv0 = tensor(values + kv, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    constexpr int CO_MAX = 64;
+    short co_row[CO_MAX];
+    const int co_cap = (int)co.get_capacity(), co_n = min(co_cap, CO_MAX);
+    for (int i = 0; i < co_n; i++) {
+        const bool valid = co.is_valid_element(i);
+        co_row[i] = valid ? (short)co.get_multidimensional_index(i)[1] : (short)-1;
+        if (valid) co[i] = 0.0f;
+    }
+    for (int i = co_n; i < co_cap; i++)
+        if (co.is_valid_element(i)) co[i] = 0.0f;
+
+    const float b_ext = lane < (uint)rd ? bias[(ulong)extent * rd + lane] : 0.0f;
+    float row_max[ROWS], row_sum[ROWS], far_off[ROWS], sink_off[ROWS];
+    for (int jj = 0; jj < ROWS; jj++) {
+        const int j = jj * SG + sg, t = t0 + j / group, h = g * group + j % group;
+        const bool live = j < live_rows && t < tokens;
+        const float s0 = live ? sink[(ulong)t * heads + h] : 0.0f;
+        const float rv = lane < (uint)rd ? sr_bias[j][lane] : 0.0f;
+        const float fb = simd_sum(rv * b_ext);
+        row_max[jj] = 0.0f;
+        row_sum[jj] = 1.0f;
+        far_off[jj] = (fb - s0) * LOG2E;
+        sink_off[jj] = s0 * LOG2E;
+    }
+
+    const int first_chunk = lo - lo % AC;
+    for (int start = first_chunk; start <= last_row; start += AC) {
+        const int from = ring > 0 ? start : min(start, max(0, last_row + 1 - AC));
+        const ulong at_cache = ring_row(from, ring) * kv_dim + kv;
+        auto tk = tensor(keys + at_cache, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
+        mm_qk.run(tq, tk, ts);
+        if (tid == 0) atomic_store_explicit(&any_fix, 0u, memory_order_relaxed);
+        BARRIER;
+        half p_reg[ROWS][COLS];
+        bool local_fix = false;
+        for (int jj = 0; jj < ROWS; jj++) {
+            const int j = jj * SG + sg, t = t0 + j / group, at = p0 + t;
+            const bool live = j < live_rows && t < tokens;
+            const int first = max(start, window > 0 ? at + 1 - window : 0);
+            float s[COLS];
+            float mx = -INFINITY;
+            const float fo = far_off[jj];
+            if (live && from >= first && from + AC - 1 <= at && (at - (from + AC - 1)) >= extent) {
+                for (int ii = 0; ii < COLS; ii++) {
+                    s[ii] = ss[j * AC + ii * 32 + lane] * scale_log2 + fo;
+                    mx = max(mx, s[ii]);
+                }
+            } else {
+                const float so = sink_off[jj];
+                for (int ii = 0; ii < COLS; ii++) {
+                    const int c = ii * 32 + lane, kpos = from + c;
+                    const bool seen = live && kpos >= first && kpos <= at;
+                    if (!seen) {
+                        s[ii] = -INFINITY;
+                    } else {
+                        const int dist = at - kpos;
+                        if (dist >= extent) {
+                            s[ii] = ss[j * AC + c] * scale_log2 + fo;
+                        } else {
+                            float b = 0.0f;
+                            if (rd == 16) {
+                                device const float4* br4 =
+                                    reinterpret_cast<device const float4*>(bias + (ulong)dist * 16);
+                                threadgroup const float4* rr4 =
+                                    reinterpret_cast<threadgroup const float4*>(&sr_bias[j][0]);
+                                b = dot(rr4[0], br4[0]) + dot(rr4[1], br4[1]) + dot(rr4[2], br4[2]) +
+                                    dot(rr4[3], br4[3]);
+                            } else {
+                                device const float* br = bias + (ulong)dist * rd;
+                                for (int k = 0; k < rd; k++) b += sr_bias[j][k] * br[k];
+                            }
+                            s[ii] = ss[j * AC + c] * scale_log2 + b * LOG2E - so;
+                        }
+                    }
+                    mx = max(mx, s[ii]);
+                }
+            }
+            mx = simd_max(mx);
+            const float new_max = max(row_max[jj], mx);
+            const float correction = metal::fast::exp2(row_max[jj] - new_max);
+            float sum = 0.0f;
+            for (int ii = 0; ii < COLS; ii++) {
+                const half p = half(metal::fast::exp2(s[ii] - new_max));
+                p_reg[jj][ii] = p;
+                sum += float(p);
+            }
+            row_sum[jj] = row_sum[jj] * correction + simd_sum(sum);
+            row_max[jj] = new_max;
+            if (lane == 0) {
+                sr[j] = correction;
+                if (correction != 1.0f) local_fix = true;
+            }
+        }
+        if (local_fix) atomic_store_explicit(&any_fix, 1u, memory_order_relaxed);
+        BARRIER;
+        for (int jj = 0; jj < ROWS; jj++) {
+            const int j = jj * SG + sg;
+            for (int ii = 0; ii < COLS; ii++) sp[j * AC + ii * 32 + lane] = p_reg[jj][ii];
+        }
+        BARRIER;
+        if (atomic_load_explicit(&any_fix, memory_order_relaxed) != 0u) {
+            for (int i = 0; i < co_n; i++) {
+                if (co_row[i] < 0) continue;
+                const float fix = sr[co_row[i]];
+                if (fix != 1.0f) co[i] *= fix;
+            }
+            for (int i = co_n; i < co_cap; i++)
+                if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
+        }
+        auto tv = tensor(values + at_cache, dextents<int32_t, 2>(D, AC), array<int, 2>({1, kv_dim}));
+        mm_pv.run(tp, tv, co);
+        BARRIER;
+    }
+    for (int jj = 0; jj < ROWS; jj++) {
+        const int j = jj * SG + sg;
+        if (lane == 0) sr[j] = 1.0f / row_sum[jj];
+    }
+    BARRIER;
+    for (uint16_t i = 0; i < co.get_capacity(); i++) {
+        if (!co.is_valid_element(i)) continue;
+        const auto at = co.get_multidimensional_index(i);
+        const int d = at[0], j = at[1], t = t0 + j / group;
+        if (j < live_rows && t < tokens) {
+            const ulong out_at = ((ulong)t * heads + g * group + j % group) * D + d;
+            out[out_at] = co[i] * sr[j] / (1.0f + exp(-gate[out_at]));
+        }
+    }
+}
+template [[host_name("ink_attention_tcg_128")]] kernel void ink_attention_tcg<128, 32, 128, 4>(ARGS, KP, uint, uint);
+
+// Quantize 32 Q8_0 weights to i8 normalized against the max |d| across 4 consecutive blocks (128 cols).
+// 4 consecutive lanes (lane & 3) decode the 4 blocks of the same row.
+static inline float decode32_i8_128_q8_0(device const u8* row, int blocks, int k, threadgroup i8* out) {
+    const int b = k / 32;
+    const float d = q8_0_scale(row, blocks, b);
+    float top = fabs(d);
+    top = max(top, simd_shuffle_xor(top, 1));
+    top = max(top, simd_shuffle_xor(top, 2));
+    const float mul = top > 0.0f ? d / top : 0.0f;
+    device const uint4* q = reinterpret_cast<device const uint4*>(row + (ulong)b * 32);
+    const uint4 q0 = q[0], q1 = q[1];
+    threadgroup u32* o = reinterpret_cast<threadgroup u32*>(out);
+    o[0] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.x)) * mul)));
+    o[1] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.y)) * mul)));
+    o[2] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.z)) * mul)));
+    o[3] = as_type<u32>(char4(rint(float4(as_type<char4>(q0.w)) * mul)));
+    o[4] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.x)) * mul)));
+    o[5] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.y)) * mul)));
+    o[6] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.z)) * mul)));
+    o[7] = as_type<u32>(char4(rint(float4(as_type<char4>(q1.w)) * mul)));
+    return top;
+}
+
+// Gather f32 activations in moe_group's order into i8 + per-K_STEP-col f32 scales.
+// Each thread handles 4 elements (float4 -> u32).
+// Grid: (cols / K_STEP, slots), threads: K_STEP / 4 (32 for K_STEP=128, 64 for K_STEP=256).
+template <int K_STEP>
+kernel void moe_gather_i8_t(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device i8* out = ARG_PTR(i8, 1);
+    device float* scales = ARG_PTR(float, 2);
+    device const int* order = ARG_PTR(const int, 3);
+    const int used = ARG_INT(4), cols = ARG_INT(5), steps = cols / K_STEP;
+    const int step = (int)gid.x, at = (int)gid.y;
+    const int tok = order[at] / used;
+    const int col = step * K_STEP + (int)tid * 4;
+    const float4 v = *reinterpret_cast<device const float4*>(x + (ulong)tok * cols + col);
+    float top = max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w)));
+    top = simd_max(top);
+    constexpr int WARPS = (K_STEP / 4) / 32;
+    if constexpr (WARPS > 1) {
+        threadgroup float most[WARPS];
+        if ((tid & 31) == 0) most[tid >> 5] = top;
+        BARRIER;
+        top = most[0];
+        for (int w = 1; w < WARPS; w++) top = max(top, most[w]);
+    }
+    const float scale = top / 127.0f;
+    const float inv = top > 0.0f ? 127.0f / top : 0.0f;
+    *reinterpret_cast<device u32*>(out + (ulong)at * cols + col) = as_type<u32>(char4(rint(v * inv)));
+    if (tid == 0) scales[(ulong)at * steps + step] = scale;
+}
+template [[host_name("moe_gather_i8_128")]] kernel void moe_gather_i8_t<128>(ARGS, KP);
+template [[host_name("moe_gather_i8_256")]] kernel void moe_gather_i8_t<256>(ARGS, KP);
+
+// Fused SiTU activation + i8 quantization (per 128 cols) from half gate_up [slots, 2*width]
+// into sorted i8 [slots, width] + scales [slots, width/128] for moe_matmul_i8.
+// 1 SIMD group (32 threads) per 128-col chunk (4 elements/thread, zero barrier).
+// Grid: (width / 128, slots), threads: 32.
+kernel void ink_situ_i8_128(ARGS, KP) {
+    device const half* gu = ARG_PTR(const half, 0);
+    device i8* out = ARG_PTR(i8, 1);
+    device float* scales = ARG_PTR(float, 2);
+    const int width = ARG_INT(3);
+    const float beta = ARG_F32(4), lb = ARG_F32(5);
+    const int steps = width / 128;
+    const int step = (int)gid.x, slot = (int)gid.y;
+    const int j = step * 128 + (int)tid * 4;
+    const ulong base = (ulong)slot * 2 * width;
+    const float4 g = float4(*reinterpret_cast<device const half4*>(gu + base + j));
+    const float4 u = float4(*reinterpret_cast<device const half4*>(gu + base + width + j));
+    const float4 v = beta * tanh(g / beta) / (1.0f + exp(-g)) * lb * tanh(u / lb);
+    float top = max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w)));
+    top = simd_max(top);
+    const float scale = top / 127.0f;
+    const float inv = top > 0.0f ? 127.0f / top : 0.0f;
+    *reinterpret_cast<device u32*>(out + (ulong)slot * width + j) = as_type<u32>(char4(rint(v * inv)));
+    if (tid == 0) scales[(ulong)slot * steps + step] = scale;
+}
+
+constant half KVALUES_IQ4NL_H[16] = {
+    -127.0h, -104.0h, -83.0h, -65.0h, -49.0h, -35.0h, -22.0h, -10.0h,
+       1.0h,   13.0h,  25.0h,  38.0h,  53.0h,  69.0h,  89.0h, 113.0h
+};
+
+// Quantize 32 IQ4_NL weights to i8 normalized against max |d| across 4 (K_STEP=128) or 8 (K_STEP=256) blocks.
+template <int K_STEP>
+static inline float decode32_i8_iq4_nl(device const u8* row, int blocks, int k, threadgroup i8* out) {
+    const int b = k / 32;
+    const float d = q4_0_scale(row, blocks, b);
+    float top = fabs(d);
+    top = max(top, simd_shuffle_xor(top, 1));
+    top = max(top, simd_shuffle_xor(top, 2));
+    if constexpr (K_STEP == 256) {
+        top = max(top, simd_shuffle_xor(top, 4));
+    }
+    const half hmul = top > 0.0f ? half(d / top) : half(0.0h);
+    const uint4 q = *reinterpret_cast<device const uint4*>(row + b * 16);
+    const u32 w[4] = {q.x, q.y, q.z, q.w};
+    threadgroup u32* o = reinterpret_cast<threadgroup u32*>(out);
+    for (int i = 0; i < 4; i++) {
+        const u32 lo = w[i] & 0x0F0F0F0Fu;
+        const half4 vlo(KVALUES_IQ4NL_H[lo & 0xF], KVALUES_IQ4NL_H[(lo >> 8) & 0xF],
+                        KVALUES_IQ4NL_H[(lo >> 16) & 0xF], KVALUES_IQ4NL_H[lo >> 24]);
+        o[i] = as_type<u32>(char4(rint(vlo * hmul)));
+        const u32 hi = (w[i] >> 4) & 0x0F0F0F0Fu;
+        const half4 vhi(KVALUES_IQ4NL_H[hi & 0xF], KVALUES_IQ4NL_H[(hi >> 8) & 0xF],
+                        KVALUES_IQ4NL_H[(hi >> 16) & 0xF], KVALUES_IQ4NL_H[hi >> 24]);
+        o[4 + i] = as_type<u32>(char4(rint(vhi * hmul)));
+    }
+    return top;
+}
+
+// MoE matmul on M5 Max INT8 neural accelerators (Q8_0 or IQ4_NL weights, K_STEP=128 or 256):
+// Arguments: w, x (i8), y (f32), rows, cols, tiles, xs (f32 scales), y_stride.
+template <int KIND, int TOK, int ROWS, int K_STEP, int SG, int BUFS>
+kernel void moe_matmul_i8_t(ARGS, KP) {
+    constexpr int THREADS = 32 * SG;
+    constexpr int RUNS = K_STEP / 32, PER = (ROWS * RUNS + THREADS - 1) / THREADS;
+    const int rows = ARG_INT(3), cols = ARG_INT(4);
+    const int blocks = cols / 32;
+    device const int* tile = ARG_PTR(const int, 5) + 3 * gid.y;
+    const int y_stride = ARG_INT(7);
+    const int tokens = tile[2];
+    if (tokens == 0) return;
+    const int steps = cols / K_STEP;
+    const ulong row_bytes = mm_row_bytes<KIND>(cols);
+    device const u8* w = ARG_PTR(const u8, 0) + (ulong)tile[0] * (ulong)rows * row_bytes;
+    device i8* x = ARG_PTR(i8, 1) + (ulong)tile[1] * cols;
+    device half* y = ARG_PTR(half, 2) + (ulong)tile[1] * y_stride;
+    device const float* xs = ARG_PTR(const float, 6) + (ulong)tile[1] * steps;
+    threadgroup i8 sab[BUFS * ROWS * K_STEP];
+    threadgroup float swb[BUFS * ROWS];
+    threadgroup float sxsb[BUFS * TOK];
+    const int row0 = gid.x * ROWS;
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(TOK, ROWS, K_STEP, false, true, true,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<SG>>
+        mm;
+    auto t_w0 = tensor(sab, dextents<int32_t, 2>(K_STEP, ROWS));
+    auto t_x0 = tensor(x, dextents<int32_t, 2>(K_STEP, tokens), array<int, 2>({1, cols}));
+    auto acc = mm.template get_destination_cooperative_tensor<decltype(t_x0), decltype(t_w0), int>();
+    constexpr int MINE = TOK * ROWS / THREADS;
+    float sum[MINE];
+    uchar at_t[MINE], at_r[MINE];
+    const int mine = min((int)acc.get_capacity(), MINE);
+    for (int i = 0; i < mine; i++) {
+        const auto at = acc.get_multidimensional_index(i);
+        at_r[i] = (uchar)at[0];
+        at_t[i] = (uchar)at[1];
+        sum[i] = 0.0f;
+    }
+
+    int flip = 0;
+    for (int step = 0; step < steps; step++, flip ^= 1) {
+        const int k0 = step * K_STEP;
+        const int buf = BUFS > 1 ? flip : 0;
+        threadgroup i8* sa = sab + buf * (ROWS * K_STEP);
+        threadgroup float* sw = swb + buf * ROWS;
+        threadgroup float* sxs = sxsb + buf * TOK;
+        for (int part = 0; part < PER; part++) {
+            const int run = tid + part * THREADS, lr = run / RUNS, lk = (run % RUNS) * 32;
+            if (lr >= ROWS) break;
+            threadgroup i8* dst = sa + lr * K_STEP + lk;
+            float scale = 0.0f;
+            if (row0 + lr < rows) {
+                device const u8* row_ptr = w + (ulong)(row0 + lr) * row_bytes;
+                if constexpr (KIND == K_IQ4_NL) {
+                    scale = decode32_i8_iq4_nl<K_STEP>(row_ptr, blocks, k0 + lk, dst);
+                } else if constexpr (K_STEP == 256) {
+                    scale = decode32_i8<K_Q8_0>(row_ptr, blocks, k0 + lk, dst);
+                } else {
+                    scale = decode32_i8_128_q8_0(row_ptr, blocks, k0 + lk, dst);
+                }
+            } else {
+                for (int i = 0; i < 32; i++) dst[i] = 0;
+            }
+            if (lk == 0) sw[lr] = scale;
+        }
+        for (int lt = tid; lt < TOK; lt += THREADS) {
+            sxs[lt] = lt < tokens ? xs[(ulong)lt * steps + step] : 0.0f;
+        }
+        BARRIER;
+        auto tile_w = tensor(sa, dextents<int32_t, 2>(K_STEP, ROWS));
+        auto tile_x = tensor(x + k0, dextents<int32_t, 2>(K_STEP, tokens), array<int, 2>({1, cols}));
+        mm.run(tile_x, tile_w, acc);
+        for (int i = 0; i < mine; i++) {
+            sum[i] += (float)acc[i] * (sxs[at_t[i]] * sw[at_r[i]]);
+        }
+        if (BUFS == 1) BARRIER;
+    }
+    for (int i = 0; i < mine; i++) {
+        const int t = (int)at_t[i], r = row0 + (int)at_r[i];
+        if (t < tokens && r < rows) y[(ulong)t * y_stride + r] = half(sum[i]);
+    }
+}
+template [[host_name("moe_matmul_i8_q8_0")]] kernel void moe_matmul_i8_t<K_Q8_0, 64, 64, 128, 4, 2>(ARGS, KP);
+template [[host_name("moe_matmul_i8_wide_q8_0")]] kernel void moe_matmul_i8_t<K_Q8_0, 128, 64, 128, 8, 2>(ARGS, KP);
+template [[host_name("moe_matmul_i8_wide256_q8_0")]] kernel void moe_matmul_i8_t<K_Q8_0, 128, 64, 256, 8, 1>(ARGS, KP);
+template [[host_name("moe_matmul_i8_iq4_nl")]] kernel void moe_matmul_i8_t<K_IQ4_NL, 64, 64, 128, 4, 2>(ARGS, KP);
+template [[host_name("moe_matmul_i8_wide_iq4_nl")]] kernel void moe_matmul_i8_t<K_IQ4_NL, 128, 64, 128, 8, 2>(ARGS, KP);
+template [[host_name("moe_matmul_i8_wide256_iq4_nl")]] kernel void moe_matmul_i8_t<K_IQ4_NL, 128, 64, 256, 8, 1>(ARGS, KP);

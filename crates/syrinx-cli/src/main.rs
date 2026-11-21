@@ -11,6 +11,8 @@ use syrinx_engine::cuda::Gpu;
 use syrinx_engine::models::gemma4::{self, Gemma4};
 use syrinx_engine::models::gemma4_cuda::{Gemma4Cuda, Gemma4CudaSession};
 use syrinx_engine::models::inkling2::{self, Inkling2};
+use syrinx_engine::models::inkling2_dspark::DSpark;
+use syrinx_engine::models::inkling2_dspark_cuda::DSparkCuda;
 use syrinx_engine::models::inkling2_cuda::{Inkling2Cuda, Inkling2CudaSession};
 use syrinx_engine::models::llama::{Llama, Session};
 use syrinx_engine::models::llama_cuda::{CudaSession, LlamaCuda};
@@ -47,6 +49,13 @@ Usage:
                                                costs with <tokens> already read (4000 by
                                                default): a draft's guesses checked at once,
                                                a short tool result. Gemma 4 and Qwen 3.5
+  syrinx-cli draft-check <inkling.gguf> <dspark.gguf> <prompt> [-n <count>] [--file]
+                                               On the CPU: greedy text, with the DSpark
+                                               drafter's 7 guesses at each token checked
+                                               against what Inkling writes next
+  syrinx-cli generate-drafted <inkling.gguf> <dspark.gguf> <prompt> [-n <count>] [-k <1-7>] [--file]
+                                               On the GPU: greedy generation with the DSpark
+                                               drafter guessing k tokens a step
   syrinx-cli --version                          Show the version";
 
 fn main() -> ExitCode {
@@ -66,6 +75,47 @@ fn main() -> ExitCode {
                 .all(|a| matches!(*a, "--file" | "--raw" | "--ids")) =>
         {
             tokenize(path, text, rest)
+        }
+        ["draft-check", path, drafter, prompt, rest @ ..] => {
+            let (mut n, mut file, mut ok) = (32usize, false, true);
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "-n" => n = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--file" => file = true,
+                    _ => ok = false,
+                }
+            }
+            if ok && n > 0 {
+                draft_check(path, drafter, prompt, n, file)
+            } else {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        }
+        ["generate-drafted", path, drafter, prompt, rest @ ..] => {
+            let (mut n, mut k, mut file, mut ok) = (64usize, 3usize, false, true);
+            let mut vocab: Option<(usize, Vec<String>)> = None;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "-n" => n = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "-k" => k = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--vocab" => {
+                        let size = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let files = it.next().map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+                        vocab = Some((size, files));
+                    }
+                    "--file" => file = true,
+                    _ => ok = false,
+                }
+            }
+            if ok && n > 0 && (1..=7).contains(&k) {
+                generate_drafted(path, drafter, prompt, n, k, file, vocab)
+            } else {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
         }
         ["generate", path, prompt, rest @ ..] => match GenerateOptions::parse(rest) {
             Some(options) => generate(path, prompt, &options),
@@ -441,6 +491,8 @@ struct GenerateOptions {
     threads: Option<usize>,
     gpu: bool,
     exact: bool,
+    /// The prompt is token ids (spaces between), not text.
+    ids: bool,
 }
 
 impl GenerateOptions {
@@ -453,6 +505,7 @@ impl GenerateOptions {
             threads: None,
             gpu: false,
             exact: false,
+            ids: false,
         };
         let mut args = args.iter();
         while let Some(&arg) = args.next() {
@@ -462,12 +515,287 @@ impl GenerateOptions {
                 "--raw" => o.raw = true,
                 "--gpu" => o.gpu = true,
                 "--exact" => o.exact = true,
+                "--ids" => o.ids = true,
                 "--top" => o.top = args.next()?.parse().ok()?,
                 "--threads" => o.threads = Some(args.next()?.parse().ok()?),
                 _ => return None,
             }
         }
         Some(o)
+    }
+}
+
+/// Greedy generation of Inkling 2 on the GPU with its DSpark drafter: each step the
+/// drafter guesses up to `k` tokens, Inkling reads the last token and the guesses in one
+/// batch and keeps the guesses it agrees with plus its own next choice. Same tokens as
+/// `generate --gpu`.
+fn generate_drafted(
+    path: &str,
+    drafter: &str,
+    prompt: &str,
+    n: usize,
+    k: usize,
+    from_file: bool,
+    vocab: Option<(usize, Vec<String>)>,
+) -> ExitCode {
+    let run = || -> Result<(), String> {
+        let prompt = if from_file {
+            std::fs::read_to_string(prompt).map_err(|e| format!("{prompt}: {e}"))?
+        } else {
+            prompt.to_string()
+        };
+        let started = Instant::now();
+        let file = GgufFile::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let dfile = GgufFile::open(drafter).map_err(|e| format!("{drafter}: {e}"))?;
+        let tokenizer = Tokenizer::from_gguf(&file).map_err(|e| e.to_string())?;
+        let gpu = Gpu::open().map_err(|e| e.to_string())?;
+        let mut model = Inkling2Cuda::load(&file, gpu).map_err(|e| e.to_string())?;
+        model.set_precision(Precision::Int8);
+        let mut draft = DSparkCuda::load(&dfile, model.gpu()).map_err(|e| e.to_string())?;
+        draft.check_target(&model).map_err(|e| e.to_string())?;
+        if let Some((size, files)) = &vocab {
+            // The `size` tokens seen most in `files` (and every special token).
+            let mut counts: std::collections::HashMap<u32, usize> = Default::default();
+            for f in files {
+                let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+                for id in tokenizer.encode(&text, false, false) {
+                    *counts.entry(id).or_default() += 1;
+                }
+            }
+            let mut ranked: Vec<(u32, usize)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let mut tokens: Vec<u32> = ranked.iter().take(*size).map(|r| r.0).collect();
+            for id in 200_000..draft.config.vocab as u32 {
+                tokens.push(id);
+            }
+            tokens.sort_unstable();
+            tokens.dedup();
+            draft.set_vocab(model.gpu(), &file, &tokens).map_err(|e| e.to_string())?;
+            eprintln!("Guessing from {} tokens.", tokens.len());
+        }
+        model.gpu().settle();
+        eprintln!("Loaded in {:.1?}.", started.elapsed());
+        let ids = tokenizer.encode(&prompt, true, true);
+        let capacity = ids.len() + n + 16;
+        let mut s = model.session(capacity).map_err(|e| e.to_string())?;
+        model.keep_features(&mut s, draft.target_visits()).map_err(|e| e.to_string())?;
+        let batch = syrinx_engine::models::inkling2_cuda::BATCH;
+        let mut ds = draft.state(&model, capacity, batch).map_err(|e| e.to_string())?;
+
+        let t0 = Instant::now();
+        let mut logits = Vec::new();
+        for chunk in ids.chunks(batch) {
+            if let Some(l) = model.forward_batch(&mut s, chunk, Logits::Last).map_err(|e| e.to_string())? {
+                logits = l.to_vec();
+            }
+            let f = model.features(&s).expect("kept");
+            draft.add(&model, &mut ds, f, f.1).map_err(|e| e.to_string())?;
+        }
+        let prompt_time = t0.elapsed();
+
+        let t1 = Instant::now();
+        let mut next = argmax(&logits);
+        let mut generated: Vec<u32> = Vec::new();
+        let mut checkpoint = None;
+        let (mut steps, mut guessed, mut kept, mut reruns) = (0usize, 0usize, 0usize, 0usize);
+        let mut draft_time = std::time::Duration::ZERO;
+        let (mut verify_time, mut rerun_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        // Lately: guesses kept a drafted step, and how long a drafted and a plain step
+        // take. Drafting goes on while (1 + kept) tokens a drafted step come faster than
+        // one a plain step; otherwise a few plain steps, then a drafted one to look again.
+        let mut kept_lately = 1.0f64;
+        let (mut drafted_secs, mut plain_secs) = (0.0f64, 0.0f64);
+        let (mut plain_left, mut plain_steps) = (0usize, 0usize);
+        // Plain steps before looking again: doubled each time drafting still doesn't pay.
+        let mut backoff = 3usize;
+        while generated.len() < n {
+            generated.push(next);
+            if tokenizer.is_end_of_generation(next) || generated.len() == n {
+                break;
+            }
+            if plain_left > 0 {
+                plain_left -= 1;
+                plain_steps += 1;
+                let tp = Instant::now();
+                next = model.forward_greedy(&mut s, next).map_err(|e| e.to_string())?;
+                let f = model.features(&s).expect("kept");
+                draft.add(&model, &mut ds, f, 1).map_err(|e| e.to_string())?;
+                let took = tp.elapsed().as_secs_f64();
+                plain_secs = if plain_secs == 0.0 { took } else { 0.8 * plain_secs + 0.2 * took };
+                continue;
+            }
+            let step_started = Instant::now();
+            let want = k.min(n - generated.len());
+            let td = Instant::now();
+            let guesses = draft.draft(&mut ds, &model, next, want).map_err(|e| e.to_string())?;
+            draft_time += td.elapsed();
+            let mut batch_tokens = vec![next];
+            batch_tokens.extend_from_slice(&guesses);
+            let tv = Instant::now();
+            model.save(&s, &mut checkpoint).map_err(|e| e.to_string())?;
+            model.forward_batch_held(&mut s, &batch_tokens).map_err(|e| e.to_string())?;
+            let mut accepted = 0;
+            let mut choice = model.held_argmax(&s, 0).map_err(|e| e.to_string())?;
+            while accepted < guesses.len() && guesses[accepted] == choice {
+                accepted += 1;
+                choice = model.held_argmax(&s, accepted).map_err(|e| e.to_string())?;
+            }
+            verify_time += tv.elapsed();
+            let tr = Instant::now();
+            steps += 1;
+            guessed += guesses.len();
+            kept += accepted;
+            kept_lately = 0.7 * kept_lately + 0.3 * accepted as f64;
+            // Keep the last token and the guesses Inkling agreed with: the caches move back
+            // and the convolutions' history is rebuilt from the batch (no tokens run again).
+            if accepted < guesses.len() {
+                reruns += 1;
+                let cp = checkpoint.as_ref().expect("saved");
+                model
+                    .keep_first(&mut s, cp, batch_tokens.len(), accepted + 1)
+                    .map_err(|e| e.to_string())?;
+            }
+            let f = model.features(&s).expect("kept");
+            draft.add(&model, &mut ds, f, accepted + 1).map_err(|e| e.to_string())?;
+            model.gpu().synchronize().map_err(|e| e.to_string())?;
+            rerun_time += tr.elapsed();
+            for &g in &guesses[..accepted] {
+                generated.push(g);
+                if generated.len() == n || tokenizer.is_end_of_generation(g) {
+                    break;
+                }
+            }
+            if generated.len() >= n || generated.last().is_some_and(|&t| tokenizer.is_end_of_generation(t)) {
+                break;
+            }
+            next = choice;
+            let took = step_started.elapsed().as_secs_f64();
+            drafted_secs = if drafted_secs == 0.0 { took } else { 0.8 * drafted_secs + 0.2 * took };
+            let slower = if plain_secs > 0.0 {
+                (1.0 + kept_lately) / drafted_secs < 1.0 / plain_secs
+            } else {
+                kept_lately < 0.5
+            };
+            if slower {
+                plain_left = backoff;
+                backoff = (backoff * 2).min(24);
+            } else {
+                backoff = 3;
+            }
+        }
+        generated.truncate(n);
+        let gen_time = t1.elapsed();
+        println!("{}", tokenizer.decode(&generated, false));
+        let ids_text: Vec<String> = generated.iter().map(u32::to_string).collect();
+        eprintln!("\nGenerated ids: [{}]", ids_text.join(", "));
+        eprintln!(
+            "Prompt: {} tokens in {prompt_time:.2?} ({:.1} tokens/s). Generated: {} tokens in {gen_time:.2?} ({:.1} tokens/s).",
+            ids.len(),
+            ids.len() as f64 / prompt_time.as_secs_f64(),
+            generated.len(),
+            generated.len() as f64 / gen_time.as_secs_f64()
+        );
+        eprintln!(
+            "Drafting: {steps} steps ({plain_steps} plain), {kept} of {guessed} guesses kept ({:.2} a step), {reruns} take-backs; a step: drafting {:.2?}, checking {:.2?}, taking back + features {:.2?}.",
+            kept as f64 / steps.max(1) as f64,
+            draft_time / steps.max(1) as u32,
+            verify_time / steps.max(1) as u32,
+            rerun_time / steps.max(1) as u32,
+        );
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Greedy generation on the CPU with an Inkling 2 DSpark drafter guessing along: how many
+/// of each step's guesses Inkling would have kept.
+fn draft_check(path: &str, drafter: &str, prompt: &str, n: usize, from_file: bool) -> ExitCode {
+    let run = || -> Result<(), String> {
+        let prompt = if from_file {
+            std::fs::read_to_string(prompt).map_err(|e| format!("{prompt}: {e}"))?
+        } else {
+            prompt.to_string()
+        };
+        let file = GgufFile::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let dfile = GgufFile::open(drafter).map_err(|e| format!("{drafter}: {e}"))?;
+        let tokenizer = Tokenizer::from_gguf(&file).map_err(|e| e.to_string())?;
+        let pool = Pool::with_all_cores();
+        let model = Inkling2::load(&file, Pool::with_all_cores()).map_err(|e| e.to_string())?;
+        let draft = DSpark::load(&dfile, pool).map_err(|e| e.to_string())?;
+        draft.check_target(&model).map_err(|e| e.to_string())?;
+        let ids = tokenizer.encode(&prompt, true, true);
+        let dc = &draft.config;
+        let targets = dc.target_layers.clone();
+        let mut features = vec![0.0f32; dc.feature_len()];
+        let capacity = ids.len() + n + dc.block + 1;
+        let mut s = model.session(capacity);
+        let mut ds = draft.state(capacity);
+        let started = Instant::now();
+        let mut logits = Vec::new();
+        for (i, &t) in ids.iter().enumerate() {
+            let last = i + 1 == ids.len();
+            let out = model.forward_with_features(&mut s, t, last, Some((&targets, &mut features)));
+            if let Some(l) = out {
+                logits = l.to_vec();
+            }
+            draft.add(&mut ds, &features);
+        }
+        eprintln!("Read {} tokens in {:.1?}.", ids.len(), started.elapsed());
+        let argmax = |l: &[f32]| {
+            let mut b = 0;
+            for (i, &v) in l.iter().enumerate() {
+                if v > l[b] {
+                    b = i;
+                }
+            }
+            b as u32
+        };
+        let mut written = vec![argmax(&logits)];
+        let mut guesses: Vec<Vec<u32>> = Vec::new();
+        let mut draft_time = std::time::Duration::ZERO;
+        for _ in 0..n {
+            let anchor = *written.last().unwrap();
+            let t0 = Instant::now();
+            guesses.push(draft.draft(&ds, &model, anchor, dc.block - 1));
+            draft_time += t0.elapsed();
+            let l = model
+                .forward_with_features(&mut s, anchor, true, Some((&targets, &mut features)))
+                .expect("logits")
+                .to_vec();
+            draft.add(&mut ds, &features);
+            written.push(argmax(&l));
+        }
+        let mut kept_hist = vec![0usize; dc.block];
+        let mut total = 0usize;
+        for (step, g) in guesses.iter().enumerate() {
+            let actual = &written[step + 1..];
+            let kept = g.iter().zip(actual).take_while(|(a, b)| a == b).count();
+            kept_hist[kept] += 1;
+            total += kept;
+        }
+        println!("{}", tokenizer.decode(&written, false));
+        println!(
+            "Steps {n}: guesses kept on average {:.2} of {} (first guess right {:.0}%); by count kept {:?}; drafting {:.1?} a step on the CPU.",
+            total as f64 / n as f64,
+            dc.block - 1,
+            100.0 * (n - kept_hist[0]) as f64 / n as f64,
+            kept_hist,
+            draft_time / n as u32,
+        );
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -516,7 +844,14 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
     }
     eprintln!("Loaded in {:.1?}: {}.", started.elapsed(), model.describe());
 
-    let ids = tokenizer.encode(&prompt, !options.raw, !options.raw);
+    let ids = if options.ids {
+        match prompt.split_whitespace().map(str::parse).collect::<Result<Vec<u32>, _>>() {
+            Ok(ids) => ids,
+            Err(e) => return fail("read the ids", &e),
+        }
+    } else {
+        tokenizer.encode(&prompt, !options.raw, !options.raw)
+    };
     if ids.is_empty() {
         eprintln!("The prompt has no tokens.");
         return ExitCode::FAILURE;

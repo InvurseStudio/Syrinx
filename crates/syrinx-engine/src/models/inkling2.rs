@@ -251,13 +251,13 @@ impl Config {
         }
     }
 
-    fn kv_dim(&self) -> usize {
+    pub fn kv_dim(&self) -> usize {
         self.kv_heads * self.head_dim
     }
 
     /// The channels a layer's convolutions keep history for: keys, values, the attention's
     /// output and the experts'.
-    fn conv_channels(&self) -> usize {
+    pub fn conv_channels(&self) -> usize {
         2 * self.kv_dim() + 2 * self.dim
     }
 }
@@ -531,7 +531,29 @@ impl<'a> Inkling2<'a> {
         token: u32,
         want_logits: bool,
     ) -> Option<&'s [f32]> {
+        self.forward_with_features(s, token, want_logits, None)
+    }
+
+    /// [`forward`](Self::forward), also writing the token's features for a DSpark drafter:
+    /// for each of `features.0` (visit numbers, the last one the number of visits), the
+    /// residual stream going into that layer visit, or for the last, the final normed
+    /// hidden state; `features.1` holds them one after another (`dim` each).
+    pub fn forward_with_features<'s>(
+        &self,
+        s: &'s mut Session,
+        token: u32,
+        want_logits: bool,
+        mut features: Option<(&[usize], &mut [f32])>,
+    ) -> Option<&'s [f32]> {
         let c = &self.config;
+        let mut visit = 0usize;
+        let capture = |visit: usize, x: &[f32], features: &mut Option<(&[usize], &mut [f32])>| {
+            if let Some((at, out)) = features.as_mut()
+                && let Some(i) = at.iter().position(|&v| v == visit)
+            {
+                out[i * x.len()..(i + 1) * x.len()].copy_from_slice(x);
+            }
+        };
         let pos = s.len;
         assert!(
             pos < s.capacity,
@@ -556,11 +578,15 @@ impl<'a> Inkling2<'a> {
         match c.looped {
             None => {
                 for l in 0..c.layers {
+                    capture(visit, &x, &mut features);
+                    visit += 1;
                     self.layer(s, l, l, pos, tau, &mut x, &mut blocks, None);
                 }
             }
             Some(lp) => {
                 for l in 0..lp.start {
+                    capture(visit, &x, &mut features);
+                    visit += 1;
                     self.layer(s, l, l, pos, tau, &mut x, &mut blocks, None);
                 }
                 // Every pass starts from the prelude's output.
@@ -588,6 +614,8 @@ impl<'a> Inkling2<'a> {
                                 .queries;
                             mix(&bank, queries)
                         });
+                        capture(visit, &x, &mut features);
+                        visit += 1;
                         self.layer(
                             s,
                             slot,
@@ -601,19 +629,25 @@ impl<'a> Inkling2<'a> {
                     }
                 }
                 for l in lp.end..c.layers {
+                    capture(visit, &x, &mut features);
+                    visit += 1;
                     self.layer(s, l, l, pos, tau, &mut x, &mut blocks, None);
                 }
             }
         }
         s.len += 1;
 
-        if !want_logits {
+        if !want_logits && features.is_none() {
             return None;
         }
         blocks.push(x);
         let mixed = mix(&blocks, std::slice::from_ref(&self.output_res_query)).remove(0);
         let mut h = vec![0.0; dim];
         cpu::rms_norm(&mixed, &self.output_norm, c.norm_eps, &mut h);
+        capture(visit, &h, &mut features);
+        if !want_logits {
+            return None;
+        }
         dump("result_norm", usize::MAX, &h);
         let mut logits = vec![0.0; c.padded_vocab];
         cpu::matvec(&self.pool, &self.output, &h, &mut logits);
