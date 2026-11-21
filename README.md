@@ -27,6 +27,9 @@ tool-calling grammar. It doesn't wrap llama.cpp or MLX.
   server checks the reply for changes it claims but never made.
 - **Several people at once.** One Mac serves 64 chats together, about 250 tokens a second
   in total, with each reply starting within about 6 seconds.
+- **New models within a day.** Inkling 2 Mini, Thinking Machines' looped mixture of
+  experts, ran on Syrinx the day it came out: first checked token for token against
+  llama.cpp on the CPU, then on the GPU with kernels of its own.
 - **Speculative decoding where it pays.** Draft models (Gemma 4 E2B for 31B, or Google's
   draft models), Qwen's own multi-token-prediction layer, and guesses taken from the chat
   itself. Every token is still the model's own pick.
@@ -82,6 +85,22 @@ quarter's revenue and the year's total with the calculator tool.
 | Qwen 3.8 27B | 32.5 s |
 | Muse Glimmer 30B | 49.7 s |
 
+### Inkling 2 Mini
+
+Inkling 2 Mini (26B, 3.4B active, looped mixture of experts), Q8_0, measured on
+20 November 2026 on the same Mac, without drafting:
+
+| Context | Reading | Writing | Peak memory |
+|---|---:|---:|---:|
+| 8K | 1,206 tok/s | 49.9 tok/s | 28.0 GB |
+| 32K | 984 tok/s | 39.9 tok/s | 30.0 GB |
+| 64K | 750 tok/s | 28.1 tok/s | 32.1 GB |
+| 128K | 514 tok/s | 18.2 tok/s | 36.1 GB |
+
+Short prompts read at 1,602 tok/s (512 tokens) and 1,450 tok/s (4K), and a short reply
+writes at 59 tok/s. It recalled all five planted facts at every size, and got all 14
+agent and coding tasks right in 449 seconds in all.
+
 ### Short replies, large models
 
 | Model | Writing speed |
@@ -123,9 +142,11 @@ Gemma 4 31B: 4 people together write 42.9 tok/s in total (first token within 0.9
 | Qwen 3.5 / 3.8 | 0.8B, 4B, 9B, 27B (with multi-token prediction) |
 | Llama 3 | 3.2 1B |
 | Muse Glimmer | 30B |
+| Inkling 2 | Mini (26B-A3.4B, looped mixture of experts; Metal and CPU, not CUDA yet) |
 
-Models are GGUF files: tested with Q4_0, Q4_K_M and Q6_K. Thinking is supported for
-Gemma 4, Qwen and Muse, with the thoughts streamed apart from the answer.
+Models are GGUF files: tested with Q4_0, Q4_K_M and Q6_K (Inkling 2 Mini with Q8_0).
+Thinking is supported for Gemma 4, Qwen, Muse and Inkling, with the thoughts streamed
+apart from the answer.
 
 ## What's inside
 

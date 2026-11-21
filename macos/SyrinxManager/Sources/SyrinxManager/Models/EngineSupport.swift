@@ -1,10 +1,11 @@
 // What Syrinx's engine (crates/syrinx-engine) runs today, so the app can say so before a
 // model is chosen or downloaded, and search Hugging Face for only what it runs. Keep it in
 // step with the engine: the architectures its models accept (models/llama.rs, qwen35.rs,
-// gemma4.rs, which also runs Muse Glimmer) and the tensor types it computes with (quant.rs on
+// gemma4.rs, which also runs Muse Glimmer, inkling2_cuda.rs) and the tensor types it computes with (quant.rs on
 // the CPU, metal/mod.rs's KINDS on the GPU; BF16 is turned into another type as it's
 // uploaded, models/gpu.rs). The Windows app's copy is windows/SyrinxManager/Models/
-// EngineSupport.cs: keep the two in step.
+// EngineSupport.cs: keep the two in step. Inkling 2 is the exception: its GPU model is Metal
+// only (CUDA builds get a stand-in), so only this copy lists it.
 import Foundation
 
 enum SupportLevel: Equatable {
@@ -25,10 +26,10 @@ struct SupportVerdict: Equatable {
 
 enum EngineSupport {
     /// GGUF architectures ("general.architecture") with a forward pass in the engine.
-    static let architectures: Set<String> = ["llama", "qwen35", "gemma4", "muse-glimmer"]
+    static let architectures: Set<String> = ["llama", "qwen35", "gemma4", "muse-glimmer", "inkling2", "inkling2_loop"]
 
     /// Architectures whose forward pass also runs on the GPU.
-    static let gpuArchitectures: Set<String> = ["llama", "qwen35", "gemma4", "muse-glimmer"]
+    static let gpuArchitectures: Set<String> = ["llama", "qwen35", "gemma4", "muse-glimmer", "inkling2", "inkling2_loop"]
 
     /// Tensor types the CPU path can read.
     static let tensorTypes: Set<String> = ["F32", "F16", "BF16", "Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K"]
@@ -40,7 +41,7 @@ enum EngineSupport {
     /// pre-tokenizers it knows ("tokenizer.ggml.pre", llama.cpp's names). The llama
     /// architecture is shared by many models with other tokenizers (Llama 2, Mistral); only
     /// Llama 3's is read.
-    static let preTokenizers: Set<String> = ["llama3", "llama-v3", "llama-bpe", "qwen2", "deepseek-r1-qwen", "qwen35", "llama4"]
+    static let preTokenizers: Set<String> = ["llama3", "llama-v3", "llama-bpe", "qwen2", "deepseek-r1-qwen", "qwen35", "llama4", "inkling2"]
 
     /// The families' names, for the architectures Hugging Face reports.
     static func familyName(_ architecture: String?) -> String {
@@ -49,6 +50,7 @@ enum EngineSupport {
         case "qwen35": return "Qwen 3.5 – 3.8"
         case "gemma4": return "Gemma 4"
         case "muse-glimmer": return "Muse Glimmer"
+        case "inkling2", "inkling2_loop": return "Inkling 2"
         case nil, "": return "Unknown"
         case let other?: return other
         }
