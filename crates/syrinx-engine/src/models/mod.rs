@@ -11,6 +11,10 @@ mod gpu;
 pub mod inkling2;
 #[cfg(target_os = "macos")]
 pub mod inkling2_cuda;
+/// CUDA has no Inkling kernels yet: the Mac model's types, which only say so.
+#[cfg(not(target_os = "macos"))]
+#[path = "inkling2_unsupported.rs"]
+pub mod inkling2_cuda;
 pub mod llama;
 pub mod llama_cuda;
 pub mod qwen35;

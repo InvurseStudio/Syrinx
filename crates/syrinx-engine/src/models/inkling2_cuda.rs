@@ -327,11 +327,7 @@ impl<'a> Inkling2Cuda<'a> {
     }
 
     /// A session that reads up to `batch` tokens at a time (its buffers are sized by it).
-    pub fn session_with_batch(
-        &self,
-        capacity: usize,
-        batch: usize,
-    ) -> Result<Inkling2CudaSession> {
+    pub fn session_with_batch(&self, capacity: usize, batch: usize) -> Result<Inkling2CudaSession> {
         let c = &self.config;
         let g = &self.gpu;
         let batch = batch.min(capacity).max(1);
@@ -435,11 +431,7 @@ impl<'a> Inkling2Cuda<'a> {
     }
 
     /// Saves where the session is (its convolution histories), into `cp` (reused).
-    pub fn save(
-        &self,
-        s: &Inkling2CudaSession,
-        cp: &mut Option<Inkling2Checkpoint>,
-    ) -> Result<()> {
+    pub fn save(&self, s: &Inkling2CudaSession, cp: &mut Option<Inkling2Checkpoint>) -> Result<()> {
         let bytes = s.histories.len_bytes();
         if cp.as_ref().is_none_or(|c| c.history.len_bytes() < bytes) {
             *cp = Some(Inkling2Checkpoint {
@@ -485,7 +477,11 @@ impl<'a> Inkling2Cuda<'a> {
         token: u32,
         want_logits: bool,
     ) -> Result<Option<&'s [f32]>> {
-        let logits = if want_logits { Logits::Last } else { Logits::None };
+        let logits = if want_logits {
+            Logits::Last
+        } else {
+            Logits::None
+        };
         self.forward_batch(s, &[token], logits)
     }
 
