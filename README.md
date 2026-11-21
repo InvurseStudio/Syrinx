@@ -145,8 +145,8 @@ Gemma 4 31B: 4 people together write 42.9 tok/s in total (first token within 0.9
 | Inkling 2 | Mini (26B-A3.4B, looped mixture of experts; Metal and CPU, not CUDA yet) |
 
 Models are GGUF files: tested with Q4_0, Q4_K_M and Q6_K (Inkling 2 Mini with Q8_0).
-Thinking is supported for Gemma 4, Qwen, Muse and Inkling, with the thoughts streamed
-apart from the answer.
+Thinking is supported for Gemma 4, Qwen and Muse, with the thoughts streamed apart from
+the answer. Inkling 2 thinks before it answers too, with its thoughts kept out of the reply.
 
 ## What's inside
 

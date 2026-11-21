@@ -4239,6 +4239,29 @@ fn reply(
                     continue;
                 }
             }
+            // Inkling with no call to make: its message is text or a thought, each one
+            // special token, picked here. Under the grammar their shared "<|content_t" was
+            // written as plain text, which the model never reads in its own messages, so it
+            // was steered into thoughts: on /v1 its answer was hidden as one, again and
+            // again, until the thinking budget ran out.
+            if family == Family::Inkling
+                && !may_call
+                && let Some(user) = tokenizer.token_id(tools::INK_TO_USER)
+            {
+                let me = tokenizer.token_id(tools::INK_TO_SELF);
+                let pick = match me {
+                    Some(me) if may_think && logits[me as usize] > logits[user as usize] => me,
+                    _ => user,
+                };
+                if kept.tokens.len() + 64 > context {
+                    break;
+                }
+                logits = model.feed(kept, &[pick])?;
+                call_tokens += 1;
+                turn_start = false;
+                thinking = Some(pick) == me;
+                continue;
+            }
             let call_started = Instant::now();
             let active_grammar = match &muse_grammars {
                 Some((_, answers)) if !may_call => answers,
