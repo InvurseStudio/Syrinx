@@ -12,6 +12,7 @@ use syrinx_engine::models::gemma4::{self, Gemma4};
 use syrinx_engine::models::gemma4_cuda::{Gemma4Cuda, Gemma4CudaSession};
 use syrinx_engine::models::inkling2::{self, Inkling2};
 use syrinx_engine::models::inkling2_dspark::DSpark;
+#[cfg(target_os = "macos")]
 use syrinx_engine::models::inkling2_dspark_cuda::DSparkCuda;
 use syrinx_engine::models::inkling2_cuda::{Inkling2Cuda, Inkling2CudaSession};
 use syrinx_engine::models::llama::{Llama, Session};
@@ -525,10 +526,26 @@ impl GenerateOptions {
     }
 }
 
+/// Inkling 2's drafter runs on the Mac's GPU only so far.
+#[cfg(not(target_os = "macos"))]
+fn generate_drafted(
+    _path: &str,
+    _drafter: &str,
+    _prompt: &str,
+    _n: usize,
+    _k: usize,
+    _from_file: bool,
+    _vocab: Option<(usize, Vec<String>)>,
+) -> ExitCode {
+    eprintln!("generate-drafted runs on the Mac's GPU only so far.");
+    ExitCode::FAILURE
+}
+
 /// Greedy generation of Inkling 2 on the GPU with its DSpark drafter: each step the
 /// drafter guesses up to `k` tokens, Inkling reads the last token and the guesses in one
 /// batch and keeps the guesses it agrees with plus its own next choice. Same tokens as
 /// `generate --gpu`.
+#[cfg(target_os = "macos")]
 fn generate_drafted(
     path: &str,
     drafter: &str,
