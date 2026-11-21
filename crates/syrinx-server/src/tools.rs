@@ -1258,6 +1258,38 @@ impl J {
         }
     }
 
+    /// `json.dumps(sort_keys=True, separators=(",", ":"))`: keys sorted at every depth,
+    /// no spaces (Inkling's template).
+    fn sorted_tight(&self, out: &mut String) {
+        match self {
+            J::Str(s) => out.push_str(&json_string(s)),
+            J::Arr(items) => {
+                out.push('[');
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.sorted_tight(out);
+                }
+                out.push(']');
+            }
+            J::Obj(fields) => {
+                let mut fields: Vec<&(String, J)> = fields.iter().collect();
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                out.push('{');
+                for (i, (k, v)) in fields.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&json_string(k));
+                    out.push(':');
+                    v.sorted_tight(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     /// Python's `json.dumps(indent=4)`, as Llama's template writes tools.
     fn indented(&self, depth: usize, out: &mut String) {
         let pad = |d: usize| "    ".repeat(d);
@@ -1541,7 +1573,41 @@ pub fn declarations(family: Family, tools: &[Tool]) -> String {
             .map(|t| format!("<|tool>{}<tool|>", gemma_declaration(t)))
             .collect(),
         Family::Muse => muse_declarations(tools),
+        Family::Inkling => ink_declarations(tools),
     }
+}
+
+/// Inkling's template's tool declarations: a system message `tool_declare`, the tools as
+/// one JSON list, keys sorted, no spaces (`tojson(sort_keys=true, separators=(",", ":"))`).
+/// None: no message.
+fn ink_declarations(tools: &[Tool]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let specs = J::Arr(
+        tools
+            .iter()
+            .map(|t| {
+                J::Obj(vec![
+                    ("description".into(), J::Str(t.description.into())),
+                    ("name".into(), J::Str(t.name.into())),
+                    (
+                        "parameters".into(),
+                        J::Obj(vec![
+                            ("type".into(), J::Str("object".into())),
+                            ("properties".into(), properties_json(&t.params)),
+                            ("required".into(), required_json(&t.params)),
+                        ]),
+                    ),
+                    ("type".into(), J::Str("function".into())),
+                ])
+            })
+            .collect(),
+    );
+    let mut out = String::from("<|message_system|>tool_declare<|content_xml|>");
+    specs.sorted_tight(&mut out);
+    out.push_str("<|end_message|>");
+    out
 }
 
 /// Muse's template's `render_tool_defs`, then its `render_system_meta` (the recipients
@@ -1751,8 +1817,22 @@ pub fn call_start(family: Family) -> Start {
             token: "<|eom|>",
             brace: false,
         },
+        // Each message of Inkling's opens with <|message_model|>, its kind chosen next
+        // (`ink_call_grammar`): one the model opens mid-reply may be a call.
+        Family::Inkling => Start {
+            token: "<|message_model|>",
+            brace: false,
+        },
     }
 }
+
+/// Inkling's message kinds, as `ink_call_grammar` writes them: text to the user, and a
+/// thought (the model's own, not shown).
+pub const INK_TO_USER: &str = "<|content_text|>";
+pub const INK_TO_SELF: &str = "<|content_thinking|>";
+/// What ends one of Inkling's messages, and its turn.
+pub const INK_END: &str = "<|end_message|>";
+pub const INK_TURN_END: &str = "<|content_model_end_sampling|>";
 
 /// Muse's recipient, as `call_grammar` writes it, when the message is to the user: plain
 /// text follows.
@@ -1814,7 +1894,7 @@ pub fn family_notes(family: Family, thinking: bool) -> Option<String> {
             "Tool-call format: call tools only in the <tool_call> format the tools section describes, one <tool_call> block per call{}. Give each parameter its full value.\n\nKeep the final reply short: the result, then the points the user must know. Do not restate rules, file contents or your steps, do not list the sources again, and do not offer a menu of next steps. Never shorten a draft, a document or a list the user asked for.",
             if thinking { ", after your thinking ends" } else { "" }
         )),
-        Family::Muse | Family::Llama => None,
+        Family::Muse | Family::Llama | Family::Inkling => None,
     }
 }
 
@@ -1822,6 +1902,8 @@ pub fn family_notes(family: Family, thinking: bool) -> Option<String> {
 pub fn call_tokens(family: Family) -> &'static [&'static str] {
     match family {
         Family::Gemma4 => &[QUOTE],
+        // A message's kind, chosen at its start (`ink_call_grammar`).
+        Family::Inkling => &[INK_TO_USER, INK_TO_SELF, "<|content_invoke_tool_json|>"],
         _ => &[],
     }
 }
@@ -1908,7 +1990,42 @@ pub fn call_grammar(family: Family, tools: &[Tool]) -> Schema {
             ])
         }
         Family::Muse => muse_call_grammar(tools, true),
+        Family::Inkling => ink_call_grammar(tools, true),
     }
+}
+
+/// Inkling's message start (after `<|message_model|>`): text to the user, a thought if
+/// `may_think`, or one of `tools`' names and its call, `{"name":..,"args":{..}}` with the
+/// arguments' keys sorted, as its template writes a call.
+pub fn ink_call_grammar(tools: &[Tool], may_think: bool) -> Schema {
+    let style = RecordStyle {
+        open: "{".into(),
+        key_open: String::new(),
+        key_close: ":".into(),
+        separator: ",".into(),
+        close: "}".into(),
+        json_keys: true,
+    };
+    let mut options = vec![(INK_TO_USER.to_string(), Schema::Seq(vec![]))];
+    if may_think {
+        options.push((INK_TO_SELF.to_string(), Schema::Seq(vec![])));
+    }
+    options.extend(tools.iter().map(|t| {
+        let mut params = t.params.clone();
+        params.sort_by_key(|p| p.name);
+        (
+            format!("{}<|content_invoke_tool_json|>", t.name),
+            Schema::Seq(vec![
+                Schema::Literal(format!("{{\"name\":{},\"args\":", json_string(t.name))),
+                Schema::Record {
+                    fields: fields(&params, |p| json_value(p.kind)),
+                    style: style.clone(),
+                },
+                Schema::Literal("}".into()),
+            ]),
+        )
+    }));
+    Schema::Branch(options)
 }
 
 /// Muse's message start: its recipient (the user, itself if `may_think`, or one of
@@ -2089,6 +2206,20 @@ pub fn parse_call(family: Family, text: &str, tools: &[Tool]) -> Option<Call> {
         })
     };
     match family {
+        Family::Inkling => {
+            let (tool, rest) = text.split_once("<|content_invoke_tool_json|>")?;
+            let v = json::parse(rest).ok()?;
+            let mut args = Vec::new();
+            if let Some(json::Value::Object(params)) = v.get("args") {
+                for (k, v) in params {
+                    args.push((k.clone(), json_arg(v)));
+                }
+            }
+            Some(Call {
+                tool: v.str("name").unwrap_or(tool).to_string(),
+                args,
+            })
+        }
         Family::Muse => {
             let (tool, rest) = text.strip_prefix(" to=")?.split_once("<|message|>")?;
             if tool == "user" || tool == "self" {
@@ -2180,6 +2311,21 @@ pub fn call_text(family: Family, call: &Call) -> String {
         })
         .collect();
     match family {
+        // From just after `chat::opening`'s <|message_model|>, as Muse's.
+        Family::Inkling => {
+            let mut sorted = texts.clone();
+            sorted.sort_by_key(|(k, _)| *k);
+            let params: Vec<String> = sorted
+                .iter()
+                .map(|(k, v)| format!("{}:{}", json::string(k), json::string(v)))
+                .collect();
+            format!(
+                "{}<|content_invoke_tool_json|>{{\"name\":{},\"args\":{{{}}}}}",
+                call.tool,
+                json::string(&call.tool),
+                params.join(",")
+            )
+        }
         Family::Qwen35 => {
             let params: String = texts
                 .iter()
@@ -2261,6 +2407,13 @@ pub fn after_call(
             format!("<|eot|><|start|>tool {tool}<|message|><tool_output name=\"{tool}\">\n"),
             result.into(),
             "\n</tool_output><|eot|><|start|>assistant".into(),
+        ),
+        // The call's message and the turn end, as the template ends an assistant turn
+        // with calls; the tool's message; then the model's next message opens.
+        Family::Inkling => (
+            format!("{INK_END}{INK_TURN_END}<|message_tool|>{tool}<|content_text|>"),
+            result.into(),
+            format!("{INK_END}<|message_model|>"),
         ),
     }
 }

@@ -14,6 +14,11 @@ pub enum Family {
     /// Muse Glimmer: Gemma 4's layer with other choices, run by the same model code
     /// (`Gemma4Cuda`, `Config::muse`), with a chat format of its own.
     Muse,
+    /// Inkling 2 (Thinking Machines; Inkling 2 Mini's looped model too). Each reply is a
+    /// run of messages, each opened with `<|message_model|>` and then its kind: text, a
+    /// thought, or a tool's name and its call. The reply loop has the model choose at
+    /// each message's start, as Muse's recipient (`tools::ink_call_grammar`).
+    Inkling,
 }
 
 impl Family {
@@ -24,6 +29,7 @@ impl Family {
             Family::Qwen35 => "qwen35",
             Family::Gemma4 => "gemma4",
             Family::Muse => "muse",
+            Family::Inkling => "inkling",
         }
     }
 
@@ -40,6 +46,7 @@ impl Family {
             "qwen35" => Some(Family::Qwen35),
             "gemma4" => Some(Family::Gemma4),
             "muse-glimmer" => Some(Family::Muse),
+            "inkling2" | "inkling2_loop" => Some(Family::Inkling),
             _ => None,
         }
     }
@@ -75,6 +82,13 @@ impl Family {
             Family::Llama => Settings {
                 temperature: 0.7,
                 top_p: 0.9,
+                ..Settings::default()
+            },
+            // The GGUF's general.sampling: 1.0 / 1.0 / top-k 50.
+            Family::Inkling => Settings {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 50,
                 ..Settings::default()
             },
         }
@@ -425,6 +439,9 @@ pub fn opening(family: Family, thinking: bool) -> &'static str {
         // Muse's turn names its recipient next: the reply loop has the model choose
         // between the user and a tool (`tools::call_grammar`).
         Family::Muse => "<|start|>assistant",
+        // Inkling's first message: its kind (text, a thought, a call) is the model's
+        // choice, as Muse's recipient.
+        Family::Inkling => "<|message_model|>",
     }
 }
 
@@ -450,6 +467,7 @@ pub fn closing(family: Family) -> &'static str {
         Family::Qwen35 => "<|im_end|>\n",
         Family::Gemma4 => "<turn|>\n",
         Family::Muse => "<|eot|>",
+        Family::Inkling => "<|end_message|>",
     }
 }
 
@@ -477,6 +495,7 @@ pub fn cut_points(messages: &[Message], step: usize) -> Vec<usize> {
 pub fn answer_opening(family: Family) -> &'static str {
     match family {
         Family::Muse => "<|start|>assistant to=user<|message|>",
+        Family::Inkling => "<|message_model|><|content_text|>",
         other => opening(other, false),
     }
 }
@@ -485,6 +504,69 @@ pub fn answer_opening(family: Family) -> &'static str {
 /// Mac's server sets it: low for thinking off, high for thinking on.
 pub const MUSE_REASONING: &str = "Reasoning strength: low.";
 pub const MUSE_REASONING_ON: &str = "Reasoning strength: high.";
+
+/// Inkling's thinking effort (its template's `reasoning_effort`, a system message before
+/// the chat's first): low with thinking off (its least, 0, still thinks; low keeps it
+/// short), high with it on (the template's default).
+pub const INK_EFFORT: &str = "0.2";
+pub const INK_EFFORT_ON: &str = "0.9";
+
+/// An Inkling reply as its template writes it back: each text a message, each call a
+/// message with its tool's result after it, and the turn's end. Past thoughts are left
+/// out (the app doesn't keep them), as the template leaves out a turn's missing
+/// `reasoning_content`. A record from another family: its results as plain notes.
+fn inkling_reply(content: &str, record: Option<&Record>) -> String {
+    let text_message = |out: &mut String, text: &str| {
+        let text = text.trim();
+        if !text.is_empty() {
+            out.push_str("<|message_model|><|content_text|>");
+            out.push_str(text);
+            out.push_str("<|end_message|>");
+        }
+    };
+    let mut out = String::new();
+    let mut done = 0;
+    let same = record.is_some_and(|r| r.family == Family::Inkling.name());
+    for step in record.map_or(&[][..], |r| &r.steps[..]) {
+        let at = if step.at >= done && step.at <= content.len() && content.is_char_boundary(step.at)
+        {
+            step.at
+        } else {
+            done
+        };
+        if !same {
+            out.push_str(&content[done..at]);
+            out.push_str(&format!("\n[{} returned:\n", step.tool));
+            out.push(PLAIN_OPEN);
+            out.push_str(&step.result);
+            out.push(PLAIN_CLOSE);
+            out.push_str("]\n");
+            done = at;
+            continue;
+        }
+        text_message(&mut out, &content[done..at]);
+        done = at;
+        let (before, body, after) =
+            crate::tools::after_call(Family::Inkling, &step.tool, &step.result, false);
+        out.push_str("<|message_model|>");
+        out.push_str(step.call.strip_prefix("<|message_model|>").unwrap_or(&step.call));
+        out.push_str(&before);
+        out.push(PLAIN_OPEN);
+        out.push_str(&body);
+        out.push(PLAIN_CLOSE);
+        // The next message opens on its own below.
+        out.push_str(after.strip_suffix("<|message_model|>").unwrap_or(&after));
+    }
+    if same || record.is_none() {
+        text_message(&mut out, &content[done..]);
+    } else {
+        let rest = format!("{}{}", out, &content[done..]);
+        out.clear();
+        text_message(&mut out, &rest);
+    }
+    out.push_str("<|content_model_end_sampling|>");
+    out
+}
 
 /// What Gemma 4's template opens its system turn with when thinking is on.
 const GEMMA_THINK: &str = "<|think|>\n";
@@ -639,6 +721,28 @@ pub fn history(
                     }
                 }
                 out.push_str("<|eot|>");
+            }
+        }
+        Family::Inkling => {
+            if let Some(s) = system {
+                out.push_str("<|message_system|><|content_text|>");
+                out.push_str(s);
+                out.push_str("<|end_message|>");
+            }
+            // The tools' declarations (`tools::declarations`): a system message of their own.
+            out.push_str(tools);
+            // Before the first message that isn't the system's, as the template puts it.
+            out.push_str("<|message_system|><|content_text|>Thinking effort level: ");
+            out.push_str(if thinking { INK_EFFORT_ON } else { INK_EFFORT });
+            out.push_str("<|end_message|>");
+            for m in messages {
+                if m.role == "assistant" {
+                    out.push_str(&inkling_reply(m.content.trim(), m.record.as_ref()));
+                } else {
+                    out.push_str("<|message_user|><|content_text|>");
+                    out.push_str(m.content.trim());
+                    out.push_str("<|end_message|>");
+                }
             }
         }
     }

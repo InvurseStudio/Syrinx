@@ -1,12 +1,16 @@
 //! The forward pass for each model architecture.
 //!
 //! So far: Llama (Llama 3 and 3.x), Qwen 3.5 (to 3.8) and Gemma 4, each on the CPU
-//! reference backend and on NVIDIA GPUs.
+//! reference backend and on NVIDIA GPUs; Inkling 2 (and the looped Inkling 2 Mini) on the
+//! CPU and on the Mac's GPU.
 
 pub mod gemma4;
 pub mod gemma4_cuda;
 pub mod gemma4_vision;
 mod gpu;
+pub mod inkling2;
+#[cfg(target_os = "macos")]
+pub mod inkling2_cuda;
 pub mod llama;
 pub mod llama_cuda;
 pub mod qwen35;

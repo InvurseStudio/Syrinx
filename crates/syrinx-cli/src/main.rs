@@ -10,6 +10,9 @@ use syrinx_engine::cpu::Pool;
 use syrinx_engine::cuda::Gpu;
 use syrinx_engine::models::gemma4::{self, Gemma4};
 use syrinx_engine::models::gemma4_cuda::{Gemma4Cuda, Gemma4CudaSession};
+use syrinx_engine::models::inkling2::{self, Inkling2};
+#[cfg(target_os = "macos")]
+use syrinx_engine::models::inkling2_cuda::{Inkling2Cuda, Inkling2CudaSession};
 use syrinx_engine::models::llama::{Llama, Session};
 use syrinx_engine::models::llama_cuda::{CudaSession, LlamaCuda};
 use syrinx_engine::models::qwen35::{self, Qwen35};
@@ -146,6 +149,9 @@ enum Engine<'a> {
     Gpu(LlamaCuda<'a>),
     Qwen35(Qwen35<'a>),
     Gemma4(Gemma4<'a>),
+    Inkling2(Inkling2<'a>),
+    #[cfg(target_os = "macos")]
+    Inkling2Gpu(Inkling2Cuda<'a>),
     Qwen35Gpu(Qwen35Cuda<'a>),
     Gemma4Gpu(Gemma4Cuda<'a>),
 }
@@ -155,6 +161,9 @@ enum State {
     Gpu(CudaSession),
     Qwen35(qwen35::Session),
     Gemma4(gemma4::Session),
+    Inkling2(inkling2::Session),
+    #[cfg(target_os = "macos")]
+    Inkling2Gpu(Inkling2CudaSession),
     Qwen35Gpu(Qwen35CudaSession),
     Gemma4Gpu(Gemma4CudaSession),
 }
@@ -166,6 +175,9 @@ impl State {
             State::Gpu(s) => s.len(),
             State::Qwen35(s) => s.len(),
             State::Gemma4(s) => s.len(),
+            State::Inkling2(s) => s.len(),
+            #[cfg(target_os = "macos")]
+            State::Inkling2Gpu(s) => s.len(),
             State::Qwen35Gpu(s) => s.len(),
             State::Gemma4Gpu(s) => s.len(),
         }
@@ -177,6 +189,9 @@ impl State {
             State::Gpu(s) => s.capacity(),
             State::Qwen35(s) => s.capacity(),
             State::Gemma4(s) => s.capacity(),
+            State::Inkling2(s) => s.capacity(),
+            #[cfg(target_os = "macos")]
+            State::Inkling2Gpu(s) => s.capacity(),
             State::Qwen35Gpu(s) => s.capacity(),
             State::Gemma4Gpu(s) => s.capacity(),
         }
@@ -203,6 +218,26 @@ impl<'a> Engine<'a> {
             let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
             return Gemma4::load(file, pool)
                 .map(Engine::Gemma4)
+                .map_err(|e| e.to_string());
+        }
+        if matches!(file.architecture(), Some("inkling2" | "inkling2_loop")) {
+            if gpu {
+                #[cfg(target_os = "macos")]
+                {
+                    let device = Gpu::open().map_err(|e| e.to_string())?;
+                    return Inkling2Cuda::load(file, device)
+                        .map(|mut m| {
+                            m.set_precision(precision);
+                            Engine::Inkling2Gpu(m)
+                        })
+                        .map_err(|e| e.to_string());
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Err("Inkling 2 runs on the Mac's GPU or the CPU so far".into());
+            }
+            let pool = threads.map_or_else(Pool::with_all_cores, Pool::new);
+            return Inkling2::load(file, pool)
+                .map(Engine::Inkling2)
                 .map_err(|e| e.to_string());
         }
         if file.architecture() == Some("qwen35") {
@@ -257,6 +292,22 @@ impl<'a> Engine<'a> {
                 m.config.dim,
                 m.threads()
             ),
+            Engine::Inkling2(m) => format!(
+                "Inkling 2: {} layers ({} visits a token), {} wide, on the CPU ({} threads)",
+                m.config.layers,
+                m.config.slots(),
+                m.config.dim,
+                m.threads()
+            ),
+            #[cfg(target_os = "macos")]
+            Engine::Inkling2Gpu(m) => format!(
+                "Inkling 2: {} layers ({} visits a token), {} wide, on the GPU ({}, {:?})",
+                m.config.layers,
+                m.config.slots(),
+                m.config.dim,
+                m.gpu().info.name,
+                m.precision()
+            ),
             Engine::Qwen35Gpu(m) => format!(
                 "Qwen 3.5: {} layers, {} wide, on the GPU ({}, {:?})",
                 m.config.layers,
@@ -288,6 +339,12 @@ impl<'a> Engine<'a> {
             Engine::Cpu(m) => State::Cpu(m.session(capacity)),
             Engine::Qwen35(m) => State::Qwen35(m.session(capacity)),
             Engine::Gemma4(m) => State::Gemma4(m.session(capacity)),
+            Engine::Inkling2(m) => State::Inkling2(m.session(capacity)),
+            #[cfg(target_os = "macos")]
+            Engine::Inkling2Gpu(m) => State::Inkling2Gpu(
+                m.session(capacity)
+                    .unwrap_or_else(|e| panic!("couldn't set up the GPU session: {e}")),
+            ),
             Engine::Qwen35Gpu(m) => State::Qwen35Gpu(
                 m.session(capacity)
                     .unwrap_or_else(|e| panic!("couldn't set up the GPU session: {e}")),
@@ -313,6 +370,11 @@ impl<'a> Engine<'a> {
             (Engine::Cpu(m), State::Cpu(s)) => m.forward(s, token, want_logits),
             (Engine::Qwen35(m), State::Qwen35(s)) => m.forward(s, token, want_logits),
             (Engine::Gemma4(m), State::Gemma4(s)) => m.forward(s, token, want_logits),
+            (Engine::Inkling2(m), State::Inkling2(s)) => m.forward(s, token, want_logits),
+            #[cfg(target_os = "macos")]
+            (Engine::Inkling2Gpu(m), State::Inkling2Gpu(s)) => m
+                .forward(s, token, want_logits)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
             (Engine::Qwen35Gpu(m), State::Qwen35Gpu(s)) => m
                 .forward(s, token, want_logits)
                 .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
@@ -332,6 +394,10 @@ impl<'a> Engine<'a> {
                 .forward_greedy(s, token)
                 .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
             (Engine::Gemma4Gpu(m), State::Gemma4Gpu(s)) => m
+                .forward_greedy(s, token)
+                .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
+            #[cfg(target_os = "macos")]
+            (Engine::Inkling2Gpu(m), State::Inkling2Gpu(s)) => m
                 .forward_greedy(s, token)
                 .unwrap_or_else(|e| panic!("the GPU failed: {e}")),
             (Engine::Gpu(m), State::Gpu(s)) => m
@@ -354,6 +420,10 @@ impl<'a> Engine<'a> {
                 return gpu(m.forward_batch(s, tokens, logits));
             }
             (Engine::Gemma4Gpu(m), State::Gemma4Gpu(s)) => {
+                return gpu(m.forward_batch(s, tokens, logits));
+            }
+            #[cfg(target_os = "macos")]
+            (Engine::Inkling2Gpu(m), State::Inkling2Gpu(s)) => {
                 return gpu(m.forward_batch(s, tokens, logits));
             }
             _ => {}
@@ -456,6 +526,8 @@ fn generate(path: &str, prompt: &str, options: &GenerateOptions) -> ExitCode {
         Engine::Gpu(m) => m.gpu().settle(),
         Engine::Qwen35Gpu(m) => m.gpu().settle(),
         Engine::Gemma4Gpu(m) => m.gpu().settle(),
+        #[cfg(target_os = "macos")]
+        Engine::Inkling2Gpu(m) => m.gpu().settle(),
         _ => {}
     }
     eprintln!("Loaded in {:.1?}: {}.", started.elapsed(), model.describe());

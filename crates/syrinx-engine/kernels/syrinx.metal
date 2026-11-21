@@ -3825,3 +3825,641 @@ kernel void argmax_final(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
         out[0] = mi == 0xFFFFFFFFu ? 0u : mi;
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Inkling 2 (models/inkling2_cuda.rs; the CPU reference is models/inkling2.rs), for a
+// batch of `tokens` tokens at positions pos0 on (one when generating). Metal only so far:
+// the CUDA build has no inkling kernels.
+
+// Attention over depth: for each query q and token t (threadgroup (q, t)), a softmax over
+// the token's RMS-normed states (no weight, eps 1e-6) of state·query / sqrt(dim), and the
+// weighted sum of the normed states, into row q × stride + t of `out`. The states are the
+// `n_blocks` blocks (block s's row for token t at row s × stride + t of `states`) and the
+// token's row of `cur`. One pass over the states, one barrier.
+#define INK_MAX_STATES 16
+kernel void ink_mix(ARGS, KP) {
+    device const float* states = ARG_PTR(const float, 0);
+    device const float* queries = ARG_PTR(const float, 1);
+    device float* out = ARG_PTR(float, 2);
+    const int n_blocks = ARG_INT(3), dim = ARG_INT(4), stride = ARG_INT(5);
+    device const float* cur = ARG_PTR(const float, 6);
+    const int n = n_blocks + 1;
+    const int t = gid.y;
+    const uint lane = tid & 31, warp = tid >> 5, warps = (tpg.x + 31) >> 5;
+    device const float* q = queries + (ulong)gid.x * dim;
+    // Each SIMD group's sums for each state, then the states' weights.
+    threadgroup float part[32][2 * INK_MAX_STATES];
+    threadgroup float weight[INK_MAX_STATES];
+    for (int s = 0; s < n; s++) {
+        device const float* x = s < n_blocks ? states + ((ulong)s * stride + t) * dim : cur + (ulong)t * dim;
+        float sq = 0.0f, dt = 0.0f;
+        for (int i = tid; i < dim; i += tpg.x) {
+            const float v = x[i];
+            sq += v * v;
+            dt += v * q[i];
+        }
+        sq = simd_sum(sq);
+        dt = simd_sum(dt);
+        if (lane == 0) {
+            part[warp][s] = sq;
+            part[warp][INK_MAX_STATES + s] = dt;
+        }
+    }
+    BARRIER;
+    if (tid == 0) {
+        const float root = sqrt((float)dim);
+        float w[INK_MAX_STATES], inv[INK_MAX_STATES], top = -INFINITY;
+        for (int s = 0; s < n; s++) {
+            float a = 0.0f, b = 0.0f;
+            for (uint k = 0; k < warps; k++) {
+                a += part[k][s];
+                b += part[k][INK_MAX_STATES + s];
+            }
+            inv[s] = 1.0f / sqrt(a / (float)dim + 1e-6f);
+            w[s] = b * inv[s] / root;
+            top = max(top, w[s]);
+        }
+        float total = 0.0f;
+        for (int s = 0; s < n; s++) {
+            w[s] = exp(w[s] - top);
+            total += w[s];
+        }
+        for (int s = 0; s < n; s++) weight[s] = w[s] / total * inv[s];
+    }
+    BARRIER;
+    device float* o = out + ((ulong)gid.x * stride + t) * dim;
+    for (int i = tid; i < dim; i += tpg.x) {
+        float v = 0.0f;
+        for (int s = 0; s < n; s++) {
+            device const float* x = s < n_blocks ? states + ((ulong)s * stride + t) * dim : cur + (ulong)t * dim;
+            v += weight[s] * x[i];
+        }
+        o[i] = v;
+    }
+}
+
+// The loop controller's input for each token (a threadgroup each): its row of `cur` and of
+// `msg`, each RMS-normed (no weight, eps 1e-6), side by side in a row of 2 × dim.
+kernel void ink_pair_norm(ARGS, KP) {
+    device const float* cur = ARG_PTR(const float, 0);
+    device const float* msg = ARG_PTR(const float, 1);
+    device float* out = ARG_PTR(float, 2);
+    const int dim = ARG_INT(3);
+    threadgroup float scratch[32];
+    device const float* c = cur + (ulong)gid.x * dim;
+    device const float* m = msg + (ulong)gid.x * dim;
+    float sc = 0.0f, sm = 0.0f;
+    for (int i = tid; i < dim; i += tpg.x) {
+        sc += c[i] * c[i];
+        sm += m[i] * m[i];
+    }
+    sc = block_sum(sc, scratch, tid, tpg.x);
+    sm = block_sum(sm, scratch, tid, tpg.x);
+    const float ic = 1.0f / sqrt(sc / (float)dim + 1e-6f), im = 1.0f / sqrt(sm / (float)dim + 1e-6f);
+    device float* o = out + (ulong)gid.x * 2 * dim;
+    for (int i = tid; i < dim; i += tpg.x) {
+        o[i] = c[i] * ic;
+        o[dim + i] = m[i] * im;
+    }
+}
+
+// A looped layer's controller: out = cur − tanh(forget) × cur + tanh(gain) × message.
+kernel void ink_control(ARGS, KP) {
+    device const float* cur = ARG_PTR(const float, 0);
+    device const float* msg = ARG_PTR(const float, 1);
+    device const float* gain = ARG_PTR(const float, 2);
+    device const float* forget = ARG_PTR(const float, 3);
+    device float* out = ARG_PTR(float, 4);
+    const int n = ARG_INT(5);
+    PER_NUMBER
+    if (i >= n) return;
+    const float c = cur[i];
+    out[i] = c - tanh(forget[i]) * c + tanh(gain[i]) * msg[i];
+}
+
+// Each row (a threadgroup) of `n`, `per_token` rows a token: times `scale`'s row (row %
+// per_token, if given), scaled down to an L2 norm of at most `threshold` (norm + 1e-6, as
+// llama.cpp), then, with `log_scale`, times 1 + alpha ln(max(1, (pos + 1) / floor)) for the
+// row's token at position pos0 + row / per_token.
+kernel void ink_clip(ARGS, KP) {
+    device float* x = ARG_PTR(float, 0);
+    device const float* scale = ARG_PTR(const float, 1);
+    const int n = ARG_INT(2);
+    const float threshold = ARG_F32(3);
+    const int per_token = ARG_INT(4), pos0 = ARG_INT(5), log_scale = ARG_INT(6);
+    const float alpha = ARG_F32(7), floor_ = ARG_F32(8);
+    threadgroup float scratch[32];
+    device float* row = x + (ulong)gid.x * n;
+    device const float* sr = scale + (ulong)(gid.x % per_token) * n;
+    const bool has_scale = NONNULL(scale);
+    float sq = 0.0f;
+    for (int i = tid; i < n; i += tpg.x) {
+        const float v = row[i] * (has_scale ? sr[i] : 1.0f);
+        sq += v * v;
+    }
+    sq = block_sum(sq, scratch, tid, tpg.x);
+    float factor = clamp(threshold / (sqrt(sq) + 1e-6f), 0.0f, 1.0f);
+    if (log_scale) {
+        const float pos = (float)(pos0 + (int)gid.x / per_token);
+        factor *= 1.0f + alpha * log(max(1.0f, (pos + 1.0f) / floor_));
+    }
+    for (int i = tid; i < n; i += tpg.x) row[i] = row[i] * (has_scale ? sr[i] : 1.0f) * factor;
+}
+
+// The causal convolution over the last `conv` inputs with a residual, a thread a channel,
+// for `tokens` rows of `x` (rows of `n`) in order: y = (x + Σ_k w[k] in_k + Σ_lag
+// taps[lag] in_{conv−1−lag}) / sqrt(m × conv + 1), the inputs oldest first (conv − 1 from
+// `history`, rows `channels` apart, then x), `taps` (conv per head of `head_width`
+// channels, a row of n / head_width × conv a token) optional, m 2 with them and 1 without.
+// y goes to `out` (x itself, or another buffer of the same rows), added to what's there
+// with `accumulate`. The history moves along a token at a time.
+kernel void ink_conv(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device float* history = ARG_PTR(float, 1);
+    device const float* weight = ARG_PTR(const float, 2);
+    device const float* taps = ARG_PTR(const float, 3);
+    const int n = ARG_INT(4), channels = ARG_INT(5), conv = ARG_INT(6), head_width = ARG_INT(7);
+    const int tokens = ARG_INT(8);
+    device float* out = ARG_PTR(float, 9);
+    const int accumulate = ARG_INT(10);
+    PER_NUMBER
+    if (i >= n) return;
+    float window[8], w[8];
+    for (int k = 0; k < conv - 1; k++) window[k] = history[(ulong)k * channels + i];
+    for (int k = 0; k < conv; k++) w[k] = weight[(ulong)i * conv + k];
+    const bool dynamic = NONNULL(taps);
+    const int head = i / head_width, taps_row = n / head_width * conv;
+    const float scale = 1.0f / sqrt((float)((dynamic ? 2 : 1) * conv + 1));
+    for (int t = 0; t < tokens; t++) {
+        const float xi = x[(ulong)t * n + i];
+        window[conv - 1] = xi;
+        float sum = xi;
+        for (int k = 0; k < conv; k++) sum += w[k] * window[k];
+        if (dynamic) {
+            device const float* tp = taps + (ulong)t * taps_row + head * conv;
+            for (int lag = 0; lag < conv; lag++) sum += tp[lag] * window[conv - 1 - lag];
+        }
+        device float* o = out + (ulong)t * n + i;
+        *o = accumulate ? *o + sum * scale : sum * scale;
+        for (int k = 0; k < conv - 1; k++) window[k] = window[k + 1];
+    }
+    for (int k = 0; k < conv - 1; k++) history[(ulong)k * channels + i] = window[k];
+}
+
+// Attention for heads of 128, split over the positions: threadgroup (head, part, token)
+// takes its token's positions first + part × chunk on (chunk: the token's positions over
+// the parts), its 4 SIMD groups a position at a time each, the lanes 4 of the head's
+// numbers each. Token t is at position pos0 + t, sees positions from first (0, or for a
+// sliding window of `window` the last `window`), with scores q·k × scale + r·bias[d] −
+// sink, d the distance (row `extent` past the table). Caches are rings of `ring` rows (0:
+// a row a position). It writes its largest score, the sum of exp(score − that) and the
+// weighted values to `parts` (130 floats a part); ink_attention_merge adds the sink.
+#define INK_HD 128
+kernel void ink_attention_part(ARGS, KP) {
+    device const float* q = ARG_PTR(const float, 0);
+    device const float* keys = ARG_PTR(const float, 1);
+    device const float* values = ARG_PTR(const float, 2);
+    device float* parts = ARG_PTR(float, 3);
+    device const float* r = ARG_PTR(const float, 4);
+    device const float* bias = ARG_PTR(const float, 5);
+    device const float* sink = ARG_PTR(const float, 6);
+    const int pos0 = ARG_INT(7), window = ARG_INT(8), extent = ARG_INT(9), ring = ARG_INT(10);
+    const int kv_dim = ARG_INT(11), group = ARG_INT(12), rd = ARG_INT(13);
+    const float scale = ARG_F32(14);
+    const int heads = ARG_INT(15);
+    device float* out = ARG_PTR(float, 16);
+    device const float* gate = ARG_PTR(const float, 17);
+    const uint lane = tid & 31, warp = tid >> 5, warps = tpg.x >> 5;
+    const int h = gid.x, part = gid.y, n_parts = ngrid.y, tok = gid.z;
+    const int pos = pos0 + tok;
+    const int first = window > 0 ? max(0, pos + 1 - window) : 0;
+    const int count = pos + 1 - first;
+    const int chunk = (count + n_parts - 1) / n_parts;
+    const ulong kv = (ulong)(h / group) * INK_HD;
+    const ulong qh = (ulong)tok * heads + h;
+    const float4 qv = f4(q + qh * INK_HD + lane * 4);
+    const float rv = lane < (uint)rd ? r[qh * rd + lane] : 0.0f;
+    const float s0 = sink[qh];
+    const int begin = part * chunk, end = min(count, begin + chunk);
+    float m = -INFINITY, l = 0.0f;
+    float4 acc = 0.0f;
+    for (int i = begin + (int)warp; i < end; i += (int)warps) {
+        const int t = first + i;
+        const ulong row = (ulong)(ring > 0 ? t % ring : t);
+        const int d = min(pos - t, extent);
+        const float4 k = f4(keys + row * kv_dim + kv + lane * 4);
+        const float b = lane < (uint)rd ? rv * bias[(ulong)d * rd + lane] : 0.0f;
+        const float s = simd_sum(dot(qv, k) * scale + b) - s0;
+        const float m2 = max(m, s);
+        const float c = exp(m - m2), p = exp(s - m2);
+        l = l * c + p;
+        acc = acc * c + p * f4(values + row * kv_dim + kv + lane * 4);
+        m = m2;
+    }
+    threadgroup float tm[16], tl[16];
+    threadgroup float4 tacc[16][32];
+    if (lane == 0) {
+        tm[warp] = m;
+        tl[warp] = l;
+    }
+    tacc[warp][lane] = acc;
+    BARRIER;
+    if (warp != 0) return;
+    float mm = -INFINITY;
+    for (uint w = 0; w < warps; w++) mm = max(mm, tm[w]);
+    float ll = 0.0f;
+    float4 o = 0.0f;
+    for (uint w = 0; w < warps; w++) {
+        const float c = tm[w] == -INFINITY ? 0.0f : exp(tm[w] - mm);
+        ll += tl[w] * c;
+        o += tacc[w][lane] * c;
+    }
+    if (n_parts == 1) {
+        // The whole context in this part: with the sink's logit of 0, times the gate.
+        const float top = max(mm, 0.0f);
+        const float c = mm == -INFINITY ? 0.0f : exp(mm - top);
+        const float total = ll * c + exp(-top);
+        const ulong at = qh * INK_HD + lane * 4;
+        const float4 g = f4(gate + at);
+        *reinterpret_cast<device float4*>(out + at) = o * c / total / (1.0f + exp(-g));
+        return;
+    }
+    device float* p = parts + (qh * n_parts + part) * (INK_HD + 2);
+    *reinterpret_cast<device float4*>(p + lane * 4) = o;
+    if (lane == 0) {
+        p[INK_HD] = mm;
+        p[INK_HD + 1] = ll;
+    }
+}
+
+// ink_attention_part's parts of each (head, token) (threadgroup (head, token), 128 threads)
+// put together with the sink's logit of 0, times sigmoid(gate), into the token's row of
+// heads × 128.
+kernel void ink_attention_merge(ARGS, KP) {
+    device const float* parts = ARG_PTR(const float, 0);
+    device float* out = ARG_PTR(float, 1);
+    const int n_parts = ARG_INT(2), heads = ARG_INT(3);
+    device const float* gate = ARG_PTR(const float, 4);
+    const ulong qh = (ulong)gid.y * heads + gid.x;
+    device const float* p = parts + qh * n_parts * (INK_HD + 2);
+    float mm = 0.0f;  // the sink
+    for (int k = 0; k < n_parts; k++) mm = max(mm, p[k * (INK_HD + 2) + INK_HD]);
+    float total = exp(-mm), v = 0.0f;
+    for (int k = 0; k < n_parts; k++) {
+        device const float* pk = p + k * (INK_HD + 2);
+        if (pk[INK_HD] == -INFINITY) continue;
+        const float c = exp(pk[INK_HD] - mm);
+        total += pk[INK_HD + 1] * c;
+        v += pk[tid] * c;
+    }
+    const ulong at = qh * INK_HD + tid;
+    out[at] = v / total / (1.0f + exp(-gate[at]));
+}
+
+// The experts' pick for each token (a threadgroup each): sigmoid scores, the `used` highest
+// after adding `bias` (selection only), their scores normalized to sum 1 (+1e-20) and times
+// `scale`.
+kernel void ink_moe_pick(ARGS, KP) {
+    device const float* logits = ARG_PTR(const float, 0);
+    device const float* bias = ARG_PTR(const float, 1);
+    device int* idx = ARG_PTR(int, 2);
+    device float* share = ARG_PTR(float, 3);
+    const int experts = ARG_INT(4), used = ARG_INT(5);
+    const float scale = ARG_F32(6);
+    threadgroup int tix[MOE_MAX_USED];
+    threadgroup float tp[MOE_MAX_USED];
+    threadgroup float sel[512];
+    device const float* lg = logits + (ulong)gid.x * experts;
+    for (int k = tid; k < used; k += tpg.x) {
+        tix[k] = k;
+        tp[k] = 0.0f;
+    }
+    for (int e = tid; e < experts; e += tpg.x) sel[e] = 1.0f / (1.0f + exp(-lg[e])) + bias[e];
+    BARRIER;
+    for (int e = tid; e < experts; e += tpg.x) {
+        const float v = sel[e];
+        int place = 0;
+        for (int j = 0; j < experts; j++) {
+            const float o = sel[j];
+            place += (o > v || (o == v && j < e)) ? 1 : 0;
+        }
+        if (place < used) {
+            tix[place] = e;
+            tp[place] = 1.0f / (1.0f + exp(-lg[e]));
+        }
+    }
+    BARRIER;
+    if (tid != 0) return;
+    float total = 1e-20f;
+    for (int k = 0; k < used; k++) total += tp[k];
+    device int* ix = idx + (ulong)gid.x * used;
+    device float* sh = share + (ulong)gid.x * used;
+    for (int k = 0; k < used; k++) {
+        ix[k] = tix[k];
+        sh[k] = tp[k] / total * scale;
+    }
+}
+
+// SiTU for each slot: act = beta tanh(g/beta) sigmoid(g) × lb tanh(u/lb), g and u the two
+// halves of the slot's row of `gate_up` (2 × width), into row `slot` of `act` (`stride`
+// apart; it may be gate_up itself, stride 2 × width).
+kernel void ink_situ(ARGS, KP) {
+    device const float* gu = ARG_PTR(const float, 0);
+    device float* act = ARG_PTR(float, 1);
+    const int width = ARG_INT(2), total = ARG_INT(3);
+    const float beta = ARG_F32(4), lb = ARG_F32(5);
+    const int stride = ARG_INT(6);
+    PER_NUMBER
+    if (i >= total) return;
+    const int slot = i / width, j = i % width;
+    const float g = gu[(ulong)slot * 2 * width + j], u = gu[(ulong)slot * 2 * width + width + j];
+    act[(ulong)slot * stride + j] = beta * tanh(g / beta) / (1.0f + exp(-g)) * lb * tanh(u / lb);
+}
+
+// The same into f16 rows of `width` (moe_matmul_fast's input, as moe_geglu_half).
+kernel void ink_situ_half(ARGS, KP) {
+    device const float* gu = ARG_PTR(const float, 0);
+    device half* act = ARG_PTR(half, 1);
+    const int width = ARG_INT(2), total = ARG_INT(3);
+    const float beta = ARG_F32(4), lb = ARG_F32(5);
+    PER_NUMBER
+    if (i >= total) return;
+    const int slot = i / width, j = i % width;
+    const float g = gu[(ulong)slot * 2 * width + j], u = gu[(ulong)slot * 2 * width + width + j];
+    act[i] = half(beta * tanh(g / beta) / (1.0f + exp(-g)) * lb * tanh(u / lb));
+}
+
+// A layer's keys or values for a batch, a threadgroup a head of 128 (a thread a channel):
+// each token's projection in `x` (rows of kv_dim) through the causal convolution (as
+// ink_conv, with input-dependent `taps` if given), then clipped to an L2 norm of
+// `threshold` (`mode` 0: keys) or RMS-normed with `threshold` as eps (1: values), into the
+// token's row of the cache (a ring of `ring` rows, or 0 for a row a position). The history
+// moves along a token at a time.
+kernel void ink_kv(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device float* history = ARG_PTR(float, 1);
+    device const float* weight = ARG_PTR(const float, 2);
+    device const float* taps = ARG_PTR(const float, 3);
+    device float* cache = ARG_PTR(float, 4);
+    const int channels = ARG_INT(5), conv = ARG_INT(6), tokens = ARG_INT(7), pos0 = ARG_INT(8);
+    const int ring = ARG_INT(9), kv_dim = ARG_INT(10), mode = ARG_INT(11);
+    const float threshold = ARG_F32(12);
+    threadgroup float scratch[32];
+    const int head = gid.x, i = head * INK_HD + tid;
+    const int kv_heads = kv_dim / INK_HD;
+    float window[8], w[8];
+    for (int k = 0; k < conv - 1; k++) window[k] = history[(ulong)k * channels + i];
+    for (int k = 0; k < conv; k++) w[k] = weight[(ulong)i * conv + k];
+    const bool dynamic = NONNULL(taps);
+    const float scale = 1.0f / sqrt((float)((dynamic ? 2 : 1) * conv + 1));
+    for (int t = 0; t < tokens; t++) {
+        const float xi = x[(ulong)t * kv_dim + i];
+        window[conv - 1] = xi;
+        float y = xi;
+        for (int k = 0; k < conv; k++) y += w[k] * window[k];
+        if (dynamic) {
+            device const float* tp = taps + ((ulong)t * kv_heads + head) * conv;
+            for (int lag = 0; lag < conv; lag++) y += tp[lag] * window[conv - 1 - lag];
+        }
+        y *= scale;
+        const float sq = block_sum(y * y, scratch, tid, tpg.x);
+        const float factor = mode == 0 ? clamp(threshold / (sqrt(sq) + 1e-6f), 0.0f, 1.0f)
+                                       : 1.0f / sqrt(sq / (float)INK_HD + threshold);
+        const int pos = pos0 + t;
+        const ulong row = (ulong)(ring > 0 ? pos % ring : pos);
+        cache[row * kv_dim + i] = y * factor;
+        for (int k = 0; k < conv - 1; k++) window[k] = window[k + 1];
+    }
+    for (int k = 0; k < conv - 1; k++) history[(ulong)k * channels + i] = window[k];
+}
+
+// A batch's Inkling 2 attention on the SIMD-group matrix units (the default mode): as
+// attention_flash (D = 128, 32 tokens a threadgroup, keys and values 16 at a time, 4 SIMD
+// groups), with each score q·k × scale + r·bias[d] − sink (d the distance, row `extent`
+// past the table), the sink's logit of 0 as the softmax's starting point (max 0, sum 1,
+// O 0), and the output times sigmoid(gate). Keys and values come from an f32 cache and go
+// to f16 in threadgroup memory, as Q does. Threadgroup (head, token block).
+kernel void ink_attention_flash(ARGS, KP, uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int D = 128, QT = 32, C = 16, RD = 32;
+    device const float* q = ARG_PTR(const float, 0);
+    device const float* keys = ARG_PTR(const float, 1);
+    device const float* values = ARG_PTR(const float, 2);
+    device float* out = ARG_PTR(float, 3);
+    device const float* r = ARG_PTR(const float, 4);
+    device const float* bias = ARG_PTR(const float, 5);
+    device const float* sink = ARG_PTR(const float, 6);
+    device const float* gate = ARG_PTR(const float, 7);
+    const int p0 = ARG_INT(8), window = ARG_INT(9), extent = ARG_INT(10), ring = ARG_INT(11);
+    const int kv_dim = ARG_INT(12), group = ARG_INT(13), rd = ARG_INT(14);
+    const float scale = ARG_F32(15);
+    const int tokens = ARG_INT(16);
+    constexpr int THREADS = 128, BLOCKS = QT / 8 * (D / 8) / 4;
+    constexpr int ROW_THREADS = THREADS / QT < C ? THREADS / QT : C, PER_THREAD = C / ROW_THREADS;
+    threadgroup half qkv[QT * D + 2 * C * D];
+    threadgroup half* sq = qkv;
+    threadgroup half* sk = qkv + QT * D;
+    threadgroup half* sv = sk + C * D;
+    threadgroup float ss[QT * C];
+    threadgroup half sp[QT * C];
+    threadgroup float row_max[QT], row_sum[QT];
+    threadgroup float diag[QT / 8][64];
+    threadgroup float sr_bias[QT][RD];
+    threadgroup float sr_sink[QT];
+    const int head = gid.x, heads = ngrid.x;
+    const int t0 = gid.y * QT;
+    const int kv = (head / group) * D;
+    const int last_row = p0 + min(t0 + QT, tokens) - 1;
+    const int lo = window > 0 ? max(0, p0 + t0 + 1 - window) : 0;
+
+    for (int i = tid; i < QT * D; i += THREADS) {
+        const int row = i / D, d = i % D;
+        sq[i] = t0 + row < tokens ? half(q[((ulong)(t0 + row) * heads + head) * D + d]) : half(0.0f);
+    }
+    for (int i = tid; i < QT * RD; i += THREADS) {
+        const int row = i / RD, j = i % RD;
+        sr_bias[row][j] = t0 + row < tokens && j < rd ? r[((ulong)(t0 + row) * heads + head) * rd + j] : 0.0f;
+    }
+    for (int i = tid; i < QT / 8 * 64; i += THREADS) diag[i / 64][i % 64] = 0.0f;
+    if ((int)tid < QT) {
+        // The sink: a logit of 0 with no value.
+        row_max[tid] = 0.0f;
+        row_sum[tid] = 1.0f;
+        sr_sink[tid] = t0 + (int)tid < tokens ? sink[(ulong)(t0 + tid) * heads + head] : 0.0f;
+    }
+    simdgroup_float8x8 o[BLOCKS];
+    for (int b = 0; b < BLOCKS; b++) o[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const int srow = tid / ROW_THREADS, sc0 = (tid % ROW_THREADS) * PER_THREAD;
+    const int s_at = p0 + t0 + srow;
+    const bool s_live = t0 + srow < tokens;
+    const int s_first = window > 0 ? max(0, s_at + 1 - window) : 0;
+
+    for (int start = lo; start <= last_row; start += C) {
+        const int count = min(C, last_row + 1 - start);
+        BARRIER;
+        for (int i = tid; i < C * D / 4; i += THREADS) {
+            const int row = (i * 4) / D, d = (i * 4) % D;
+            half4 k4 = half4(0.0h), v4 = half4(0.0h);
+            if (row < count) {
+                const ulong at = ring_row(start + row, ring) * kv_dim + kv + d;
+                k4 = half4(f4(keys + at));
+                v4 = half4(f4(values + at));
+            }
+            *reinterpret_cast<threadgroup half4*>(sk + row * D + d) = k4;
+            *reinterpret_cast<threadgroup half4*>(sv + row * D + d) = v4;
+        }
+        BARRIER;
+        for (int tile = sg; tile < QT / 8 * (C / 8); tile += 4) {
+            const int rb = tile / (C / 8), kb = tile % (C / 8);
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int d = 0; d < D; d += 8) {
+                simdgroup_half8x8 a, b;
+                simdgroup_load(a, sq + rb * 8 * D + d, D);
+                simdgroup_load(b, sk + kb * 8 * D + d, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            simdgroup_store(acc, ss + rb * 8 * C + kb * 8, C);
+        }
+        BARRIER;
+        if ((int)tid < QT * ROW_THREADS) {
+            float s[PER_THREAD];
+            float mx = -INFINITY;
+            for (int j = 0; j < PER_THREAD; j++) {
+                const int c = sc0 + j, kpos = start + c;
+                const bool seen = s_live && c < count && kpos <= s_at && kpos >= s_first;
+                float b = 0.0f;
+                if (seen) {
+                    device const float* br = bias + (ulong)min(s_at - kpos, extent) * rd;
+                    for (int k = 0; k < rd; k++) b += sr_bias[srow][k] * br[k];
+                }
+                s[j] = seen ? ss[srow * C + c] * scale + b - sr_sink[srow] : -INFINITY;
+                mx = max(mx, s[j]);
+            }
+            for (int o2 = ROW_THREADS / 2; o2 > 0; o2 >>= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o2));
+            const float old_max = row_max[srow];
+            const float new_max = max(old_max, mx);
+            const float correction = exp(old_max - new_max);
+            float sum = 0.0f;
+            for (int j = 0; j < PER_THREAD; j++) {
+                const float p = s[j] == -INFINITY ? 0.0f : exp(s[j] - new_max);
+                sp[srow * C + sc0 + j] = half(p);
+                sum += p;
+            }
+            for (int o2 = ROW_THREADS / 2; o2 > 0; o2 >>= 1) sum += simd_shuffle_xor(sum, (ushort)o2);
+            if (tid % ROW_THREADS == 0) {
+                row_max[srow] = new_max;
+                row_sum[srow] = row_sum[srow] * correction + sum;
+                diag[srow / 8][(srow % 8) * 9] = correction;
+            }
+        }
+        BARRIER;
+        for (int b = 0; b < BLOCKS; b++) {
+            const int blk = sg * BLOCKS + b, rb = blk / (D / 8), cb = blk % (D / 8);
+            simdgroup_float8x8 dg;
+            simdgroup_load(dg, &diag[rb][0], 8);
+            simdgroup_multiply(o[b], dg, o[b]);
+            for (int kc = 0; kc < C; kc += 8) {
+                simdgroup_half8x8 p, v;
+                simdgroup_load(p, sp + rb * 8 * C + kc, C);
+                simdgroup_load(v, sv + kc * D + cb * 8, D);
+                simdgroup_multiply_accumulate(o[b], p, v, o[b]);
+            }
+        }
+    }
+    BARRIER;
+    threadgroup float* so = reinterpret_cast<threadgroup float*>(qkv);
+    for (int b = 0; b < BLOCKS; b++) {
+        const int blk = sg * BLOCKS + b, rb = blk / (D / 8), cb = blk % (D / 8);
+        simdgroup_store(o[b], so + rb * 8 * D + cb * 8, D);
+    }
+    BARRIER;
+    for (int i = tid; i < QT * D; i += THREADS) {
+        const int row = i / D, d = i % D;
+        if (t0 + row < tokens) {
+            const ulong at = ((ulong)(t0 + row) * heads + head) * D + d;
+            out[at] = so[i] / row_sum[row] / (1.0f + exp(-gate[at]));
+        }
+    }
+}
+
+// ink_conv for a batch with all tokens at once, a thread a (channel, token): each output
+// reads its own last `conv` inputs (from x's rows, or `history` before the batch), so
+// `out` must not be x. ink_conv_history moves the history along after.
+kernel void ink_conv_parallel(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device const float* history = ARG_PTR(const float, 1);
+    device const float* weight = ARG_PTR(const float, 2);
+    device const float* taps = ARG_PTR(const float, 3);
+    const int n = ARG_INT(4), channels = ARG_INT(5), conv = ARG_INT(6), head_width = ARG_INT(7);
+    const int tokens = ARG_INT(8);
+    device float* out = ARG_PTR(float, 9);
+    const int accumulate = ARG_INT(10);
+    const int i = gid.x * tpg.x + tid, t = gid.y;
+    if (i >= n || t >= tokens) return;
+    const bool dynamic = NONNULL(taps);
+    const int head = i / head_width, taps_row = n / head_width * conv;
+    // Input k (0 the oldest, conv − 1 this token's).
+    auto input = [&](int k) {
+        const int at = t - (conv - 1) + k;
+        return at >= 0 ? x[(ulong)at * n + i] : history[(ulong)(at + conv - 1) * channels + i];
+    };
+    const float xi = x[(ulong)t * n + i];
+    float sum = xi;
+    for (int k = 0; k < conv; k++) sum += weight[(ulong)i * conv + k] * input(k);
+    if (dynamic) {
+        device const float* tp = taps + (ulong)t * taps_row + head * conv;
+        for (int lag = 0; lag < conv; lag++) sum += tp[lag] * input(conv - 1 - lag);
+    }
+    const float y = sum / sqrt((float)((dynamic ? 2 : 1) * conv + 1));
+    device float* o = out + (ulong)t * n + i;
+    *o = accumulate ? *o + y : y;
+}
+
+// The history after a batch of `tokens` rows of `x` (rows of n): its last conv − 1 inputs.
+kernel void ink_conv_history(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device float* history = ARG_PTR(float, 1);
+    const int n = ARG_INT(2), channels = ARG_INT(3), conv = ARG_INT(4), tokens = ARG_INT(5);
+    PER_NUMBER
+    if (i >= n) return;
+    float window[8];
+    for (int k = 0; k < conv - 1; k++) window[k] = history[(ulong)k * channels + i];
+    for (int k = 0; k < conv - 1; k++) {
+        const int at = tokens - (conv - 1) + k;  // the input that ends up in place k
+        history[(ulong)k * channels + i] = at >= 0 ? x[(ulong)at * n + i] : window[k + tokens];
+    }
+}
+
+// ink_kv for a batch with all tokens at once: a threadgroup a (head, token), a thread a
+// channel. The cache and `x` differ, so each output reads its own inputs; ink_conv_history
+// moves the history along after.
+kernel void ink_kv_parallel(ARGS, KP) {
+    device const float* x = ARG_PTR(const float, 0);
+    device const float* history = ARG_PTR(const float, 1);
+    device const float* weight = ARG_PTR(const float, 2);
+    device const float* taps = ARG_PTR(const float, 3);
+    device float* cache = ARG_PTR(float, 4);
+    const int channels = ARG_INT(5), conv = ARG_INT(6), pos0 = ARG_INT(8);
+    const int ring = ARG_INT(9), kv_dim = ARG_INT(10), mode = ARG_INT(11);
+    const float threshold = ARG_F32(12);
+    threadgroup float scratch[32];
+    const int head = gid.x, t = gid.y, i = head * INK_HD + tid;
+    const int kv_heads = kv_dim / INK_HD;
+    auto input = [&](int k) {
+        const int at = t - (conv - 1) + k;
+        return at >= 0 ? x[(ulong)at * kv_dim + i] : history[(ulong)(at + conv - 1) * channels + i];
+    };
+    const float xi = x[(ulong)t * kv_dim + i];
+    float y = xi;
+    for (int k = 0; k < conv; k++) y += weight[(ulong)i * conv + k] * input(k);
+    const bool dynamic = NONNULL(taps);
+    if (dynamic) {
+        device const float* tp = taps + ((ulong)t * kv_heads + head) * conv;
+        for (int lag = 0; lag < conv; lag++) y += tp[lag] * input(conv - 1 - lag);
+    }
+    y /= sqrt((float)((dynamic ? 2 : 1) * conv + 1));
+    const float sq = block_sum(y * y, scratch, tid, tpg.x);
+    const float factor = mode == 0 ? clamp(threshold / (sqrt(sq) + 1e-6f), 0.0f, 1.0f)
+                                   : 1.0f / sqrt(sq / (float)INK_HD + threshold);
+    cache[ring_row(pos0 + t, ring) * kv_dim + i] = y * factor;
+}
