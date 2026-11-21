@@ -19,6 +19,7 @@ pub fn supports(kind: TensorType) -> bool {
             | TensorType::F16
             | TensorType::BF16
             | TensorType::Q4_0
+            | TensorType::IQ4_NL
             | TensorType::Q8_0
             | TensorType::Q4_K
             | TensorType::Q5_K
@@ -37,6 +38,7 @@ pub fn dequantize_block(kind: TensorType, src: &[u8], dst: &mut [f32]) {
         TensorType::F16 => dst[0] = read_f16(src),
         TensorType::BF16 => dst[0] = bf16_to_f32(u16::from_le_bytes([src[0], src[1]])),
         TensorType::Q4_0 => q4_0(src, dst),
+        TensorType::IQ4_NL => iq4_nl(src, dst),
         TensorType::Q8_0 => q8_0(src, dst),
         TensorType::Q4_K => q4_k(src, dst),
         TensorType::Q5_K => q5_k(src, dst),
@@ -120,6 +122,21 @@ fn q4_0(src: &[u8], dst: &mut [f32]) {
     for (i, &q) in src[2..18].iter().enumerate() {
         dst[i] = d * ((q & 0xF) as i32 - 8) as f32;
         dst[i + 16] = d * ((q >> 4) as i32 - 8) as f32;
+    }
+}
+
+/// Non-linear 4-bit lookup table for IQ4_NL (ggml `kvalues_iq4nl`).
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// IQ4_NL, 32 numbers in 18 bytes: an f16 scale `d`, then 16 bytes of 4-bit LUT indices.
+/// x = d × kvalues_iq4nl[q]. Byte i holds number i (low nibble) and number i + 16 (high).
+fn iq4_nl(src: &[u8], dst: &mut [f32]) {
+    let d = read_f16(src);
+    for (i, &q) in src[2..18].iter().enumerate() {
+        dst[i] = d * f32::from(KVALUES_IQ4NL[(q & 0xF) as usize]);
+        dst[i + 16] = d * f32::from(KVALUES_IQ4NL[(q >> 4) as usize]);
     }
 }
 
@@ -304,6 +321,22 @@ mod tests {
         for i in 0..16 {
             assert_eq!(y[i], 0.5 * (i as f32 - 8.0), "number {i}");
             assert_eq!(y[i + 16], 0.5 * (7.0 - i as f32), "number {}", i + 16);
+        }
+    }
+
+    #[test]
+    fn iq4_nl_block() {
+        let mut b = HALF.to_vec();
+        b.extend((0..16u8).map(|i| i | ((15 - i) << 4)));
+        let y = decode(TensorType::IQ4_NL, &b);
+        for i in 0..16 {
+            assert_eq!(y[i], 0.5 * f32::from(KVALUES_IQ4NL[i]), "number {i}");
+            assert_eq!(
+                y[i + 16],
+                0.5 * f32::from(KVALUES_IQ4NL[15 - i]),
+                "number {}",
+                i + 16
+            );
         }
     }
 

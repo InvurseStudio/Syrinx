@@ -9,8 +9,11 @@ pub mod gemma4_cuda;
 pub mod gemma4_vision;
 mod gpu;
 pub mod inkling2;
+pub mod inkling2_dspark;
 #[cfg(target_os = "macos")]
 pub mod inkling2_cuda;
+#[cfg(target_os = "macos")]
+pub mod inkling2_dspark_cuda;
 /// CUDA has no Inkling kernels yet: the Mac model's types, which only say so.
 #[cfg(not(target_os = "macos"))]
 #[path = "inkling2_unsupported.rs"]

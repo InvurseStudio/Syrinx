@@ -121,13 +121,18 @@ struct Dispatch {
 /// only reads. None for a kernel without a list, which is kept apart from all others.
 fn written_args(name: &str) -> Option<&'static [usize]> {
     Some(match name {
+        "ink_qkv_q8_0" => &[11, 12, 13, 14, 15, 16, 17, 18],
+        "matvec_split_q8_0_multi4" => &[3, 6, 9, 12],
+        "matvec_split_q8_0_pair" => &[3, 6],
         n if n.starts_with("matvec") || n.starts_with("matmul") => &[2],
         "rms_norm" => &[2],
         "moe_pick" => &[2, 3],
         n if n.starts_with("moe_matvec") || n.starts_with("moe_matmul") => &[2],
-        "moe_group" => &[1, 2, 7],
-        "moe_geglu" | "moe_sum" => &[0],
+        "moe_count" => &[8],
+        "moe_place" => &[1, 2, 7],
+        "moe_geglu" | "moe_sum" | "moe_sum_half" => &[0],
         "moe_gather_half" | "moe_geglu_half" => &[1],
+        "moe_gather_i8_128" | "moe_gather_i8_256" | "ink_situ_i8_128" => &[1, 2],
         "residual_norm" => &[0, 5],
         "qkv_prep" => &[4, 9, 10, 23],
         "dequant_kv_q8_to_half" => &[1],
@@ -154,20 +159,34 @@ fn written_args(name: &str) -> Option<&'static [usize]> {
         "argmax_final" => &[2],
         "to_half" | "q_group_half" => &[1],
         "to_i8" => &[1, 2],
-        "ink_mix" => &[2],
+        "ink_mix" | "ink_mix_fast" => &[2],
+        "ink_mix_pair" => &[2, 7],
         "ink_pair_norm" => &[2],
         "ink_control" => &[4],
+        "ink_ctrl_down_f16" => &[3],
+        "ink_ctrl_up_apply_f16" => &[7],
+        "ink_ctrl3_down_f16" => &[9, 10, 11],
+        "ink_ctrl3_up_apply_f16" => &[17, 18, 19],
         "ink_clip" => &[0],
         "ink_conv" => &[1, 9],
-        "ink_attention_part" => &[3, 16],
-        "ink_kv" => &[1, 4],
-        "ink_kv_parallel" => &[4],
+        "ink_attention_part" | "ink_attention_part_f16" | "ink_attention_decode_f16" | "ink_attention_decode8_f16" => &[3, 16],
+        "ink_qkvr_prep_f16" => &[2, 3, 4, 9, 10],
+        "ink_o_conv_q8_0" => &[2, 4, 5],
+        "ink_kv" | "ink_kv_f16" => &[1, 4],
+        "ink_kv_parallel" | "ink_kv_parallel_f16" => &[4],
         "ink_conv_parallel" => &[9],
         "ink_conv_history" => &[1],
-        "ink_attention_flash" => &[3],
+        "ink_attention_flash" | "ink_attention_flash_f16" | "ink_attention_tcg_128" => &[3],
         "ink_attention_merge" => &[1],
         "ink_moe_pick" => &[2, 3],
+        "ink_router_pick" => &[2, 6, 7, 11],
+        "dspark_mix" => &[1],
+        "ink_history_rebuild" => &[0],
+        "dspark_head_act" => &[1, 2],
+        "dspark_permute" => &[1],
         "ink_situ" | "ink_situ_half" => &[1],
+        "ink_moe_gate_up_situ_q8_0" | "ink_moe_gate_up_situ_iq4_nl" => &[2],
+        "ink_moe_down_sum_conv_q8_0" | "ink_moe_down_sum_conv_iq4_nl" => &[4, 6],
         _ => return None,
     })
 }
@@ -742,24 +761,24 @@ impl Graph {
 }
 
 struct Kernels {
-    matvec: [Pso; 7],
+    matvec: [Pso; 8],
     /// The quantized ones with each row pair split over the threadgroup's 4 SIMD groups
     /// (none for F32 and F16).
-    matvec_split: [Option<Pso>; 7],
+    matvec_split: [Option<Pso>; 8],
     /// Q6_K's own kernels for 2 and 3 tokens at once (see [`Gpu::matvec_multi`]).
     matvec_q6_k_multi: Vec<Pso>,
     /// One token's gate and up projections with the activation (Gpu::matvec_glu).
-    matvec_glu: [Option<Pso>; 7],
+    matvec_glu: [Option<Pso>; 8],
     /// The split kernels with tanh-GELU times another vector after (Gpu::matvec_gelu).
-    matvec_gelu: [Option<Pso>; 7],
+    matvec_gelu: [Option<Pso>; 8],
     /// A few tokens' products (Gpu::matvec_few), for up to 2, 3 and 4 tokens.
-    matvec_few: [[Pso; 7]; 3],
+    matvec_few: [[Pso; 8]; 3],
 
     /// The matrix-matrix products on the SIMD-group matrix units, in f32.
-    matmul_sg: [Pso; 7],
+    matmul_sg: [Pso; 8],
     /// On the neural accelerators (f16 weights and activations), where the GPU has them,
     /// with the kernel that rounds the activations.
-    matmul_tc: Option<([Pso; 7], Pso)>,
+    matmul_tc: Option<([Pso; 8], Pso)>,
     /// Adds up matmul_tc's splits (Gpu::matmul_8bit).
     sum_parts: Option<Pso>,
     /// A long batch's products in 8-bit whole numbers on the neural accelerators
@@ -767,14 +786,15 @@ struct Kernels {
     /// tiles), and the kernels that round the activations.
     matmul_i8: Option<MatmulI8>,
     /// The same with the wide tile, for long batches (TC_WIDE).
-    matmul_tc_wide: Option<[Pso; 7]>,
+    matmul_tc_wide: Option<[Pso; 8]>,
     /// The same with 8- to 192-token tiles, for short batches (SMALL_TILES).
-    matmul_tc_small: Option<[[Pso; 7]; 6]>,
+    matmul_tc_small: Option<[[Pso; 8]; 6]>,
     rms_norm: Pso,
     /// A mixture of experts' kernels: its pick, its products for Q8_0 and Q6_K matrices,
     /// its activation and its sum.
     moe_pick: Pso,
     moe_matvec_q4_0: Pso,
+    moe_matvec_iq4_nl: Pso,
     moe_matvec_q4_k: Pso,
     moe_matvec_q5_k: Pso,
     moe_matvec_q8_0: Pso,
@@ -782,13 +802,15 @@ struct Kernels {
     moe_geglu: Pso,
     moe_geglu_half: Pso,
     moe_sum: Pso,
+    moe_sum_half: Pso,
     /// A batch's slots put in order of their expert, and the product a tile of them.
-    moe_group: Pso,
-    moe_matmul: [Pso; 7],
+    moe_count: Pso,
+    moe_place: Pso,
+    moe_matmul: [Pso; 8],
     moe_gather_half: Pso,
     /// `moe_matmul` on the neural accelerators, where the GPU has them.
-    moe_matmul_tc: Option<[Pso; 7]>,
-    moe_matmul_tc_small: Option<[Pso; 7]>,
+    moe_matmul_tc: Option<[Pso; 8]>,
+    moe_matmul_tc_small: Option<[Pso; 8]>,
     residual_norm: Pso,
     qkv_prep: Pso,
     dequant_kv_q8_to_half: Pso,
@@ -849,24 +871,61 @@ struct Kernels {
     argmax_final: Pso,
     /// Inkling 2's own steps (see the `ink_` kernels and the `ink_*` methods).
     ink_mix: Pso,
+    ink_mix_fast: Pso,
+    ink_mix_pair: Pso,
+    ink_router_pick: Pso,
+    dspark_mix: Pso,
+    ink_history_rebuild: Pso,
+    dspark_head_act: Pso,
+    dspark_permute: Pso,
     ink_pair_norm: Pso,
     ink_control: Pso,
+    ink_ctrl_down_f16: Pso,
+    ink_ctrl_up_apply_f16: Pso,
+    ink_ctrl3_down_f16: Pso,
+    ink_ctrl3_up_apply_f16: Pso,
     ink_clip: Pso,
     ink_conv: Pso,
     ink_attention_part: Pso,
+    ink_attention_part_f16: Pso,
+    ink_attention_decode_f16: Pso,
+    ink_attention_decode8_f16: Pso,
+    ink_qkvr_prep_f16: Pso,
+    ink_o_conv_q8_0: Pso,
+    matvec_split_f32: Pso,
     ink_attention_merge: Pso,
     ink_kv: Pso,
+    ink_kv_f16: Pso,
     ink_kv_parallel: Pso,
+    ink_kv_parallel_f16: Pso,
     ink_conv_parallel: Pso,
     ink_conv_history: Pso,
     ink_attention_flash: Pso,
+    ink_attention_flash_f16: Pso,
+    ink_attention_tcg: Option<Pso>,
+    moe_gather_i8_128: Option<Pso>,
+    moe_gather_i8_256: Option<Pso>,
+    ink_situ_i8_128: Option<Pso>,
+    moe_matmul_i8_q8_0: Option<Pso>,
+    moe_matmul_i8_wide_q8_0: Option<Pso>,
+    moe_matmul_i8_wide256_q8_0: Option<Pso>,
+    moe_matmul_i8_iq4_nl: Option<Pso>,
+    moe_matmul_i8_wide_iq4_nl: Option<Pso>,
+    moe_matmul_i8_wide256_iq4_nl: Option<Pso>,
     ink_moe_pick: Pso,
     ink_situ: Pso,
     ink_situ_half: Pso,
+    ink_moe_gate_up_situ_q8_0: Pso,
+    ink_moe_down_sum_conv_q8_0: Pso,
+    ink_moe_gate_up_situ_iq4_nl: Pso,
+    ink_moe_down_sum_conv_iq4_nl: Pso,
+    ink_qkv_q8_0: Pso,
+    matvec_split_q8_0_multi4: Pso,
+    matvec_split_q8_0_pair: Pso,
 }
 
 /// The weight types with kernels, in the order of `Kernels::matvec` and `matmul`.
-const KINDS: [TensorType; 7] = [
+const KINDS: [TensorType; 8] = [
     TensorType::F32,
     TensorType::F16,
     TensorType::Q4_0,
@@ -874,6 +933,7 @@ const KINDS: [TensorType; 7] = [
     TensorType::Q4_K,
     TensorType::Q5_K,
     TensorType::Q6_K,
+    TensorType::IQ4_NL,
 ];
 
 /// What Metal reports about the GPU. The fields are the CUDA backend's: `multiprocessors`
@@ -899,6 +959,10 @@ pub struct Gpu {
     matmul_parts: Buffer,
     /// attention_decode's count of finished parts, one per head (left at 0).
     attention_counters: Buffer,
+    /// ink_router_pick's count of finished threadgroups (back to 0 after each).
+    pick_counter: Buffer,
+    /// moe_count's slots an expert, for moe_place.
+    moe_counts: Buffer,
     /// attention_tcg's queries in f16 (q_group_half), grown to the largest batch seen.
     attention_qh: Mutex<Option<Buffer>>,
     /// attention_tcg's parts for attention_tcg_merge, grown the same way.
@@ -1128,7 +1192,7 @@ impl Gpu {
             );
             Ok(pso)
         };
-        let per_kind = |prefix: &str| -> Result<[Pso; 7]> {
+        let per_kind = |prefix: &str| -> Result<[Pso; 8]> {
             let v: Vec<Pso> = KINDS
                 .iter()
                 .map(|k| pipeline(&format!("{prefix}_{}", k.name().to_lowercase())))
@@ -1136,8 +1200,8 @@ impl Gpu {
             Ok(v.try_into().unwrap_or_else(|_| unreachable!()))
         };
         // The quantized types' kernels of a family (none for F32 and F16).
-        let quantized = |prefix: &str| -> Result<[Option<Pso>; 7]> {
-            let mut v: [Option<Pso>; 7] = Default::default();
+        let quantized = |prefix: &str| -> Result<[Option<Pso>; 8]> {
+            let mut v: [Option<Pso>; 8] = Default::default();
             for (slot, kind) in v.iter_mut().zip(KINDS) {
                 if !matches!(kind, TensorType::F32 | TensorType::F16) {
                     *slot = Some(pipeline(&format!(
@@ -1206,6 +1270,7 @@ impl Gpu {
             rms_norm: pipeline("rms_norm")?,
             moe_pick: pipeline("moe_pick")?,
             moe_matvec_q4_0: pipeline("moe_matvec_q4_0")?,
+            moe_matvec_iq4_nl: pipeline("moe_matvec_iq4_nl")?,
             moe_matvec_q4_k: pipeline("moe_matvec_q4_k")?,
             moe_matvec_q5_k: pipeline("moe_matvec_q5_k")?,
             moe_matvec_q8_0: pipeline("moe_matvec_q8_0")?,
@@ -1213,7 +1278,9 @@ impl Gpu {
             moe_geglu: pipeline("moe_geglu")?,
             moe_geglu_half: pipeline("moe_geglu_half")?,
             moe_sum: pipeline("moe_sum")?,
-            moe_group: pipeline("moe_group")?,
+            moe_sum_half: pipeline("moe_sum_half")?,
+            moe_count: pipeline("moe_count")?,
+            moe_place: pipeline("moe_place")?,
             moe_matmul: per_kind("moe_matmul")?,
             moe_gather_half: pipeline("moe_gather_half")?,
             moe_matmul_tc: if tensor_ops {
@@ -1355,20 +1422,97 @@ impl Gpu {
             argmax_part: pipeline("argmax_part")?,
             argmax_final: pipeline("argmax_final")?,
             ink_mix: pipeline("ink_mix")?,
+            ink_mix_fast: pipeline("ink_mix_fast")?,
+            ink_mix_pair: pipeline("ink_mix_pair")?,
+            ink_router_pick: pipeline("ink_router_pick")?,
+            dspark_mix: pipeline("dspark_mix")?,
+            ink_history_rebuild: pipeline("ink_history_rebuild")?,
+            dspark_head_act: pipeline("dspark_head_act")?,
+            dspark_permute: pipeline("dspark_permute")?,
             ink_pair_norm: pipeline("ink_pair_norm")?,
             ink_control: pipeline("ink_control")?,
+            ink_ctrl_down_f16: pipeline("ink_ctrl_down_f16")?,
+            ink_ctrl_up_apply_f16: pipeline("ink_ctrl_up_apply_f16")?,
+            ink_ctrl3_down_f16: pipeline("ink_ctrl3_down_f16")?,
+            ink_ctrl3_up_apply_f16: pipeline("ink_ctrl3_up_apply_f16")?,
             ink_clip: pipeline("ink_clip")?,
             ink_conv: pipeline("ink_conv")?,
             ink_attention_part: pipeline("ink_attention_part")?,
+            ink_attention_part_f16: pipeline("ink_attention_part_f16")?,
+            ink_attention_decode_f16: pipeline("ink_attention_decode_f16")?,
+            ink_attention_decode8_f16: pipeline("ink_attention_decode8_f16")?,
+            ink_qkvr_prep_f16: pipeline("ink_qkvr_prep_f16")?,
+            ink_o_conv_q8_0: pipeline("ink_o_conv_q8_0")?,
+            matvec_split_f32: pipeline("matvec_split_f32")?,
             ink_attention_merge: pipeline("ink_attention_merge")?,
             ink_kv: pipeline("ink_kv")?,
+            ink_kv_f16: pipeline("ink_kv_f16")?,
             ink_kv_parallel: pipeline("ink_kv_parallel")?,
+            ink_kv_parallel_f16: pipeline("ink_kv_parallel_f16")?,
             ink_conv_parallel: pipeline("ink_conv_parallel")?,
             ink_conv_history: pipeline("ink_conv_history")?,
             ink_attention_flash: pipeline("ink_attention_flash")?,
+            ink_attention_flash_f16: pipeline("ink_attention_flash_f16")?,
+            ink_attention_tcg: if tensor_ops {
+                Some(pipeline("ink_attention_tcg_128")?)
+            } else {
+                None
+            },
+            moe_gather_i8_128: if tensor_ops {
+                Some(pipeline("moe_gather_i8_128")?)
+            } else {
+                None
+            },
+            moe_gather_i8_256: if tensor_ops {
+                Some(pipeline("moe_gather_i8_256")?)
+            } else {
+                None
+            },
+            ink_situ_i8_128: if tensor_ops {
+                Some(pipeline("ink_situ_i8_128")?)
+            } else {
+                None
+            },
+            moe_matmul_i8_q8_0: if tensor_ops {
+                Some(pipeline("moe_matmul_i8_q8_0")?)
+            } else {
+                None
+            },
+            moe_matmul_i8_wide_q8_0: if tensor_ops {
+                Some(pipeline("moe_matmul_i8_wide_q8_0")?)
+            } else {
+                None
+            },
+            moe_matmul_i8_wide256_q8_0: if tensor_ops {
+                Some(pipeline("moe_matmul_i8_wide256_q8_0")?)
+            } else {
+                None
+            },
+            moe_matmul_i8_iq4_nl: if tensor_ops {
+                Some(pipeline("moe_matmul_i8_iq4_nl")?)
+            } else {
+                None
+            },
+            moe_matmul_i8_wide_iq4_nl: if tensor_ops {
+                Some(pipeline("moe_matmul_i8_wide_iq4_nl")?)
+            } else {
+                None
+            },
+            moe_matmul_i8_wide256_iq4_nl: if tensor_ops {
+                Some(pipeline("moe_matmul_i8_wide256_iq4_nl")?)
+            } else {
+                None
+            },
             ink_moe_pick: pipeline("ink_moe_pick")?,
             ink_situ: pipeline("ink_situ")?,
             ink_situ_half: pipeline("ink_situ_half")?,
+            ink_moe_gate_up_situ_q8_0: pipeline("ink_moe_gate_up_situ_q8_0")?,
+            ink_moe_down_sum_conv_q8_0: pipeline("ink_moe_down_sum_conv_q8_0")?,
+            ink_moe_gate_up_situ_iq4_nl: pipeline("ink_moe_gate_up_situ_iq4_nl")?,
+            ink_moe_down_sum_conv_iq4_nl: pipeline("ink_moe_down_sum_conv_iq4_nl")?,
+            ink_qkv_q8_0: pipeline("ink_qkv_q8_0")?,
+            matvec_split_q8_0_multi4: pipeline("matvec_split_q8_0_multi4")?,
+            matvec_split_q8_0_pair: pipeline("matvec_split_q8_0_pair")?,
         };
         let copy = pipeline("copy_bytes")?;
         TENSOR_OPS.store(tensor_ops, Ordering::Relaxed);
@@ -1437,6 +1581,9 @@ impl Gpu {
         // A counter a threadgroup column (up to 64 heads) and token (up to 8).
         let attention_counters = Self::alloc_in(&context, 64 * 64 * 4)?;
         attention_counters.write_bytes_at(0, &[0u8; 64 * 64 * 4])?;
+        let pick_counter = Self::alloc_in(&context, 256)?;
+        let moe_counts = Self::alloc_in(&context, 512 * 4)?;
+        pick_counter.write_bytes_at(0, &[0u8; 256])?;
         let matmul_parts = Self::alloc_in(&context, MATMUL_PARTS_BYTES)?;
         let argmax_vals = Self::alloc_in(&context, 256 * 4)?;
         let argmax_idxs = Self::alloc_in(&context, 256 * 4)?;
@@ -1447,6 +1594,8 @@ impl Gpu {
             attention_parts,
             matmul_parts,
             attention_counters,
+            pick_counter,
+            moe_counts,
             attention_qh: Mutex::new(None),
             attention_tcg_parts: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
@@ -1526,7 +1675,27 @@ impl Gpu {
             }
             return self.upload(&out);
         }
-        if kind != TensorType::Q4_0 {
+        if kind == TensorType::Q8_0 {
+            let blocks = cols / 32;
+            let row_bytes = blocks * 32 + (blocks * 2).next_multiple_of(16);
+            let total = rows * row_bytes;
+            let buf = self.alloc(total)?;
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(buf.buffer.contents().as_ptr() as *mut u8, total)
+            };
+            for (src, dst) in data
+                .chunks_exact(blocks * 34)
+                .zip(out.chunks_exact_mut(row_bytes))
+            {
+                let (numbers, scales) = dst.split_at_mut(blocks * 32);
+                for (b, block) in src.as_chunks::<34>().0.iter().enumerate() {
+                    scales[b * 2..b * 2 + 2].copy_from_slice(&block[..2]);
+                    numbers[b * 32..b * 32 + 32].copy_from_slice(&block[2..]);
+                }
+            }
+            return Ok(buf);
+        }
+        if !matches!(kind, TensorType::Q4_0 | TensorType::IQ4_NL) {
             return self.upload(data);
         }
         let blocks = cols / 32;
@@ -1663,6 +1832,7 @@ impl Gpu {
             *slot = match *a {
                 Arg::Ptr(v) => v,
                 Arg::I32(v) => v as u32 as u64,
+                Arg::I32x2(a, b) => (a as u32 as u64) | ((b as u32 as u64) << 32),
                 Arg::F32(v) => v.to_bits() as u64,
             };
         }
@@ -1707,13 +1877,16 @@ impl Gpu {
             Arg::I32(rows as i32),
             Arg::I32(cols as i32),
         ];
+        if kind == TensorType::F32 && rows <= 256 && cols.is_multiple_of(4) && cols >= 512 {
+            return self.run(&self.kernels.matvec_split_f32, (rows as u32, 1), 128, &args);
+        }
         if let Some(split) = &self.kernels.matvec_split[index] {
             // A SIMD group of the plain kernel takes 512 columns a step (Q8_0 128), one
             // after another. Long rows (4 steps or more) and small matrices are quicker
             // with each row pair split over 4 SIMD groups; many short rows aren't (on the
             // M5 Max: 2,048 × 8,192 Q6_K 21.8 → 19.2 µs, 512 × 2,048 Q4_K 5.7 → 4.2, but
             // 6,144 × 1,024 Q5_K 11.1 → 11.9).
-            let per_step = if kind == TensorType::Q8_0 { 128 } else { 512 };
+            let per_step = if kind == TensorType::Q8_0 { 256 } else { 512 };
             if cols / per_step >= 4 || rows <= 1024 {
                 return self.run(split, ((rows as u32).div_ceil(2), 1), 128, &args);
             }
@@ -1938,7 +2111,12 @@ impl Gpu {
     pub fn supports_experts(kind: TensorType) -> bool {
         matches!(
             kind,
-            TensorType::Q4_0 | TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K | TensorType::Q8_0
+            TensorType::Q4_0
+                | TensorType::IQ4_NL
+                | TensorType::Q4_K
+                | TensorType::Q5_K
+                | TensorType::Q6_K
+                | TensorType::Q8_0
         )
     }
 
@@ -1989,6 +2167,7 @@ impl Gpu {
     ) -> Result<()> {
         let kernel = match kind {
             TensorType::Q4_0 => &self.kernels.moe_matvec_q4_0,
+            TensorType::IQ4_NL => &self.kernels.moe_matvec_iq4_nl,
             TensorType::Q4_K => &self.kernels.moe_matvec_q4_k,
             TensorType::Q5_K => &self.kernels.moe_matvec_q5_k,
             TensorType::Q8_0 => &self.kernels.moe_matvec_q8_0,
@@ -2026,7 +2205,8 @@ impl Gpu {
     }
 
     /// The slots in one of `moe_group`'s tiles: for `moe_matmul_fast` (16 for short/sparse
-    /// batches where each expert averages ≤ 8 slots, 64 for dense prompt batches) or
+    /// batches where each expert averages ≤ 8 slots, 128 for dense batches averaging > 32
+    /// slots so experts with > 64 slots aren't split into two tiles, 64 in between) or
     /// `moe_matmul`.
     fn moe_tile_slots(fast: bool, slots: usize, experts: usize) -> usize {
         if !fast {
@@ -2042,6 +2222,34 @@ impl Gpu {
     /// where each slot went into `place`), and cut into `tiles` (three i32s each,
     /// `moe_tiles` of them) for `moe_matmul`, or for `moe_matmul_fast` (`fast`).
     #[allow(clippy::too_many_arguments)]
+    /// Same as [`Gpu::moe_group`] with an explicit `tile` slot cap (for wide INT8 MoE tiles).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_group_tile(
+        &self,
+        idx: CuDevicePtr,
+        order: CuDevicePtr,
+        tiles: CuDevicePtr,
+        place: CuDevicePtr,
+        slots: usize,
+        experts: usize,
+        tile: usize,
+    ) -> Result<()> {
+        assert!(experts <= 512, "moe_group holds up to 512 experts");
+        let args = [
+            Arg::Ptr(idx),
+            Arg::Ptr(order),
+            Arg::Ptr(tiles),
+            Arg::I32(slots as i32),
+            Arg::I32(experts as i32),
+            Arg::I32((slots / tile + experts) as i32),
+            Arg::I32(tile as i32),
+            Arg::Ptr(place),
+            Arg::Ptr(self.moe_counts.ptr()),
+        ];
+        self.run(&self.kernels.moe_count, (experts as u32, 1), 256, &args)?;
+        self.run(&self.kernels.moe_place, (experts as u32, 1), 256, &args)
+    }
+
     pub fn moe_group(
         &self,
         idx: CuDevicePtr,
@@ -2063,8 +2271,10 @@ impl Gpu {
             Arg::I32((slots / tile + experts) as i32),
             Arg::I32(tile as i32),
             Arg::Ptr(place),
+            Arg::Ptr(self.moe_counts.ptr()),
         ];
-        self.run(&self.kernels.moe_group, (1, 1), 1024, &args)
+        self.run(&self.kernels.moe_count, (experts as u32, 1), 256, &args)?;
+        self.run(&self.kernels.moe_place, (experts as u32, 1), 256, &args)
     }
 
     /// The inputs of `moe_matmul_fast` into `out`, `slots` rows of `cols` f16s in
@@ -2119,18 +2329,24 @@ impl Gpu {
         experts: usize,
     ) -> Result<()> {
         let tile_slots = Self::moe_tile_slots(true, slots, experts);
-        let kernels = if tile_slots == MOE_TC_SMALL_SLOTS {
-            self.kernels
-                .moe_matmul_tc_small
-                .as_ref()
-                .expect("checked with moe_fast")
+        let (kernels, tile_rows) = if tile_slots == MOE_TC_SMALL_SLOTS {
+            (
+                self.kernels
+                    .moe_matmul_tc_small
+                    .as_ref()
+                    .expect("checked with moe_fast"),
+                tensor_tile().0,
+            )
         } else {
-            self.kernels
-                .moe_matmul_tc
-                .as_ref()
-                .expect("checked with moe_fast")
+            (
+                self.kernels
+                    .moe_matmul_tc
+                    .as_ref()
+                    .expect("checked with moe_fast"),
+                64,
+            )
         };
-        let (tc_rows, _, tc_sg) = tensor_tile();
+        let (_, _, tc_sg) = tensor_tile();
         let args = [
             Arg::Ptr(w),
             Arg::Ptr(x),
@@ -2142,7 +2358,7 @@ impl Gpu {
             Arg::I32(y_stride as i32),
         ];
         let grid = (
-            (rows as u32).div_ceil(tc_rows),
+            (rows as u32).div_ceil(tile_rows),
             (slots / tile_slots + experts) as u32,
         );
         self.run(&kernels[Self::kind_index(kind)?], grid, 32 * tc_sg, &args)
@@ -2253,6 +2469,37 @@ impl Gpu {
         )
     }
 
+    /// Vectorized `moe_sum` reading f16 `parts` (`n` must be a multiple of 4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_sum_half(
+        &self,
+        out: CuDevicePtr,
+        parts: CuDevicePtr,
+        share: CuDevicePtr,
+        used: usize,
+        n: usize,
+        tokens: usize,
+        place: Option<CuDevicePtr>,
+    ) -> Result<()> {
+        debug_assert!(n.is_multiple_of(4));
+        let n4 = n / 4;
+        let total4 = n4 * tokens;
+        self.run_per_number(
+            &self.kernels.moe_sum_half,
+            total4,
+            &[
+                Arg::Ptr(out),
+                Arg::Ptr(parts),
+                Arg::Ptr(share),
+                Arg::I32(used as i32),
+                Arg::I32(n4 as i32),
+                Arg::I32(total4 as i32),
+                Arg::Ptr(place.unwrap_or(share)),
+                Arg::I32(i32::from(place.is_some())),
+            ],
+        )
+    }
+
     pub fn rms_norm_rows(
         &self,
         x: CuDevicePtr,
@@ -2268,8 +2515,35 @@ impl Gpu {
             Arg::Ptr(out),
             Arg::I32(n as i32),
             Arg::F32(eps),
+            Arg::Ptr(0),
+            Arg::Ptr(0),
+            Arg::I32(0),
         ];
         self.run(&self.kernels.rms_norm, (rows as u32, 1), 256, &args)
+    }
+
+    /// Three RMS norms in one dispatch: blocks `k` = 0, 1, 2 of `rows` rows each (contiguous
+    /// in `x` and `out`), block `k` with `weights[k]`.
+    pub fn rms_norm_rows3(
+        &self,
+        x: CuDevicePtr,
+        weights: [CuDevicePtr; 3],
+        out: CuDevicePtr,
+        rows: usize,
+        n: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(weights[0]),
+            Arg::Ptr(out),
+            Arg::I32(n as i32),
+            Arg::F32(eps),
+            Arg::Ptr(weights[1]),
+            Arg::Ptr(weights[2]),
+            Arg::I32(rows as i32),
+        ];
+        self.run(&self.kernels.rms_norm, (3 * rows as u32, 1), 256, &args)
     }
 
     /// The residual stream between steps (see the CUDA backend's `residual_norm`).
@@ -3567,6 +3841,26 @@ impl Gpu {
         stride: usize,
     ) -> Result<()> {
         assert!(blocks < 16, "ink_mix of {} states", blocks + 1);
+        if dim.is_multiple_of(4) && blocks + 1 <= 8 && dim / 4 <= 1024 {
+            let threads = ((dim / 4) as u32).next_multiple_of(32);
+            let args = [
+                Arg::Ptr(states),
+                Arg::Ptr(query),
+                Arg::Ptr(out),
+                Arg::I32(blocks as i32),
+                Arg::I32(dim as i32),
+                Arg::I32(stride as i32),
+                Arg::Ptr(cur),
+                Arg::Ptr(0),
+                Arg::F32(0.0),
+            ];
+            return self.run(
+                &self.kernels.ink_mix_fast,
+                (queries as u32, tokens as u32),
+                threads,
+                &args,
+            );
+        }
         let args = [
             Arg::Ptr(states),
             Arg::Ptr(query),
@@ -3579,6 +3873,103 @@ impl Gpu {
         // A batch has threadgroups enough in its tokens; one token gets wide ones.
         let threads = if tokens == 1 { 1024 } else { 256 };
         self.run(&self.kernels.ink_mix, (queries as u32, tokens as u32), threads, &args)
+    }
+
+    /// Two independent `ink_mix` calls in one dispatch (4 loop message queries on `bank`
+    /// plus `attn_queries` on `stack`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_mix_pair(
+        &self,
+        bank: CuDevicePtr,
+        msg_queries: CuDevicePtr,
+        messages: CuDevicePtr,
+        n_bank: usize,
+        cur_bank: CuDevicePtr,
+        stack: CuDevicePtr,
+        attn_queries: CuDevicePtr,
+        attn_n: usize,
+        inputs: CuDevicePtr,
+        n_blocks: usize,
+        cur_x: CuDevicePtr,
+        dim: usize,
+        tokens: usize,
+        stride: usize,
+    ) -> Result<()> {
+        if dim.is_multiple_of(4) && n_bank + 1 <= 8 && n_blocks + 1 <= 8 && dim / 4 <= 1024 {
+            let threads = ((dim / 4) as u32).next_multiple_of(32);
+            let args = [
+                Arg::Ptr(bank),
+                Arg::Ptr(msg_queries),
+                Arg::Ptr(messages),
+                Arg::I32(n_bank as i32),
+                Arg::Ptr(cur_bank),
+                Arg::Ptr(stack),
+                Arg::Ptr(attn_queries),
+                Arg::Ptr(inputs),
+                Arg::I32(n_blocks as i32),
+                Arg::Ptr(cur_x),
+                Arg::I32(dim as i32),
+                Arg::I32(stride as i32),
+            ];
+            return self.run(
+                &self.kernels.ink_mix_pair,
+                ((4 + attn_n) as u32, tokens as u32),
+                threads,
+                &args,
+            );
+        }
+        self.ink_mix(bank, n_bank, cur_bank, msg_queries, 4, messages, dim, tokens, stride)?;
+        self.ink_mix(
+            stack,
+            n_blocks,
+            cur_x,
+            attn_queries,
+            attn_n,
+            inputs,
+            dim,
+            tokens,
+            stride,
+        )
+    }
+
+    /// Fused `ink_mix` (for 1 query) + `rms_norm_rows(out, norm_w, out, tokens, dim, eps)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_mix_norm(
+        &self,
+        states: CuDevicePtr,
+        blocks: usize,
+        cur: CuDevicePtr,
+        query: CuDevicePtr,
+        out: CuDevicePtr,
+        norm_w: CuDevicePtr,
+        dim: usize,
+        tokens: usize,
+        stride: usize,
+        eps: f32,
+    ) -> Result<()> {
+        assert!(blocks < 16, "ink_mix of {} states", blocks + 1);
+        if dim.is_multiple_of(4) && blocks + 1 <= 8 && dim / 4 <= 1024 {
+            let threads = ((dim / 4) as u32).next_multiple_of(32);
+            let args = [
+                Arg::Ptr(states),
+                Arg::Ptr(query),
+                Arg::Ptr(out),
+                Arg::I32(blocks as i32),
+                Arg::I32(dim as i32),
+                Arg::I32(stride as i32),
+                Arg::Ptr(cur),
+                Arg::Ptr(norm_w),
+                Arg::F32(eps),
+            ];
+            return self.run(
+                &self.kernels.ink_mix_fast,
+                (1, tokens as u32),
+                threads,
+                &args,
+            );
+        }
+        self.ink_mix(states, blocks, cur, query, 1, out, dim, tokens, stride)?;
+        self.rms_norm_rows(out, norm_w, out, tokens, dim, eps)
     }
 
     /// Each token's rows of `cur` and `message` RMS-normed (no weight) side by side, a row of
@@ -3619,7 +4010,88 @@ impl Gpu {
             Arg::Ptr(out),
             Arg::I32(n as i32),
         ];
-        self.run_per_number(&self.kernels.ink_control, n, &args)
+        let count = if n.is_multiple_of(4) { n / 4 } else { n };
+        self.run_per_number(&self.kernels.ink_control, count, &args)
+    }
+
+    /// [`Gpu::ink_control_f16`] for 3 controllers in 2 dispatches: controller j from
+    /// `cur_in[j]` and `message[j]` into `cur_out[j]` (an output may be another's input).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_control3_f16(
+        &self,
+        cur_in: [CuDevicePtr; 3],
+        cur_out: [CuDevicePtr; 3],
+        message: [CuDevicePtr; 3],
+        low: [CuDevicePtr; 3],
+        w_down: [CuDevicePtr; 3],
+        w_gain: [CuDevicePtr; 3],
+        w_forget: [CuDevicePtr; 3],
+        dim: usize,
+        rank: usize,
+    ) -> Result<()> {
+        assert!(dim.is_multiple_of(4) && rank <= 128 && rank.is_multiple_of(4));
+        let mut down: Vec<Arg> = Vec::with_capacity(13);
+        for group in [&cur_in, &message, &w_down, &low] {
+            down.extend(group.iter().map(|&p| Arg::Ptr(p)));
+        }
+        down.push(Arg::I32(dim as i32));
+        self.run(&self.kernels.ink_ctrl3_down_f16, (rank as u32, 3), 256, &down)?;
+        let mut up: Vec<Arg> = Vec::with_capacity(20);
+        for group in [&cur_in, &message, &low, &w_gain, &w_forget] {
+            up.extend(group.iter().map(|&p| Arg::Ptr(p)));
+        }
+        up.push(Arg::I32(dim as i32));
+        up.push(Arg::I32(rank as i32));
+        up.extend(cur_out.iter().map(|&p| Arg::Ptr(p)));
+        self.run(
+            &self.kernels.ink_ctrl3_up_apply_f16,
+            ((dim as u32).div_ceil(8), 1),
+            128,
+            &up,
+        )
+    }
+
+    /// Single-token fused loop controller with f16 weights:
+    /// `cur_out = cur_in - tanh(W_forget low) cur_in + tanh(W_gain low) message`,
+    /// where `low = W_down [rms_norm(cur_in); rms_norm(message)]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_control_f16(
+        &self,
+        cur_in: CuDevicePtr,
+        cur_out: CuDevicePtr,
+        message: CuDevicePtr,
+        low: CuDevicePtr,
+        w_down: CuDevicePtr,
+        w_gain: CuDevicePtr,
+        w_forget: CuDevicePtr,
+        dim: usize,
+        rank: usize,
+    ) -> Result<()> {
+        assert!(dim.is_multiple_of(4) && rank <= 128 && rank.is_multiple_of(4));
+        let down_args = [
+            Arg::Ptr(cur_in),
+            Arg::Ptr(message),
+            Arg::Ptr(w_down),
+            Arg::Ptr(low),
+            Arg::I32(dim as i32),
+        ];
+        self.run(&self.kernels.ink_ctrl_down_f16, (rank as u32, 1), 256, &down_args)?;
+        let up_args = [
+            Arg::Ptr(cur_in),
+            Arg::Ptr(message),
+            Arg::Ptr(low),
+            Arg::Ptr(w_gain),
+            Arg::Ptr(w_forget),
+            Arg::I32(dim as i32),
+            Arg::I32(rank as i32),
+            Arg::Ptr(cur_out),
+        ];
+        self.run(
+            &self.kernels.ink_ctrl_up_apply_f16,
+            ((dim as u32).div_ceil(8), 1),
+            128,
+            &up_args,
+        )
     }
 
     /// Each of `rows` rows of `n` in place (`per_token` rows a token): times `scale`'s row
@@ -3649,8 +4121,9 @@ impl Gpu {
             Arg::I32(i32::from(log_scale.is_some())),
             Arg::F32(alpha),
             Arg::F32(floor),
+            Arg::I32(rows as i32),
         ];
-        self.run(&self.kernels.ink_clip, (rows as u32, 1), 128, &args)
+        self.run(&self.kernels.ink_clip, ((rows as u32).div_ceil(4), 1), 128, &args)
     }
 
     /// Inkling 2's causal convolution of `tokens` rows of `x` (`n` channels each), in
@@ -3738,6 +4211,7 @@ impl Gpu {
         kv_dim: usize,
         clip: Option<f32>,
         eps: f32,
+        kv_f16: bool,
     ) -> Result<()> {
         assert!((2..=8).contains(&conv), "convolution of {conv}");
         assert!(kv_dim.is_multiple_of(128), "ink_kv takes heads of 128");
@@ -3759,14 +4233,26 @@ impl Gpu {
         if tokens > 1 {
             // Every token at once, then the history.
             let grid = ((kv_dim / 128) as u32, tokens as u32);
-            self.run(&self.kernels.ink_kv_parallel, grid, 128, &args)?;
+            let k = if kv_f16 {
+                &self.kernels.ink_kv_parallel_f16
+            } else {
+                &self.kernels.ink_kv_parallel
+            };
+            self.run(k, grid, 128, &args)?;
             return self.ink_conv_history(x, history, kv_dim, channels, conv, tokens);
         }
-        self.run(&self.kernels.ink_kv, ((kv_dim / 128) as u32, 1), 128, &args)
+        let k = if kv_f16 {
+            &self.kernels.ink_kv_f16
+        } else {
+            &self.kernels.ink_kv
+        };
+        self.run(k, ((kv_dim / 128) as u32, 1), 128, &args)
     }
 
     /// The most parts [`Gpu::ink_attention`] splits a head's positions into.
     pub const INK_ATTENTION_PARTS: usize = 32;
+    /// From how many positions one token's attention takes ink_attention_decode8_f16.
+    pub const INK_DECODE8_FROM: usize = 4096;
 
     /// How many parts a batch of `tokens` with up to `count` positions each is split into,
     /// and the threads of each part: one token, 16 SIMD groups and a part per 1,024
@@ -3794,6 +4280,52 @@ impl Gpu {
         assert_eq!(a.head_dim, 128, "ink_attention takes heads of 128");
         assert!(a.rel_dim <= 32, "ink_attention takes up to 32 bias numbers a head");
         if a.flash && a.tokens > 1 {
+            if a.kv_f16
+                && !TCG_OFF.load(Ordering::Relaxed)
+                && a.group <= 32
+                && (a.ring == 0 || (a.ring >= 128 && a.ring.is_multiple_of(128)))
+                && (a.ring > 0 || a.pos0 + a.tokens >= 128)
+                && let (Some(tcg), Some((_, q_group_half, _))) = (
+                    self.kernels.ink_attention_tcg.as_ref(),
+                    self.kernels.attention_tcg.as_ref(),
+                )
+            {
+                let qh = self.qh_buffer((a.tokens * a.heads + 32) * 128 * 2)?;
+                let q_args = [
+                    Arg::Ptr(a.q),
+                    Arg::Ptr(qh),
+                    Arg::I32(a.heads as i32),
+                    Arg::I32(a.group as i32),
+                    Arg::I32(128),
+                    Arg::I32(a.tokens as i32),
+                ];
+                self.run_per_number(q_group_half, a.tokens * a.heads * 32, &q_args)?;
+                let args = [
+                    Arg::Ptr(qh),
+                    Arg::Ptr(a.keys),
+                    Arg::Ptr(a.values),
+                    Arg::Ptr(a.out),
+                    Arg::Ptr(a.r),
+                    Arg::Ptr(a.bias),
+                    Arg::Ptr(a.sink),
+                    Arg::Ptr(a.gate),
+                    Arg::I32(a.pos0 as i32),
+                    Arg::I32(a.window as i32),
+                    Arg::I32(a.extent as i32),
+                    Arg::I32(a.ring as i32),
+                    Arg::I32(a.kv_dim as i32),
+                    Arg::I32(a.group as i32),
+                    Arg::I32(a.rel_dim as i32),
+                    Arg::F32(a.scale),
+                    Arg::I32(a.tokens as i32),
+                ];
+                let tb = 32 / a.group;
+                let grid = (
+                    (a.heads / a.group) as u32,
+                    (a.tokens as u32).div_ceil(tb as u32),
+                );
+                return self.run(tcg, grid, 128, &args);
+            }
             let args = [
                 Arg::Ptr(a.q),
                 Arg::Ptr(a.keys),
@@ -3814,7 +4346,12 @@ impl Gpu {
                 Arg::I32(a.tokens as i32),
             ];
             let grid = (a.heads as u32, (a.tokens as u32).div_ceil(32));
-            return self.run(&self.kernels.ink_attention_flash, grid, 128, &args);
+            let k = if a.kv_f16 {
+                &self.kernels.ink_attention_flash_f16
+            } else {
+                &self.kernels.ink_attention_flash
+            };
+            return self.run(k, grid, 128, &args);
         }
         let last = a.pos0 + a.tokens - 1;
         let count = if a.window > 0 {
@@ -3822,7 +4359,22 @@ impl Gpu {
         } else {
             last + 1
         };
-        let (parts, threads) = Self::ink_attention_parts(a.tokens, count);
+        let grouped_decode = a.kv_f16 && a.tokens == 1 && a.group <= 4;
+        let (parts, threads) = if grouped_decode {
+            // Scale parts so 8 KV heads saturate all GPU cores (4 parts = 32 TGs at 1024 SWA).
+            // Short contexts (<512) are latency-bound (each warp walks its positions in
+            // turn): a part per 32 positions, 8 warps each, spreads them over more cores
+            // (+7% short generation on Inkling 2 Mini; 8K and up unchanged).
+            let p = if count < 512 {
+                count.div_ceil(32).clamp(1, Self::INK_ATTENTION_PARTS)
+            } else {
+                count.div_ceil(256).clamp(1, Self::INK_ATTENTION_PARTS)
+            };
+            let th = if count <= 2048 { 256 } else { 512 };
+            (p, th)
+        } else {
+            Self::ink_attention_parts(a.tokens, count)
+        };
         let args = [
             Arg::Ptr(a.q),
             Arg::Ptr(a.keys),
@@ -3843,13 +4395,36 @@ impl Gpu {
             Arg::Ptr(a.out),
             Arg::Ptr(a.gate),
         ];
-        self.run_3d(
-            &self.kernels.ink_attention_part,
-            (a.heads as u32, parts as u32, a.tokens as u32),
-            threads,
-            0,
-            &args,
-        )?;
+        if grouped_decode {
+            let kv_heads = (a.heads / a.group) as u32;
+            // Long contexts: the flash-decoding layout (VIREO_INK_DECODE8=off for the other).
+            let wide = count >= Self::INK_DECODE8_FROM
+                && !std::env::var("VIREO_INK_DECODE8").is_ok_and(|v| v == "off");
+            self.run_3d(
+                if wide {
+                    &self.kernels.ink_attention_decode8_f16
+                } else {
+                    &self.kernels.ink_attention_decode_f16
+                },
+                (kv_heads, parts as u32, 1),
+                threads,
+                0,
+                &args,
+            )?;
+        } else {
+            let k = if a.kv_f16 {
+                &self.kernels.ink_attention_part_f16
+            } else {
+                &self.kernels.ink_attention_part
+            };
+            self.run_3d(
+                k,
+                (a.heads as u32, parts as u32, a.tokens as u32),
+                threads,
+                0,
+                &args,
+            )?;
+        }
         if parts == 1 {
             return Ok(());
         }
@@ -3866,6 +4441,146 @@ impl Gpu {
             128,
             &merge,
         )
+    }
+
+    /// Inkling 2: every slot's convolution history as after the first `keep` tokens of a
+    /// batch (see the kernel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_history_rebuild(
+        &self,
+        histories: CuDevicePtr,
+        saved: CuDevicePtr,
+        log: CuDevicePtr,
+        slots: usize,
+        channels: usize,
+        kv: usize,
+        dim: usize,
+        conv: usize,
+        keep: usize,
+    ) -> Result<()> {
+        let total = slots * channels;
+        self.run_per_number(
+            &self.kernels.ink_history_rebuild,
+            total,
+            &[
+                Arg::Ptr(histories),
+                Arg::Ptr(saved),
+                Arg::Ptr(log),
+                Arg::I32(channels as i32),
+                Arg::I32(kv as i32),
+                Arg::I32(dim as i32),
+                Arg::I32(keep as i32),
+                Arg::I32(total as i32),
+                Arg::I32(conv as i32),
+            ],
+        )
+    }
+
+    /// Inkling 2 DSpark: `rows` rows of `out` = RMSNorm(Σ_k w[k] features[k]) × `norm`, the
+    /// four blocks of `features` `block` floats apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_mix(
+        &self,
+        features: CuDevicePtr,
+        block: usize,
+        w: [f32; 4],
+        norm: CuDevicePtr,
+        out: CuDevicePtr,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(features),
+            Arg::Ptr(out),
+            Arg::Ptr(norm),
+            Arg::I32(dim as i32),
+            Arg::I32(block as i32),
+            Arg::F32(eps),
+            Arg::F32(w[0]),
+            Arg::F32(w[1]),
+            Arg::F32(w[2]),
+            Arg::F32(w[3]),
+        ];
+        self.run(&self.kernels.dspark_mix, (rows as u32, 1), 256, &args)
+    }
+
+    /// The DSpark block's heads from [row][kv][g] to [kv][row][g] (`back`: the other way).
+    pub fn dspark_permute(
+        &self,
+        src: CuDevicePtr,
+        dst: CuDevicePtr,
+        rows: usize,
+        kv_heads: usize,
+        group: usize,
+        head_dim: usize,
+        back: bool,
+    ) -> Result<()> {
+        let n = rows * kv_heads * group * head_dim;
+        self.run_per_number(
+            &self.kernels.dspark_permute,
+            n,
+            &[
+                Arg::Ptr(src),
+                Arg::Ptr(dst),
+                Arg::I32(rows as i32),
+                Arg::I32(kv_heads as i32),
+                Arg::I32(group as i32),
+                Arg::I32(head_dim as i32),
+                Arg::I32(back as i32),
+            ],
+        )
+    }
+
+    /// The DSpark recurrent head's step (see the kernel).
+    pub fn dspark_head_act(
+        &self,
+        j: CuDevicePtr,
+        state: CuDevicePtr,
+        latent: CuDevicePtr,
+        rank: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(j),
+            Arg::Ptr(state),
+            Arg::Ptr(latent),
+            Arg::I32(rank as i32),
+        ];
+        self.run(&self.kernels.dspark_head_act, (1, 1), 256, &args)
+    }
+
+    /// One token's router scores (`w`, f32 rows of `cols`, one an expert) and expert pick
+    /// (as [`Gpu::ink_moe_pick`]) in one dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_router_pick(
+        &self,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        logits: CuDevicePtr,
+        cols: usize,
+        bias: CuDevicePtr,
+        idx: CuDevicePtr,
+        share: CuDevicePtr,
+        experts: usize,
+        used: usize,
+        scale: f32,
+    ) -> Result<()> {
+        assert!(used <= 32 && experts <= 512 && cols.is_multiple_of(4));
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(logits),
+            Arg::I32(experts as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(bias),
+            Arg::Ptr(idx),
+            Arg::Ptr(share),
+            Arg::I32(experts as i32),
+            Arg::I32(used as i32),
+            Arg::F32(scale),
+            Arg::Ptr(self.pick_counter.ptr()),
+        ];
+        self.run(&self.kernels.ink_router_pick, (experts as u32, 1), 128, &args)
     }
 
     /// Inkling 2's experts' pick for each of `tokens` tokens: sigmoid scores, the `used`
@@ -3927,6 +4642,473 @@ impl Gpu {
             &self.kernels.ink_situ
         };
         self.run_per_number(kernel, total, &args)
+    }
+
+    /// All Q8_0 attention projections across up to 3 inputs (h0: q, gate, rel, sink;
+    /// h1: k, k_taps; h2: v, v_taps) in a single dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_qkv_q8_0(
+        &self,
+        h: [CuDevicePtr; 3],
+        cols: usize,
+        w: [CuDevicePtr; 8],
+        y: [CuDevicePtr; 8],
+        r: [usize; 8],
+    ) -> Result<()> {
+        let total: usize = r.iter().sum();
+        let args = [
+            Arg::Ptr(h[0]),
+            Arg::Ptr(h[1]),
+            Arg::Ptr(h[2]),
+            Arg::Ptr(w[0]),
+            Arg::Ptr(w[1]),
+            Arg::Ptr(w[2]),
+            Arg::Ptr(w[3]),
+            Arg::Ptr(w[4]),
+            Arg::Ptr(w[5]),
+            Arg::Ptr(w[6]),
+            Arg::Ptr(w[7]),
+            Arg::Ptr(y[0]),
+            Arg::Ptr(y[1]),
+            Arg::Ptr(y[2]),
+            Arg::Ptr(y[3]),
+            Arg::Ptr(y[4]),
+            Arg::Ptr(y[5]),
+            Arg::Ptr(y[6]),
+            Arg::Ptr(y[7]),
+            Arg::I32x2(r[0] as i32, r[1] as i32),
+            Arg::I32x2(r[2] as i32, r[3] as i32),
+            Arg::I32x2(r[4] as i32, r[5] as i32),
+            Arg::I32x2(r[6] as i32, r[7] as i32),
+            Arg::I32(cols as i32),
+        ];
+        self.run(
+            &self.kernels.ink_qkv_q8_0,
+            ((total as u32).div_ceil(4), 1),
+            128,
+            &args,
+        )
+    }
+
+    /// Four Q8_0 matvecs sharing the same input `x` in a single dispatch.
+    /// `r0`, `r1`, `r2` must be even.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_q8_0_multi4(
+        &self,
+        x: CuDevicePtr,
+        cols: usize,
+        m0: (CuDevicePtr, CuDevicePtr, usize),
+        m1: (CuDevicePtr, CuDevicePtr, usize),
+        m2: (CuDevicePtr, CuDevicePtr, usize),
+        m3: (CuDevicePtr, CuDevicePtr, usize),
+    ) -> Result<()> {
+        assert!(m0.2.is_multiple_of(2) && m1.2.is_multiple_of(2) && m2.2.is_multiple_of(2));
+        let total = m0.2 + m1.2 + m2.2 + m3.2;
+        let args = [
+            Arg::Ptr(x),
+            Arg::I32(cols as i32),
+            Arg::Ptr(m0.0),
+            Arg::Ptr(m0.1),
+            Arg::I32(m0.2 as i32),
+            Arg::Ptr(m1.0),
+            Arg::Ptr(m1.1),
+            Arg::I32(m1.2 as i32),
+            Arg::Ptr(m2.0),
+            Arg::Ptr(m2.1),
+            Arg::I32(m2.2 as i32),
+            Arg::Ptr(m3.0),
+            Arg::Ptr(m3.1),
+            Arg::I32(m3.2 as i32),
+        ];
+        self.run(
+            &self.kernels.matvec_split_q8_0_multi4,
+            ((total as u32).div_ceil(4), 1),
+            128,
+            &args,
+        )
+    }
+
+    /// Two Q8_0 matvecs sharing the same input `x` in a single dispatch.
+    pub fn matvec_q8_0_pair(
+        &self,
+        x: CuDevicePtr,
+        cols: usize,
+        m0: (CuDevicePtr, CuDevicePtr, usize),
+        m1: (CuDevicePtr, CuDevicePtr, usize),
+    ) -> Result<()> {
+        let total = m0.2 + m1.2;
+        let args = [
+            Arg::Ptr(x),
+            Arg::I32(cols as i32),
+            Arg::Ptr(m0.0),
+            Arg::Ptr(m0.1),
+            Arg::I32(m0.2 as i32),
+            Arg::Ptr(m1.0),
+            Arg::Ptr(m1.1),
+            Arg::I32(m1.2 as i32),
+        ];
+        self.run(
+            &self.kernels.matvec_split_q8_0_pair,
+            ((total as u32).div_ceil(4), 1),
+            128,
+            &args,
+        )
+    }
+
+    /// Fused Q8_0 / IQ4_NL MoE gate_up matvec + SiTU activation into `y` (rows of `width`, `y_stride` apart).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_moe_gate_up_situ(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x: CuDevicePtr,
+        y: CuDevicePtr,
+        width: usize,
+        cols: usize,
+        idx: CuDevicePtr,
+        used: usize,
+        x_stride: usize,
+        y_stride: usize,
+        beta: f32,
+        linear_beta: f32,
+        slots: usize,
+    ) -> Result<()> {
+        let (kernel, rows_per_tg) = match kind {
+            TensorType::Q8_0 => (&self.kernels.ink_moe_gate_up_situ_q8_0, 4u32),
+            TensorType::IQ4_NL => (&self.kernels.ink_moe_gate_up_situ_iq4_nl, 4u32),
+            other => return Err(Error::Unsupported(other)),
+        };
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x),
+            Arg::Ptr(y),
+            Arg::I32(width as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(idx),
+            Arg::I32(used as i32),
+            Arg::I32(x_stride as i32),
+            Arg::I32(y_stride as i32),
+            Arg::F32(beta),
+            Arg::F32(linear_beta),
+        ];
+        let grid = (width as u32).div_ceil(rows_per_tg);
+        self.run(kernel, (grid, slots as u32), 128, &args)
+    }
+
+    /// Single-token fused Q8_0 / IQ4_NL MoE down projection + weighted expert sum + ffn_post_conv +
+    /// residual add into `x_out` (for `used <= 8`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_moe_down_sum_conv(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        act: CuDevicePtr,
+        idx: CuDevicePtr,
+        share: CuDevicePtr,
+        history: CuDevicePtr,
+        conv_w: CuDevicePtr,
+        x_out: CuDevicePtr,
+        dim: usize,
+        width: usize,
+        used: usize,
+        channels: usize,
+        conv: usize,
+    ) -> Result<()> {
+        assert!(used <= 8 && conv <= 8);
+        let (kernel, rows_per_tg) = match kind {
+            TensorType::Q8_0 => (&self.kernels.ink_moe_down_sum_conv_q8_0, 2u32),
+            TensorType::IQ4_NL => (&self.kernels.ink_moe_down_sum_conv_iq4_nl, 2u32),
+            other => return Err(Error::Unsupported(other)),
+        };
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(act),
+            Arg::Ptr(idx),
+            Arg::Ptr(share),
+            Arg::Ptr(history),
+            Arg::Ptr(conv_w),
+            Arg::Ptr(x_out),
+            Arg::I32(dim as i32),
+            Arg::I32(width as i32),
+            Arg::I32(used as i32),
+            Arg::I32(channels as i32),
+            Arg::I32(conv as i32),
+        ];
+        self.run(kernel, ((dim as u32).div_ceil(rows_per_tg), 1), 256, &args)
+    }
+
+    /// Single-token fused QKVR prep (f16 KV cache): K conv+clip -> K cache, V conv+rms -> V cache,
+    /// Q scale+clip+log_scale, and R scale+clip+log_scale in a single dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_qkvr_prep_f16(
+        &self,
+        k_in: CuDevicePtr,
+        v_in: CuDevicePtr,
+        q: CuDevicePtr,
+        r: CuDevicePtr,
+        history: CuDevicePtr,
+        k_conv: CuDevicePtr,
+        v_conv: CuDevicePtr,
+        k_taps: Option<CuDevicePtr>,
+        v_taps: Option<CuDevicePtr>,
+        k_cache: CuDevicePtr,
+        v_cache: CuDevicePtr,
+        q_clip_w: CuDevicePtr,
+        r_clip_w: CuDevicePtr,
+        kv_heads: usize,
+        heads: usize,
+        rd: usize,
+        channels: usize,
+        conv: usize,
+        pos: usize,
+        ring: usize,
+        qk_clip: f32,
+        rel_clip: f32,
+        eps: f32,
+        log_mult: f32,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(k_in),
+            Arg::Ptr(v_in),
+            Arg::Ptr(q),
+            Arg::Ptr(r),
+            Arg::Ptr(history),
+            Arg::Ptr(k_conv),
+            Arg::Ptr(v_conv),
+            Arg::Ptr(k_taps.unwrap_or(0)),
+            Arg::Ptr(v_taps.unwrap_or(0)),
+            Arg::Ptr(k_cache),
+            Arg::Ptr(v_cache),
+            Arg::Ptr(q_clip_w),
+            Arg::Ptr(r_clip_w),
+            Arg::I32(kv_heads as i32),
+            Arg::I32(heads as i32),
+            Arg::I32(rd as i32),
+            Arg::I32(channels as i32),
+            Arg::I32(conv as i32),
+            Arg::I32(pos as i32),
+            Arg::I32(ring as i32),
+            Arg::F32(qk_clip),
+            Arg::F32(rel_clip),
+            Arg::F32(eps),
+            Arg::F32(log_mult),
+        ];
+        self.run(
+            &self.kernels.ink_qkvr_prep_f16,
+            ((2 * kv_heads + 2 * heads) as u32, 1),
+            128,
+            &args,
+        )
+    }
+
+    /// Single-token fused Q8_0 attn_output matvec + optional new_block stack save +
+    /// attn_post_conv + residual into `x_out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_o_conv_q8_0(
+        &self,
+        w: CuDevicePtr,
+        x_in: CuDevicePtr,
+        history: CuDevicePtr,
+        conv_w: CuDevicePtr,
+        x_out: CuDevicePtr,
+        stack_dst: Option<CuDevicePtr>,
+        rows: usize,
+        cols: usize,
+        channels: usize,
+        conv: usize,
+    ) -> Result<()> {
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x_in),
+            Arg::Ptr(history),
+            Arg::Ptr(conv_w),
+            Arg::Ptr(x_out),
+            Arg::Ptr(stack_dst.unwrap_or(0)),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::I32(channels as i32),
+            Arg::I32(conv as i32),
+        ];
+        self.run(
+            &self.kernels.ink_o_conv_q8_0,
+            ((rows as u32).div_ceil(2), 1),
+            128,
+            &args,
+        )
+    }
+
+    /// Whether dense Q8_0 / IQ4_NL MoE prompt batches can run on INT8 neural accelerators
+    /// (`moe_matmul_i8_*`, 64- or 128-slot tiles, K multiple of 128).
+    pub fn moe_fast_i8(
+        &self,
+        kind: TensorType,
+        slots: usize,
+        experts: usize,
+        dim: usize,
+        width: usize,
+    ) -> bool {
+        matches!(kind, TensorType::Q8_0 | TensorType::IQ4_NL)
+            && self.kernels.moe_matmul_i8_q8_0.is_some()
+            && Self::moe_tile_slots(true, slots, experts) == MOE_TC_SLOTS
+            && dim.is_multiple_of(128)
+            && width.is_multiple_of(128)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gather_i8(
+        &self,
+        x: CuDevicePtr,
+        out_i8: CuDevicePtr,
+        scales: CuDevicePtr,
+        order: CuDevicePtr,
+        used: usize,
+        cols: usize,
+        slots: usize,
+        k_step: usize,
+    ) -> Result<()> {
+        let k = if k_step == 256 {
+            self.kernels
+                .moe_gather_i8_256
+                .as_ref()
+                .expect("checked with moe_fast_i8_q8_0")
+        } else {
+            self.kernels
+                .moe_gather_i8_128
+                .as_ref()
+                .expect("checked with moe_fast_i8_q8_0")
+        };
+        let args = [
+            Arg::Ptr(x),
+            Arg::Ptr(out_i8),
+            Arg::Ptr(scales),
+            Arg::Ptr(order),
+            Arg::I32(used as i32),
+            Arg::I32(cols as i32),
+        ];
+        self.run(
+            k,
+            ((cols / k_step) as u32, slots as u32),
+            (k_step / 4) as u32,
+            &args,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ink_situ_i8_128(
+        &self,
+        gate_up: CuDevicePtr,
+        out_i8: CuDevicePtr,
+        scales: CuDevicePtr,
+        width: usize,
+        slots: usize,
+        beta: f32,
+        linear_beta: f32,
+    ) -> Result<()> {
+        let k = self
+            .kernels
+            .ink_situ_i8_128
+            .as_ref()
+            .expect("checked with moe_fast_i8_q8_0");
+        let args = [
+            Arg::Ptr(gate_up),
+            Arg::Ptr(out_i8),
+            Arg::Ptr(scales),
+            Arg::I32(width as i32),
+            Arg::F32(beta),
+            Arg::F32(linear_beta),
+        ];
+        self.run(k, ((width / 128) as u32, slots as u32), 32, &args)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_matmul_i8(
+        &self,
+        kind: TensorType,
+        w: CuDevicePtr,
+        x_i8: CuDevicePtr,
+        y: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        tiles: CuDevicePtr,
+        scales: CuDevicePtr,
+        y_stride: usize,
+        slots: usize,
+        experts: usize,
+        wide: bool,
+        k_step: usize,
+    ) -> Result<()> {
+        let (k, tile_slots, tile_rows, threads) = match (kind, wide, k_step) {
+            (TensorType::Q8_0, true, 256) => (
+                self.kernels
+                    .moe_matmul_i8_wide256_q8_0
+                    .as_ref()
+                    .expect("checked with moe_fast_i8"),
+                128,
+                64u32,
+                256,
+            ),
+            (TensorType::Q8_0, true, _) => (
+                self.kernels
+                    .moe_matmul_i8_wide_q8_0
+                    .as_ref()
+                    .expect("checked with moe_fast_i8"),
+                128,
+                64u32,
+                256,
+            ),
+            (TensorType::Q8_0, false, _) => (
+                self.kernels
+                    .moe_matmul_i8_q8_0
+                    .as_ref()
+                    .expect("checked with moe_fast_i8"),
+                MOE_TC_SLOTS,
+                64u32,
+                128,
+            ),
+            (TensorType::IQ4_NL, true, 256) => (
+                self.kernels
+                    .moe_matmul_i8_wide256_iq4_nl
+                    .as_ref()
+                    .expect("checked with moe_fast_i8"),
+                128,
+                64u32,
+                256,
+            ),
+            (TensorType::IQ4_NL, true, _) => (
+                self.kernels
+                    .moe_matmul_i8_wide_iq4_nl
+                    .as_ref()
+                    .expect("checked with moe_fast_i8"),
+                128,
+                64u32,
+                256,
+            ),
+            (TensorType::IQ4_NL, false, _) => (
+                self.kernels
+                    .moe_matmul_i8_iq4_nl
+                    .as_ref()
+                    .expect("checked with moe_fast_i8"),
+                MOE_TC_SLOTS,
+                64u32,
+                128,
+            ),
+            (other, _, _) => return Err(Error::Unsupported(other)),
+        };
+        let args = [
+            Arg::Ptr(w),
+            Arg::Ptr(x_i8),
+            Arg::Ptr(y),
+            Arg::I32(rows as i32),
+            Arg::I32(cols as i32),
+            Arg::Ptr(tiles),
+            Arg::Ptr(scales),
+            Arg::I32(y_stride as i32),
+        ];
+        let grid = (
+            (rows as u32).div_ceil(tile_rows),
+            (slots / tile_slots + experts) as u32,
+        );
+        self.run(k, grid, threads, &args)
     }
 
     pub fn zero(&self, buffer: &Buffer) -> Result<()> {
@@ -3999,6 +5181,8 @@ pub struct InkAttention {
     /// A batch on the SIMD-group matrix units (`ink_attention_flash`), with the keys,
     /// values and queries rounded to f16: the default mode's prompts.
     pub flash: bool,
+    /// Keys and values stored in f16 (2 bytes each) instead of f32 (4 bytes each).
+    pub kv_f16: bool,
 }
 
 pub struct QkvPrep {
@@ -4078,6 +5262,7 @@ pub struct Q8 {
 enum Arg {
     Ptr(CuDevicePtr),
     I32(i32),
+    I32x2(i32, i32),
     F32(f32),
 }
 
