@@ -14,9 +14,9 @@
 //! the batch's rows (so a batch never overwrites a position one of its tokens still sees);
 //! global ones a row a position. Each visit has its convolutions' history.
 
-use super::gpu::{GpuMatrix, Input, gpu_error, q8_room};
+use super::gpu::{GpuMatrix, Input, Positions, gpu_error, load_state, q8_room, save_state};
 use super::inkling2::{Config, Controller, Inkling2, Layer};
-use super::{Error, Logits, Precision, Result};
+use super::{Error, Logits, Precision, Result, SavedState};
 use crate::GgufFile;
 use crate::cpu::{Matrix, Pool};
 use crate::cuda::{Buffer, CuDevicePtr, Gpu, InkAttention, Q8};
@@ -87,6 +87,8 @@ pub struct Inkling2Cuda<'a> {
     output_norm: Buffer,
     output_res_query: Buffer,
     layers: Vec<GpuLayer>,
+    /// A DSpark drafter to guess with (`set_drafter`), in sessions that keep drafting.
+    drafter: Option<super::inkling2_dspark_cuda::DSparkCuda<'a>>,
 }
 
 /// One layer visit's state.
@@ -179,6 +181,9 @@ pub struct Inkling2CudaSession {
     /// The furthest any position was read to since the session was emptied: what the
     /// rings hold from.
     furthest: usize,
+    /// The earliest position it can go back to: an imported state's length, when its
+    /// sliding-window layers brought only their window.
+    floor: usize,
     logits: Vec<f32>,
     rows: Vec<f32>,
     /// A DSpark drafter's features of the last batch, when asked for (`keep_features`).
@@ -186,7 +191,26 @@ pub struct Inkling2CudaSession {
     /// Each slot's convolution inputs of the last batch of 2 to LOG_ROWS tokens, for
     /// `keep_first` (when asked for, with `keep_features`).
     conv_log: Option<Buffer>,
+    /// The drafter's cache, kept up with what the session reads (`keep_drafting`).
+    draft: Option<Drafting>,
+    /// The last batch, when it was a held one of up to LOG_ROWS tokens read with its
+    /// convolution log: where it started and its length, for `rewind_held`, and the
+    /// session saved just before it.
+    held: Option<(usize, usize)>,
+    held_cp: Option<Inkling2Checkpoint>,
 }
+
+/// A session's DSpark cache and the rows of the last batch's features not in it yet:
+/// they go in before the next batch overwrites them, or before a draft, as many as the
+/// session still holds (after a check, only the tokens kept).
+struct Drafting {
+    state: super::inkling2_dspark_cuda::DSparkCudaState,
+    /// The last batch's first position and rows.
+    pending: Option<(usize, usize)>,
+}
+
+/// The end of a saved Inkling chat (`export`), after its parts' lengths.
+const SAVED_TAG: &[u8; 8] = b"INKSAVE1";
 
 /// The most tokens a checked batch can have for `keep_first` (the kernel's INK_LOG_ROWS).
 pub const LOG_ROWS: usize = 8;
@@ -331,6 +355,7 @@ impl<'a> Inkling2Cuda<'a> {
             config: c,
             gpu,
             precision: Precision::default(),
+            drafter: None,
         })
     }
 
@@ -450,10 +475,14 @@ impl<'a> Inkling2Cuda<'a> {
             len: 0,
             capacity,
             furthest: 0,
+            floor: 0,
             logits: vec![0.0; c.vocab],
             rows: vec![0.0; batch * dim],
             features: None,
             conv_log: None,
+            draft: None,
+            held: None,
+            held_cp: None,
         })
     }
 
@@ -462,6 +491,8 @@ impl<'a> Inkling2Cuda<'a> {
         self.gpu.zero(&s.histories).map_err(gpu_error)?;
         s.len = 0;
         s.furthest = 0;
+        s.floor = 0;
+        s.held = None;
         Ok(())
     }
 
@@ -492,6 +523,7 @@ impl<'a> Inkling2Cuda<'a> {
             .copy(s.histories.ptr(), cp.history.ptr(), s.histories.len_bytes())
             .map_err(gpu_error)?;
         s.len = cp.len;
+        s.held = None;
         Ok(true)
     }
 
@@ -499,6 +531,7 @@ impl<'a> Inkling2Cuda<'a> {
     pub fn can_restore(&self, s: &Inkling2CudaSession, len: usize) -> bool {
         let window = self.config.sliding_window;
         len <= s.len
+            && len >= s.floor
             && s.slots
                 .iter()
                 .filter(|slot| slot.ring && slot.rows < s.capacity)
@@ -556,6 +589,168 @@ impl<'a> Inkling2Cuda<'a> {
             )
             .map_err(gpu_error)?;
         s.len = cp.len + keep;
+        s.held = None;
+        Ok(())
+    }
+
+    /// Guesses with `drafter` from now on, in sessions made to (`keep_drafting`).
+    pub fn set_drafter(&mut self, drafter: super::inkling2_dspark_cuda::DSparkCuda<'a>) -> Result<()> {
+        drafter.check_target(self)?;
+        self.drafter = Some(drafter);
+        Ok(())
+    }
+
+    pub fn has_drafter(&self) -> bool {
+        self.drafter.is_some()
+    }
+
+    /// Has an empty session keep the drafter's cache up with what it reads (its features
+    /// and convolution log kept too), for `draft` and `rewind_held`.
+    pub fn keep_drafting(&self, s: &mut Inkling2CudaSession) -> Result<()> {
+        let d = self
+            .drafter
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("no drafter (set_drafter)".into()))?;
+        self.keep_features(s, d.target_visits())?;
+        s.draft = Some(Drafting {
+            state: d.state(self, s.capacity, s.batch)?,
+            pending: None,
+        });
+        Ok(())
+    }
+
+    /// Whether `s` keeps a drafter's cache (`keep_drafting`).
+    pub fn keeps_drafting(&self, s: &Inkling2CudaSession) -> bool {
+        s.draft.is_some()
+    }
+
+    /// Puts the last batch's features the session still holds into the drafter's cache,
+    /// after cutting the cache back to the session.
+    fn sync_draft(&self, s: &mut Inkling2CudaSession) -> Result<()> {
+        let (Some(d), Some(dr)) = (self.drafter.as_ref(), s.draft.as_mut()) else {
+            return Ok(());
+        };
+        if dr.state.len() > s.len {
+            dr.state.truncate(s.len);
+        }
+        if let Some((from, rows)) = dr.pending.take() {
+            let start = dr.state.len();
+            let end = s.len.min(from + rows);
+            if start >= from && end > start {
+                let f = s.features.as_ref().expect("kept with the drafter's cache");
+                d.add_from(self, &mut dr.state, (f.buffer.ptr(), f.rows), start - from, end - start)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Up to `count` guesses at the tokens after `anchor` (picked for the session's next
+    /// position, not read yet); none when the session doesn't keep drafting, or its
+    /// drafter's cache is behind it (it was read without).
+    pub fn draft(&self, s: &mut Inkling2CudaSession, anchor: u32, count: usize) -> Result<Vec<u32>> {
+        self.sync_draft(s)?;
+        match (self.drafter.as_ref(), s.draft.as_mut()) {
+            (Some(d), Some(dr)) if dr.state.len() == s.len => d.draft(&mut dr.state, self, anchor, count),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Takes the session back to `len` positions inside the last batch, when that was a
+    /// held one of up to [`LOG_ROWS`] tokens in a session that keeps drafting (a round of
+    /// guesses checked): false, changing nothing, otherwise.
+    pub fn rewind_held(&self, s: &mut Inkling2CudaSession, len: usize) -> Result<bool> {
+        if len == s.len {
+            return Ok(true);
+        }
+        let Some((from, t)) = s.held else {
+            return Ok(false);
+        };
+        if s.len != from + t || len < from || len > s.len {
+            return Ok(false);
+        }
+        let Some(cp) = s.held_cp.take() else {
+            return Ok(false);
+        };
+        let done = if len == from {
+            self.restore(s, &cp)
+        } else {
+            self.keep_first(s, &cp, t, len - from).map(|()| true)
+        };
+        s.held_cp = Some(cp);
+        done
+    }
+
+    /// Each slot's keys, then values, with the window a saved state keeps of them (a
+    /// sliding-window layer's) and its ring.
+    fn positions<'s>(&self, s: &'s Inkling2CudaSession) -> Vec<Positions<'s>> {
+        let window = self.config.sliding_window;
+        let each = |b: fn(&Slot) -> &Buffer| {
+            s.slots.iter().map(move |slot| {
+                if slot.ring {
+                    (b(slot), Some(window), slot.rows)
+                } else {
+                    (b(slot), None, 0)
+                }
+            })
+        };
+        each(|slot| &slot.keys).chain(each(|slot| &slot.values)).collect()
+    }
+
+    /// The session's first `cp.len()` positions and its convolution histories there
+    /// (`cp`, saved at that point), copied to system memory (a sliding-window layer's
+    /// only for its window), with the drafter's cache when the session keeps it up that
+    /// far. None when the caches no longer hold that point.
+    pub fn export(&self, s: &Inkling2CudaSession, cp: &Inkling2Checkpoint) -> Result<Option<SavedState>> {
+        let len = cp.len;
+        if len == 0 || !self.can_restore(s, len) {
+            return Ok(None);
+        }
+        let mut bytes = save_state(&self.positions(s), s.capacity, len, &[&cp.history])?
+            .bytes()
+            .to_vec();
+        let ours = bytes.len();
+        let mut drafted = 0usize;
+        if let (Some(d), Some(dr)) = (self.drafter.as_ref(), s.draft.as_ref())
+            && dr.state.len() >= len
+        {
+            d.export(&dr.state, len, &mut bytes)?;
+            drafted = len;
+        }
+        bytes.extend_from_slice(&(ours as u64).to_le_bytes());
+        bytes.extend_from_slice(&(drafted as u64).to_le_bytes());
+        bytes.extend_from_slice(SAVED_TAG);
+        Ok(Some(SavedState::from_bytes(len, bytes)))
+    }
+
+    /// Loads a state `export` made (from a session of this model and precision, of any
+    /// capacity it fits) in place of what the session held: it can't go back before it.
+    pub fn import(&self, s: &mut Inkling2CudaSession, saved: &SavedState) -> Result<()> {
+        let bytes = saved.bytes();
+        let n = bytes.len();
+        let bad = || Error::Invalid("not a saved Inkling 2 chat".into());
+        if n < 24 || &bytes[n - 8..] != SAVED_TAG {
+            return Err(bad());
+        }
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+        let (ours, drafted) = (word(n - 24), word(n - 16));
+        if ours > n - 24 {
+            return Err(bad());
+        }
+        let len = saved.len();
+        let state = SavedState::from_bytes(len, bytes[..ours].to_vec());
+        load_state(&state, len, &self.positions(s), s.capacity, &[&s.histories])?;
+        s.len = len;
+        s.furthest = len;
+        s.floor = if len > self.config.sliding_window { len } else { 0 };
+        s.held = None;
+        if let (Some(d), Some(dr)) = (self.drafter.as_ref(), s.draft.as_mut()) {
+            dr.pending = None;
+            dr.state.truncate(0);
+            // A drafter's cache from another drafter, or none: this chat goes undrafted.
+            if drafted == len && d.import(&mut dr.state, len, &bytes[ours..n - 24]).is_err() {
+                dr.state.truncate(0);
+            }
+        }
         Ok(())
     }
 
@@ -652,7 +847,18 @@ impl<'a> Inkling2Cuda<'a> {
                 HELD.min(s.batch)
             )));
         }
+        // A round of guesses: saved before it, to keep only those taken (`rewind_held`).
+        let from = s.len;
+        let rewindable = s.draft.is_some() && s.conv_log.is_some() && tokens.len() <= LOG_ROWS;
+        if rewindable {
+            let mut cp = s.held_cp.take();
+            self.save(s, &mut cp)?;
+            s.held_cp = cp;
+        }
         self.queue(s, tokens, true)?;
+        if rewindable {
+            s.held = Some((from, tokens.len()));
+        }
         self.queue_logits(s, tokens.len())
     }
 
@@ -689,6 +895,9 @@ impl<'a> Inkling2Cuda<'a> {
         let g = &self.gpu;
         let (pos0, t) = (s.len, tokens.len());
         assert!(t >= 1 && t <= s.batch, "a batch of {t} tokens");
+        // The last batch's features go to the drafter before this one's overwrite them.
+        self.sync_draft(s)?;
+        s.held = None;
         if pos0 + t > s.capacity {
             return Err(Error::Invalid(format!(
                 "the session is full ({} positions)",
@@ -848,6 +1057,9 @@ impl<'a> Inkling2Cuda<'a> {
         let _ = visit;
         if let Some(f) = &mut s.features {
             f.rows = t;
+        }
+        if let Some(dr) = &mut s.draft {
+            dr.pending = Some((pos0, t));
         }
         s.len += t;
         s.furthest = s.furthest.max(s.len);

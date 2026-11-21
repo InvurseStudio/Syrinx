@@ -3,13 +3,26 @@
 //! model runs on the Mac's GPU (or the CPU) for now; nothing else can be reached.
 
 use super::inkling2::Config;
-use super::{Error, Logits, Precision, Result};
+use super::{Error, Logits, Precision, Result, SavedState};
 use crate::GgufFile;
 use crate::cuda::Gpu;
 use std::marker::PhantomData;
 
 pub const BATCH: usize = 512;
 pub const REWIND: usize = 2048;
+pub const LOG_ROWS: usize = 8;
+
+/// Inkling 2's DSpark drafter on the GPU: as the model, Mac only so far.
+pub struct DSparkCuda<'a> {
+    never: Never,
+    _file: PhantomData<&'a ()>,
+}
+
+impl<'a> DSparkCuda<'a> {
+    pub fn load(_file: &'a GgufFile, _gpu: &Gpu) -> Result<Self> {
+        Err(Error::Unsupported("Inkling 2's drafter on this GPU".into()))
+    }
+}
 
 /// No value of it can be made: what makes the methods below unreachable.
 enum Never {}
@@ -139,6 +152,38 @@ impl<'a> Inkling2Cuda<'a> {
     }
 
     pub fn forward_greedy(&self, _s: &mut Inkling2CudaSession, _token: u32) -> Result<u32> {
+        match self.never {}
+    }
+
+    pub fn set_drafter(&mut self, drafter: DSparkCuda<'a>) -> Result<()> {
+        match drafter.never {}
+    }
+
+    pub fn has_drafter(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn keep_drafting(&self, _s: &mut Inkling2CudaSession) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn keeps_drafting(&self, _s: &Inkling2CudaSession) -> bool {
+        match self.never {}
+    }
+
+    pub fn draft(&self, _s: &mut Inkling2CudaSession, _anchor: u32, _count: usize) -> Result<Vec<u32>> {
+        match self.never {}
+    }
+
+    pub fn rewind_held(&self, _s: &mut Inkling2CudaSession, _len: usize) -> Result<bool> {
+        match self.never {}
+    }
+
+    pub fn export(&self, _s: &Inkling2CudaSession, _cp: &Inkling2Checkpoint) -> Result<Option<SavedState>> {
+        match self.never {}
+    }
+
+    pub fn import(&self, _s: &mut Inkling2CudaSession, _saved: &SavedState) -> Result<()> {
         match self.never {}
     }
 }

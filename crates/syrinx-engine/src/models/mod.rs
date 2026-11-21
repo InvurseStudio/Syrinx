@@ -18,6 +18,10 @@ pub mod inkling2_dspark_cuda;
 #[cfg(not(target_os = "macos"))]
 #[path = "inkling2_unsupported.rs"]
 pub mod inkling2_cuda;
+#[cfg(not(target_os = "macos"))]
+pub mod inkling2_dspark_cuda {
+    pub use super::inkling2_cuda::DSparkCuda;
+}
 pub mod llama;
 pub mod llama_cuda;
 pub mod qwen35;
